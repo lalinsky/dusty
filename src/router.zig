@@ -195,10 +195,10 @@ pub fn Router(comptime Ctx: type) type {
             std.debug.assert(method_idx < 256);
             const root = self.trees[method_idx] orelse return null;
 
-            // Strip query parameters from URL
-            // Split URL at '?' to separate path from query string
+            // Strip query parameters from URL and parse them
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
-                req.query = req.url[query_start + 1 ..];
+                const query_string = req.url[query_start + 1 ..];
+                try parseQueryString(req, query_string);
                 break :blk req.url[0..query_start];
             } else req.url;
 
@@ -250,6 +250,32 @@ pub fn Router(comptime Ctx: type) type {
 
         pub fn delete(self: *Self, path: []const u8, handler: Handler) void {
             self.insert(path, .delete, handler) catch @panic("OOM");
+        }
+
+        fn parseQueryString(req: *Request, query_string: []const u8) !void {
+            if (query_string.len == 0) return;
+
+            // Count '&' to estimate capacity (upper bound on number of key-value pairs)
+            // Number of segments = ampersands + 1
+            const ampersand_count = std.mem.count(u8, query_string, "&");
+            const max_params = ampersand_count + 1;
+
+            // Pre-allocate capacity for the query hashmap
+            try req.query.ensureTotalCapacity(req.arena, @intCast(max_params));
+
+            var it = std.mem.splitScalar(u8, query_string, '&');
+            while (it.next()) |pair| {
+                if (pair.len == 0) continue;
+
+                if (std.mem.indexOfScalar(u8, pair, '=')) |sep| {
+                    const key = try Request.urlUnescape(req.arena, pair[0..sep]);
+                    const value = try Request.urlUnescape(req.arena, pair[sep + 1 ..]);
+                    req.query.putAssumeCapacity(key, value);
+                } else {
+                    const key = try Request.urlUnescape(req.arena, pair);
+                    req.query.putAssumeCapacity(key, "");
+                }
+            }
         }
     };
 }
@@ -696,8 +722,9 @@ test "Router: static route with query parameters" {
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.? == testHandler);
 
-    // Query string should be extracted
-    try std.testing.expectEqualStrings("debug=true&page=1", req.query);
+    // Query parameters should be parsed
+    try std.testing.expectEqualStrings("true", req.query.get("debug").?);
+    try std.testing.expectEqualStrings("1", req.query.get("page").?);
 }
 
 test "Router: param route with query parameters" {
@@ -724,8 +751,8 @@ test "Router: param route with query parameters" {
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("123", id.?);
 
-    // Query string should be extracted
-    try std.testing.expectEqualStrings("format=json", req.query);
+    // Query parameters should be parsed
+    try std.testing.expectEqualStrings("json", req.query.get("format").?);
 }
 
 test "Router: multiple params with query parameters" {
@@ -755,8 +782,9 @@ test "Router: multiple params with query parameters" {
     try std.testing.expect(postId != null);
     try std.testing.expectEqualStrings("789", postId.?);
 
-    // Query string should be extracted
-    try std.testing.expectEqualStrings("include=comments&sort=date", req.query);
+    // Query parameters should be parsed
+    try std.testing.expectEqualStrings("comments", req.query.get("include").?);
+    try std.testing.expectEqualStrings("date", req.query.get("sort").?);
 }
 
 test "Router: wildcard route with query parameters" {
@@ -782,8 +810,8 @@ test "Router: wildcard route with query parameters" {
     try std.testing.expect(path != null);
     try std.testing.expectEqualStrings("docs/readme.md", path.?);
 
-    // Query string should be extracted
-    try std.testing.expectEqualStrings("download=true", req.query);
+    // Query parameters should be parsed
+    try std.testing.expectEqualStrings("true", req.query.get("download").?);
 }
 
 test "Router: empty query string" {
@@ -808,8 +836,8 @@ test "Router: empty query string" {
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("123", id.?);
 
-    // Empty query string
-    try std.testing.expectEqualStrings("", req.query);
+    // Empty query parameters
+    try std.testing.expectEqual(0, req.query.count());
 }
 
 test "Router: no query parameters" {
@@ -834,6 +862,77 @@ test "Router: no query parameters" {
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("123", id.?);
 
-    // No query string
-    try std.testing.expectEqualStrings("", req.query);
+    // No query parameters
+    try std.testing.expectEqual(0, req.query.count());
+}
+
+test "Router: URL encoded query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/search", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/search?q=hello+world&tag=foo%20bar&special=%21%40%23%24",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    // URL decoding: + -> space, %20 -> space, %XX -> byte
+    try std.testing.expectEqualStrings("hello world", req.query.get("q").?);
+    try std.testing.expectEqualStrings("foo bar", req.query.get("tag").?);
+    try std.testing.expectEqualStrings("!@#$", req.query.get("special").?);
+}
+
+test "Router: query parameter without value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/items", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/items?featured&sort=name",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    // Parameters without values should have empty string value
+    try std.testing.expectEqualStrings("", req.query.get("featured").?);
+    try std.testing.expectEqualStrings("name", req.query.get("sort").?);
+}
+
+test "Router: query with empty key-value pairs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/test", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/test?a=1&&b=2&",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    // Should handle double && and trailing &
+    try std.testing.expectEqualStrings("1", req.query.get("a").?);
+    try std.testing.expectEqualStrings("2", req.query.get("b").?);
+    try std.testing.expectEqual(2, req.query.count());
 }
