@@ -196,6 +196,7 @@ pub fn Router(comptime Ctx: type) type {
             const root = self.trees[method_idx] orelse return null;
 
             // Strip query parameters from URL and parse them
+            req.query.clearRetainingCapacity();
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
                 const query_string = req.url[query_start + 1 ..];
                 try parseQueryString(req, query_string);
@@ -253,7 +254,6 @@ pub fn Router(comptime Ctx: type) type {
         }
 
         fn parseQueryString(req: *Request, query_string: []const u8) !void {
-            req.query.clearRetainingCapacity();
             if (query_string.len == 0) return;
 
             // Count '&' to estimate capacity (upper bound on number of key-value pairs)
