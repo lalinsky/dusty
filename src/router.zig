@@ -253,6 +253,7 @@ pub fn Router(comptime Ctx: type) type {
         }
 
         fn parseQueryString(req: *Request, query_string: []const u8) !void {
+            req.query.clearRetainingCapacity();
             if (query_string.len == 0) return;
 
             // Count '&' to estimate capacity (upper bound on number of key-value pairs)
