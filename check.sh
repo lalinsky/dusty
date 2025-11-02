@@ -74,6 +74,6 @@ if [ -n "$TEST_FILTER" ]; then
 else
     echo "Running all unit tests..."
 fi
-zig build test
+zig build test --summary all
 
 echo "=== All checks passed! ==="

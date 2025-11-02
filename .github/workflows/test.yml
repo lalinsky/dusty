@@ -27,5 +27,5 @@ jobs:
       timeout-minutes: 5
 
     - name: Run tests
-      run: zig build test
+      run: zig build test --summary all
       timeout-minutes: 5

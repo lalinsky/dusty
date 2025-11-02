@@ -1,3 +1,7 @@
 const std = @import("std");
 
-pub const Request = struct {};
+const http = @import("http.zig");
+
+pub const Request = struct {
+    method: http.Method,
+};
