@@ -38,7 +38,7 @@ pub fn Router(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
-        pub const Handler = fn (*Ctx, *const Request, *Response) anyerror!void;
+        pub const Handler = fn (*Ctx, *Request, *Response) anyerror!void;
 
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree
@@ -254,13 +254,13 @@ const TestContext = struct {
     called: bool = false,
 };
 
-fn testHandler(ctx: *TestContext, req: *const Request, res: *Response) !void {
+fn testHandler(ctx: *TestContext, req: *Request, res: *Response) !void {
     _ = req;
     _ = res;
     ctx.called = true;
 }
 
-fn testHandler2(ctx: *TestContext, req: *const Request, res: *Response) !void {
+fn testHandler2(ctx: *TestContext, req: *Request, res: *Response) !void {
     _ = req;
     _ = res;
     _ = ctx;

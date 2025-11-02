@@ -10,3 +10,8 @@ pub const Method = @import("http.zig").Method;
 test {
     std.testing.refAllDecls(@This());
 }
+
+// Import server tests
+comptime {
+    _ = @import("server_test.zig");
+}

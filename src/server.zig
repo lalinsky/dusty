@@ -8,14 +8,14 @@ const Response = @import("response.zig").Response;
 
 const log = std.log.scoped(.dust);
 
-fn defaultUncaughtError(req: *const Request, res: *Response, err: anyerror) void {
+fn defaultUncaughtError(req: *Request, res: *Response, err: anyerror) void {
     _ = req;
     log.err("Handler failed: {}", .{err});
     res.status = .internal_server_error;
     res.body = "500 Internal Server Error\n";
 }
 
-fn defaultNotFound(req: *const Request, res: *Response) void {
+fn defaultNotFound(req: *Request, res: *Response) void {
     log.info("No handler found for {s}", .{req.url});
     res.status = .not_found;
     res.body = "404 Not Found\n";
@@ -25,7 +25,7 @@ pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
-        fn handleError(self: *Self, req: *const Request, res: *Response, err: anyerror) void {
+        fn handleError(self: *Self, req: *Request, res: *Response, err: anyerror) void {
             if (comptime std.meta.hasFn(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(req, res, err);
             } else {
@@ -37,6 +37,8 @@ pub fn Server(comptime Ctx: type) type {
         router: Router(Ctx),
         ctx: *Ctx,
         active_connections: std.atomic.Value(usize),
+        address: zio.net.Address,
+        ready: zio.ResetEvent,
 
         pub fn init(allocator: std.mem.Allocator, ctx: *Ctx) Self {
             return .{
@@ -44,6 +46,8 @@ pub fn Server(comptime Ctx: type) type {
                 .router = Router(Ctx).init(allocator),
                 .ctx = ctx,
                 .active_connections = std.atomic.Value(usize).init(0),
+                .address = undefined,
+                .ready = .init,
             };
         }
 
@@ -56,6 +60,8 @@ pub fn Server(comptime Ctx: type) type {
             defer server.close(rt);
 
             log.info("Listening on {f}", .{server.socket.address});
+            self.address = server.socket.address;
+            self.ready.set();
 
             while (true) {
                 const stream = try server.accept(rt);
@@ -69,7 +75,7 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
-        fn handleConnection(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
+        pub fn handleConnection(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
             // Close connection if it's already closed
             defer stream.close(rt);
 
@@ -104,7 +110,16 @@ pub fn Server(comptime Ctx: type) type {
                     const buffered = reader.interface.buffered();
                     const unparsed = buffered[parsed_len..];
                     if (unparsed.len > 0) {
-                        try parser.feed(unparsed);
+                        parser.feed(unparsed) catch |err| switch (err) {
+                            error.Paused => {
+                                // Parser paused after headers, track consumed bytes
+                                const consumed = parser.getConsumedBytes(unparsed.ptr);
+                                parsed_len += consumed;
+                                continue;
+                            },
+                            else => return err,
+                        };
+                        // If we get here, parsing is still going (no pause yet)
                         parsed_len += unparsed.len;
                         continue;
                     }
@@ -121,6 +136,12 @@ pub fn Server(comptime Ctx: type) type {
                         else => return err,
                     };
                 }
+
+                // Headers are done, toss header bytes from buffer and setup body reading
+                reader.interface.toss(parsed_len);
+                request.parser = &parser;
+                request.stream_reader = &reader.interface;
+                request.body_read_buffer = &read_buffer;
 
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
 
@@ -149,12 +170,19 @@ pub fn Server(comptime Ctx: type) type {
                     break;
                 }
 
-                reader.interface.toss(parsed_len);
+                // Drain unconsumed body before connection reuse
+                if (!parser.isBodyComplete()) {
+                    var drain_buf: [4096]u8 = undefined;
+                    var body_reader = try request.bodyReader();
+                    while (true) {
+                        const n = try body_reader.read(&drain_buf);
+                        if (n == 0) break;
+                    }
+                }
+
                 parser.reset();
                 request.reset();
                 _ = arena.reset(.retain_capacity);
-
-                // TODO we need to make sure we drain previous request body
             }
         }
     };
