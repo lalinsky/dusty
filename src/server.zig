@@ -148,6 +148,15 @@ pub fn Server(comptime Ctx: type) type {
                 // Resume parser after headers pause
                 parser.resumeParsing();
 
+                // Feed empty buffer to advance parser state machine
+                // This allows llhttp__after_headers_complete to run, which will
+                // call on_message_complete for requests without bodies (e.g. GET)
+                const empty: []const u8 = &.{};
+                parser.feed(empty) catch |err| switch (err) {
+                    error.Paused => {}, // Expected if message is complete
+                    else => return err,
+                };
+
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = Response.init(arena.allocator(), &writer.interface);

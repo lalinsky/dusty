@@ -55,61 +55,74 @@ pub const BodyReader = struct {
         const conn = self.req.conn;
         const parser = self.req.parser;
 
+        // Check if body is already complete
         if (parser.isBodyComplete()) {
             return error.EndOfStream;
         }
 
-        // Setup destination for onBody callback
+        // Setup destination for onBody callback (resets body_dest_pos to 0)
         parser.prepareBodyRead(dest);
 
-        // We got some data just from resuming
-        if (parser.state.body_dest_pos > 0) {
-            w.advance(parser.state.body_dest_pos);
-            return parser.state.body_dest_pos;
-        }
+        // Loop until we have body bytes, body is complete, or error occurs
+        // This handles cases where parser consumes framing data (chunk headers)
+        // but doesn't produce body bytes yet - we must not return 0 mid-body
+        while (true) {
+            // If we have body bytes, return them
+            if (parser.state.body_dest_pos > 0) {
+                w.advance(parser.state.body_dest_pos);
+                return parser.state.body_dest_pos;
+            }
 
-        // On first body read, feed empty buffer to advance parser state machine
-        // This allows llhttp__after_headers_complete to run
-        if (!parser.state.body_read_started) {
-            parser.state.body_read_started = true;
-            const empty: []const u8 = &.{};
-            parser.feed(empty) catch |err| switch (err) {
-                error.Paused => {}, // Expected if there's a body to read
-                else => return error.ReadFailed,
-            };
-
-            // Check if message completed (e.g., GET with no body)
+            // Check if body is complete
             if (parser.isBodyComplete()) {
                 return error.EndOfStream;
             }
-        }
 
-        // Check if there's buffered data
-        if (conn.bufferedLen() == 0) {
-            conn.fillMore() catch return error.ReadFailed;
-        }
+            // Ensure connection buffer has data
+            if (conn.bufferedLen() == 0) {
+                conn.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => {
+                        // Connection closed - call finish() to complete the message
+                        parser.finish() catch {
+                            // finish() failed - message was not complete
+                            return error.ReadFailed;
+                        };
 
-        // How much data is buffered
-        const buffered = conn.buffered();
-        if (buffered.len == 0) return error.EndOfStream;
-        const n = @min(dest.len, buffered.len);
+                        // Check if body is now complete after finish()
+                        if (parser.isBodyComplete()) {
+                            return error.EndOfStream;
+                        }
 
-        // Feed data to parser
-        if (parser.feed(buffered[0..n])) {
-            // Not paused - consumed all n bytes
-            conn.toss(n);
-        } else |err| {
-            switch (err) {
-                // Paused means onMessageComplete was called
-                error.Paused => {
-                    const consumed = parser.getConsumedBytes(buffered.ptr);
-                    conn.toss(consumed);
-                },
-                else => return error.ReadFailed,
+                        // Message not complete despite EOF
+                        return error.ReadFailed;
+                    },
+                    else => return error.ReadFailed,
+                };
             }
-        }
 
-        w.advance(parser.state.body_dest_pos);
-        return parser.state.body_dest_pos;
+            // Get buffered data
+            const buffered = conn.buffered();
+            if (buffered.len == 0) {
+                // Shouldn't happen after successful fillMore
+                return error.EndOfStream;
+            }
+
+            // Feed data to parser (may consume framing data without producing body bytes)
+            if (parser.feed(buffered)) {
+                // Not paused - consumed all bytes
+                conn.toss(buffered.len);
+            } else |err| {
+                switch (err) {
+                    // Paused means onMessageComplete was called
+                    error.Paused => {
+                        const consumed = parser.getConsumedBytes(buffered.ptr);
+                        conn.toss(consumed);
+                    },
+                    else => return error.ReadFailed,
+                }
+            }
+
+            // Continue loop to check if we got body bytes now
+        }
     }
 };

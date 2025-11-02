@@ -58,7 +58,6 @@ pub const RequestParser = struct {
         // Body reading state
         body_dest_buf: []u8 = &.{}, // Where onBody should copy to
         body_dest_pos: usize = 0, // How much onBody has written
-        body_read_started: bool = false, // Track if we've started reading body
     };
 
     pub fn init(self: *RequestParser, request: *Request) !void {
