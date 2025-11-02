@@ -148,7 +148,7 @@ pub fn Router(comptime Ctx: type) type {
             current.handler = @ptrCast(handler);
         }
 
-        fn matchRecursive(node: *Node, req: *Request, segments: []const []const u8, segment_offsets: []const usize, index: usize) !?*Node {
+        fn matchRecursive(node: *Node, req: *Request, path: []const u8, segments: []const []const u8, segment_offsets: []const usize, index: usize) !?*Node {
             // Terminal case: consumed all segments
             if (index >= segments.len) {
                 // Only return node if it has a handler registered
@@ -164,7 +164,7 @@ pub fn Router(comptime Ctx: type) type {
             var static_child = node.static_children;
             while (static_child) |c| {
                 if (std.mem.eql(u8, c.segment, current_segment)) {
-                    const result = try matchRecursive(c, req, segments, segment_offsets, index + 1);
+                    const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
                     if (result != null) return result;
                 }
                 static_child = c.next_sibling;
@@ -173,15 +173,15 @@ pub fn Router(comptime Ctx: type) type {
             // 2. Try param child (medium precedence)
             if (node.param_child) |c| {
                 try req.params.put(req.arena, c.param_name.?, current_segment);
-                const result = try matchRecursive(c, req, segments, segment_offsets, index + 1);
+                const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
                 if (result != null) return result;
                 _ = req.params.remove(c.param_name.?); // backtrack
             }
 
             // 3. Try wildcard child (lowest precedence)
             if (node.wildcard_child) |c| {
-                // Capture remaining path from original URL
-                const remaining = req.url[segment_offsets[index]..];
+                // Capture remaining path (without query parameters)
+                const remaining = path[segment_offsets[index]..];
                 try req.params.put(req.arena, c.param_name.?, remaining);
                 return c;
             }
@@ -195,8 +195,15 @@ pub fn Router(comptime Ctx: type) type {
             std.debug.assert(method_idx < 256);
             const root = self.trees[method_idx] orelse return null;
 
+            // Strip query parameters from URL
+            // Split URL at '?' to separate path from query string
+            const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
+                req.query = req.url[query_start + 1 ..];
+                break :blk req.url[0..query_start];
+            } else req.url;
+
             // Count segments (max possible is number of '/' + 1)
-            const max_segments = std.mem.count(u8, req.url, "/") + 1;
+            const max_segments = std.mem.count(u8, path, "/") + 1;
 
             // Pre-allocate exact capacity needed
             var segments = try std.ArrayList([]const u8).initCapacity(req.arena, max_segments);
@@ -207,7 +214,7 @@ pub fn Router(comptime Ctx: type) type {
 
             // Split path into segments and track their offsets
             var offset: usize = 0;
-            var iter = std.mem.splitScalar(u8, req.url, '/');
+            var iter = std.mem.splitScalar(u8, path, '/');
             while (iter.next()) |segment| {
                 if (segment.len > 0) {
                     segments.appendAssumeCapacity(segment);
@@ -216,7 +223,7 @@ pub fn Router(comptime Ctx: type) type {
                 offset += segment.len + 1; // +1 for the '/'
             }
 
-            const node = try matchRecursive(root, req, segments.items, offsets.items, 0);
+            const node = try matchRecursive(root, req, path, segments.items, offsets.items, 0);
             if (node) |n| {
                 if (n.handler) |opaque_handler| {
                     return @ptrCast(@alignCast(opaque_handler));
@@ -668,4 +675,165 @@ test "Router: wildcard with prefix path" {
     const path = req.params.get("path");
     try std.testing.expect(path != null);
     try std.testing.expectEqualStrings("docs/readme.md", path.?);
+}
+
+test "Router: static route with query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/profile", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/users/profile?debug=true&page=1",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+    try std.testing.expect(handler.? == testHandler);
+
+    // Query string should be extracted
+    try std.testing.expectEqualStrings("debug=true&page=1", req.query);
+}
+
+test "Router: param route with query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:id", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/users/123?format=json",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+    try std.testing.expect(handler.? == testHandler);
+
+    // Parameter should not include query string
+    const id = req.params.get("id");
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("123", id.?);
+
+    // Query string should be extracted
+    try std.testing.expectEqualStrings("format=json", req.query);
+}
+
+test "Router: multiple params with query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:userId/posts/:postId", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/users/456/posts/789?include=comments&sort=date",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    // Parameters should not include query string
+    const userId = req.params.get("userId");
+    try std.testing.expect(userId != null);
+    try std.testing.expectEqualStrings("456", userId.?);
+
+    const postId = req.params.get("postId");
+    try std.testing.expect(postId != null);
+    try std.testing.expectEqualStrings("789", postId.?);
+
+    // Query string should be extracted
+    try std.testing.expectEqualStrings("include=comments&sort=date", req.query);
+}
+
+test "Router: wildcard route with query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/files/*path", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/files/docs/readme.md?download=true",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    // Wildcard should not include query string
+    const path = req.params.get("path");
+    try std.testing.expect(path != null);
+    try std.testing.expectEqualStrings("docs/readme.md", path.?);
+
+    // Query string should be extracted
+    try std.testing.expectEqualStrings("download=true", req.query);
+}
+
+test "Router: empty query string" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:id", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/users/123?",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    const id = req.params.get("id");
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("123", id.?);
+
+    // Empty query string
+    try std.testing.expectEqualStrings("", req.query);
+}
+
+test "Router: no query parameters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:id", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/users/123",
+        .arena = arena.allocator(),
+    };
+
+    const handler = try router.findHandler(&req);
+    try std.testing.expect(handler != null);
+
+    const id = req.params.get("id");
+    try std.testing.expect(id != null);
+    try std.testing.expectEqualStrings("123", id.?);
+
+    // No query string
+    try std.testing.expectEqualStrings("", req.query);
 }
