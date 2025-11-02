@@ -39,14 +39,15 @@ pub const Response = struct {
             try self.writeHeader();
         }
 
-        // Format: \r\n{size_hex}\r\n{data}
+        // Format: {size_hex}\r\n{data}\r\n
         // Buffer size: enough for a 1TB chunk (40 bits = 10 hex digits) + formatting
         var buf: [16]u8 = undefined;
-        const chunk_header = try std.fmt.bufPrint(&buf, "\r\n{x}\r\n", .{data.len});
+        const chunk_header = try std.fmt.bufPrint(&buf, "{x}\r\n", .{data.len});
 
-        // Write chunk size header and data
+        // Write chunk size header, data, and trailing CRLF
         try self.conn.writeAll(chunk_header);
         try self.conn.writeAll(data);
+        try self.conn.writeAll("\r\n");
         try self.conn.flush();
     }
 
@@ -72,8 +73,6 @@ pub const Response = struct {
 
         // Write Transfer-Encoding or Content-Length
         if (self.chunked) {
-            // For chunked responses, end with single \r\n because chunk() prepends \r\n
-            // This creates the correct \r\n\r\n separator for the first chunk
             try self.conn.writeAll("Transfer-Encoding: chunked\r\n");
         } else {
             // Write Content-Length if not manually set
@@ -83,9 +82,10 @@ pub const Response = struct {
                 const body_len = if (buffer_end > 0) buffer_end else self.body.len;
                 try self.conn.print("Content-Length: {d}\r\n", .{body_len});
             }
-            // End of headers
-            try self.conn.writeAll("\r\n");
         }
+
+        // End of headers (applies to both chunked and non-chunked)
+        try self.conn.writeAll("\r\n");
 
         try self.conn.flush();
     }
@@ -98,8 +98,8 @@ pub const Response = struct {
 
         if (self.chunked) {
             // For chunked responses, headers are already written by chunk()
-            // We just need to write the trailing chunk terminator
-            try self.conn.writeAll("\r\n0\r\n\r\n");
+            // We just need to write the final zero-length chunk terminator
+            try self.conn.writeAll("0\r\n\r\n");
             try self.conn.flush();
             return;
         }
@@ -388,17 +388,16 @@ test "Response: chunked with single chunk" {
 
     const written = conn_writer.buffered();
 
-    // Should have Transfer-Encoding header
-    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+    // Validate exact chunked encoding format
+    const expected =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++ // End of headers
+        "5\r\n" ++ // Chunk size
+        "Hello\r\n" ++ // Chunk data + trailing CRLF
+        "0\r\n\r\n"; // Final terminator
 
-    // Should have chunk size (5 in hex)
-    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n5\r\n") != null);
-
-    // Should have chunk data
-    try std.testing.expect(std.mem.indexOf(u8, written, "Hello") != null);
-
-    // Should have terminator
-    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n0\r\n\r\n") != null);
+    try std.testing.expectEqualStrings(expected, written);
 }
 
 test "Response: chunked with multiple chunks" {
@@ -416,19 +415,18 @@ test "Response: chunked with multiple chunks" {
 
     const written = conn_writer.buffered();
 
-    // Should have Transfer-Encoding header
-    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+    // Validate exact chunked encoding format
+    const expected =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++ // End of headers
+        "5\r\n" ++ // First chunk size
+        "First\r\n" ++ // First chunk data + trailing CRLF
+        "c\r\n" ++ // Second chunk size (12 in hex)
+        "Second chunk\r\n" ++ // Second chunk data + trailing CRLF
+        "0\r\n\r\n"; // Final terminator
 
-    // Should have first chunk (5 bytes in hex)
-    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n5\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "First") != null);
-
-    // Should have second chunk (12 bytes in hex = c)
-    try std.testing.expect(std.mem.indexOf(u8, written, "\r\nc\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Second chunk") != null);
-
-    // Should have terminator
-    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n0\r\n\r\n") != null);
+    try std.testing.expectEqualStrings(expected, written);
 }
 
 test "Response: chunked with custom headers" {
@@ -447,17 +445,17 @@ test "Response: chunked with custom headers" {
 
     const written = conn_writer.buffered();
 
-    // Should have custom status
-    try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 201") != null);
+    // Validate exact chunked encoding format with custom headers
+    const expected =
+        "HTTP/1.1 201 CREATED\r\n" ++
+        "X-Custom: value\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++ // End of headers
+        "4\r\n" ++ // Chunk size (4 bytes)
+        "Data\r\n" ++ // Chunk data + trailing CRLF
+        "0\r\n\r\n"; // Final terminator
 
-    // Should have custom header
-    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: value") != null);
-
-    // Should have Transfer-Encoding header
-    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
-
-    // Should have chunk data
-    try std.testing.expect(std.mem.indexOf(u8, written, "Data") != null);
+    try std.testing.expectEqualStrings(expected, written);
 }
 
 test "Response: chunked flag defaults to false" {
