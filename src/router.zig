@@ -38,7 +38,10 @@ pub fn Router(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
-        pub const Handler = fn (*Ctx, *Request, *Response) anyerror!void;
+        pub const Handler = if (Ctx == void)
+            fn (*Request, *Response) anyerror!void
+        else
+            fn (*Ctx, *Request, *Response) anyerror!void;
 
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree

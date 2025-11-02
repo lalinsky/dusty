@@ -245,3 +245,68 @@ test "Server: HTTP/1.0 GET request" {
     try std.testing.expectEqual(1, ctx.version_major);
     try std.testing.expectEqual(0, ctx.version_minor);
 }
+
+test "Server: void context handlers" {
+    const Test = struct {
+        pub fn mainFn(rt: *zio.Runtime) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+            defer server.deinit();
+
+            server.router.get("/test", handleGet);
+            server.router.post("/echo", handlePost);
+
+            var server_task = try rt.spawn(serverFn, .{ rt, &server }, .{});
+            defer server_task.cancel(rt);
+
+            var client_task = try rt.spawn(clientFn, .{ rt, &server }, .{});
+            defer client_task.cancel(rt);
+
+            try client_task.join(rt);
+        }
+
+        pub fn serverFn(rt: *zio.Runtime, server: *dusty.Server(void)) !void {
+            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
+            try server.listen(rt, addr);
+        }
+
+        pub fn clientFn(rt: *zio.Runtime, server: *dusty.Server(void)) !void {
+            try server.ready.wait(rt);
+
+            const client = try server.address.connect(rt);
+            defer client.close(rt);
+            defer client.shutdown(rt, .both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = client.writer(rt, &write_buf);
+
+            // Test GET request
+            try writer.interface.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            try writer.interface.flush();
+
+            // Read response - just verify we get something back
+            var read_buf: [1024]u8 = undefined;
+            var reader = client.reader(rt, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+
+            std.log.info("Response: {s}", .{status_line});
+            // Just verify we got a 200 OK response
+            try std.testing.expect(std.mem.indexOf(u8, status_line, "200 OK") != null);
+        }
+
+        fn handleGet(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "Hello from void context!\n";
+        }
+
+        fn handlePost(req: *dusty.Request, res: *dusty.Response) !void {
+            var reader = req.reader();
+            const body = try reader.interface.allocRemaining(req.arena, .limited(1024));
+            res.body = try std.fmt.allocPrint(res.arena, "Echo: {s}\n", .{body});
+        }
+    };
+
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try rt.runUntilComplete(Test.mainFn, .{rt}, .{});
+}

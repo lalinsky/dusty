@@ -39,7 +39,7 @@ pub fn Server(comptime Ctx: type) type {
         const Self = @This();
 
         fn handleError(self: *Self, req: *Request, res: *Response, err: anyerror) void {
-            if (comptime std.meta.hasFn(Ctx, "uncaughtError")) {
+            if (comptime Ctx != void and std.meta.hasFn(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(req, res, err);
             } else {
                 defaultUncaughtError(req, res, err);
@@ -48,13 +48,13 @@ pub fn Server(comptime Ctx: type) type {
 
         allocator: std.mem.Allocator,
         router: Router(Ctx),
-        ctx: *Ctx,
+        ctx: if (Ctx == void) void else *Ctx,
         config: ServerConfig,
         active_connections: std.atomic.Value(usize),
         address: zio.net.Address,
         ready: zio.ResetEvent,
 
-        pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: *Ctx) Self {
+        pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
             return .{
                 .allocator = allocator,
                 .router = Router(Ctx).init(allocator),
@@ -202,11 +202,17 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 if (try self.router.findHandler(&request)) |handler| {
-                    handler(self.ctx, &request, &response) catch |err| {
-                        self.handleError(&request, &response, err);
-                    };
+                    if (comptime Ctx == void) {
+                        handler(&request, &response) catch |err| {
+                            self.handleError(&request, &response, err);
+                        };
+                    } else {
+                        handler(self.ctx, &request, &response) catch |err| {
+                            self.handleError(&request, &response, err);
+                        };
+                    }
                 } else {
-                    if (comptime std.meta.hasFn(Ctx, "notFound")) {
+                    if (comptime Ctx != void and std.meta.hasFn(Ctx, "notFound")) {
                         self.ctx.notFound(&request, &response) catch |err| {
                             self.handleError(&request, &response, err);
                         };
