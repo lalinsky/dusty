@@ -23,7 +23,7 @@ const AppContext = struct {
     rt: *zio.Runtime,
 };
 
-fn handleIndex(ctx: *AppContext, req: *const http.Request, res: *http.Response) !void {
+fn handleIndex(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     _ = ctx;
     _ = req;
     res.body = "Hello World!\n";
