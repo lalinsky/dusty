@@ -9,21 +9,18 @@ const AppContext = struct {
 fn handleRoot(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) void {
     _ = ctx;
     _ = req;
-    res.body = "Hello World!";
+    res.body = "Hello World!\n";
 }
 
 fn handleUser(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) void {
     _ = ctx;
     const id = req.params.get("id") orelse "unknown";
-    std.log.info("Handling user request: {s}, id={s}", .{ req.url, id });
-    res.body = std.fmt.allocPrint(req.arena, "User {s}", .{id}) catch unreachable;
+    res.body = std.fmt.allocPrint(req.arena, "Hello User {s}\n", .{id}) catch unreachable;
 }
 
 fn handlePost(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) void {
-    _ = req;
-    _ = res;
     ctx.counter += 1;
-    std.log.info("Post created! Counter: {d}", .{ctx.counter});
+    res.body = std.fmt.allocPrint(req.arena, "Counter: {d}\n", .{ctx.counter}) catch unreachable;
 }
 
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
