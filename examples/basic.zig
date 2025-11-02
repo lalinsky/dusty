@@ -54,6 +54,27 @@ fn handleError(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !voi
     return error.TestError;
 }
 
+fn handleChunked(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) !void {
+    _ = ctx;
+    _ = req;
+
+    // Set custom headers before first chunk
+    try res.header("X-Demo", "Chunked-Response");
+    res.status = .ok;
+
+    // Send chunks of data
+    try res.chunk("First chunk of data\n");
+    try res.chunk("Second chunk of data\n");
+    try res.chunk("Third chunk of data\n");
+
+    // Dynamic content in chunk
+    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{std.time.timestamp()});
+    try res.chunk(dynamic);
+
+    try res.chunk("Final chunk!\n");
+    // res.write() will be called automatically by the server to add terminator
+}
+
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     var ctx: AppContext = .{};
 
@@ -65,6 +86,7 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     server.router.get("/users/:id", handleUser);
     server.router.post("/posts", handlePost);
     server.router.get("/error", handleError);
+    server.router.get("/chunked", handleChunked);
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
     try server.listen(rt, addr);
