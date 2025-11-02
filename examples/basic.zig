@@ -78,7 +78,7 @@ fn handleChunked(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Respon
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     var ctx: AppContext = .{};
 
-    var server = dusty.Server(AppContext).init(allocator, &ctx);
+    var server = dusty.Server(AppContext).init(allocator, .{}, &ctx);
     defer server.deinit();
 
     // Register routes

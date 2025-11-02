@@ -7,7 +7,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
 
     const Test = struct {
         pub fn mainFn(rt: *zio.Runtime, test_ctx: *Ctx) !void {
-            var server = TestServer.init(std.testing.allocator, test_ctx);
+            var server = TestServer.init(std.testing.allocator, .{}, test_ctx);
             defer server.deinit();
 
             try test_ctx.setup(&server);

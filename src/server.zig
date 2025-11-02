@@ -21,6 +21,14 @@ fn defaultNotFound(req: *Request, res: *Response) void {
     res.body = "404 Not Found\n";
 }
 
+pub const Config = struct {
+    timeout: Timeout = .{},
+
+    pub const Timeout = struct {
+        request_count: ?usize = null,
+    };
+};
+
 pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
@@ -36,15 +44,17 @@ pub fn Server(comptime Ctx: type) type {
         allocator: std.mem.Allocator,
         router: Router(Ctx),
         ctx: *Ctx,
+        config: Config,
         active_connections: std.atomic.Value(usize),
         address: zio.net.Address,
         ready: zio.ResetEvent,
 
-        pub fn init(allocator: std.mem.Allocator, ctx: *Ctx) Self {
+        pub fn init(allocator: std.mem.Allocator, config: Config, ctx: *Ctx) Self {
             return .{
                 .allocator = allocator,
                 .router = Router(Ctx).init(allocator),
                 .ctx = ctx,
+                .config = config,
                 .active_connections = std.atomic.Value(usize).init(0),
                 .address = undefined,
                 .ready = .init,
@@ -108,7 +118,10 @@ pub fn Server(comptime Ctx: type) type {
 
             request.parser = &parser;
 
+            var request_count: usize = 0;
+
             while (true) {
+                request_count += 1;
                 var parsed_len: usize = 0;
                 while (!parser.state.headers_complete) {
                     const buffered = reader.interface.buffered();
@@ -162,6 +175,13 @@ pub fn Server(comptime Ctx: type) type {
                 var response = Response.init(arena.allocator(), &writer.interface);
                 if (!parser.shouldKeepAlive()) {
                     response.keepalive = false;
+                }
+
+                // Check if we've reached the request count limit
+                if (self.config.timeout.request_count) |max_count| {
+                    if (request_count >= max_count) {
+                        response.keepalive = false;
+                    }
                 }
 
                 if (try self.router.findHandler(&request)) |handler| {
