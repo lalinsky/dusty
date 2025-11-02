@@ -1,18 +1,19 @@
 const std = @import("std");
 const zio = @import("zio");
-const dusty = @import("dusty");
+const http = @import("dusty");
 
 const AppContext = struct {
+    rt: *zio.Runtime,
     counter: usize = 0,
 
-    pub fn uncaughtError(self: *AppContext, req: *dusty.Request, res: *dusty.Response, err: anyerror) void {
+    pub fn uncaughtError(self: *AppContext, req: *http.Request, res: *http.Response, err: anyerror) void {
         _ = self;
         std.log.err("Uncaught error for {s}: {}", .{ req.url, err });
         res.status = .internal_server_error;
         res.body = std.fmt.allocPrint(res.arena, "Error: {s}\n", .{@errorName(err)}) catch "500 Internal Server Error\n";
     }
 
-    pub fn notFound(self: *AppContext, req: *dusty.Request, res: *dusty.Response) !void {
+    pub fn notFound(self: *AppContext, req: *http.Request, res: *http.Response) !void {
         _ = self;
         std.log.warn("Route not found: {s}", .{req.url});
         res.status = .not_found;
@@ -20,19 +21,25 @@ const AppContext = struct {
     }
 };
 
-fn handleRoot(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void {
+fn handleSlow(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+    _ = req;
+    try ctx.rt.sleep(10000);
+    res.body = "Hello World!\n";
+}
+
+fn handleRoot(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     _ = ctx;
     _ = req;
     res.body = "Hello World!\n";
 }
 
-fn handleUser(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void {
+fn handleUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     _ = ctx;
     const id = req.params.get("id") orelse "unknown";
     res.body = try std.fmt.allocPrint(req.arena, "Hello User {s}\n", .{id});
 }
 
-fn handlePost(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void {
+fn handlePost(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     ctx.counter += 1;
 
     // Read the request body
@@ -47,14 +54,14 @@ fn handlePost(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void
     }
 }
 
-fn handleError(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void {
+fn handleError(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     _ = ctx;
     _ = req;
     _ = res;
     return error.TestError;
 }
 
-fn handleChunked(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) !void {
+fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response) !void {
     _ = ctx;
     _ = req;
 
@@ -76,9 +83,16 @@ fn handleChunked(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Respon
 }
 
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
-    var ctx: AppContext = .{};
+    var ctx: AppContext = .{ .rt = rt };
 
-    var server = dusty.Server(AppContext).init(allocator, .{}, &ctx);
+    const config: http.ServerConfig = .{
+        .timeout = .{
+            .request = 60 * std.time.ms_per_s,
+            .keepalive = 300 * std.time.ms_per_s,
+        },
+    };
+
+    var server = http.Server(AppContext).init(allocator, config, &ctx);
     defer server.deinit();
 
     // Register routes
@@ -87,6 +101,7 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     server.router.post("/posts", handlePost);
     server.router.get("/error", handleError);
     server.router.get("/chunked", handleChunked);
+    server.router.get("/slow", handleSlow);
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
     try server.listen(rt, addr);

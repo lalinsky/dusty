@@ -21,7 +21,7 @@ fn defaultNotFound(req: *Request, res: *Response) void {
     res.body = "404 Not Found\n";
 }
 
-pub const Config = struct {
+pub const ServerConfig = struct {
     timeout: Timeout = .{},
 
     pub const Timeout = struct {
@@ -49,12 +49,12 @@ pub fn Server(comptime Ctx: type) type {
         allocator: std.mem.Allocator,
         router: Router(Ctx),
         ctx: *Ctx,
-        config: Config,
+        config: ServerConfig,
         active_connections: std.atomic.Value(usize),
         address: zio.net.Address,
         ready: zio.ResetEvent,
 
-        pub fn init(allocator: std.mem.Allocator, config: Config, ctx: *Ctx) Self {
+        pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: *Ctx) Self {
             return .{
                 .allocator = allocator,
                 .router = Router(Ctx).init(allocator),

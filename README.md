@@ -10,6 +10,7 @@ This is project is in very early stages, don't use it unless you want to experim
 - Router with support for parameters and wildcards
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
+- Request/keepalive timeouts via coroutine auto-cancellation
 
 ## Example
 
