@@ -19,6 +19,7 @@ pub const ParseError = error{
     UnexpectedContentLength,
     ClosedConnection,
     ParseFailed,
+    Paused,
 };
 
 fn mapError(err: c.llhttp_errno_t) ParseError {
@@ -53,6 +54,10 @@ pub const RequestParser = struct {
 
         headers_complete: bool = false,
         message_complete: bool = false,
+
+        // Body reading state
+        body_dest_buf: []u8 = &.{}, // Where onBody should copy to
+        body_dest_pos: usize = 0, // How much onBody has written
     };
 
     pub fn init(self: *RequestParser, request: *Request) !void {
@@ -72,6 +77,7 @@ pub const RequestParser = struct {
         self.settings.on_header_value = onHeaderValue;
         self.settings.on_header_value_complete = onHeaderValueComplete;
         self.settings.on_headers_complete = onHeadersComplete;
+        self.settings.on_body = onBody;
         self.settings.on_message_complete = onMessageComplete;
 
         c.llhttp_init(&self.parser, c.HTTP_REQUEST, &self.settings);
@@ -89,9 +95,15 @@ pub const RequestParser = struct {
     pub fn feed(self: *RequestParser, data: []const u8) !void {
         const err = c.llhttp_execute(&self.parser, data.ptr, data.len);
 
-        if (err != c.HPE_OK and err != c.HPE_PAUSED) {
-            return mapError(err);
+        if (err == c.HPE_OK) {
+            return;
         }
+
+        if (err == c.HPE_PAUSED) {
+            return error.Paused;
+        }
+
+        return mapError(err);
     }
 
     pub fn finish(self: *RequestParser) !void {
@@ -103,6 +115,28 @@ pub const RequestParser = struct {
 
     pub fn shouldKeepAlive(self: *RequestParser) bool {
         return c.llhttp_should_keep_alive(&self.parser) != 0;
+    }
+
+    pub fn resumeParsing(self: *RequestParser) void {
+        c.llhttp_resume(&self.parser);
+    }
+
+    pub fn prepareBodyRead(self: *RequestParser, dest: []u8) void {
+        self.state.body_dest_buf = dest;
+        self.state.body_dest_pos = 0;
+    }
+
+    pub fn getConsumedBytes(self: *RequestParser, buf_start: [*c]const u8) usize {
+        const pos = c.llhttp_get_error_pos(&self.parser);
+        return @intFromPtr(pos) - @intFromPtr(buf_start);
+    }
+
+    pub fn isBodyComplete(self: *RequestParser) bool {
+        return self.state.message_complete;
+    }
+
+    pub fn messageNeedsEof(self: *RequestParser) bool {
+        return c.llhttp_message_needs_eof(&self.parser) != 0;
     }
 
     fn appendSlice(target: *[]const u8, at: [*c]const u8, length: usize) void {
@@ -198,13 +232,29 @@ pub const RequestParser = struct {
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.state.headers_complete = true;
+        return c.HPE_PAUSED; // Always pause so we can track consumed bytes
+    }
+
+    fn onBody(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
+        const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+
+        const available = self.state.body_dest_buf.len - self.state.body_dest_pos;
+        const to_copy = @min(length, available);
+
+        if (to_copy > 0) {
+            @memcpy(self.state.body_dest_buf[self.state.body_dest_pos..][0..to_copy], at[0..to_copy]);
+            self.state.body_dest_pos += to_copy;
+        }
+
+        // Continue - let parser run to completion or next callback
         return 0;
     }
 
     fn onMessageComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.state.message_complete = true;
-        return 0;
+        // Pause so we can detect completion
+        return c.HPE_PAUSED;
     }
 };
 
@@ -214,6 +264,8 @@ test "RequestParser: basic" {
 
     var req: Request = .{
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     var parser: RequestParser = undefined;
@@ -224,9 +276,11 @@ test "RequestParser: basic" {
 
     // We will feed it the requst 1 byte at a time
     for (0..request.len) |i| {
-        try parser.feed(request[i .. i + 1]);
+        parser.feed(request[i .. i + 1]) catch |err| switch (err) {
+            error.Paused => break, // Headers complete, parser paused - we're done
+            else => return err,
+        };
     }
-    try parser.finish();
 
     try std.testing.expectEqual(true, parser.state.has_method);
     try std.testing.expectEqual(.get, req.method);
@@ -239,7 +293,6 @@ test "RequestParser: basic" {
     try std.testing.expectEqualStrings("/example", req.url);
 
     try std.testing.expectEqual(true, parser.state.headers_complete);
-    try std.testing.expectEqual(true, parser.state.message_complete);
 
     const host_val = req.headers.get("Host");
     try std.testing.expect(host_val != null);
