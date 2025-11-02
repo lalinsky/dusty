@@ -25,6 +25,9 @@ pub const Config = struct {
     timeout: Timeout = .{},
 
     pub const Timeout = struct {
+        /// Maximum time (ms) to receive a complete request
+        request: ?u64 = null,
+        /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
     };
 };
@@ -120,8 +123,18 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
+            var request_timeout = zio.Timeout.init;
+
             while (true) {
                 request_count += 1;
+
+                defer request_timeout.clear(rt);
+                if (self.config.timeout.request) |timeout_ms| {
+                    request_timeout.set(rt, timeout_ms * std.time.ns_per_ms);
+                }
+
+                // TODO: handle error.Canceled caused by timeout and return 504
+
                 var parsed_len: usize = 0;
                 while (!parser.state.headers_complete) {
                     const buffered = reader.interface.buffered();
