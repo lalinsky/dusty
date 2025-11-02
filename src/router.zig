@@ -754,6 +754,8 @@ test "Router: static route with query parameters" {
         .method = .get,
         .url = "/users/profile?debug=true&page=1",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -778,6 +780,8 @@ test "Router: param route with query parameters" {
         .method = .get,
         .url = "/users/123?format=json",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -806,6 +810,8 @@ test "Router: multiple params with query parameters" {
         .method = .get,
         .url = "/users/456/posts/789?include=comments&sort=date",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -838,6 +844,8 @@ test "Router: wildcard route with query parameters" {
         .method = .get,
         .url = "/files/docs/readme.md?download=true",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -865,6 +873,8 @@ test "Router: empty query string" {
         .method = .get,
         .url = "/users/123?",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -891,6 +901,8 @@ test "Router: no query parameters" {
         .method = .get,
         .url = "/users/123",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -917,6 +929,8 @@ test "Router: URL encoded query parameters" {
         .method = .get,
         .url = "/search?q=hello+world&tag=foo%20bar&special=%21%40%23%24",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -941,6 +955,8 @@ test "Router: query parameter without value" {
         .method = .get,
         .url = "/items?featured&sort=name",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -964,6 +980,8 @@ test "Router: query with empty key-value pairs" {
         .method = .get,
         .url = "/test?a=1&&b=2&",
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     const handler = try router.findHandler(&req);
