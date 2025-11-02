@@ -208,3 +208,40 @@ test "Server: GET with no body" {
     try std.testing.expect(ctx.reader_tested);
     try std.testing.expectEqual(0, ctx.read_len);
 }
+
+test "Server: HTTP/1.0 GET request" {
+    const TestContext = struct {
+        const Self = @This();
+
+        request_handled: bool = false,
+        version_major: u16 = 0,
+        version_minor: u16 = 0,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.get("/http10", handleGet);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            // HTTP/1.0 request - no Host header required, connection closes after response
+            try writer.writeAll("GET /http10 HTTP/1.0\r\n\r\n");
+            try writer.flush();
+        }
+
+        fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            ctx.request_handled = true;
+            ctx.version_major = req.version_major;
+            ctx.version_minor = req.version_minor;
+
+            res.body = "HTTP/1.0 OK\n";
+        }
+    };
+
+    var ctx: TestContext = .{};
+    try testClientServer(TestContext, &ctx);
+
+    try std.testing.expect(ctx.request_handled);
+    try std.testing.expectEqual(1, ctx.version_major);
+    try std.testing.expectEqual(0, ctx.version_minor);
+}
