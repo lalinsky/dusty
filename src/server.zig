@@ -145,6 +145,9 @@ pub fn Server(comptime Ctx: type) type {
                 // body reading will use a different strategy
                 reader.interface.toss(parsed_len);
 
+                // Resume parser after headers pause
+                parser.resumeParsing();
+
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = Response.init(arena.allocator(), &writer.interface);

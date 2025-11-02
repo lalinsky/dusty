@@ -58,6 +58,7 @@ pub const RequestParser = struct {
         // Body reading state
         body_dest_buf: []u8 = &.{}, // Where onBody should copy to
         body_dest_pos: usize = 0, // How much onBody has written
+        body_read_started: bool = false, // Track if we've started reading body
     };
 
     pub fn init(self: *RequestParser, request: *Request) !void {
@@ -117,10 +118,13 @@ pub const RequestParser = struct {
         return c.llhttp_should_keep_alive(&self.parser) != 0;
     }
 
+    pub fn resumeParsing(self: *RequestParser) void {
+        c.llhttp_resume(&self.parser);
+    }
+
     pub fn prepareBodyRead(self: *RequestParser, dest: []u8) void {
         self.state.body_dest_buf = dest;
         self.state.body_dest_pos = 0;
-        c.llhttp_resume(&self.parser);
     }
 
     pub fn getConsumedBytes(self: *RequestParser, buf_start: [*c]const u8) usize {
@@ -130,6 +134,10 @@ pub const RequestParser = struct {
 
     pub fn isBodyComplete(self: *RequestParser) bool {
         return self.state.message_complete;
+    }
+
+    pub fn messageNeedsEof(self: *RequestParser) bool {
+        return c.llhttp_message_needs_eof(&self.parser) != 0;
     }
 
     fn appendSlice(target: *[]const u8, at: [*c]const u8, length: usize) void {
@@ -239,20 +247,15 @@ pub const RequestParser = struct {
             self.state.body_dest_pos += to_copy;
         }
 
-        // Only pause if we couldn't copy all the data (buffer too small)
-        if (to_copy < length) {
-            return c.HPE_PAUSED;
-        }
-
-        // Otherwise let parser continue to potentially call onMessageComplete
+        // Continue - let parser run to completion or next callback
         return 0;
     }
 
     fn onMessageComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
-        std.log.info("onMessageComplete called", .{});
         self.state.message_complete = true;
-        return 0;
+        // Pause so we can detect completion
+        return c.HPE_PAUSED;
     }
 };
 
