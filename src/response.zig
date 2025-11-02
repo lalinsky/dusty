@@ -11,6 +11,7 @@ pub const Response = struct {
     written: bool = false,
     headers_written: bool = false,
     keepalive: bool = true,
+    chunked: bool = false,
 
     pub fn init(arena: std.mem.Allocator, conn: *std.Io.Writer) Response {
         return .{
@@ -30,6 +31,23 @@ pub const Response = struct {
 
     pub fn clearWriter(self: *Response) void {
         _ = self.buffer.writer.consumeAll();
+    }
+
+    pub fn chunk(self: *Response, data: []const u8) !void {
+        if (!self.chunked) {
+            self.chunked = true;
+            try self.writeHeader();
+        }
+
+        // Format: \r\n{size_hex}\r\n{data}
+        // Buffer size: enough for a 1TB chunk (40 bits = 10 hex digits) + formatting
+        var buf: [16]u8 = undefined;
+        const chunk_header = try std.fmt.bufPrint(&buf, "\r\n{x}\r\n", .{data.len});
+
+        // Write chunk size header and data
+        try self.conn.writeAll(chunk_header);
+        try self.conn.writeAll(data);
+        try self.conn.flush();
     }
 
     pub fn writeHeader(self: *Response) !void {
@@ -52,16 +70,23 @@ pub const Response = struct {
             try self.conn.writeAll("Connection: close\r\n");
         }
 
-        // Write Content-Length if not manually set
-        const has_content_length = self.headers.get("Content-Length") != null;
-        if (!has_content_length) {
-            const buffer_end = self.buffer.writer.end;
-            const body_len = if (buffer_end > 0) buffer_end else self.body.len;
-            try self.conn.print("Content-Length: {d}\r\n", .{body_len});
+        // Write Transfer-Encoding or Content-Length
+        if (self.chunked) {
+            // For chunked responses, end with single \r\n because chunk() prepends \r\n
+            // This creates the correct \r\n\r\n separator for the first chunk
+            try self.conn.writeAll("Transfer-Encoding: chunked\r\n");
+        } else {
+            // Write Content-Length if not manually set
+            const has_content_length = self.headers.get("Content-Length") != null;
+            if (!has_content_length) {
+                const buffer_end = self.buffer.writer.end;
+                const body_len = if (buffer_end > 0) buffer_end else self.body.len;
+                try self.conn.print("Content-Length: {d}\r\n", .{body_len});
+            }
+            // End of headers
+            try self.conn.writeAll("\r\n");
         }
 
-        // End of headers
-        try self.conn.writeAll("\r\n");
         try self.conn.flush();
     }
 
@@ -70,6 +95,14 @@ pub const Response = struct {
             return;
         }
         self.written = true;
+
+        if (self.chunked) {
+            // For chunked responses, headers are already written by chunk()
+            // We just need to write the trailing chunk terminator
+            try self.conn.writeAll("\r\n0\r\n\r\n");
+            try self.conn.flush();
+            return;
+        }
 
         // Write headers if not already written
         try self.writeHeader();
@@ -338,4 +371,123 @@ test "Response: Connection close header when keepalive is false" {
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") != null);
+}
+
+test "Response: chunked with single chunk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    response.status = .ok;
+
+    try response.chunk("Hello");
+    try response.write();
+
+    const written = conn_writer.buffered();
+
+    // Should have Transfer-Encoding header
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+
+    // Should have chunk size (5 in hex)
+    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n5\r\n") != null);
+
+    // Should have chunk data
+    try std.testing.expect(std.mem.indexOf(u8, written, "Hello") != null);
+
+    // Should have terminator
+    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n0\r\n\r\n") != null);
+}
+
+test "Response: chunked with multiple chunks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+
+    try response.chunk("First");
+    try response.chunk("Second chunk");
+    try response.write();
+
+    const written = conn_writer.buffered();
+
+    // Should have Transfer-Encoding header
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+
+    // Should have first chunk (5 bytes in hex)
+    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n5\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "First") != null);
+
+    // Should have second chunk (12 bytes in hex = c)
+    try std.testing.expect(std.mem.indexOf(u8, written, "\r\nc\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Second chunk") != null);
+
+    // Should have terminator
+    try std.testing.expect(std.mem.indexOf(u8, written, "\r\n0\r\n\r\n") != null);
+}
+
+test "Response: chunked with custom headers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    response.status = .created;
+    try response.header("X-Custom", "value");
+
+    try response.chunk("Data");
+    try response.write();
+
+    const written = conn_writer.buffered();
+
+    // Should have custom status
+    try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 201") != null);
+
+    // Should have custom header
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: value") != null);
+
+    // Should have Transfer-Encoding header
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+
+    // Should have chunk data
+    try std.testing.expect(std.mem.indexOf(u8, written, "Data") != null);
+}
+
+test "Response: chunked flag defaults to false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const response = Response.init(arena.allocator(), &conn_writer);
+    try std.testing.expectEqual(false, response.chunked);
+}
+
+test "Response: chunked mode doesn't write Content-Length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+
+    try response.chunk("test");
+    try response.write();
+
+    const written = conn_writer.buffered();
+
+    // Should NOT have Content-Length header
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
+
+    // Should have Transfer-Encoding instead
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
 }
