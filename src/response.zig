@@ -10,6 +10,7 @@ pub const Response = struct {
     conn: *std.Io.Writer,
     written: bool = false,
     headers_written: bool = false,
+    keepalive: bool = true,
 
     pub fn init(arena: std.mem.Allocator, conn: *std.Io.Writer) Response {
         return .{
@@ -44,6 +45,11 @@ pub const Response = struct {
         var iter = self.headers.iterator();
         while (iter.next()) |entry| {
             try self.conn.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+
+        // Write Connection header based on keepalive
+        if (!self.keepalive) {
+            try self.conn.writeAll("Connection: close\r\n");
         }
 
         // Write Content-Length if not manually set
@@ -297,4 +303,39 @@ test "Response: clearWriter()" {
 
     try w.writeAll("Second content");
     try std.testing.expectEqualStrings("Second content", response.buffer.writer.buffered());
+}
+
+test "Response: keepalive defaults to true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    try std.testing.expectEqual(true, response.keepalive);
+
+    response.body = "test";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    // Should not have Connection: close header when keepalive is true
+    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") == null);
+}
+
+test "Response: Connection close header when keepalive is false" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    response.keepalive = false;
+    response.body = "test";
+
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") != null);
 }

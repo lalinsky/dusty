@@ -125,6 +125,9 @@ pub fn Server(comptime Ctx: type) type {
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = Response.init(arena.allocator(), &writer.interface);
+                if (!parser.shouldKeepAlive()) {
+                    response.keepalive = false;
+                }
 
                 if (try self.router.findHandler(&request)) |handler| {
                     handler(self.ctx, &request, &response) catch |err| {
@@ -142,10 +145,11 @@ pub fn Server(comptime Ctx: type) type {
 
                 try response.write();
 
-                if (!parser.shouldKeepAlive() or true) {
+                if (!response.keepalive) {
                     break;
                 }
 
+                reader.interface.toss(parsed_len);
                 parser.reset();
                 request.reset();
                 _ = arena.reset(.retain_capacity);
