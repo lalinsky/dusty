@@ -82,6 +82,37 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     // res.write() will be called automatically by the server to add terminator
 }
 
+fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+    _ = req;
+
+    // Return a JSON response
+    res.status = .ok;
+    try res.json(.{
+        .message = "Hello from Dusty!",
+        .counter = ctx.counter,
+        .timestamp = std.time.timestamp(),
+        .server = "dusty-http",
+        .data = .{
+            .nested = true,
+            .items = [_]i32{ 1, 2, 3, 4, 5 },
+        },
+    }, .{});
+}
+
+fn handleApiUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+    _ = ctx;
+    const id = req.params.get("id") orelse "unknown";
+    const name = req.query.get("name") orelse "Anonymous";
+
+    res.status = .ok;
+    try res.json(.{
+        .id = id,
+        .name = name,
+        .active = true,
+        .roles = [_][]const u8{ "user", "viewer" },
+    }, .{});
+}
+
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     var ctx: AppContext = .{ .rt = rt };
 
@@ -102,6 +133,8 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     server.router.get("/error", handleError);
     server.router.get("/chunked", handleChunked);
     server.router.get("/slow", handleSlow);
+    server.router.get("/json", handleJson);
+    server.router.get("/api/users/:id", handleApiUser);
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
     try server.listen(rt, addr);

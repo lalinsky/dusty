@@ -33,6 +33,12 @@ pub const Response = struct {
         _ = self.buffer.writer.consumeAll();
     }
 
+    pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
+        const json_formatter = std.json.fmt(value, options);
+        try json_formatter.format(&self.buffer.writer);
+        try self.header("Content-Type", "application/json; charset=UTF-8");
+    }
+
     pub fn chunk(self: *Response, data: []const u8) !void {
         if (!self.chunked) {
             self.chunked = true;
@@ -488,4 +494,83 @@ test "Response: chunked mode doesn't write Content-Length" {
 
     // Should have Transfer-Encoding instead
     try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+}
+
+test "Response: json() with simple object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    try response.json(.{ .name = "Alice", .age = 30 }, .{});
+
+    const buffered = response.buffer.writer.buffered();
+    try std.testing.expectEqualStrings("{\"name\":\"Alice\",\"age\":30}", buffered);
+
+    // Check that Content-Type was set
+    const content_type = response.headers.get("Content-Type");
+    try std.testing.expect(content_type != null);
+    try std.testing.expectEqualStrings("application/json; charset=UTF-8", content_type.?);
+}
+
+test "Response: json() writes complete response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    response.status = .created;
+    try response.json(.{ .id = 123, .message = "Created" }, .{});
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 201") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: application/json; charset=UTF-8") != null);
+    // Check the actual JSON content length: {"id":123,"message":"Created"}
+    const expected_json = "{\"id\":123,\"message\":\"Created\"}";
+    try std.testing.expect(std.mem.indexOf(u8, written, expected_json) != null);
+
+    // Build expected content-length string
+    var cl_buf: [32]u8 = undefined;
+    const cl_str = try std.fmt.bufPrint(&cl_buf, "Content-Length: {d}", .{expected_json.len});
+    try std.testing.expect(std.mem.indexOf(u8, written, cl_str) != null);
+}
+
+test "Response: json() with array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    const items = [_]i32{ 1, 2, 3, 4, 5 };
+    try response.json(items, .{});
+
+    const buffered = response.buffer.writer.buffered();
+    try std.testing.expectEqualStrings("[1,2,3,4,5]", buffered);
+}
+
+test "Response: json() with nested object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    try response.json(.{
+        .user = .{
+            .name = "Bob",
+            .id = 42,
+        },
+        .active = true,
+    }, .{});
+
+    const buffered = response.buffer.writer.buffered();
+    try std.testing.expectEqualStrings("{\"user\":{\"name\":\"Bob\",\"id\":42},\"active\":true}", buffered);
 }
