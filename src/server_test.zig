@@ -62,8 +62,7 @@ test "Server: POST with body" {
         }
 
         fn handlePost(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
-            var buffer: [4096]u8 = undefined;
-            var reader = req.reader(&buffer);
+            var reader = req.reader();
 
             // Read all body data using streamRemaining
             var writer = std.Io.Writer.fixed(&ctx.received_body);
@@ -160,8 +159,7 @@ test "Server: POST with chunked encoding" {
         }
 
         fn handlePost(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
-            var buffer: [4096]u8 = undefined;
-            var reader = req.reader(&buffer);
+            var reader = req.reader();
 
             // Read all body data using streamRemaining
             var writer = std.Io.Writer.fixed(&ctx.received_body);
@@ -240,8 +238,7 @@ test "Server: GET with no body" {
         }
 
         fn handleGet(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
-            var buffer: [4096]u8 = undefined;
-            var reader = req.reader(&buffer);
+            var reader = req.reader();
 
             // Try to read body - should get 0 bytes since GET has no body
             var body_buf: [256]u8 = undefined;

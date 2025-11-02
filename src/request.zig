@@ -15,6 +15,7 @@ pub const Request = struct {
     // Body reading support
     parser: *RequestParser,
     conn: *std.Io.Reader,
+    body_reader_buffer: [1024]u8 = undefined,
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
@@ -27,14 +28,14 @@ pub const Request = struct {
         };
     }
 
-    pub fn reader(self: *Request, buffer: []u8) BodyReader {
+    pub fn reader(self: *Request) BodyReader {
         return .{
             .req = self,
             .interface = .{
                 .vtable = &.{
                     .stream = BodyReader.stream,
                 },
-                .buffer = buffer,
+                .buffer = &self.body_reader_buffer,
                 .seek = 0,
                 .end = 0,
             },
