@@ -2,26 +2,20 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("root.zig");
 
-test "Server: POST with body" {
-    const TestContext = struct {
-        body_received: bool = false,
-        received_body: [256]u8 = undefined,
-        received_len: usize = 0,
-    };
-
-    const TestServer = dusty.Server(TestContext);
+fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
+    const TestServer = dusty.Server(Ctx);
 
     const Test = struct {
-        pub fn mainFn(rt: *zio.Runtime, ctx: *TestContext) !void {
-            var server = TestServer.init(std.testing.allocator, ctx);
+        pub fn mainFn(rt: *zio.Runtime, test_ctx: *Ctx) !void {
+            var server = TestServer.init(std.testing.allocator, test_ctx);
             defer server.deinit();
 
-            server.router.post("/test", handlePost);
+            try test_ctx.setup(&server);
 
             var server_task = try rt.spawn(serverFn, .{ rt, &server }, .{});
             defer server_task.cancel(rt);
 
-            var client_task = try rt.spawn(clientFn, .{ rt, &server }, .{});
+            var client_task = try rt.spawn(clientFn, .{ rt, &server, test_ctx }, .{});
             defer client_task.cancel(rt);
 
             try client_task.join(rt);
@@ -32,7 +26,7 @@ test "Server: POST with body" {
             try server.listen(rt, addr);
         }
 
-        pub fn clientFn(rt: *zio.Runtime, server: *TestServer) !void {
+        pub fn clientFn(rt: *zio.Runtime, server: *TestServer, test_ctx: *Ctx) !void {
             try server.ready.wait(rt);
 
             const client = try server.address.connect(rt);
@@ -42,16 +36,7 @@ test "Server: POST with body" {
             var write_buf: [1024]u8 = undefined;
             var writer = client.writer(rt, &write_buf);
 
-            const request_body = "Hello from test!";
-            const request = try std.fmt.allocPrint(
-                std.testing.allocator,
-                "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}",
-                .{ request_body.len, request_body },
-            );
-            defer std.testing.allocator.free(request);
-
-            try writer.interface.writeAll(request);
-            try writer.interface.flush();
+            try test_ctx.makeRequest(&writer.interface);
 
             // Read response
             var read_buf: [1024]u8 = undefined;
@@ -60,8 +45,35 @@ test "Server: POST with body" {
 
             std.log.info("Response: {s}", .{response});
         }
+    };
 
-        fn handlePost(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try rt.runUntilComplete(Test.mainFn, .{ rt, ctx }, .{});
+}
+
+test "Server: POST with body" {
+    const TestContext = struct {
+        const Self = @This();
+
+        body_received: bool = false,
+        received_body: [256]u8 = undefined,
+        received_len: usize = 0,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.post("/test", handlePost);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            const request_body = "Hello from test!";
+            try writer.print("POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}", .{ request_body.len, request_body });
+            try writer.flush();
+        }
+
+        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var reader = req.reader();
 
             // Read all body data using streamRemaining
@@ -78,11 +90,7 @@ test "Server: POST with body" {
     };
 
     var ctx: TestContext = .{};
-
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
-    try rt.runUntilComplete(Test.mainFn, .{ rt, &ctx }, .{});
+    try testClientServer(TestContext, &ctx);
 
     try std.testing.expect(ctx.body_received);
     try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
@@ -90,75 +98,49 @@ test "Server: POST with body" {
 
 test "Server: POST with chunked encoding" {
     const TestContext = struct {
+        const Self = @This();
+
         body_received: bool = false,
         received_body: [256]u8 = undefined,
         received_len: usize = 0,
-    };
 
-    const TestServer = dusty.Server(TestContext);
-
-    const Test = struct {
-        pub fn mainFn(rt: *zio.Runtime, ctx: *TestContext) !void {
-            var server = TestServer.init(std.testing.allocator, ctx);
-            defer server.deinit();
-
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
             server.router.post("/chunked", handlePost);
-
-            var server_task = try rt.spawn(serverFn, .{ rt, &server }, .{});
-            defer server_task.cancel(rt);
-
-            var client_task = try rt.spawn(clientFn, .{ rt, &server }, .{});
-            defer client_task.cancel(rt);
-
-            try client_task.join(rt);
         }
 
-        pub fn serverFn(rt: *zio.Runtime, server: *TestServer) !void {
-            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
-            try server.listen(rt, addr);
-        }
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            // Send chunked encoded request in separate packets:
+            // Headers
+            try writer.writeAll("POST /chunked HTTP/1.1\r\n");
+            try writer.writeAll("Host: localhost\r\n");
+            try writer.writeAll("Transfer-Encoding: chunked\r\n");
+            try writer.writeAll("\r\n");
+            try writer.flush();
 
-        pub fn clientFn(rt: *zio.Runtime, server: *TestServer) !void {
-            try server.ready.wait(rt);
-
-            const client = try server.address.connect(rt);
-            defer client.close(rt);
-            defer client.shutdown(rt, .both) catch {};
-
-            var write_buf: [1024]u8 = undefined;
-            var writer = client.writer(rt, &write_buf);
-
-            // Send chunked encoded request:
             // Chunk 1: "Hello " (6 bytes = 0x6)
+            try writer.writeAll("6\r\n");
+            try writer.writeAll("Hello \r\n");
+            try writer.flush();
+
             // Chunk 2: "from " (5 bytes = 0x5)
+            try writer.writeAll("5\r\n");
+            try writer.writeAll("from \r\n");
+            try writer.flush();
+
             // Chunk 3: "chunked test!" (13 bytes = 0xD)
+            try writer.writeAll("D\r\n");
+            try writer.writeAll("chunked test!\r\n");
+            try writer.flush();
+
             // Final chunk: 0
-            const request =
-                "POST /chunked HTTP/1.1\r\n" ++
-                "Host: localhost\r\n" ++
-                "Transfer-Encoding: chunked\r\n" ++
-                "\r\n" ++
-                "6\r\n" ++
-                "Hello \r\n" ++
-                "5\r\n" ++
-                "from \r\n" ++
-                "D\r\n" ++
-                "chunked test!\r\n" ++
-                "0\r\n" ++
-                "\r\n";
-
-            try writer.interface.writeAll(request);
-            try writer.interface.flush();
-
-            // Read response
-            var read_buf: [1024]u8 = undefined;
-            var reader = client.reader(rt, &read_buf);
-            const response = try reader.interface.takeDelimiterExclusive('\n');
-
-            std.log.info("Response: {s}", .{response});
+            try writer.writeAll("0\r\n");
+            try writer.writeAll("\r\n");
+            try writer.flush();
         }
 
-        fn handlePost(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var reader = req.reader();
 
             // Read all body data using streamRemaining
@@ -175,11 +157,7 @@ test "Server: POST with chunked encoding" {
     };
 
     var ctx: TestContext = .{};
-
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
-    try rt.runUntilComplete(Test.mainFn, .{ rt, &ctx }, .{});
+    try testClientServer(TestContext, &ctx);
 
     try std.testing.expect(ctx.body_received);
     try std.testing.expectEqualStrings("Hello from chunked test!", ctx.received_body[0..ctx.received_len]);
@@ -187,57 +165,23 @@ test "Server: POST with chunked encoding" {
 
 test "Server: GET with no body" {
     const TestContext = struct {
+        const Self = @This();
+
         reader_tested: bool = false,
         read_len: usize = 0,
-    };
 
-    const TestServer = dusty.Server(TestContext);
-
-    const Test = struct {
-        pub fn mainFn(rt: *zio.Runtime, ctx: *TestContext) !void {
-            var server = TestServer.init(std.testing.allocator, ctx);
-            defer server.deinit();
-
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
             server.router.get("/test", handleGet);
-
-            var server_task = try rt.spawn(serverFn, .{ rt, &server }, .{});
-            defer server_task.cancel(rt);
-
-            var client_task = try rt.spawn(clientFn, .{ rt, &server }, .{});
-            defer client_task.cancel(rt);
-
-            try client_task.join(rt);
         }
 
-        pub fn serverFn(rt: *zio.Runtime, server: *TestServer) !void {
-            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
-            try server.listen(rt, addr);
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            try writer.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            try writer.flush();
         }
 
-        pub fn clientFn(rt: *zio.Runtime, server: *TestServer) !void {
-            try server.ready.wait(rt);
-
-            const client = try server.address.connect(rt);
-            defer client.close(rt);
-            defer client.shutdown(rt, .both) catch {};
-
-            var write_buf: [1024]u8 = undefined;
-            var writer = client.writer(rt, &write_buf);
-
-            const request = "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n";
-
-            try writer.interface.writeAll(request);
-            try writer.interface.flush();
-
-            // Read response
-            var read_buf: [1024]u8 = undefined;
-            var reader = client.reader(rt, &read_buf);
-            const response = try reader.interface.takeDelimiterExclusive('\n');
-
-            std.log.info("Response: {s}", .{response});
-        }
-
-        fn handleGet(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var reader = req.reader();
 
             // Try to read body - should get 0 bytes since GET has no body
@@ -259,11 +203,7 @@ test "Server: GET with no body" {
     };
 
     var ctx: TestContext = .{};
-
-    var rt = try zio.Runtime.init(std.testing.allocator, .{});
-    defer rt.deinit();
-
-    try rt.runUntilComplete(Test.mainFn, .{ rt, &ctx }, .{});
+    try testClientServer(TestContext, &ctx);
 
     try std.testing.expect(ctx.reader_tested);
     try std.testing.expectEqual(0, ctx.read_len);
