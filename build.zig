@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
     });
 
     // A run step that will run the test executable.
