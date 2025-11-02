@@ -92,7 +92,7 @@ pub fn Server(comptime Ctx: type) type {
                     };
                 }
 
-                std.log.info("Received: {f} {s}", .{ parser.state.method, parser.state.url });
+                std.log.info("Received: {f} {s}", .{ parser.state.request.method, parser.state.request.url });
                 try writer.interface.flush();
 
                 if (!parser.shouldKeepAlive()) {

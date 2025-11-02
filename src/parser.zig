@@ -6,6 +6,7 @@ const c = @cImport({
 
 const Method = @import("http.zig").Method;
 const Headers = @import("http.zig").Headers;
+const Request = @import("request.zig").Request;
 
 pub const ParseError = error{
     InvalidMethod,
@@ -41,21 +42,16 @@ pub const RequestParser = struct {
     state: State = .{},
 
     const State = struct {
+        request: Request = .{},
+
         has_method: bool = false,
-        method: Method = undefined,
-
         has_version: bool = false,
-        version_minor: u8 = 0,
-        version_major: u8 = 0,
-
         has_url: bool = false,
-        url: []const u8 = "",
 
+        // Temporary state for header parsing
         has_header_field: bool = false,
         header_field: []const u8 = "",
         header_value: []const u8 = "",
-
-        headers: Headers = .{},
 
         headers_complete: bool = false,
         message_complete: bool = false,
@@ -84,11 +80,11 @@ pub const RequestParser = struct {
     }
 
     pub fn deinit(self: *RequestParser) void {
-        self.state.headers.deinit(self.allocator);
+        self.state.request.headers.deinit(self.allocator);
     }
 
     pub fn reset(self: *RequestParser) void {
-        self.state.headers.deinit(self.allocator);
+        self.state.request.headers.deinit(self.allocator);
         self.state = .{};
         c.llhttp_reset(&self.parser);
     }
@@ -110,6 +106,15 @@ pub const RequestParser = struct {
 
     pub fn shouldKeepAlive(self: *RequestParser) bool {
         return c.llhttp_should_keep_alive(&self.parser) != 0;
+    }
+
+    fn appendSlice(target: *[]const u8, at: [*c]const u8, length: usize) void {
+        if (target.len == 0) {
+            target.* = at[0..length];
+        } else {
+            std.debug.assert(target.ptr + target.len == at);
+            target.* = target.ptr[0 .. target.len + length];
+        }
     }
 
     fn saveCurrentHeader(self: *RequestParser) !void {
@@ -134,27 +139,22 @@ pub const RequestParser = struct {
     fn onMethod(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.state.has_method = true;
-        self.state.method = @enumFromInt(c.llhttp_get_method(&self.parser));
+        self.state.request.method = @enumFromInt(c.llhttp_get_method(&self.parser));
         return 0;
     }
 
     fn onVersion(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.state.has_version = true;
-        self.state.version_major = c.llhttp_get_http_major(&self.parser);
-        self.state.version_minor = c.llhttp_get_http_minor(&self.parser);
+        self.state.request.version_major = c.llhttp_get_http_major(&self.parser);
+        self.state.request.version_minor = c.llhttp_get_http_minor(&self.parser);
         return 0;
     }
 
     // Callbacks - store slices directly without copying
     fn onUrl(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
-        if (self.state.url.len == 0) {
-            self.state.url = at[0..length];
-        } else {
-            std.debug.assert(self.state.url.ptr + self.state.url.len == at);
-            self.state.url = self.state.url.ptr[0 .. self.state.url.len + length];
-        }
+        appendSlice(&self.state.request.url, at, length);
         return 0;
     }
 
@@ -166,12 +166,7 @@ pub const RequestParser = struct {
 
     fn onHeaderField(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
-        if (self.state.header_field.len == 0) {
-            self.state.header_field = at[0..length];
-        } else {
-            std.debug.assert(self.state.header_field.ptr + self.state.header_field.len == at);
-            self.state.header_field = self.state.header_field.ptr[0 .. self.state.header_field.len + length];
-        }
+        appendSlice(&self.state.header_field, at, length);
         return 0;
     }
 
@@ -184,12 +179,7 @@ pub const RequestParser = struct {
 
     fn onHeaderValue(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
-        if (self.state.header_value.len == 0) {
-            self.state.header_value = at[0..length];
-        } else {
-            std.debug.assert(self.state.header_value.ptr + self.state.header_value.len == at);
-            self.state.header_value = self.state.header_value.ptr[0 .. self.state.header_value.len + length];
-        }
+        appendSlice(&self.state.header_value, at, length);
         return 0;
     }
 
@@ -199,7 +189,7 @@ pub const RequestParser = struct {
         std.debug.assert(self.state.has_header_field);
         std.debug.assert(self.state.header_value.len > 0);
 
-        self.state.headers.put(self.allocator, self.state.header_field, self.state.header_value) catch return -1;
+        self.state.request.headers.put(self.allocator, self.state.header_field, self.state.header_value) catch return -1;
 
         self.state.header_value = "";
         self.state.header_field = "";
@@ -235,19 +225,19 @@ test "RequestParser: basic" {
     try parser.finish();
 
     try std.testing.expectEqual(true, parser.state.has_method);
-    try std.testing.expectEqual(.get, parser.state.method);
+    try std.testing.expectEqual(.get, parser.state.request.method);
 
     try std.testing.expectEqual(true, parser.state.has_version);
-    try std.testing.expectEqual(1, parser.state.version_major);
-    try std.testing.expectEqual(1, parser.state.version_minor);
+    try std.testing.expectEqual(1, parser.state.request.version_major);
+    try std.testing.expectEqual(1, parser.state.request.version_minor);
 
     try std.testing.expectEqual(true, parser.state.has_url);
-    try std.testing.expectEqualStrings("/example", parser.state.url);
+    try std.testing.expectEqualStrings("/example", parser.state.request.url);
 
     try std.testing.expectEqual(true, parser.state.headers_complete);
     try std.testing.expectEqual(true, parser.state.message_complete);
 
-    const host_val = parser.state.headers.get("Host");
+    const host_val = parser.state.request.headers.get("Host");
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("example.com", host_val.?);
 }
