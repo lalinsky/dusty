@@ -27,6 +27,8 @@ pub const Config = struct {
     pub const Timeout = struct {
         /// Maximum time (ms) to receive a complete request
         request: ?u64 = null,
+        /// Maximum time (ms) to keep idle connections open
+        keepalive: ?u64 = null,
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
     };
@@ -123,14 +125,14 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
-            var request_timeout = zio.Timeout.init;
+            var timeout = zio.Timeout.init;
 
             while (true) {
                 request_count += 1;
 
-                defer request_timeout.clear(rt);
+                defer timeout.clear(rt);
                 if (self.config.timeout.request) |timeout_ms| {
-                    request_timeout.set(rt, timeout_ms * std.time.ns_per_ms);
+                    timeout.set(rt, timeout_ms * std.time.ns_per_ms);
                 }
 
                 // TODO: handle error.Canceled caused by timeout and return 504
@@ -186,6 +188,8 @@ pub fn Server(comptime Ctx: type) type {
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = Response.init(arena.allocator(), &writer.interface);
+
+                // Check if the connection allows keepalive
                 if (!parser.shouldKeepAlive()) {
                     response.keepalive = false;
                 }
@@ -212,6 +216,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 if (!parser.isBodyComplete()) {
+                    // TODO maybe we should drain the body here?
                     response.keepalive = false;
                 }
 
@@ -224,6 +229,23 @@ pub fn Server(comptime Ctx: type) type {
                 parser.reset();
                 request.reset();
                 _ = arena.reset(.retain_capacity);
+
+                // Activate keepalive timeout
+                if (self.config.timeout.keepalive) |timeout_ms| {
+                    timeout.set(rt, timeout_ms * std.time.ns_per_ms);
+                }
+
+                // Fill some data here, while the the keepalive timeout is active
+                reader.interface.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => {
+                        needs_shutdown = false;
+                        return;
+                    },
+                    else => {
+                        // TODO: handle error.Canceled caused by timeout and return cleanly
+                        return err;
+                    },
+                };
             }
         }
     };
