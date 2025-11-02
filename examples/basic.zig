@@ -36,13 +36,13 @@ fn handlePost(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void
     ctx.counter += 1;
 
     // Read the request body
-    var buf: [1024]u8 = undefined;
-    var body_reader = req.reader();
-    const n = try body_reader.readAll(&buf);
+    var reader_buf: [4096]u8 = undefined;
+    var reader = req.reader(&reader_buf);
+    const body = try reader.interface.allocRemaining(req.arena, .limited(1024 * 1024));
 
-    if (n > 0) {
-        std.log.info("Received body ({d} bytes): {s}", .{ n, buf[0..n] });
-        res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}, Received {d} bytes: {s}\n", .{ ctx.counter, n, buf[0..n] });
+    if (body.len > 0) {
+        std.log.info("Received body ({d} bytes): {s}", .{ body.len, body });
+        res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}, Received {d} bytes: {s}\n", .{ ctx.counter, body.len, body });
     } else {
         res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}\n", .{ctx.counter});
     }

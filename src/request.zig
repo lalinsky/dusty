@@ -27,27 +27,44 @@ pub const Request = struct {
         };
     }
 
-    pub fn reader(self: *Request) BodyReader {
-        return .{ .req = self };
+    pub fn reader(self: *Request, buffer: []u8) BodyReader {
+        return .{
+            .req = self,
+            .interface = .{
+                .vtable = &.{
+                    .stream = BodyReader.stream,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
     }
 };
 
 pub const BodyReader = struct {
     req: *Request,
+    interface: std.Io.Reader,
 
-    pub fn read(self: *BodyReader, dest: []u8) !usize {
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *BodyReader = @alignCast(@fieldParentPtr("interface", io_r));
+
+        const dest = limit.slice(try w.writableSliceGreedy(1));
         if (dest.len == 0) return 0;
 
         const conn = self.req.conn;
         const parser = self.req.parser;
 
-        if (parser.isBodyComplete()) return 0;
+        if (parser.isBodyComplete()) {
+            return error.EndOfStream;
+        }
 
         // Setup destination for onBody callback
         parser.prepareBodyRead(dest);
 
         // We got some data just from resuming
         if (parser.state.body_dest_pos > 0) {
+            w.advance(parser.state.body_dest_pos);
             return parser.state.body_dest_pos;
         }
 
@@ -56,9 +73,9 @@ pub const BodyReader = struct {
             try conn.fillMore();
         }
 
-        // How much do
+        // How much data is buffered
         const buffered = conn.buffered();
-        if (buffered.len == 0) return 0;
+        if (buffered.len == 0) return error.EndOfStream;
         const n = @min(dest.len, buffered.len);
 
         if (parser.feed(buffered[0..n])) {
@@ -69,20 +86,11 @@ pub const BodyReader = struct {
                     const consumed = parser.getConsumedBytes(buffered.ptr);
                     conn.toss(consumed);
                 },
-                else => return err,
+                else => return error.ReadFailed,
             }
         }
 
+        w.advance(parser.state.body_dest_pos);
         return parser.state.body_dest_pos;
-    }
-
-    pub fn readAll(self: *BodyReader, dest: []u8) !usize {
-        var total: usize = 0;
-        while (total < dest.len) {
-            const n = try self.read(dest[total..]);
-            if (n == 0) break;
-            total += n;
-        }
-        return total;
     }
 };

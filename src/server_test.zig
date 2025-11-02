@@ -62,8 +62,13 @@ test "Server: POST with body" {
         }
 
         fn handlePost(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
-            var body_reader = req.reader();
-            const n = try body_reader.readAll(&ctx.received_body);
+            var buffer: [4096]u8 = undefined;
+            var reader = req.reader(&buffer);
+
+            // Read all body data using streamRemaining
+            var writer = std.Io.Writer.fixed(&ctx.received_body);
+            const n = try reader.interface.streamRemaining(&writer);
+
             ctx.body_received = true;
             ctx.received_len = n;
 
@@ -155,8 +160,13 @@ test "Server: POST with chunked encoding" {
         }
 
         fn handlePost(ctx: *TestContext, req: *dusty.Request, res: *dusty.Response) !void {
-            var body_reader = req.reader();
-            const n = try body_reader.readAll(&ctx.received_body);
+            var buffer: [4096]u8 = undefined;
+            var reader = req.reader(&buffer);
+
+            // Read all body data using streamRemaining
+            var writer = std.Io.Writer.fixed(&ctx.received_body);
+            const n = try reader.interface.streamRemaining(&writer);
+
             ctx.body_received = true;
             ctx.received_len = n;
 
