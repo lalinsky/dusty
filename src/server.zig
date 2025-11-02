@@ -8,6 +8,31 @@ const Response = @import("response.zig").Response;
 
 const log = std.log.scoped(.dust);
 
+fn writeResponseHeader(writer: *std.Io.Writer, response: *Response) !void {
+    // TODO maybe support 1.0 responses?
+    try writer.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(response.status), response.status });
+
+    var iter = response.headers.iterator();
+    while (iter.next()) |entry| {
+        try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+    }
+
+    const has_content_length = response.headers.get("Content-Length") != null;
+    if (!has_content_length) {
+        try writer.print("Content-Length: {d}\r\n", .{response.body.len});
+    }
+
+    // TODO add Connection header
+
+    try writer.writeAll("\r\n");
+}
+
+fn writeResponse(writer: *std.Io.Writer, response: *Response) !void {
+    try writeResponseHeader(writer, response);
+    try writer.writeAll(response.body);
+    try writer.flush();
+}
+
 pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
@@ -78,11 +103,6 @@ pub fn Server(comptime Ctx: type) type {
             defer parser.deinit();
 
             while (true) {
-                defer {
-                    _ = arena.reset(.retain_capacity);
-                    request.reset();
-                }
-
                 var parsed_len: usize = 0;
                 while (!parser.state.headers_complete) {
                     const buffered = reader.interface.buffered();
@@ -107,20 +127,28 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
-                try writer.interface.flush();
 
-                const handler = try self.router.findHandler(&request) orelse {
-                    @panic("handle 404");
+                var response: Response = .{
+                    .arena = arena.allocator(),
                 };
 
-                var response: Response = undefined;
-                handler(self.ctx, &request, &response);
+                if (try self.router.findHandler(&request)) |handler| {
+                    handler(self.ctx, &request, &response);
+                } else {
+                    response.status = .not_found;
+                    response.body = "404 Not Found\n";
+                }
+
+                try writeResponse(&writer.interface, &response);
 
                 if (!parser.shouldKeepAlive() or true) {
                     break;
                 }
 
                 parser.reset();
+                request.reset();
+                _ = arena.reset(.retain_capacity);
+
                 // TODO we need to make sure we drain previous request body
             }
         }

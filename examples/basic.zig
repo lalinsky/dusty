@@ -9,15 +9,14 @@ const AppContext = struct {
 fn handleRoot(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) void {
     _ = ctx;
     _ = req;
-    _ = res;
-    std.log.info("Handling root request", .{});
+    res.body = "Hello World!";
 }
 
 fn handleUser(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) void {
     _ = ctx;
-    _ = res;
     const id = req.params.get("id") orelse "unknown";
     std.log.info("Handling user request: {s}, id={s}", .{ req.url, id });
+    res.body = std.fmt.allocPrint(req.arena, "User {s}", .{id}) catch unreachable;
 }
 
 fn handlePost(ctx: *AppContext, req: *const dusty.Request, res: *dusty.Response) void {
