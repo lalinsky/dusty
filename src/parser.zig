@@ -262,6 +262,8 @@ test "RequestParser: basic" {
 
     var req: Request = .{
         .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
     };
 
     var parser: RequestParser = undefined;

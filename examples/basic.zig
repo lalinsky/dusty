@@ -37,7 +37,7 @@ fn handlePost(ctx: *AppContext, req: *dusty.Request, res: *dusty.Response) !void
 
     // Read the request body
     var buf: [1024]u8 = undefined;
-    var body_reader = try req.bodyReader();
+    var body_reader = req.reader();
     const n = try body_reader.readAll(&buf);
 
     if (n > 0) {

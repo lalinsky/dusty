@@ -10,72 +10,70 @@ pub const Request = struct {
     version_minor: u8 = 0,
     headers: http.Headers = .{},
     params: std.StringHashMapUnmanaged([]const u8) = .{},
-    arena: std.mem.Allocator = undefined,
+    arena: std.mem.Allocator,
 
     // Body reading support
-    parser: ?*RequestParser = null,
-    stream_reader: ?*std.Io.Reader = null,
-    body_read_buffer: ?[]u8 = null,
+    parser: *RequestParser,
+    conn: *std.Io.Reader,
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
+        const parser = self.parser;
+        const conn = self.conn;
         self.* = .{
             .arena = arena,
+            .parser = parser,
+            .conn = conn,
         };
     }
 
-    pub fn bodyReader(self: *Request) !BodyReader {
-        return BodyReader{
-            .parser = self.parser orelse return error.NoParser,
-            .stream_reader = self.stream_reader orelse return error.NoStreamReader,
-            .socket_buffer = self.body_read_buffer orelse return error.NoBuffer,
-        };
+    pub fn reader(self: *Request) BodyReader {
+        return .{ .req = self };
     }
 };
 
 pub const BodyReader = struct {
-    parser: *RequestParser,
-    stream_reader: *std.Io.Reader,
-    socket_buffer: []u8, // Buffer for socket reads
+    req: *Request,
 
     pub fn read(self: *BodyReader, dest: []u8) !usize {
         if (dest.len == 0) return 0;
-        if (self.parser.isBodyComplete()) return 0;
+
+        const conn = self.req.conn;
+        const parser = self.req.parser;
+
+        if (parser.isBodyComplete()) return 0;
 
         // Setup destination for onBody callback
-        self.parser.prepareBodyRead(dest);
+        parser.prepareBodyRead(dest);
 
-        // Check if there's buffered data first
-        const buffered = self.stream_reader.buffered();
-        std.log.info("BodyReader.read: buffered.len={d}, dest.len={d}, isBodyComplete={}", .{ buffered.len, dest.len, self.parser.isBodyComplete() });
-        if (buffered.len > 0) {
-            std.log.info("BodyReader.read: feeding buffered data", .{});
-            self.parser.feed(buffered) catch |err| switch (err) {
-                error.Paused => {}, // Expected when body chunk is read
-                else => return err,
-            };
-            const consumed = self.parser.getConsumedBytes(buffered.ptr);
-            std.log.info("BodyReader.read: consumed={d}, copied={d}", .{ consumed, self.parser.state.body_dest_pos });
-            self.stream_reader.toss(consumed);
-            return self.parser.state.body_dest_pos;
+        // We got some data just from resuming
+        if (parser.state.body_dest_pos > 0) {
+            return parser.state.body_dest_pos;
         }
 
-        // Read fresh data from socket
-        std.log.info("BodyReader.read: calling fillMore", .{});
-        _ = try self.stream_reader.fillMore();
-        const fresh = self.stream_reader.buffered();
-        std.log.info("BodyReader.read: fresh.len={d}", .{fresh.len});
-        if (fresh.len == 0) return 0;
+        // Make sure we have something in the buffer
+        if (conn.bufferedLen() == 0) {
+            try conn.fillMore();
+        }
 
-        self.parser.feed(fresh) catch |err| switch (err) {
-            error.Paused => {}, // Expected when body chunk is read
-            else => return err,
-        };
-        const consumed = self.parser.getConsumedBytes(fresh.ptr);
-        std.log.info("BodyReader.read: consumed={d}, copied={d}", .{ consumed, self.parser.state.body_dest_pos });
-        self.stream_reader.toss(consumed);
+        // How much do
+        const buffered = conn.buffered();
+        if (buffered.len == 0) return 0;
+        const n = @min(dest.len, buffered.len);
 
-        return self.parser.state.body_dest_pos;
+        if (parser.feed(buffered[0..n])) {
+            conn.toss(n);
+        } else |err| {
+            switch (err) {
+                error.Paused => {
+                    const consumed = parser.getConsumedBytes(buffered.ptr);
+                    conn.toss(consumed);
+                },
+                else => return err,
+            }
+        }
+
+        return parser.state.body_dest_pos;
     }
 
     pub fn readAll(self: *BodyReader, dest: []u8) !usize {

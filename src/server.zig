@@ -98,11 +98,15 @@ pub fn Server(comptime Ctx: type) type {
 
             var request: Request = .{
                 .arena = arena.allocator(),
+                .conn = &reader.interface,
+                .parser = undefined,
             };
 
             var parser: RequestParser = undefined;
             try parser.init(&request);
             defer parser.deinit();
+
+            request.parser = &parser;
 
             while (true) {
                 var parsed_len: usize = 0;
@@ -137,11 +141,9 @@ pub fn Server(comptime Ctx: type) type {
                     };
                 }
 
-                // Headers are done, toss header bytes from buffer and setup body reading
+                // Toss what we hav read from the buffer so far,
+                // body reading will use a different strategy
                 reader.interface.toss(parsed_len);
-                request.parser = &parser;
-                request.stream_reader = &reader.interface;
-                request.body_read_buffer = &read_buffer;
 
                 std.log.info("Received: {f} {s}", .{ request.method, request.url });
 
@@ -164,20 +166,14 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
 
+                if (!parser.isBodyComplete()) {
+                    response.keepalive = false;
+                }
+
                 try response.write();
 
                 if (!response.keepalive) {
                     break;
-                }
-
-                // Drain unconsumed body before connection reuse
-                if (!parser.isBodyComplete()) {
-                    var drain_buf: [4096]u8 = undefined;
-                    var body_reader = try request.bodyReader();
-                    while (true) {
-                        const n = try body_reader.read(&drain_buf);
-                        if (n == 0) break;
-                    }
                 }
 
                 parser.reset();
