@@ -102,16 +102,10 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             var active_connections = self.active_connections.load(.acquire);
-            if (active_connections > 0) {
-                while (true) {
-                    log.info("Waiting for {} remaining connections to close", .{active_connections});
-                    try self.last_connection_closed.timedWait(rt, 100 * std.time.ns_per_ms);
-                    active_connections = self.active_connections.load(.acquire);
-                    if (active_connections == 0) {
-                        log.info("All connections closed", .{});
-                        break;
-                    }
-                }
+            while (active_connections > 0) {
+                log.info("Waiting for {} remaining connections to close", .{active_connections});
+                try self.last_connection_closed.timedWait(rt, 100 * std.time.ns_per_ms);
+                active_connections = self.active_connections.load(.acquire);
             }
         }
 
