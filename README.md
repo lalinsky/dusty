@@ -23,10 +23,10 @@ const AppContext = struct {
     rt: *zio.Runtime,
 };
 
-fn handleIndex(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
-    _ = req;
-    res.body = "Hello World!\n";
+fn handleUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+    ctx.rt.sleep(100); // simulate some work
+    const user_id = req.params.get("id") orelse "guest";
+    try res.json(.{ .id = user_id, .name = "John Doe" }, .{});
 }
 
 // ...
@@ -37,9 +37,8 @@ fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     var server = http.Server(AppContext).init(allocator, .{}, &ctx);
     defer server.deinit();
 
-    server.router.get("/", handleIndex);
-    server.router.get("/file/:id", handleFile);
-    server.router.put("/upload/*path", handleUpload);
+    server.router.get("/user/:id", handleUser);
+    server.router.get("/file/*path", handleFile);
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
     try server.listen(rt, addr);
