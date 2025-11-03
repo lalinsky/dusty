@@ -93,7 +93,7 @@ pub const Response = struct {
         // End of headers (applies to both chunked and non-chunked)
         try self.conn.writeAll("\r\n");
 
-        try self.conn.flush();
+        // Don't flush here - let the caller flush after writing (the first part of) the body
     }
 
     pub fn write(self: *Response) !void {
