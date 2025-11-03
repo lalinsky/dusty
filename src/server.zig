@@ -53,6 +53,7 @@ pub fn Server(comptime Ctx: type) type {
         active_connections: std.atomic.Value(usize),
         address: zio.net.Address,
         ready: zio.ResetEvent,
+        shutdown: zio.ResetEvent,
 
         pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
             return .{
@@ -63,6 +64,7 @@ pub fn Server(comptime Ctx: type) type {
                 .active_connections = std.atomic.Value(usize).init(0),
                 .address = undefined,
                 .ready = .init,
+                .shutdown = .init,
             };
         }
 
@@ -70,14 +72,32 @@ pub fn Server(comptime Ctx: type) type {
             self.router.deinit();
         }
 
+        pub fn stop(self: *Self) void {
+            self.shutdown.set();
+        }
+
         pub fn listen(self: *Self, rt: *zio.Runtime, addr: zio.net.IpAddress) !void {
             const server = try addr.listen(rt, .{ .reuse_address = true });
             defer server.close(rt);
 
-            log.info("Listening on {f}", .{server.socket.address});
             self.address = server.socket.address;
             self.ready.set();
 
+            var listener = try rt.spawn(acceptLoop, .{ self, rt, server }, .{});
+            defer listener.cancel(rt);
+
+            const selected = try zio.select(rt, .{ .done = &listener, .shutdown = &self.shutdown });
+            switch (selected) {
+                .done => |result| {
+                    result catch |err| {
+                        log.err("Failed to accept connection: {}", .{err});
+                    };
+                },
+                .shutdown => {},
+            }
+        }
+
+        pub fn acceptLoop(self: *Self, rt: *zio.Runtime, server: zio.net.Server) !void {
             while (true) {
                 const stream = try server.accept(rt);
                 errdefer stream.close(rt);
@@ -85,8 +105,8 @@ pub fn Server(comptime Ctx: type) type {
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
                 errdefer _ = self.active_connections.fetchSub(1, .acq_rel);
 
-                var task = try rt.spawn(handleConnection, .{ self, rt, stream }, .{});
-                task.detach(rt);
+                var handler = try rt.spawn(handleConnection, .{ self, rt, stream }, .{});
+                handler.detach(rt);
             }
         }
 

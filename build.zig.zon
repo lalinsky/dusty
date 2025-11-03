@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#4bbbad90e830aab6d844746c701dc12e37217578",
-            .hash = "zio-0.4.0-xHbVVPMTHAAm2jqIM-fsB_nn3gHlfN2fs4PPBCsz98Dl",
+            .url = "git+https://github.com/lalinsky/zio#9af04e71daeaf2109a4b7b11d3b843ad19d8bead",
+            .hash = "zio-0.4.0-xHbVVPYUHAD9oGcTKBUs3qdKDEa9lHHLjtq4ATt0zUIk",
         },
     },
     .paths = .{
