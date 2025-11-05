@@ -113,6 +113,36 @@ fn handleApiUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !voi
     }, .{});
 }
 
+fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+    _ = ctx;
+
+    // Define the expected request body structure
+    const CreateUserRequest = struct {
+        name: []const u8,
+        email: []const u8,
+        age: ?u32 = null,
+    };
+
+    // Parse JSON body
+    const user_data = try req.json(CreateUserRequest) orelse {
+        res.status = .bad_request;
+        try res.json(.{ .err = "Missing or invalid JSON body" }, .{});
+        return;
+    };
+
+    std.log.info("Creating user: name={s}, email={s}, age={?d}", .{ user_data.name, user_data.email, user_data.age });
+
+    // Return success response
+    res.status = .created;
+    try res.json(.{
+        .id = "usr_123456",
+        .name = user_data.name,
+        .email = user_data.email,
+        .age = user_data.age,
+        .created_at = std.time.timestamp(),
+    }, .{});
+}
+
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     var ctx: AppContext = .{ .rt = rt };
     const AppServer = http.Server(AppContext);
@@ -136,6 +166,7 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     server.router.get("/slow", handleSlow);
     server.router.get("/json", handleJson);
     server.router.get("/api/users/:id", handleApiUser);
+    server.router.post("/api/users", handleCreateUser);
 
     var sigint = try zio.Signal.init(.interrupt);
     defer sigint.deinit();

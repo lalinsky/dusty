@@ -2,6 +2,7 @@ const std = @import("std");
 
 const http = @import("http.zig");
 const RequestParser = @import("parser.zig").RequestParser;
+const ServerConfig = @import("config.zig").ServerConfig;
 
 pub const Request = struct {
     method: http.Method = undefined,
@@ -17,19 +18,34 @@ pub const Request = struct {
     parser: *RequestParser,
     conn: *std.Io.Reader,
     body_reader_buffer: [1024]u8 = undefined,
+    config: ServerConfig.Request = .{},
+    _body: ?[]const u8 = null,
+    _body_read: bool = false,
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
         const parser = self.parser;
         const conn = self.conn;
+        const cfg = self.config;
         self.* = .{
             .arena = arena,
             .parser = parser,
             .conn = conn,
+            .config = cfg,
         };
     }
 
     pub fn reader(self: *Request) BodyReader {
+        // If body has already been read, return a reader for the cached body
+        if (self._body_read) {
+            const cached_body = self._body orelse &.{};
+            return .{
+                .req = self,
+                .interface = std.Io.Reader.fixed(cached_body),
+            };
+        }
+
+        // Otherwise return the streaming body reader
         return .{
             .req = self,
             .interface = .{
@@ -41,6 +57,48 @@ pub const Request = struct {
                 .end = 0,
             },
         };
+    }
+
+    /// Read the entire body into memory. Result is cached for subsequent calls.
+    pub fn body(self: *Request) !?[]const u8 {
+        if (self._body_read) {
+            return self._body;
+        }
+
+        var r = self.reader();
+        const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
+            error.StreamTooLong => return error.BodyTooBig,
+            else => return err,
+        };
+
+        self._body_read = true;
+        if (result.len == 0) {
+            self._body = null;
+            return null;
+        }
+        self._body = result;
+        return result;
+    }
+
+    /// Parse body as JSON into type T
+    pub fn json(self: *Request, comptime T: type) !?T {
+        const b = try self.body() orelse return null;
+        return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});
+    }
+
+    /// Parse body as a generic JSON value
+    pub fn jsonValue(self: *Request) !?std.json.Value {
+        const b = try self.body() orelse return null;
+        return try std.json.parseFromSliceLeaky(std.json.Value, self.arena, b, .{});
+    }
+
+    /// Parse body as a JSON object
+    pub fn jsonObject(self: *Request) !?std.json.ObjectMap {
+        const value = try self.jsonValue() orelse return null;
+        switch (value) {
+            .object => |o| return o,
+            else => return null,
+        }
     }
 
     /// Unescape a URL-encoded string

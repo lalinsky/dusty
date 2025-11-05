@@ -5,6 +5,7 @@ const Router = @import("router.zig").Router;
 const RequestParser = @import("parser.zig").RequestParser;
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
+const ServerConfig = @import("config.zig").ServerConfig;
 
 const log = std.log.scoped(.dusty);
 
@@ -20,19 +21,6 @@ fn defaultNotFound(req: *Request, res: *Response) void {
     res.status = .not_found;
     res.body = "404 Not Found\n";
 }
-
-pub const ServerConfig = struct {
-    timeout: Timeout = .{},
-
-    pub const Timeout = struct {
-        /// Maximum time (ms) to receive a complete request
-        request: ?u64 = null,
-        /// Maximum time (ms) to keep idle connections open
-        keepalive: ?u64 = null,
-        /// Maximum number of requests per keepalive connection
-        request_count: ?usize = null,
-    };
-};
 
 pub fn Server(comptime Ctx: type) type {
     return struct {
@@ -152,6 +140,7 @@ pub fn Server(comptime Ctx: type) type {
                 .arena = arena.allocator(),
                 .conn = &reader.interface,
                 .parser = undefined,
+                .config = self.config.request,
             };
 
             var parser: RequestParser = undefined;

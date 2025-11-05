@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const Server = @import("server.zig").Server;
-pub const ServerConfig = @import("server.zig").ServerConfig;
+pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const Router = @import("router.zig").Router;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
