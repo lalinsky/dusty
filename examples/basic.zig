@@ -137,8 +137,11 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     server.router.get("/json", handleJson);
     server.router.get("/api/users/:id", handleApiUser);
 
-    var signal = try zio.Signal.init(.interrupt);
-    defer signal.deinit();
+    var sigint = try zio.Signal.init(.interrupt);
+    defer sigint.deinit();
+
+    var sigterm = try zio.Signal.init(.terminate);
+    defer sigterm.deinit();
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
 
@@ -146,12 +149,12 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     defer task.cancel(rt);
 
     while (true) {
-        const result = try zio.select(rt, .{ .task = &task, .signal = &signal });
+        const result = try zio.select(rt, .{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
         switch (result) {
             .task => |r| {
                 return r;
             },
-            .signal => {
+            .sigint, .sigterm => {
                 server.stop();
             },
         }
