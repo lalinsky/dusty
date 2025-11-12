@@ -23,11 +23,11 @@ jobs:
         version: 0.15.2
 
     - name: Build
-      run: zig build
+      run: zig build --release=safe
       timeout-minutes: 5
 
     - name: Run tests
-      run: zig build test --summary all
+      run: zig build test --release=safe --summary=all
       timeout-minutes: 5
 
     - name: Test demo server
