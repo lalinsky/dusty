@@ -27,7 +27,7 @@ jobs:
       timeout-minutes: 5
 
     - name: Run tests
-      run: zig build test --release=safe --summary=all
+      run: zig build test --release=safe --summary all
       timeout-minutes: 5
 
     - name: Test demo server
