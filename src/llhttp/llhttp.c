@@ -2651,7 +2651,11 @@ static llparse_state_t llhttp__internal__run(
         mask = vorrq_u16(mask, single);
         narrow = vshrn_n_u16(mask, 4);
         match_mask = ~vget_lane_u64(vreinterpret_u64_u8(narrow), 0);
-        match_len = __builtin_ctzll(match_mask) >> 2;
+        if (match_mask == 0) {
+          match_len = 16;  // All characters matched
+        } else {
+          match_len = __builtin_ctzll(match_mask) >> 2;
+        }
         if (match_len != 16) {
           p += match_len;
           goto s_n_llhttp__internal__n_header_value_otherwise;
