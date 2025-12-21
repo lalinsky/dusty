@@ -263,6 +263,7 @@ test "RequestParser: basic" {
     defer arena.deinit();
 
     var req: Request = .{
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,

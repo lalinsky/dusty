@@ -137,6 +137,7 @@ pub fn Server(comptime Ctx: type) type {
             defer arena.deinit();
 
             var request: Request = .{
+                .io = rt.io(),
                 .arena = arena.allocator(),
                 .conn = &reader.interface,
                 .parser = undefined,

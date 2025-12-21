@@ -50,7 +50,8 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
 
-    try rt.runUntilComplete(Test.mainFn, .{ rt, ctx }, .{});
+    var task = try rt.spawn(Test.mainFn, .{ rt, ctx }, .{});
+    try task.join(rt);
 }
 
 test "Server: POST with body" {
@@ -308,5 +309,6 @@ test "Server: void context handlers" {
     var rt = try zio.Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
 
-    try rt.runUntilComplete(Test.mainFn, .{rt}, .{});
+    var task = try rt.spawn(Test.mainFn, .{rt}, .{});
+    try task.join(rt);
 }

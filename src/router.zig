@@ -315,6 +315,7 @@ test "Router: register and find GET route" {
     var req = Request{
         .method = .get,
         .url = "/users",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -337,6 +338,7 @@ test "Router: register and find POST route" {
     var req = Request{
         .method = .post,
         .url = "/posts",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -359,6 +361,7 @@ test "Router: method mismatch returns null" {
     var req = Request{
         .method = .post,
         .url = "/users",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -380,6 +383,7 @@ test "Router: path mismatch returns null" {
     var req = Request{
         .method = .get,
         .url = "/posts",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -401,6 +405,7 @@ test "Router: parameterized routes" {
     var req = Request{
         .method = .get,
         .url = "/users/123",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -426,6 +431,7 @@ test "Router: multiple routes" {
     var req1 = Request{
         .method = .get,
         .url = "/users",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -438,6 +444,7 @@ test "Router: multiple routes" {
     var req2 = Request{
         .method = .post,
         .url = "/users",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -450,6 +457,7 @@ test "Router: multiple routes" {
     var req3 = Request{
         .method = .get,
         .url = "/posts",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -477,6 +485,7 @@ test "Router: all HTTP methods" {
         var req = Request{
             .method = method,
             .url = "/resource",
+            .io = undefined,
             .arena = arena.allocator(),
             .parser = undefined,
             .conn = undefined,
@@ -498,6 +507,7 @@ test "Router: extract single parameter" {
     var req = Request{
         .method = .get,
         .url = "/users/123",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -523,6 +533,7 @@ test "Router: extract multiple parameters" {
     var req = Request{
         .method = .get,
         .url = "/users/456/posts/789",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -552,6 +563,7 @@ test "Router: mixed static and parameter segments" {
     var req = Request{
         .method = .get,
         .url = "/api/v1/users/abc123/profile",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -580,6 +592,7 @@ test "Router: static route has precedence over param route" {
     var req = Request{
         .method = .get,
         .url = "/users/new",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -605,6 +618,7 @@ test "Router: wildcard route basic matching" {
     var req = Request{
         .method = .get,
         .url = "/files/document.txt",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -627,6 +641,7 @@ test "Router: wildcard captures remaining path" {
     var req = Request{
         .method = .get,
         .url = "/files/path/to/file.txt",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -653,6 +668,7 @@ test "Router: static route has precedence over wildcard" {
     var req = Request{
         .method = .get,
         .url = "/files/config.json",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -679,6 +695,7 @@ test "Router: param route has precedence over wildcard" {
     var req = Request{
         .method = .get,
         .url = "/api/123",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -707,6 +724,7 @@ test "Router: wildcard with multiple segments" {
     var req = Request{
         .method = .get,
         .url = "/assets/images/icons/logo.png",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -732,6 +750,7 @@ test "Router: wildcard with prefix path" {
     var req = Request{
         .method = .get,
         .url = "/api/v1/files/docs/readme.md",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -757,6 +776,7 @@ test "Router: static route with query parameters" {
     var req = Request{
         .method = .get,
         .url = "/users/profile?debug=true&page=1",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -783,6 +803,7 @@ test "Router: param route with query parameters" {
     var req = Request{
         .method = .get,
         .url = "/users/123?format=json",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -813,6 +834,7 @@ test "Router: multiple params with query parameters" {
     var req = Request{
         .method = .get,
         .url = "/users/456/posts/789?include=comments&sort=date",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -847,6 +869,7 @@ test "Router: wildcard route with query parameters" {
     var req = Request{
         .method = .get,
         .url = "/files/docs/readme.md?download=true",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -876,6 +899,7 @@ test "Router: empty query string" {
     var req = Request{
         .method = .get,
         .url = "/users/123?",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -904,6 +928,7 @@ test "Router: no query parameters" {
     var req = Request{
         .method = .get,
         .url = "/users/123",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -932,6 +957,7 @@ test "Router: URL encoded query parameters" {
     var req = Request{
         .method = .get,
         .url = "/search?q=hello+world&tag=foo%20bar&special=%21%40%23%24",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -958,6 +984,7 @@ test "Router: query parameter without value" {
     var req = Request{
         .method = .get,
         .url = "/items?featured&sort=name",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
@@ -983,6 +1010,7 @@ test "Router: query with empty key-value pairs" {
     var req = Request{
         .method = .get,
         .url = "/test?a=1&&b=2&",
+        .io = undefined,
         .arena = arena.allocator(),
         .parser = undefined,
         .conn = undefined,
