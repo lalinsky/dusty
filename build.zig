@@ -47,6 +47,8 @@ pub fn build(b: *std.Build) void {
         example.root_module.addImport("zio", zio.module("zio"));
         const install = b.addInstallArtifact(example, .{});
         examples_step.dependOn(&install.step);
+        // Add to default install step so examples are built with plain `zig build`
+        b.getInstallStep().dependOn(&install.step);
     }
 
     // Creates an executable that will run `test` blocks from the provided module.
