@@ -6,6 +6,7 @@ const c = @cImport({
 
 const Method = @import("http.zig").Method;
 const Headers = @import("http.zig").Headers;
+const ContentType = @import("http.zig").ContentType;
 const Request = @import("request.zig").Request;
 
 pub const ParseError = error{
@@ -231,6 +232,11 @@ pub const RequestParser = struct {
 
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+
+        if (self.request.headers.get("Content-Type")) |content_type| {
+            self.request.content_type = ContentType.fromContentType(content_type);
+        }
+
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
     }

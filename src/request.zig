@@ -11,6 +11,7 @@ pub const Request = struct {
     version_major: u8 = 0,
     version_minor: u8 = 0,
     headers: http.Headers = .{},
+    content_type: ?http.ContentType = null,
     params: std.StringHashMapUnmanaged([]const u8) = .{},
     query: std.StringHashMapUnmanaged([]const u8) = .{},
 

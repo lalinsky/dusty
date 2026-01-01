@@ -5,6 +5,7 @@ pub const Response = struct {
     status: http.Status = .ok,
     body: []const u8 = "",
     headers: http.Headers = .{},
+    content_type: ?http.ContentType = null,
     arena: std.mem.Allocator,
     buffer: std.Io.Writer.Allocating,
     conn: *std.Io.Writer,
@@ -65,6 +66,11 @@ pub const Response = struct {
 
         // Write status line
         try self.conn.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
+
+        // Set the Content-Type header
+        if (self.content_type) |content_type| {
+            try self.header("Content-Type", content_type.toContentType());
+        }
 
         // Write headers
         var iter = self.headers.iterator();

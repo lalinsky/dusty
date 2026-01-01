@@ -251,3 +251,151 @@ test "Headers: put/get case insenstive" {
     try std.testing.expect(val != null);
     try std.testing.expectEqualStrings("bar", val.?);
 }
+
+pub const ContentType = enum(u32) {
+    text,
+    html,
+    css,
+    js,
+    xml,
+    json,
+    yaml,
+    png,
+    jpeg,
+    webp,
+    gif,
+    mp4,
+    webm,
+    mp3,
+    wav,
+    ogg,
+    woff,
+    woff2,
+    ttf,
+    unknown,
+
+    pub fn fromContentType(value: []const u8) ContentType {
+        const MAX_VALUE_LENGTH = 22;
+
+        if (value.len == 0 or value.len > MAX_VALUE_LENGTH) {
+            return .unknown;
+        }
+
+        var main_buffer: [MAX_VALUE_LENGTH]u8 = undefined;
+        var main_length: usize = 0;
+
+        while (main_length < value.len) {
+            if (main_buffer[main_length] == ';') {
+                break;
+            }
+
+            main_buffer[main_length] = std.ascii.toLower(value[main_length]);
+            main_length += 1;
+        }
+
+        if (main_length < 8) {
+            return .unknown;
+        }
+
+        const main = main_buffer[0..main_length];
+        const hash = std.hash.Fnv1a_32.hash(main); 
+
+        if ((hash == comptime std.hash.Fnv1a_32.hash("text/plain")) and std.mem.eql(u8, main, "text/plain")) return .text;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("text/html")) and std.mem.eql(u8, main, "text/html")) return .html;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("text/css")) and std.mem.eql(u8, main, "text/css")) return .css;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/javascript")) and std.mem.eql(u8, main, "application/javascript")) return .js;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/xml")) and std.mem.eql(u8, main, "application/xml")) return .xml;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/json")) and std.mem.eql(u8, main, "application/json")) return .json;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/yaml")) and std.mem.eql(u8, main, "application/yaml")) return .yaml;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("image/png")) and std.mem.eql(u8, main, "image/png")) return .png;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("image/jpeg")) and std.mem.eql(u8, main, "image/jpeg")) return .jpeg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("image/webp")) and std.mem.eql(u8, main, "image/webp")) return .webp;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("image/gif")) and std.mem.eql(u8, main, "image/gif")) return .gif;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("video/mp4")) and std.mem.eql(u8, main, "video/mp4")) return .mp4;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("video/webm")) and std.mem.eql(u8, main, "video/webm")) return .webm;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("audio/mpeg")) and std.mem.eql(u8, main, "audio/mpeg")) return .mp3;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("audio/wav")) and std.mem.eql(u8, main, "audio/wav")) return .wav;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("audio/ogg")) and std.mem.eql(u8, main, "audio/ogg")) return .ogg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("font/woff")) and std.mem.eql(u8, main, "font/woff")) return .woff;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("font/woff2")) and std.mem.eql(u8, main, "font/woff2")) return .woff2;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("font/ttf")) and std.mem.eql(u8, main, "font/ttf")) return .ttf;
+
+        return .unknown;
+    }
+
+    pub fn fromExtension(value: []const u8) ContentType {
+        if (value.len == 0) {
+            return .unknown;
+        }
+
+        const name = if (value[0] == '.') value[1..] else value;
+        const hash = std.hash.Fnv1a_32.hash(name);
+
+        if (name.len < 2) {
+            return .unknown;
+        }
+
+        if ((hash == comptime std.hash.Fnv1a_32.hash("txt")) and std.mem.eql(u8, name, "txt")) return .text;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("html")) and std.mem.eql(u8, name, "html")) return .html;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("css")) and std.mem.eql(u8, name, "css")) return .css;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("js")) and std.mem.eql(u8, name, "js")) return .js;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("xml")) and std.mem.eql(u8, name, "xml")) return .xml;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("json")) and std.mem.eql(u8, name, "json")) return .json;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("yaml")) and std.mem.eql(u8, name, "yaml")) return .yaml;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("png")) and std.mem.eql(u8, name, "png")) return .png;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("jpg")) and std.mem.eql(u8, name, "jpg")) return .jpeg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("jpeg")) and std.mem.eql(u8, name, "jpeg")) return .jpeg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("webp")) and std.mem.eql(u8, name, "webp")) return .webp;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("gif")) and std.mem.eql(u8, name, "gif")) return .gif;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("mp4")) and std.mem.eql(u8, name, "mp4")) return .mp4;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("webm")) and std.mem.eql(u8, name, "webm")) return .webm;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("mp3")) and std.mem.eql(u8, name, "mp3")) return .mp3;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("wav")) and std.mem.eql(u8, name, "wav")) return .wav;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("ogg")) and std.mem.eql(u8, name, "ogg")) return .ogg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("woff")) and std.mem.eql(u8, name, "woff")) return .woff;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("woff2")) and std.mem.eql(u8, name, "woff2")) return .woff2;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("ttf")) and std.mem.eql(u8, name, "ttf")) return .ttf;
+
+        return .unknown;
+    }
+
+    pub fn toContentType(self: ContentType) []const u8 {
+        return switch (self) {
+            .text => "text/plain; charset=UTF-8",
+            .html => "text/html; charset=UTF-8",
+            .css => "text/css; charset=UTF-8",
+            .js => "application/javascript; charset=UTF-8",
+            .xml => "application/xml; charset=UTF-8",
+            .json => "application/json; charset=UTF-8",
+            .yaml => "application/yaml; charset=UTF-8",
+            .png => "image/png",
+            .jpeg => "image/jpeg",
+            .webp => "image/webp",
+            .gif => "image/gif",
+            .mp4 => "video/mp4",
+            .webm => "video/webm",
+            .mp3 => "audio/mpeg",
+            .wav => "audio/wav",
+            .ogg => "audio/ogg",
+            .woff => "font/woff",
+            .woff2 => "font/woff2",
+            .ttf => "font/ttf",
+            .unknown => "application/octet-stream"
+        };
+    }
+};
+
+test "ContentType: parse from Content-Type" {
+    try std.testing.expectEqual(ContentType.text, ContentType.fromContentType("text/plain"));
+    try std.testing.expectEqual(ContentType.text, ContentType.fromContentType("TEXT/PLAIN"));
+    try std.testing.expectEqual(ContentType.jpeg, ContentType.fromContentType("image/jpeg"));
+    try std.testing.expectEqual(ContentType.unknown, ContentType.fromContentType(""));
+}
+
+test "ContentType: parse from file extension" { 
+    try std.testing.expectEqual(ContentType.text, ContentType.fromExtension("txt"));
+    try std.testing.expectEqual(ContentType.text, ContentType.fromExtension(".txt"));
+    try std.testing.expectEqual(ContentType.jpeg, ContentType.fromExtension(".jpg"));
+    try std.testing.expectEqual(ContentType.jpeg, ContentType.fromExtension(".jpeg"));
+    try std.testing.expectEqual(ContentType.unknown, ContentType.fromExtension(""));
+}
