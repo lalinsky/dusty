@@ -16,7 +16,7 @@ from typing import Optional
 
 PORT = 8080
 HOST = "127.0.0.1"
-BINARY_NAME = "basic" + (".exe" if platform.system() == "Windows" else "")
+BINARY_NAME = "basic-example" + (".exe" if platform.system() == "Windows" else "")
 BINARY_PATH = os.path.join("zig-out", "bin", BINARY_NAME)
 STARTUP_TIMEOUT = 10  # seconds
 SHUTDOWN_TIMEOUT = 5  # seconds

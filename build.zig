@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
 
     for (example_files) |name| {
         const example = b.addExecutable(.{
-            .name = name,
+            .name = b.fmt("{s}-example", .{name}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
                 .target = target,
