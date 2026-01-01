@@ -26,18 +26,30 @@ pub fn build(b: *std.Build) void {
     });
     mod.addIncludePath(b.path("src/llhttp"));
 
-    // Example executable
-    const basic_example = b.addExecutable(.{
-        .name = "basic-example",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/basic.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    basic_example.root_module.addImport("dusty", mod);
-    basic_example.root_module.addImport("zio", zio.module("zio"));
-    b.installArtifact(basic_example);
+    // Examples
+    const examples_step = b.step("examples", "Build all examples");
+
+    const example_files = [_][]const u8{
+        "basic",
+        "sse",
+    };
+
+    for (example_files) |name| {
+        const example = b.addExecutable(.{
+            .name = b.fmt("{s}-example", .{name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        example.root_module.addImport("dusty", mod);
+        example.root_module.addImport("zio", zio.module("zio"));
+        const install = b.addInstallArtifact(example, .{});
+        examples_step.dependOn(&install.step);
+        // Add to default install step so examples are built with plain `zig build`
+        b.getInstallStep().dependOn(&install.step);
+    }
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to

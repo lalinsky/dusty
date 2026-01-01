@@ -68,6 +68,9 @@ export TEST_VERBOSE="$TEST_VERBOSE"
 echo "=== Building code ==="
 zig build
 
+echo "=== Building examples ==="
+zig build examples
+
 echo "=== Running unit tests ==="
 if [ -n "$TEST_FILTER" ]; then
     echo "Running unit tests with filter: $TEST_FILTER"
