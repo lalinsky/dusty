@@ -1,6 +1,24 @@
 const std = @import("std");
 const http = @import("http.zig");
 
+pub const EventStream = struct {
+    conn: *std.Io.Writer,
+
+    pub const Options = struct {
+        event: ?[]const u8 = null,
+        id: ?[]const u8 = null,
+        retry: ?u32 = null,
+    };
+
+    pub fn send(self: EventStream, data: []const u8, opts: Options) !void {
+        if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
+        if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
+        if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
+        try self.conn.print("data: {s}\n\n", .{data});
+        try self.conn.flush();
+    }
+};
+
 pub const Response = struct {
     status: http.Status = .ok,
     body: []const u8 = "",
@@ -12,6 +30,7 @@ pub const Response = struct {
     headers_written: bool = false,
     keepalive: bool = true,
     chunked: bool = false,
+    streaming: bool = false,
 
     pub fn init(arena: std.mem.Allocator, conn: *std.Io.Writer) Response {
         return .{
@@ -57,6 +76,16 @@ pub const Response = struct {
         try self.conn.flush();
     }
 
+    pub fn startEventStream(self: *Response) !EventStream {
+        try self.header("Content-Type", "text/event-stream");
+        try self.header("Cache-Control", "no-cache");
+        self.keepalive = false;
+        self.streaming = true;
+        try self.writeHeader();
+        try self.conn.flush();
+        return .{ .conn = self.conn };
+    }
+
     pub fn writeHeader(self: *Response) !void {
         if (self.headers_written) {
             return;
@@ -80,8 +109,8 @@ pub const Response = struct {
         // Write Transfer-Encoding or Content-Length
         if (self.chunked) {
             try self.conn.writeAll("Transfer-Encoding: chunked\r\n");
-        } else {
-            // Write Content-Length if not manually set
+        } else if (!self.streaming) {
+            // Write Content-Length if not manually set (skip for streaming responses like SSE)
             const has_content_length = self.headers.get("Content-Length") != null;
             if (!has_content_length) {
                 const buffer_end = self.buffer.writer.end;
@@ -573,4 +602,69 @@ test "Response: json() with nested object" {
 
     const buffered = response.buffer.writer.buffered();
     try std.testing.expectEqualStrings("{\"user\":{\"name\":\"Bob\",\"id\":42},\"active\":true}", buffered);
+}
+
+test "EventStream: send with data only" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try stream.send("hello world", .{});
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqualStrings("data: hello world\n\n", written);
+}
+
+test "EventStream: send with event name" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try stream.send("payload", .{ .event = "update" });
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqualStrings("event: update\ndata: payload\n\n", written);
+}
+
+test "EventStream: send with all options" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try stream.send("payload", .{ .event = "update", .id = "42", .retry = 5000 });
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqualStrings("event: update\nid: 42\nretry: 5000\ndata: payload\n\n", written);
+}
+
+test "EventStream: multiple sends" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try stream.send("first", .{});
+    try stream.send("second", .{ .event = "msg" });
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqualStrings("data: first\n\nevent: msg\ndata: second\n\n", written);
+}
+
+test "Response: startEventStream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    const stream = try response.startEventStream();
+
+    try stream.send("connected", .{});
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: text/event-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Cache-Control: no-cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "data: connected\n\n") != null);
+    try std.testing.expectEqual(false, response.keepalive);
 }
