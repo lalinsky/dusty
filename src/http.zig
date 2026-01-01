@@ -275,18 +275,20 @@ pub const ContentType = enum(u32) {
     unknown,
 
     pub fn fromContentType(value: []const u8) ContentType {
-        const MAX_VALUE_LENGTH = 22;
-
-        if (value.len == 0 or value.len > MAX_VALUE_LENGTH) {
+        if (value.len == 0) {
             return .unknown;
         }
 
-        var main_buffer: [MAX_VALUE_LENGTH]u8 = undefined;
+        var main_buffer: [22]u8 = undefined;
         var main_length: usize = 0;
 
         while (main_length < value.len) {
             if (value[main_length] == ';') {
                 break;
+            }
+
+            if (main_length >= main_buffer.len) {
+                return .unknown;
             }
 
             main_buffer[main_length] = std.ascii.toLower(value[main_length]);
@@ -389,6 +391,8 @@ test "ContentType: parse from Content-Type" {
     try std.testing.expectEqual(ContentType.text, ContentType.fromContentType("text/plain"));
     try std.testing.expectEqual(ContentType.text, ContentType.fromContentType("TEXT/PLAIN"));
     try std.testing.expectEqual(ContentType.jpeg, ContentType.fromContentType("image/jpeg"));
+    try std.testing.expectEqual(ContentType.json, ContentType.fromContentType("application/json; charset=UTF-8"));
+    try std.testing.expectEqual(ContentType.js, ContentType.fromContentType("application/javascript; charset=UTF-8"));
     try std.testing.expectEqual(ContentType.unknown, ContentType.fromContentType(""));
 }
 
