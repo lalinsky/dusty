@@ -285,7 +285,7 @@ pub const ContentType = enum(u32) {
         var main_length: usize = 0;
 
         while (main_length < value.len) {
-            if (main_buffer[main_length] == ';') {
+            if (value[main_length] == ';') {
                 break;
             }
 
