@@ -7,6 +7,7 @@ pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 pub const Status = @import("http.zig").Status;
 pub const Method = @import("http.zig").Method;
+pub const ContentType = @import("http.zig").ContentType;
 
 test {
     std.testing.refAllDecls(@This());
