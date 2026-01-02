@@ -272,6 +272,8 @@ pub const ContentType = enum(u32) {
     woff,
     woff2,
     ttf,
+    form,
+    multipart_form,
     unknown,
 
     pub fn fromContentType(value: []const u8) ContentType {
@@ -320,6 +322,8 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("audio/ogg")) and std.mem.eql(u8, main, "audio/ogg")) return .ogg;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/woff")) and std.mem.eql(u8, main, "font/woff")) return .woff;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/woff2")) and std.mem.eql(u8, main, "font/woff2")) return .woff2;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("x-www-form-urlencoded")) and std.mem.eql(u8, main, "x-www-form-urlencoded")) return .form;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("multipart/form-data")) and std.mem.eql(u8, main, "multipart/form-data")) return .multipart_form;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/ttf")) and std.mem.eql(u8, main, "font/ttf")) return .ttf;
 
         return .unknown;
@@ -382,6 +386,8 @@ pub const ContentType = enum(u32) {
             .woff => "font/woff",
             .woff2 => "font/woff2",
             .ttf => "font/ttf",
+            .form => "application/x-www-form-urlencoded",
+            .multipart_form => "multipart/form-data",
             .unknown => "application/octet-stream"
         };
     }

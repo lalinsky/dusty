@@ -114,6 +114,10 @@ pub const Request = struct {
             return form_data;
         }
 
+        if (self.content_type == null or self.content_type != .form) {
+            return error.NotForm;
+        }
+
         const buffer = try self.body() orelse return null;
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
         var form_data = std.StringHashMapUnmanaged([]const u8){};
@@ -131,7 +135,7 @@ pub const Request = struct {
 
         self._form_data = form_data;
 
-        return &self._form_data;
+        return &(self._form_data orelse unreachable);
     }
 
     /// Unescape a URL-encoded string
