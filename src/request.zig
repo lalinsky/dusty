@@ -1,5 +1,4 @@
 const std = @import("std");
-const Io = @import("zio").Io; // TODO: replace with std.Io in Zig 0.16
 
 const http = @import("http.zig");
 const RequestParser = @import("parser.zig").RequestParser;
@@ -15,7 +14,6 @@ pub const Request = struct {
     params: std.StringHashMapUnmanaged([]const u8) = .{},
     query: std.StringHashMapUnmanaged([]const u8) = .{},
 
-    io: Io,
     arena: std.mem.Allocator,
 
     // Body reading support
@@ -27,13 +25,11 @@ pub const Request = struct {
     _body_read: bool = false,
 
     pub fn reset(self: *Request) void {
-        const io = self.io;
         const arena = self.arena;
         const parser = self.parser;
         const conn = self.conn;
         const cfg = self.config;
         self.* = .{
-            .io = io,
             .arena = arena,
             .parser = parser,
             .conn = conn,
