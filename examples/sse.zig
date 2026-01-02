@@ -6,46 +6,45 @@ const BroadcastChannel = zio.BroadcastChannel;
 
 const AppContext = struct {
     rt: *zio.Runtime,
-    channel: *BroadcastChannel([]const u8),
+    channel: *BroadcastChannel(u64),
 };
 
 fn handleEvents(ctx: *AppContext, _: *http.Request, res: *http.Response) !void {
     var stream = try res.startEventStream();
 
-    var consumer: BroadcastChannel([]const u8).Consumer = .{};
+    var consumer: BroadcastChannel(u64).Consumer = .{};
     ctx.channel.subscribe(&consumer);
     defer ctx.channel.unsubscribe(&consumer);
 
     try stream.send("connected", .{});
 
+    var buf: [64]u8 = undefined;
     while (true) {
-        const msg = ctx.channel.receive(ctx.rt, &consumer) catch |err| switch (err) {
+        const count = ctx.channel.receive(ctx.rt, &consumer) catch |err| switch (err) {
             error.Closed => break,
             error.Lagged => continue,
             else => return err,
         };
+        const msg = try std.fmt.bufPrint(&buf, "tick {d}", .{count});
         try stream.send(msg, .{ .event = "tick" });
     }
 }
 
-fn ticker(rt: *zio.Runtime, channel: *BroadcastChannel([]const u8)) !void {
-    var count: u32 = 0;
+fn ticker(rt: *zio.Runtime, channel: *BroadcastChannel(u64)) !void {
+    var count: u64 = 0;
     while (true) {
         try rt.sleep(1000);
         count += 1;
 
-        var buf: [64]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "tick {d}", .{count});
-
-        channel.send(msg) catch |err| switch (err) {
+        channel.send(count) catch |err| switch (err) {
             error.Closed => break,
         };
     }
 }
 
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
-    var channel_buffer: [16][]const u8 = undefined;
-    var channel = BroadcastChannel([]const u8).init(&channel_buffer);
+    var channel_buffer: [16]u64 = undefined;
+    var channel = BroadcastChannel(u64).init(&channel_buffer);
 
     var ctx: AppContext = .{ .rt = rt, .channel = &channel };
 
