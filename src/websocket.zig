@@ -148,16 +148,6 @@ pub const WebSocket = struct {
         try self.writeFrame(msg_type, data, true);
     }
 
-    /// Send JSON as text frame
-    pub fn sendJson(self: *WebSocket, value: anytype, options: std.json.Stringify.Options) !void {
-        if (self.closed) return Error.ConnectionClosed;
-
-        var list: std.ArrayListUnmanaged(u8) = .{};
-        const json_formatter = std.json.fmt(value, options);
-        try json_formatter.format(list.writer(self.arena).any());
-        try self.writeFrame(.text, list.items, true);
-    }
-
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
         if (self.closed) return Error.ConnectionClosed;
