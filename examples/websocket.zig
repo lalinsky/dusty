@@ -18,7 +18,7 @@ fn handleWebSocket(_: *AppContext, req: *http.Request, res: *http.Response) !voi
 
     while (true) {
         const msg = ws.receive() catch |err| switch (err) {
-            error.ConnectionClosed => break,
+            error.EndOfStream => break,
             else => return err,
         };
 

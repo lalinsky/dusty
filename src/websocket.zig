@@ -43,7 +43,6 @@ pub const WebSocket = struct {
     };
 
     pub const Error = error{
-        ConnectionClosed,
         ReservedFlags,
         LargeControlFrame,
         InvalidOpcode,
@@ -51,7 +50,6 @@ pub const WebSocket = struct {
         NestedFragment,
         InvalidUtf8,
         MessageTooLarge,
-        ReadFailed,
     };
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -143,14 +141,14 @@ pub const WebSocket = struct {
 
     /// Send a text or binary message
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (self.closed) return Error.ConnectionClosed;
+        if (self.closed) return error.EndOfStream;
         if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
         try self.writeFrame(msg_type, data, true);
     }
 
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
-        if (self.closed) return Error.ConnectionClosed;
+        if (self.closed) return error.EndOfStream;
         if (data.len > 125) return Error.LargeControlFrame;
         try self.writeFrame(.ping, data, true);
     }
@@ -168,28 +166,10 @@ pub const WebSocket = struct {
         payload: []const u8,
     };
 
-    fn readExact(self: *WebSocket, dest: []u8) !void {
-        var filled: usize = 0;
-        while (filled < dest.len) {
-            const buffered = self.reader.buffered();
-            if (buffered.len > 0) {
-                const to_copy = @min(buffered.len, dest.len - filled);
-                @memcpy(dest[filled..][0..to_copy], buffered[0..to_copy]);
-                self.reader.toss(to_copy);
-                filled += to_copy;
-            } else {
-                self.reader.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => return Error.ConnectionClosed,
-                    else => return Error.ReadFailed,
-                };
-            }
-        }
-    }
-
     fn readFrame(self: *WebSocket) !Frame {
         // Read first 2 bytes (header)
         var header: [2]u8 = undefined;
-        try self.readExact(&header);
+        try self.reader.readSliceAll(&header);
 
         const fin = (header[0] & 0x80) != 0;
         // RSV1, RSV2, RSV3 must be 0 (we don't support extensions)
@@ -212,18 +192,18 @@ pub const WebSocket = struct {
         // Extended payload length
         if (payload_len == 126) {
             var len_buf: [2]u8 = undefined;
-            try self.readExact(&len_buf);
+            try self.reader.readSliceAll(&len_buf);
             payload_len = std.mem.readInt(u16, &len_buf, .big);
         } else if (payload_len == 127) {
             var len_buf: [8]u8 = undefined;
-            try self.readExact(&len_buf);
+            try self.reader.readSliceAll(&len_buf);
             payload_len = std.mem.readInt(u64, &len_buf, .big);
         }
 
         // Read masking key if present (client -> server messages are masked)
         var mask_key: [4]u8 = undefined;
         if (masked) {
-            try self.readExact(&mask_key);
+            try self.reader.readSliceAll(&mask_key);
         }
 
         // Read payload
@@ -231,7 +211,7 @@ pub const WebSocket = struct {
             return Error.MessageTooLarge;
         }
         const payload = try self.arena.alloc(u8, @intCast(payload_len));
-        try self.readExact(payload);
+        try self.reader.readSliceAll(payload);
 
         // Unmask if needed
         if (masked) {

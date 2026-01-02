@@ -287,7 +287,7 @@ test "Server: WebSocket echo" {
 
             // Receive one message and echo it
             const msg = ws.receive() catch |err| switch (err) {
-                error.ConnectionClosed => return,
+                error.EndOfStream => return,
                 else => return err,
             };
 
