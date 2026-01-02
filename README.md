@@ -11,6 +11,7 @@ This project is in very early stages, don't use it unless you want to experiment
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
 - Server-Sent Events (SSE) for streaming responses
+- WebSocket support (RFC 6455)
 - Request/keepalive timeouts via coroutine auto-cancellation
 
 ## Example

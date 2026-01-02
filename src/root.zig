@@ -5,6 +5,8 @@ pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const Router = @import("router.zig").Router;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
+pub const EventStream = @import("response.zig").EventStream;
+pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const Status = @import("http.zig").Status;
 pub const Method = @import("http.zig").Method;
 pub const ContentType = @import("http.zig").ContentType;
@@ -13,7 +15,8 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-// Import server tests
+// Import tests
 comptime {
     _ = @import("server_test.zig");
+    _ = @import("websocket.zig");
 }
