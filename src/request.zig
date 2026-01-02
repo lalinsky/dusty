@@ -110,7 +110,7 @@ pub const Request = struct {
 
     /// Parse the body as application/x-www-form-urlencoded
     pub fn formData(self: *Request) !?*std.StringHashMapUnmanaged([]const u8) {
-        if (self._form_data_read) |*form_data| {
+        if (self._form_data) |*form_data| {
             return form_data;
         }
 
@@ -123,13 +123,15 @@ pub const Request = struct {
                 const key = try Request.urlUnescape(self.arena, entry[0..separator]);
                 const value = try Request.urlUnescape(self.arena, entry[separator + 1..]);
 
-                try form_data.put(key, value);
+                try form_data.put(self.arena, key, value);
             } else {
-                try form_data.put(try Request.urlUnescape(self.arena), "");
+                try form_data.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
             }
         }
 
         self._form_data = form_data;
+
+        return &self._form_data;
     }
 
     /// Unescape a URL-encoded string
