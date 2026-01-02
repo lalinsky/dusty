@@ -281,7 +281,7 @@ pub const ContentType = enum(u32) {
             return .unknown;
         }
 
-        var main_buffer: [22]u8 = undefined;
+        var main_buffer: [33]u8 = undefined;
         var main_length: usize = 0;
 
         while (main_length < value.len) {
@@ -322,7 +322,7 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("audio/ogg")) and std.mem.eql(u8, main, "audio/ogg")) return .ogg;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/woff")) and std.mem.eql(u8, main, "font/woff")) return .woff;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/woff2")) and std.mem.eql(u8, main, "font/woff2")) return .woff2;
-        if ((hash == comptime std.hash.Fnv1a_32.hash("x-www-form-urlencoded")) and std.mem.eql(u8, main, "x-www-form-urlencoded")) return .form;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/x-www-form-urlencoded")) and std.mem.eql(u8, main, "application/x-www-form-urlencoded")) return .form;
         if ((hash == comptime std.hash.Fnv1a_32.hash("multipart/form-data")) and std.mem.eql(u8, main, "multipart/form-data")) return .multipart_form;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/ttf")) and std.mem.eql(u8, main, "font/ttf")) return .ttf;
 
@@ -398,7 +398,7 @@ test "ContentType: parse from Content-Type" {
     try std.testing.expectEqual(ContentType.text, ContentType.fromContentType("TEXT/PLAIN"));
     try std.testing.expectEqual(ContentType.jpeg, ContentType.fromContentType("image/jpeg"));
     try std.testing.expectEqual(ContentType.json, ContentType.fromContentType("application/json; charset=UTF-8"));
-    try std.testing.expectEqual(ContentType.js, ContentType.fromContentType("application/javascript; charset=UTF-8"));
+    try std.testing.expectEqual(ContentType.form, ContentType.fromContentType("application/x-www-form-urlencoded; charset=UTF-8"));
     try std.testing.expectEqual(ContentType.unknown, ContentType.fromContentType(""));
 }
 
