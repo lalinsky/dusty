@@ -23,6 +23,8 @@ pub const Request = struct {
     config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
+    _fd: std.StringHashMapUnmanaged([]const u8) = .{},
+    _fd_read: bool = false,
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
@@ -101,6 +103,40 @@ pub const Request = struct {
             .object => |o| return o,
             else => return null,
         }
+    }
+
+    /// Parse the body as a form (application/x-www-form-urlencoded)
+    pub fn formData(self: *Request) !*std.StringHashMapUnmanaged([]const u8) {
+        if (self._fd_read) {
+            return &self._fd;
+        }
+
+        if (self.content_type == null or self.content_type != .form) {
+            return error.NotForm;
+        }
+
+        const buffer = try self.body() orelse {
+            self._fd_read = true;
+
+            return &self._fd;
+        };
+
+        var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
+
+        while (entry_iterator.next()) |entry| {
+            if (std.mem.indexOfScalar(u8, entry, '=')) |separator| {
+                const key = try Request.urlUnescape(self.arena, entry[0..separator]);
+                const value = try Request.urlUnescape(self.arena, entry[separator + 1..]);
+
+                try self._fd.put(self.arena, key, value);
+            } else {
+                try self._fd.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
+            }
+        }
+
+        self._fd_read = true;
+
+        return &self._fd;
     }
 
     /// Unescape a URL-encoded string
@@ -306,4 +342,77 @@ test "Request.body: basic POST" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.formData: basic key and value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\nfoo=123&bar=abc";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.formData();
+    try std.testing.expectEqualStrings("123", form_data.get("foo").?);
+    try std.testing.expectEqualStrings("abc", form_data.get("bar").?);
+}
+
+test "Request.formData: URL-encoded key and value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 17\r\n\r\nfoo+bar=123%21abc";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.formData();
+    try std.testing.expectEqualStrings("123!abc", form_data.get("foo bar").?);
+}
+
+test "Request.formData: entry with no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nfoo";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.formData();
+    try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
