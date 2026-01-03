@@ -23,7 +23,8 @@ pub const Request = struct {
     config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
-    _form_data: ?std.StringHashMapUnmanaged([]const u8) = null,
+    _fd: std.StringHashMapUnmanaged([]const u8) = .{},
+    _fd_read: bool = false,
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
@@ -106,8 +107,8 @@ pub const Request = struct {
 
     /// Parse the body as a form (application/x-www-form-urlencoded)
     pub fn formData(self: *Request) !?*std.StringHashMapUnmanaged([]const u8) {
-        if (self._form_data) |*form_data| {
-            return form_data;
+        if (self._fd_read) {
+            return &self._fd;
         }
 
         if (self.content_type == null or self.content_type != .form) {
@@ -116,22 +117,21 @@ pub const Request = struct {
 
         const buffer = try self.body() orelse return null;
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
-        var form_data = std.StringHashMapUnmanaged([]const u8){};
 
         while (entry_iterator.next()) |entry| {
             if (std.mem.indexOfScalar(u8, entry, '=')) |separator| {
                 const key = try Request.urlUnescape(self.arena, entry[0..separator]);
                 const value = try Request.urlUnescape(self.arena, entry[separator + 1..]);
 
-                try form_data.put(self.arena, key, value);
+                try self._fd.put(self.arena, key, value);
             } else {
-                try form_data.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
+                try self._fd.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
             }
         }
 
-        self._form_data = form_data;
+        self._fd_read = true;
 
-        return &(self._form_data orelse unreachable);
+        return &self._fd;
     }
 
     /// Unescape a URL-encoded string
