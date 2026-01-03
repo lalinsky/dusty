@@ -302,7 +302,7 @@ pub const ContentType = enum(u32) {
         }
 
         const main = main_buffer[0..main_length];
-        const hash = std.hash.Fnv1a_32.hash(main); 
+        const hash = std.hash.Fnv1a_32.hash(main);
 
         if ((hash == comptime std.hash.Fnv1a_32.hash("text/plain")) and std.mem.eql(u8, main, "text/plain")) return .text;
         if ((hash == comptime std.hash.Fnv1a_32.hash("text/html")) and std.mem.eql(u8, main, "text/html")) return .html;
@@ -402,7 +402,7 @@ test "ContentType: parse from Content-Type" {
     try std.testing.expectEqual(ContentType.unknown, ContentType.fromContentType(""));
 }
 
-test "ContentType: parse from file extension" { 
+test "ContentType: parse from file extension" {
     try std.testing.expectEqual(ContentType.text, ContentType.fromExtension("txt"));
     try std.testing.expectEqual(ContentType.text, ContentType.fromExtension(".txt"));
     try std.testing.expectEqual(ContentType.jpeg, ContentType.fromExtension(".jpg"));

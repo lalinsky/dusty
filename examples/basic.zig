@@ -3,6 +3,7 @@ const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
+    rt: *zio.Runtime,
     counter: usize = 0,
 
     pub fn uncaughtError(self: *AppContext, req: *http.Request, res: *http.Response, err: anyerror) void {
@@ -21,8 +22,8 @@ const AppContext = struct {
 };
 
 fn handleSlow(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
-    try req.io.sleep(.fromMilliseconds(10), .awake);
+    _ = req;
+    try ctx.rt.sleep(10);
     res.body = "Hello World!\n";
 }
 
@@ -143,7 +144,7 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
 }
 
 pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
-    var ctx: AppContext = .{};
+    var ctx: AppContext = .{ .rt = rt };
     const AppServer = http.Server(AppContext);
 
     const config: http.ServerConfig = .{

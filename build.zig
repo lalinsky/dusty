@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     const example_files = [_][]const u8{
         "basic",
         "sse",
+        "websocket",
     };
 
     for (example_files) |name| {

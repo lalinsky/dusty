@@ -1,5 +1,7 @@
 const std = @import("std");
 const http = @import("http.zig");
+const Request = @import("request.zig").Request;
+pub const WebSocket = @import("websocket.zig").WebSocket;
 
 pub const EventStream = struct {
     conn: *std.Io.Writer,
@@ -11,6 +13,9 @@ pub const EventStream = struct {
     };
 
     pub fn send(self: EventStream, data: []const u8, opts: Options) !void {
+        if (std.debug.runtime_safety) {
+            std.debug.assert(std.mem.indexOfScalar(u8, data, '\n') == null); // data must not contain newlines
+        }
         if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
         if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
         if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
@@ -85,6 +90,37 @@ pub const Response = struct {
         try self.writeHeader();
         try self.conn.flush();
         return .{ .conn = self.conn };
+    }
+
+    /// Upgrade HTTP connection to WebSocket.
+    /// Returns null if request is not a valid WebSocket upgrade request.
+    pub fn upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
+        // Validate upgrade headers
+        const upgrade = req.headers.get("Upgrade") orelse return null;
+        if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
+
+        const connection = req.headers.get("Connection") orelse return null;
+        if (std.ascii.indexOfIgnoreCase(connection, "upgrade") == null) return null;
+
+        const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
+        if (!std.mem.eql(u8, version, "13")) return null;
+
+        const key = req.headers.get("Sec-WebSocket-Key") orelse return null;
+
+        // Compute accept key
+        var accept_key: [28]u8 = undefined;
+        WebSocket.computeAcceptKey(key, &accept_key);
+
+        // Send 101 Switching Protocols response
+        self.status = .switching_protocols;
+        try self.header("Upgrade", "websocket");
+        try self.header("Connection", "Upgrade");
+        try self.header("Sec-WebSocket-Accept", &accept_key);
+        self.streaming = true;
+        try self.writeHeader();
+        try self.conn.flush();
+
+        return WebSocket.init(self.conn, req.conn, self.arena);
     }
 
     pub fn writeHeader(self: *Response) !void {

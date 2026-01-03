@@ -247,6 +247,196 @@ test "Server: HTTP/1.0 GET request" {
     try std.testing.expectEqual(0, ctx.version_minor);
 }
 
+test "Server: WebSocket echo" {
+    const TestContext = struct {
+        const Self = @This();
+
+        ws_upgraded: bool = false,
+        message_received: bool = false,
+        received_msg: [256]u8 = undefined,
+        received_len: usize = 0,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.get("/ws", handleWebSocket);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            // Send WebSocket upgrade request
+            try writer.writeAll("GET /ws HTTP/1.1\r\n");
+            try writer.writeAll("Host: localhost\r\n");
+            try writer.writeAll("Upgrade: websocket\r\n");
+            try writer.writeAll("Connection: Upgrade\r\n");
+            try writer.writeAll("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+            try writer.writeAll("Sec-WebSocket-Version: 13\r\n");
+            try writer.writeAll("\r\n");
+            try writer.flush();
+        }
+
+        fn handleWebSocket(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            var ws = try res.upgradeWebSocket(req) orelse {
+                res.status = .bad_request;
+                return;
+            };
+
+            ctx.ws_upgraded = true;
+
+            // Send welcome message
+            try ws.send(.text, "Welcome!");
+
+            // Receive one message and echo it
+            const msg = ws.receive() catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => return err,
+            };
+
+            if (msg.type == .text) {
+                ctx.message_received = true;
+                ctx.received_len = @min(msg.data.len, ctx.received_msg.len);
+                @memcpy(ctx.received_msg[0..ctx.received_len], msg.data[0..ctx.received_len]);
+                try ws.send(.text, msg.data);
+            }
+        }
+    };
+
+    const Test = struct {
+        pub fn mainFn(rt: *zio.Runtime, ctx: *TestContext) !void {
+            var server = dusty.Server(TestContext).init(std.testing.allocator, .{}, ctx);
+            defer server.deinit();
+
+            try ctx.setup(&server);
+
+            var server_task = try rt.spawn(serverFn, .{ rt, &server }, .{});
+            defer server_task.cancel(rt);
+
+            var client_task = try rt.spawn(clientFn, .{ rt, &server }, .{});
+            defer client_task.cancel(rt);
+
+            try client_task.join(rt);
+        }
+
+        pub fn serverFn(rt: *zio.Runtime, server: *dusty.Server(TestContext)) !void {
+            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
+            try server.listen(rt, addr);
+        }
+
+        pub fn clientFn(rt: *zio.Runtime, server: *dusty.Server(TestContext)) !void {
+            try server.ready.wait(rt);
+
+            const client = try server.address.connect(rt);
+            defer client.close(rt);
+            defer client.shutdown(rt, .both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = client.writer(rt, &write_buf);
+            const w = &writer.interface;
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = client.reader(rt, &read_buf);
+            const r = &reader.interface;
+
+            // Send WebSocket upgrade request
+            try w.writeAll("GET /ws HTTP/1.1\r\n");
+            try w.writeAll("Host: localhost\r\n");
+            try w.writeAll("Upgrade: websocket\r\n");
+            try w.writeAll("Connection: Upgrade\r\n");
+            try w.writeAll("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+            try w.writeAll("Sec-WebSocket-Version: 13\r\n");
+            try w.writeAll("\r\n");
+            try w.flush();
+
+            // Read upgrade response headers until we see \r\n\r\n
+            var response_buf: [512]u8 = undefined;
+            var response_len: usize = 0;
+            while (response_len < response_buf.len - 1) {
+                const buffered = r.buffered();
+                if (buffered.len > 0) {
+                    response_buf[response_len] = buffered[0];
+                    r.toss(1);
+                    response_len += 1;
+                    // Check for end of headers
+                    if (response_len >= 4 and
+                        response_buf[response_len - 4] == '\r' and
+                        response_buf[response_len - 3] == '\n' and
+                        response_buf[response_len - 2] == '\r' and
+                        response_buf[response_len - 1] == '\n')
+                    {
+                        break;
+                    }
+                } else {
+                    try r.fillMore();
+                }
+            }
+            const response_str = response_buf[0..response_len];
+            try std.testing.expect(std.mem.indexOf(u8, response_str, "101") != null);
+            try std.testing.expect(std.mem.indexOf(u8, response_str, "Sec-WebSocket-Accept") != null);
+
+            // Helper to read exact bytes
+            const readExact = struct {
+                fn read(rdr: *std.Io.Reader, dest: []u8) !void {
+                    var filled: usize = 0;
+                    while (filled < dest.len) {
+                        const buffered = rdr.buffered();
+                        if (buffered.len > 0) {
+                            const to_copy = @min(buffered.len, dest.len - filled);
+                            @memcpy(dest[filled..][0..to_copy], buffered[0..to_copy]);
+                            rdr.toss(to_copy);
+                            filled += to_copy;
+                        } else {
+                            try rdr.fillMore();
+                        }
+                    }
+                }
+            }.read;
+
+            // Read welcome message frame
+            var frame_header: [2]u8 = undefined;
+            try readExact(r, &frame_header);
+            try std.testing.expectEqual(0x81, frame_header[0]); // FIN + text
+            const welcome_len = frame_header[1] & 0x7F;
+            const welcome = try std.testing.allocator.alloc(u8, welcome_len);
+            defer std.testing.allocator.free(welcome);
+            try readExact(r, welcome);
+            try std.testing.expectEqualStrings("Welcome!", welcome);
+
+            // Send a masked text frame: "Hello"
+            // Mask key: 0x37, 0xfa, 0x21, 0x3d
+            const masked_hello = [_]u8{
+                0x81, // FIN + text
+                0x85, // masked + length 5
+                0x37, 0xfa, 0x21, 0x3d, // mask key
+                'H' ^ 0x37, 'e' ^ 0xfa, 'l' ^ 0x21, 'l' ^ 0x3d, 'o' ^ 0x37, // masked "Hello"
+            };
+            try w.writeAll(&masked_hello);
+            try w.flush();
+
+            // Read echo response
+            try readExact(r, &frame_header);
+            try std.testing.expectEqual(0x81, frame_header[0]); // FIN + text
+            const echo_len = frame_header[1] & 0x7F;
+            const echo = try std.testing.allocator.alloc(u8, echo_len);
+            defer std.testing.allocator.free(echo);
+            try readExact(r, echo);
+            try std.testing.expectEqualStrings("Hello", echo);
+
+            std.log.info("WebSocket test passed: received echo '{s}'", .{echo});
+        }
+    };
+
+    var ctx: TestContext = .{};
+
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var task = try rt.spawn(Test.mainFn, .{ rt, &ctx }, .{});
+    try task.join(rt);
+
+    try std.testing.expect(ctx.ws_upgraded);
+    try std.testing.expect(ctx.message_received);
+    try std.testing.expectEqualStrings("Hello", ctx.received_msg[0..ctx.received_len]);
+}
+
 test "Server: void context handlers" {
     const Test = struct {
         pub fn mainFn(rt: *zio.Runtime) !void {

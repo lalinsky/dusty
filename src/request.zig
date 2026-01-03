@@ -1,5 +1,4 @@
 const std = @import("std");
-const Io = @import("zio").Io; // TODO: replace with std.Io in Zig 0.16
 
 const http = @import("http.zig");
 const RequestParser = @import("parser.zig").RequestParser;
@@ -15,7 +14,6 @@ pub const Request = struct {
     params: std.StringHashMapUnmanaged([]const u8) = .{},
     query: std.StringHashMapUnmanaged([]const u8) = .{},
 
-    io: Io,
     arena: std.mem.Allocator,
 
     // Body reading support
@@ -28,13 +26,11 @@ pub const Request = struct {
     _form_data: ?std.StringHashMapUnmanaged([]const u8) = null,
 
     pub fn reset(self: *Request) void {
-        const io = self.io;
         const arena = self.arena;
         const parser = self.parser;
         const conn = self.conn;
         const cfg = self.config;
         self.* = .{
-            .io = io,
             .arena = arena,
             .parser = parser,
             .conn = conn,
@@ -280,3 +276,65 @@ pub const BodyReader = struct {
         }
     }
 };
+
+/// Parse HTTP headers from a reader and prepare for body reading.
+/// Returns error.EndOfStream if connection closed cleanly with no data.
+/// Returns error.IncompleteRequest if connection closed mid-request.
+pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) !void {
+    var parsed_len: usize = 0;
+    while (!parser.state.headers_complete) {
+        const buffered = reader.buffered();
+        const unparsed = buffered[parsed_len..];
+        if (unparsed.len > 0) {
+            parser.feed(unparsed) catch |err| switch (err) {
+                error.Paused => {
+                    const consumed = parser.getConsumedBytes(unparsed.ptr);
+                    parsed_len += consumed;
+                    continue;
+                },
+                else => return err,
+            };
+            parsed_len += unparsed.len;
+            continue;
+        }
+        reader.fillMore() catch |err| switch (err) {
+            error.EndOfStream => {
+                if (parsed_len == 0) return error.EndOfStream;
+                return error.IncompleteRequest;
+            },
+            else => return err,
+        };
+    }
+    reader.toss(parsed_len);
+    parser.resumeParsing();
+
+    // Feed empty buffer to advance state machine for bodyless requests
+    parser.feed(&.{}) catch |err| switch (err) {
+        error.Paused => {},
+        else => return err,
+    };
+}
+
+test "Request.body: basic POST" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const body = try req.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+}
