@@ -115,7 +115,12 @@ pub const Request = struct {
             return error.NotForm;
         }
 
-        const buffer = try self.body() orelse return &self._fd;
+        const buffer = try self.body() orelse {
+            self._fd_read = true;
+
+            return &self._fd;
+        };
+
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
