@@ -104,7 +104,7 @@ pub const Request = struct {
         }
     }
 
-    /// Parse the body as application/x-www-form-urlencoded
+    /// Parse the body as a form (application/x-www-form-urlencoded)
     pub fn formData(self: *Request) !?*std.StringHashMapUnmanaged([]const u8) {
         if (self._form_data) |*form_data| {
             return form_data;
@@ -337,4 +337,77 @@ test "Request.body: basic POST" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.formData: basic key and value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\nfoo=123&bar=abc";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.formData();
+    try std.testing.expectEqualStrings("123", form_data.?.get("foo").?);
+    try std.testing.expectEqualStrings("abc", form_data.?.get("bar").?);
+}
+
+test "Request.formData: URL-encoded key and value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 17\r\n\r\nfoo+bar=123%21abc";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.formData();
+    try std.testing.expectEqualStrings("123!abc", form_data.?.get("foo bar").?);
+}
+
+test "Request.formData: entry with no value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nfoo";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.formData();
+    try std.testing.expectEqualStrings("", form_data.?.get("foo").?);
 }
