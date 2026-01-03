@@ -106,7 +106,7 @@ pub const Request = struct {
     }
 
     /// Parse the body as a form (application/x-www-form-urlencoded)
-    pub fn formData(self: *Request) !?*std.StringHashMapUnmanaged([]const u8) {
+    pub fn formData(self: *Request) !*std.StringHashMapUnmanaged([]const u8) {
         if (self._fd_read) {
             return &self._fd;
         }
@@ -115,7 +115,7 @@ pub const Request = struct {
             return error.NotForm;
         }
 
-        const buffer = try self.body() orelse return null;
+        const buffer = try self.body() orelse return &self._fd;
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
@@ -360,8 +360,8 @@ test "Request.formData: basic key and value" {
     try parseHeaders(&reader, &parser);
 
     const form_data = try req.formData();
-    try std.testing.expectEqualStrings("123", form_data.?.get("foo").?);
-    try std.testing.expectEqualStrings("abc", form_data.?.get("bar").?);
+    try std.testing.expectEqualStrings("123", form_data.get("foo").?);
+    try std.testing.expectEqualStrings("abc", form_data.get("bar").?);
 }
 
 test "Request.formData: URL-encoded key and value" {
@@ -385,7 +385,7 @@ test "Request.formData: URL-encoded key and value" {
     try parseHeaders(&reader, &parser);
 
     const form_data = try req.formData();
-    try std.testing.expectEqualStrings("123!abc", form_data.?.get("foo bar").?);
+    try std.testing.expectEqualStrings("123!abc", form_data.get("foo bar").?);
 }
 
 test "Request.formData: entry with no value" {
@@ -409,5 +409,5 @@ test "Request.formData: entry with no value" {
     try parseHeaders(&reader, &parser);
 
     const form_data = try req.formData();
-    try std.testing.expectEqualStrings("", form_data.?.get("foo").?);
+    try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
