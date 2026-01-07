@@ -388,7 +388,7 @@ pub const ContentType = enum(u32) {
             .ttf => "font/ttf",
             .form => "application/x-www-form-urlencoded",
             .multipart_form => "multipart/form-data",
-            .unknown => "application/octet-stream"
+            .unknown => "application/octet-stream",
         };
     }
 };

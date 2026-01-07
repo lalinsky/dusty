@@ -126,7 +126,7 @@ pub const Request = struct {
         while (entry_iterator.next()) |entry| {
             if (std.mem.indexOfScalar(u8, entry, '=')) |separator| {
                 const key = try Request.urlUnescape(self.arena, entry[0..separator]);
-                const value = try Request.urlUnescape(self.arena, entry[separator + 1..]);
+                const value = try Request.urlUnescape(self.arena, entry[separator + 1 ..]);
 
                 try self._fd.put(self.arena, key, value);
             } else {
@@ -262,10 +262,14 @@ pub const BodyReader = struct {
                 return error.EndOfStream;
             }
 
+            // Limit feed size to available dest space to avoid consuming more than we can store
+            const available = dest.len - parser.state.body_dest_pos;
+            const to_feed = @min(buffered.len, available);
+
             // Feed data to parser (may consume framing data without producing body bytes)
-            if (parser.feed(buffered)) {
+            if (parser.feed(buffered[0..to_feed])) {
                 // Not paused - consumed all bytes
-                conn.toss(buffered.len);
+                conn.toss(to_feed);
             } else |err| {
                 switch (err) {
                     // Paused means onMessageComplete was called
@@ -342,6 +346,32 @@ test "Request.body: basic POST" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.body: large body over 128 bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const body_content = "A" ** 256;
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 256\r\n\r\n" ++ body_content;
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const body = try req.body();
+    try std.testing.expectEqual(256, body.?.len);
+    try std.testing.expectEqualStrings(body_content, body.?);
 }
 
 test "Request.formData: basic key and value" {
