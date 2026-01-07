@@ -418,7 +418,7 @@ const MultipartForm = struct {
                 return error.InvalidMultiPartEncoding;
             }
 
-            // constCast is safe here because we know this ultilately comes from one of our buffers
+            // constCast is safe here because we know this ultimately comes from one of our buffers
             const value_start = "form-data;".len;
             const value_end = value.len - 1; // remove the trailing \r
             attributes = try getContentDispositionAttributes(@constCast(trimLeadingSpace(value[value_start..value_end])));
