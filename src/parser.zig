@@ -252,7 +252,6 @@ pub const RequestParser = struct {
             self.state.body_dest_pos += to_copy;
         }
 
-        // Continue - let parser run to completion or next callback
         return 0;
     }
 
