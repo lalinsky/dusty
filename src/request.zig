@@ -421,11 +421,10 @@ const MultipartForm = struct {
             // constCast is safe here because we know this ultilately comes from one of our buffers
             const value_start = "form-data;".len;
             const value_end = value.len - 1; // remove the trailing \r
-            attributes = try getContentDispotionAttributes(@constCast(trimLeadingSpace(value[value_start..value_end])));
+            attributes = try getContentDispositionAttributes(@constCast(trimLeadingSpace(value[value_start..value_end])));
         }
 
         const value = entry[pos..];
-        std.debug.print("{s}\n", .{value});
         if (value.len < 2 or value[value.len - 2] != '\r' or value[value.len - 1] != '\n') {
             return error.InvalidMultiPartEncoding;
         }
@@ -446,7 +445,7 @@ const MultipartForm = struct {
         filename: ?[]const u8 = null,
     };
 
-    fn getContentDispotionAttributes(fields: []u8) !ContentDispositionAttributes {
+    fn getContentDispositionAttributes(fields: []u8) !ContentDispositionAttributes {
         var pos: usize = 0;
 
         var name: ?[]const u8 = null;
