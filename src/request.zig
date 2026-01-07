@@ -454,3 +454,29 @@ test "Request.formData: entry with no value" {
     const form_data = try req.formData();
     try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
+
+test "Request.cookies: parse cookies from header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "GET /test HTTP/1.1\r\nCookie: session=abc123; user=john\r\n\r\n";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const cookies = req.cookies();
+    try std.testing.expectEqualStrings("abc123", cookies.get("session").?);
+    try std.testing.expectEqualStrings("john", cookies.get("user").?);
+    try std.testing.expectEqual(null, cookies.get("missing"));
+}
