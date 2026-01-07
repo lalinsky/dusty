@@ -3,6 +3,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const RequestParser = @import("parser.zig").RequestParser;
 const ServerConfig = @import("config.zig").ServerConfig;
+pub const Cookie = @import("cookie.zig").Cookie;
 
 pub const Request = struct {
     method: http.Method = undefined,
@@ -103,6 +104,13 @@ pub const Request = struct {
             .object => |o| return o,
             else => return null,
         }
+    }
+
+    /// Get cookies from the request
+    pub fn cookies(self: *const Request) Cookie {
+        return .{
+            .header = self.headers.get("Cookie") orelse "",
+        };
     }
 
     /// Parse the body as a form (application/x-www-form-urlencoded)

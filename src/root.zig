@@ -10,6 +10,8 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const Status = @import("http.zig").Status;
 pub const Method = @import("http.zig").Method;
 pub const ContentType = @import("http.zig").ContentType;
+pub const Cookie = @import("cookie.zig").Cookie;
+pub const CookieOpts = @import("cookie.zig").CookieOpts;
 
 test {
     std.testing.refAllDecls(@This());

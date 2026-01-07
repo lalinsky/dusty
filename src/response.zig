@@ -2,6 +2,8 @@ const std = @import("std");
 const http = @import("http.zig");
 const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
+pub const CookieOpts = @import("cookie.zig").CookieOpts;
+const serializeCookie = @import("cookie.zig").serializeCookie;
 
 pub const EventStream = struct {
     conn: *std.Io.Writer,
@@ -62,6 +64,11 @@ pub const Response = struct {
         const json_formatter = std.json.fmt(value, options);
         try json_formatter.format(&self.buffer.writer);
         try self.header("Content-Type", "application/json; charset=UTF-8");
+    }
+
+    pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
+        const serialized = try serializeCookie(self.arena, name, value, opts);
+        try self.header("Set-Cookie", serialized);
     }
 
     pub fn chunk(self: *Response, data: []const u8) !void {
