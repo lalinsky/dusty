@@ -26,6 +26,8 @@ pub const Request = struct {
     _body_read: bool = false,
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
     _fd_read: bool = false,
+    _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
+    _mfd_read: bool = false,
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
@@ -145,6 +147,90 @@ pub const Request = struct {
         self._fd_read = true;
 
         return &self._fd;
+    }
+
+    /// Parse the body as a multipart form (multipart/form-data)
+    pub fn multiFormData(self: *Request) !*std.StringHashMapUnmanaged(MultipartForm.Entry) {
+        if (self._mfd_read) {
+            return &self._mfd;
+        }
+
+        if (self.content_type == null or self.content_type != .multipart_form) {
+            return error.NotMultipartForm;
+        }
+
+        const buffer = try self.body() orelse {
+            self._mfd_read = true;
+
+            return &self._mfd;
+        };
+
+        // The following chunk of code is from https://github.com/karlseguin/http.zig, see LICENSE for more details.
+
+        var boundary_buf: [72]u8 = undefined;
+        const boundary = blk: {
+            const directive = (self.headers.get("Content-Type") orelse unreachable)["multipart/form-data".len..];
+            for (directive, 0..) |b, i| loop: {
+                if (b != ' ' and b != ';') {
+                    if (std.ascii.startsWithIgnoreCase(directive[i..], "boundary=")) {
+                        const raw_boundary = directive["boundary=".len + i ..];
+                        if (raw_boundary.len > 0 and raw_boundary.len <= 70) {
+                            boundary_buf[0] = '-';
+                            boundary_buf[1] = '-';
+                            if (raw_boundary[0] == '"') {
+                                if (raw_boundary.len > 2 and raw_boundary[raw_boundary.len - 1] == '"') {
+                                    // it's really -2, since we need to strip out the two quotes
+                                    // but buf is already at + 2, so they cancel out.
+                                    const end = raw_boundary.len;
+                                    @memcpy(boundary_buf[2..end], raw_boundary[1 .. raw_boundary.len - 1]);
+                                    break :blk boundary_buf[0..end];
+                                }
+                            } else {
+                                const end = 2 + raw_boundary.len;
+                                @memcpy(boundary_buf[2..end], raw_boundary);
+                                break :blk boundary_buf[0..end];
+                            }
+                        }
+                    }
+                    // not valid, break out of the loop so we can return
+                    // an error.InvalidMultiPartFormDataHeader
+                    break :loop;
+                }
+            }
+            return error.InvalidMultiPartFormDataHeader;
+        };
+
+        var entry_it = std.mem.splitSequence(u8, buffer, boundary);
+
+        {
+            // We expect the body to begin with a boundary
+            const first = entry_it.next() orelse {
+                self._mfd_read = true;
+                return &self._mfd;
+            };
+            if (first.len != 0) {
+                return error.InvalidMultiPartEncoding;
+            }
+        }
+
+        while (entry_it.next()) |entry| {
+            // body ends with -- after a final boundary
+            if (entry.len == 4 and entry[0] == '-' and entry[1] == '-' and entry[2] == '\r' and entry[3] == '\n') {
+                break;
+            }
+
+            if (entry.len < 2 or entry[0] != '\r' or entry[1] != '\n') return error.InvalidMultiPartEncoding;
+
+            // [2..] to skip our boundary's trailing line terminator
+            const field = try MultipartForm.parseMultiPartEntry(entry[2..]);
+            try self._mfd.put(self.arena, field.name, field.value);
+        }
+
+        // End of chunk.
+
+        self._mfd_read = true;
+
+        return &self._mfd;
     }
 
     /// Unescape a URL-encoded string
@@ -294,6 +380,170 @@ pub const BodyReader = struct {
     }
 };
 
+const MultipartForm = struct {
+    const Entry = struct {
+        value: []const u8,
+        filename: ?[]const u8 = null
+    };
+
+    // The following chunk of code is from https://github.com/karlseguin/http.zig, see LICENSE for more details.
+
+    const Field = struct {
+        name: []const u8,
+        value: Entry,
+    };
+
+    fn parseMultiPartEntry(entry: []const u8) !Field {
+        var pos: usize = 0;
+        var attributes: ?ContentDispositionAttributes = null;
+
+        while (true) {
+            const end_line_pos = std.mem.indexOfScalarPos(u8, entry, pos, '\n') orelse return error.InvalidMultiPartEncoding;
+            const line = entry[pos..end_line_pos];
+
+            pos = end_line_pos + 1;
+            if (line.len == 0 or line[line.len - 1] != '\r') return error.InvalidMultiPartEncoding;
+
+            if (line.len == 1) {
+                break;
+            }
+
+            // we need to look for the name
+            if (std.ascii.startsWithIgnoreCase(line, "content-disposition:") == false) {
+                continue;
+            }
+
+            const value = trimLeadingSpace(line["content-disposition:".len..]);
+            if (std.ascii.startsWithIgnoreCase(value, "form-data;") == false) {
+                return error.InvalidMultiPartEncoding;
+            }
+
+            // constCast is safe here because we know this ultimately comes from one of our buffers
+            const value_start = "form-data;".len;
+            const value_end = value.len - 1; // remove the trailing \r
+            attributes = try getContentDispositionAttributes(@constCast(trimLeadingSpace(value[value_start..value_end])));
+        }
+
+        const value = entry[pos..];
+        if (value.len < 2 or value[value.len - 2] != '\r' or value[value.len - 1] != '\n') {
+            return error.InvalidMultiPartEncoding;
+        }
+
+        const attr = attributes orelse return error.InvalidMultiPartEncoding;
+
+        return .{
+            .name = attr.name,
+            .value = .{
+                .value = value[0 .. value.len - 2],
+                .filename = attr.filename,
+            },
+        };
+    }
+
+    const ContentDispositionAttributes = struct {
+        name: []const u8,
+        filename: ?[]const u8 = null,
+    };
+
+    fn getContentDispositionAttributes(fields: []u8) !ContentDispositionAttributes {
+        var pos: usize = 0;
+
+        var name: ?[]const u8 = null;
+        var filename: ?[]const u8 = null;
+
+        while (pos < fields.len) {
+            {
+                const b = fields[pos];
+                if (b == ';' or b == ' ' or b == '\t') {
+                    pos += 1;
+                    continue;
+                }
+            }
+
+            const sep = std.mem.indexOfScalarPos(u8, fields, pos, '=') orelse return error.InvalidMultiPartEncoding;
+            const field_name = fields[pos..sep];
+
+            // skip the equal
+            const value_start = sep + 1;
+            if (value_start == fields.len) {
+                return error.InvalidMultiPartEncoding;
+            }
+
+            var value: []const u8 = undefined;
+            if (fields[value_start] != '"') {
+                const value_end = std.mem.indexOfScalarPos(u8, fields, pos, ';') orelse fields.len;
+                pos = value_end;
+                value = fields[value_start..value_end];
+            } else blk: {
+                // skip the double quote
+                pos = value_start + 1;
+                var write_pos = pos;
+                while (pos < fields.len) {
+                    switch (fields[pos]) {
+                        '\\' => {
+                            if (pos == fields.len) {
+                                return error.InvalidMultiPartEncoding;
+                            }
+                            // supposedly MSIE doesn't always escape \, so if the \ isn't escape
+                            // one of the special characters, it must be a single \. This is what Go does.
+                            switch (fields[pos + 1]) {
+                                // from Go's mime parser func isTSpecial(r rune) bool
+                                '(', ')', '<', '>', '@', ',', ';', ':', '"', '/', '[', ']', '?', '=' => |n| {
+                                    fields[write_pos] = n;
+                                    pos += 1;
+                                },
+                                else => fields[write_pos] = '\\',
+                            }
+                        },
+                        '"' => {
+                            pos += 1;
+                            value = fields[value_start + 1 .. write_pos];
+                            break :blk;
+                        },
+                        else => |b| fields[write_pos] = b,
+                    }
+                    pos += 1;
+                    write_pos += 1;
+                }
+                return error.InvalidMultiPartEncoding;
+            }
+
+            if (std.mem.eql(u8, field_name, "name")) {
+                name = value;
+            } else if (std.mem.eql(u8, field_name, "filename")) {
+                filename = value;
+            }
+        }
+
+        return .{
+            .name = name orelse return error.InvalidMultiPartEncoding,
+            .filename = filename,
+        };
+    }
+
+    inline fn trimLeadingSpaceCount(in: []const u8) struct { []const u8, usize } {
+        if (in.len > 1 and in[0] == ' ') {
+            // very common case
+            const n = in[1];
+            if (n != ' ' and n != '\t') {
+                return .{ in[1..], 1 };
+            }
+        }
+
+        for (in, 0..) |b, i| {
+            if (b != ' ' and b != '\t') return .{ in[i..], i };
+        }
+        return .{ "", in.len };
+    }
+
+    inline fn trimLeadingSpace(in: []const u8) []const u8 {
+        const out, _ = trimLeadingSpaceCount(in);
+        return out;
+    }
+
+    // End of chunk.
+};
+
 /// Parse HTTP headers from a reader and prepare for body reading.
 /// Returns error.EndOfStream if connection closed cleanly with no data.
 /// Returns error.IncompleteRequest if connection closed mid-request.
@@ -382,6 +632,32 @@ test "Request.body: large body over 128 bytes" {
     try std.testing.expectEqualStrings(body_content, body.?);
 }
 
+test "Request.cookies: parse cookies from header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "GET /test HTTP/1.1\r\nCookie: session=abc123; user=john\r\n\r\n";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const cookies = req.cookies();
+    try std.testing.expectEqualStrings("abc123", cookies.get("session").?);
+    try std.testing.expectEqualStrings("john", cookies.get("user").?);
+    try std.testing.expectEqual(null, cookies.get("missing"));
+}
+
 test "Request.formData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -455,11 +731,11 @@ test "Request.formData: entry with no value" {
     try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
 
-test "Request.cookies: parse cookies from header" {
+test "Request.multiFormData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "GET /test HTTP/1.1\r\nCookie: session=abc123; user=john\r\n\r\n";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 155\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"\r\n\r\n123\r\n----boundary123\r\nContent-Disposition: form-data; name=\"bar\"\r\n\r\nabc\r\n----boundary123--\r\n";
     var reader = std.Io.Reader.fixed(raw_request);
 
     var req: Request = .{
@@ -475,8 +751,31 @@ test "Request.cookies: parse cookies from header" {
 
     try parseHeaders(&reader, &parser);
 
-    const cookies = req.cookies();
-    try std.testing.expectEqualStrings("abc123", cookies.get("session").?);
-    try std.testing.expectEqualStrings("john", cookies.get("user").?);
-    try std.testing.expectEqual(null, cookies.get("missing"));
+    const form_data = try req.multiFormData();
+    try std.testing.expectEqualStrings("123", form_data.get("foo").?.value);
+    try std.testing.expectEqualStrings("abc", form_data.get("bar").?.value);
+}
+
+test "Request.multiFormData: entry with filename" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 133\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"; filename=\"foo.txt\"\r\nContent-Type: text/plain\r\n\r\n123\r\n----boundary123--\r\n";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const form_data = try req.multiFormData();
+    try std.testing.expectEqualStrings("foo.txt", form_data.get("foo").?.filename.?);
 }
