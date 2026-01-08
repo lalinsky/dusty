@@ -150,25 +150,6 @@ pub const RequestParser = struct {
         }
     }
 
-    fn saveCurrentHeader(self: *RequestParser) !void {
-        if (self.state.current_header_field_start != null and self.state.current_header_value_start != null) {
-            const field_start = self.state.current_header_field_start.?;
-            const value_start = self.state.current_header_value_start.?;
-
-            const field = field_start[0..self.state.current_header_field_len];
-            const value = value_start[0..self.state.current_header_value_len];
-
-            std.log.info("Header: {s} = {s}", .{ field, value });
-            //try self.headers.put(self.allocator, field, value);
-
-            // Reset for next header
-            self.state.current_header_field_start = null;
-            self.state.current_header_field_len = 0;
-            self.state.current_header_value_start = null;
-            self.state.current_header_value_len = 0;
-        }
-    }
-
     fn onMethod(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.state.has_method = true;
