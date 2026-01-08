@@ -388,6 +388,7 @@ pub const Client = struct {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
                 var resolve_buf: [2048]u8 = undefined;
+                if (location.len > resolve_buf.len) return error.InvalidUrl;
                 @memcpy(resolve_buf[0..location.len], location);
                 var aux_buf: []u8 = resolve_buf[0..];
                 const redirect_uri = Uri.resolveInPlace(uri, location.len, &aux_buf) catch return error.InvalidUrl;
