@@ -13,6 +13,12 @@ pub const ContentType = @import("http.zig").ContentType;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 
+// Client
+pub const Client = @import("client.zig").Client;
+pub const ClientConfig = @import("client.zig").ClientConfig;
+pub const ClientResponse = @import("client.zig").ClientResponse;
+pub const FetchOptions = @import("client.zig").FetchOptions;
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -21,4 +27,6 @@ test {
 comptime {
     _ = @import("server_test.zig");
     _ = @import("websocket.zig");
+    _ = @import("client.zig");
+    _ = @import("client_test.zig");
 }
