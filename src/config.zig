@@ -16,5 +16,15 @@ pub const ServerConfig = struct {
         max_body_size: usize = 1_048_576, // 1MB default
         /// Buffer size (bytes) for reading request headers
         buffer_size: usize = 4096,
+        /// Maximum number of headers allowed in a request
+        max_header_count: usize = 32,
+        /// Maximum number of route parameters (e.g., /user/:id/:action)
+        max_param_count: usize = 8,
+        /// Maximum number of query string parameters
+        max_query_count: usize = 32,
+        /// Maximum number of form fields (application/x-www-form-urlencoded)
+        max_form_count: usize = 32,
+        /// Maximum number of multipart form fields
+        max_multiform_count: usize = 32,
     };
 };
