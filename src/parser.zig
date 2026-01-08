@@ -468,6 +468,126 @@ pub const ResponseParser = struct {
     }
 };
 
+/// Generic streaming body reader for HTTP messages.
+/// Works with any parser type that has the standard body reading interface:
+/// - `state.body_dest_pos: usize`
+/// - `isBodyComplete() bool`
+/// - `prepareBodyRead(dest: []u8) void`
+/// - `feed(data: []const u8) !void`
+/// - `finish() !void`
+/// - `getConsumedBytes(ptr: [*c]const u8) usize`
+pub fn BodyReader(comptime Parser: type) type {
+    return struct {
+        parser: *Parser,
+        conn: *std.Io.Reader,
+        interface: std.Io.Reader,
+
+        const Self = @This();
+
+        pub fn init(parser: *Parser, conn: *std.Io.Reader, buffer: []u8) Self {
+            return .{
+                .parser = parser,
+                .conn = conn,
+                .interface = .{
+                    .vtable = &.{ .stream = stream },
+                    .buffer = buffer,
+                    .seek = 0,
+                    .end = 0,
+                },
+            };
+        }
+
+        fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
+            const parser = self.parser;
+            const conn = self.conn;
+
+            const dest = limit.slice(try w.writableSliceGreedy(1));
+            if (dest.len == 0) return 0;
+
+            // Check if body is already complete
+            if (parser.isBodyComplete()) {
+                return error.EndOfStream;
+            }
+
+            // Setup destination for onBody callback (resets body_dest_pos to 0)
+            parser.prepareBodyRead(dest);
+
+            // Loop until we have body bytes, body is complete, or error occurs
+            // This handles cases where parser consumes framing data (chunk headers)
+            // but doesn't produce body bytes yet - we must not return 0 mid-body
+            while (true) {
+                // If we have body bytes, return them
+                if (parser.state.body_dest_pos > 0) {
+                    w.advance(parser.state.body_dest_pos);
+                    return parser.state.body_dest_pos;
+                }
+
+                // Check if body is complete
+                if (parser.isBodyComplete()) {
+                    return error.EndOfStream;
+                }
+
+                // Ensure connection buffer has data
+                if (conn.bufferedLen() == 0) {
+                    conn.fillMore() catch |err| switch (err) {
+                        error.EndOfStream => {
+                            // Connection closed - call finish() to complete the message
+                            parser.finish() catch {
+                                // finish() failed - message was not complete
+                                return error.ReadFailed;
+                            };
+
+                            // Check if body is now complete after finish()
+                            if (parser.isBodyComplete()) {
+                                return error.EndOfStream;
+                            }
+
+                            // Message not complete despite EOF
+                            return error.ReadFailed;
+                        },
+                        else => return error.ReadFailed,
+                    };
+                }
+
+                // Get buffered data
+                const buffered = conn.buffered();
+                if (buffered.len == 0) {
+                    // Shouldn't happen after successful fillMore
+                    return error.EndOfStream;
+                }
+
+                // Limit feed size to available dest space to avoid consuming more than we can store
+                const available = dest.len - parser.state.body_dest_pos;
+                const to_feed = @min(buffered.len, available);
+
+                // Feed data to parser (may consume framing data without producing body bytes)
+                if (parser.feed(buffered[0..to_feed])) {
+                    // Not paused - consumed all bytes
+                    conn.toss(to_feed);
+                } else |err| {
+                    switch (err) {
+                        // Paused means onMessageComplete was called
+                        error.Paused => {
+                            const consumed = parser.getConsumedBytes(buffered.ptr);
+                            conn.toss(consumed);
+                        },
+                        else => return error.ReadFailed,
+                    }
+                }
+
+                // Continue loop to check if we got body bytes now
+            }
+        }
+    };
+}
+
+/// BodyReader specialized for HTTP requests.
+pub const RequestBodyReader = BodyReader(RequestParser);
+
+/// BodyReader specialized for HTTP responses.
+pub const ResponseBodyReader = BodyReader(ResponseParser);
+
 test "RequestParser: basic" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

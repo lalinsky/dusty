@@ -9,6 +9,7 @@ const ContentType = http.ContentType;
 
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
+const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
 
 /// Configuration for the HTTP client.
 pub const ClientConfig = struct {
@@ -172,101 +173,17 @@ pub const ClientResponse = struct {
     }
 
     /// Get a streaming body reader.
-    pub fn reader(self: *ClientResponse) BodyReader {
+    pub fn reader(self: *ClientResponse) ResponseBodyReader {
         // If body has already been read, return a reader for the cached body
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
-            return .{
-                .response = self,
-                .interface = std.Io.Reader.fixed(cached_body),
-            };
+            var r = ResponseBodyReader.init(&self.conn.parser, &self.conn.reader.interface, &self.body_reader_buffer);
+            r.interface = std.Io.Reader.fixed(cached_body);
+            return r;
         }
 
         // Return the streaming body reader
-        return .{
-            .response = self,
-            .interface = .{
-                .vtable = &.{ .stream = BodyReader.stream },
-                .buffer = &self.body_reader_buffer,
-                .seek = 0,
-                .end = 0,
-            },
-        };
-    }
-};
-
-/// Streaming body reader for HTTP responses.
-pub const BodyReader = struct {
-    response: *ClientResponse,
-    interface: std.Io.Reader,
-
-    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *BodyReader = @alignCast(@fieldParentPtr("interface", io_r));
-        const conn = self.response.conn;
-        const parser = &conn.parser;
-        const reader_iface = &conn.reader.interface;
-
-        const dest = limit.slice(try w.writableSliceGreedy(1));
-        if (dest.len == 0) return 0;
-
-        // Check if body is already complete
-        if (parser.isBodyComplete()) {
-            return error.EndOfStream;
-        }
-
-        // Setup destination for onBody callback
-        parser.prepareBodyRead(dest);
-
-        // Loop until we have body bytes, body is complete, or error occurs
-        while (true) {
-            // If we have body bytes, return them
-            if (parser.state.body_dest_pos > 0) {
-                w.advance(parser.state.body_dest_pos);
-                return parser.state.body_dest_pos;
-            }
-
-            // Check if body is complete
-            if (parser.isBodyComplete()) {
-                return error.EndOfStream;
-            }
-
-            // Ensure connection buffer has data
-            if (reader_iface.bufferedLen() == 0) {
-                reader_iface.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => {
-                        parser.finish() catch return error.ReadFailed;
-                        if (parser.isBodyComplete()) {
-                            return error.EndOfStream;
-                        }
-                        return error.ReadFailed;
-                    },
-                    else => return error.ReadFailed,
-                };
-            }
-
-            // Get buffered data
-            const buffered = reader_iface.buffered();
-            if (buffered.len == 0) {
-                return error.EndOfStream;
-            }
-
-            // Limit feed size to available dest space
-            const available = dest.len - parser.state.body_dest_pos;
-            const to_feed = @min(buffered.len, available);
-
-            // Feed data to parser
-            if (parser.feed(buffered[0..to_feed])) {
-                reader_iface.toss(to_feed);
-            } else |err| {
-                switch (err) {
-                    error.Paused => {
-                        const consumed = parser.getConsumedBytes(buffered.ptr);
-                        reader_iface.toss(consumed);
-                    },
-                    else => return error.ReadFailed,
-                }
-            }
-        }
+        return ResponseBodyReader.init(&self.conn.parser, &self.conn.reader.interface, &self.body_reader_buffer);
     }
 };
 
