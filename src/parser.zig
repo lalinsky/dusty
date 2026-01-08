@@ -150,25 +150,6 @@ pub const RequestParser = struct {
         }
     }
 
-    fn saveCurrentHeader(self: *RequestParser) !void {
-        if (self.state.current_header_field_start != null and self.state.current_header_value_start != null) {
-            const field_start = self.state.current_header_field_start.?;
-            const value_start = self.state.current_header_value_start.?;
-
-            const field = field_start[0..self.state.current_header_field_len];
-            const value = value_start[0..self.state.current_header_value_len];
-
-            std.log.info("Header: {s} = {s}", .{ field, value });
-            //try self.headers.put(self.allocator, field, value);
-
-            // Reset for next header
-            self.state.current_header_field_start = null;
-            self.state.current_header_field_len = 0;
-            self.state.current_header_value_start = null;
-            self.state.current_header_value_len = 0;
-        }
-    }
-
     fn onMethod(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.state.has_method = true;
@@ -193,9 +174,6 @@ pub const RequestParser = struct {
 
     fn onUrlComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
-        // Duplicate URL since it points into the reader buffer
-        // which will be overwritten when reading the body
-        self.request.url = self.request.arena.dupe(u8, self.request.url) catch return -1;
         self.state.has_url = true;
         return 0;
     }
@@ -224,11 +202,8 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
-        // Duplicate header field and value since they point into the reader buffer
-        // which will be overwritten when reading the body
-        const field = self.request.arena.dupe(u8, self.state.header_field) catch return -1;
-        const value = self.request.arena.dupe(u8, self.state.header_value) catch return -1;
-        self.request.headers.put(self.request.arena, field, value) catch return -1;
+        // Headers point directly into arena-allocated read buffer, no copy needed
+        self.request.headers.put(self.request.arena, self.state.header_field, self.state.header_value) catch return -1;
 
         self.state.header_value = "";
         self.state.header_field = "";
@@ -431,11 +406,8 @@ pub const ResponseParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
-        // Duplicate header field and value since they point into the reader buffer
-        // which will be overwritten when reading the body
-        const field = self.response.arena.dupe(u8, self.state.header_field) catch return -1;
-        const value = self.response.arena.dupe(u8, self.state.header_value) catch return -1;
-        self.response.headers.put(self.response.arena, field, value) catch return -1;
+        // Headers point directly into arena-allocated read buffer, no copy needed
+        self.response.headers.put(self.response.arena, self.state.header_field, self.state.header_value) catch return -1;
 
         self.state.header_value = "";
         self.state.header_field = "";

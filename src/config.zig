@@ -14,5 +14,7 @@ pub const ServerConfig = struct {
     pub const Request = struct {
         /// Maximum size (bytes) for request body
         max_body_size: usize = 1_048_576, // 1MB default
+        /// Buffer size (bytes) for reading request headers
+        buffer_size: usize = 4096,
     };
 };

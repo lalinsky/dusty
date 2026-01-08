@@ -473,6 +473,14 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) !void {
     reader.toss(parsed_len);
     parser.resumeParsing();
 
+    // Shorten buffer so body reading doesn't overwrite header data.
+    // Headers remain valid in buffer[0..headers_len], body uses the rest.
+    std.debug.assert(reader.seek == parsed_len);
+    const headers_len = reader.seek;
+    reader.buffer = reader.buffer[headers_len..];
+    reader.end -= headers_len;
+    reader.seek = 0;
+
     // Feed empty buffer to advance state machine for bodyless requests
     parser.feed(&.{}) catch |err| switch (err) {
         error.Paused => {},
