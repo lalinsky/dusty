@@ -22,6 +22,8 @@ pub const ClientConfig = struct {
     max_response_size: usize = 10_485_760, // 10MB
     /// Maximum idle connections to keep in pool (0 = no pooling).
     max_idle_connections: u8 = 8,
+    /// Buffer size (bytes) for reading response headers.
+    buffer_size: usize = 4096,
 };
 
 /// Options for a single fetch request.
@@ -147,11 +149,11 @@ pub const Connection = struct {
     arena: std.heap.ArenaAllocator,
     parser: ResponseParser,
     parsed_response: ParsedResponse,
-    read_buffer: [4096]u8,
     write_buffer: [4096]u8,
     reader: zio.net.Stream.Reader,
     writer: zio.net.Stream.Writer,
     rt: *zio.Runtime,
+    buffer_size: usize,
 
     // Connection pool metadata
     pool_node: std.DoublyLinkedList.Node = .{},
@@ -166,12 +168,13 @@ pub const Connection = struct {
     idle_deadline: ?u64 = null, // milliseconds from rt.now()
 
     /// Initialize the connection in place (required because parser stores internal pointers).
-    pub fn init(self: *Connection, allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16) void {
+    pub fn init(self: *Connection, allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16, buffer_size: usize) !void {
         self.allocator = allocator;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
         self.rt = rt;
         self.closing = false;
+        self.buffer_size = buffer_size;
 
         // Keep-Alive tracking
         self.request_count = 0;
@@ -186,8 +189,19 @@ pub const Connection = struct {
 
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.init(&self.parsed_response);
-        self.reader = stream.reader(rt, &self.read_buffer);
+        self.reader = stream.reader(rt, &.{});
         self.writer = stream.writer(rt, &self.write_buffer);
+
+        // Allocate initial read buffer from arena
+        try self.allocReadBuffer();
+    }
+
+    /// Allocate read buffer from arena for parsing response headers.
+    fn allocReadBuffer(self: *Connection) !void {
+        const read_buffer = try self.arena.allocator().alloc(u8, self.buffer_size + 1024);
+        self.reader.interface.buffer = read_buffer;
+        self.reader.interface.seek = 0;
+        self.reader.interface.end = 0;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -202,6 +216,9 @@ pub const Connection = struct {
         self.parser.reset();
         self.parser.init(&self.parsed_response);
         self.closing = false;
+
+        // Allocate fresh read buffer after arena reset (can't fail - capacity retained)
+        self.allocReadBuffer() catch unreachable;
     }
 
     pub fn host(self: *const Connection) []const u8 {
@@ -370,7 +387,7 @@ pub const Client = struct {
 
             const new_conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(new_conn);
-            new_conn.init(self.allocator, rt, stream, host, port);
+            try new_conn.init(self.allocator, rt, stream, host, port, self.config.buffer_size);
 
             break :blk new_conn;
         };
@@ -497,6 +514,14 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
     }
     reader.toss(parsed_len);
     parser.resumeParsing();
+
+    // Shorten buffer so body reading doesn't overwrite header data.
+    // Headers remain valid in buffer[0..headers_len], body uses the rest.
+    std.debug.assert(reader.seek == parsed_len);
+    const headers_len = reader.seek;
+    reader.buffer = reader.buffer[headers_len..];
+    reader.end -= headers_len;
+    reader.seek = 0;
 
     // Feed empty buffer to advance state machine for bodyless responses
     parser.feed(&.{}) catch |err| switch (err) {

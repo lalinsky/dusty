@@ -128,8 +128,7 @@ pub fn Server(comptime Ctx: type) type {
                 log.warn("Failed to shutdown client connection: {}", .{err});
             };
 
-            var read_buffer: [4096]u8 = undefined;
-            var reader = stream.reader(rt, &read_buffer);
+            var reader = stream.reader(rt, &.{});
 
             var write_buffer: [4096]u8 = undefined;
             var writer = stream.writer(rt, &write_buffer);
@@ -153,6 +152,12 @@ pub fn Server(comptime Ctx: type) type {
             var request_count: usize = 0;
 
             var timeout = zio.Timeout.init;
+
+            // Allocate initial buffer from arena
+            reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
+                log.err("Failed to allocate read buffer: {}", .{err});
+                return err;
+            };
 
             while (true) {
                 request_count += 1;
@@ -221,7 +226,21 @@ pub fn Server(comptime Ctx: type) type {
 
                 parser.reset();
                 request.reset();
+
+                // If there's buffered data (pipelining), close connection - we don't support it
+                if (reader.interface.end > reader.interface.seek) {
+                    break;
+                }
+
                 _ = arena.reset(.retain_capacity);
+
+                // Allocate fresh buffer for keepalive wait (previous buffer was freed by arena reset)
+                reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
+                    log.err("Failed to allocate read buffer: {}", .{err});
+                    return err;
+                };
+                reader.interface.seek = 0;
+                reader.interface.end = 0;
 
                 // Activate keepalive timeout
                 if (self.config.timeout.keepalive) |timeout_ms| {
