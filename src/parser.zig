@@ -202,6 +202,11 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
+        // Check header count limit
+        if (self.request.headers.count() >= self.request.config.max_header_count) {
+            return -1;
+        }
+
         // Headers point directly into arena-allocated read buffer, no copy needed
         self.request.headers.put(self.request.arena, self.state.header_field, self.state.header_value) catch return -1;
 

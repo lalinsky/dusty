@@ -124,6 +124,10 @@ pub const Request = struct {
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
+            if (self._fd.count() >= self.config.max_form_count) {
+                return error.TooManyFormFields;
+            }
+
             if (std.mem.indexOfScalar(u8, entry, '=')) |separator| {
                 const key = try Request.urlUnescape(self.arena, entry[0..separator]);
                 const value = try Request.urlUnescape(self.arena, entry[separator + 1 ..]);
@@ -207,6 +211,10 @@ pub const Request = struct {
             // body ends with -- after a final boundary
             if (entry.len == 4 and entry[0] == '-' and entry[1] == '-' and entry[2] == '\r' and entry[3] == '\n') {
                 break;
+            }
+
+            if (self._mfd.count() >= self.config.max_multiform_count) {
+                return error.TooManyMultiFormFields;
             }
 
             if (entry.len < 2 or entry[0] != '\r' or entry[1] != '\n') return error.InvalidMultiPartEncoding;
