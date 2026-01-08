@@ -588,6 +588,66 @@ pub const RequestBodyReader = BodyReader(RequestParser);
 /// BodyReader specialized for HTTP responses.
 pub const ResponseBodyReader = BodyReader(ResponseParser);
 
+/// Parsed Keep-Alive header parameters.
+pub const KeepAliveParams = struct {
+    timeout: ?u32 = null, // seconds until idle connection closes
+    max: ?u32 = null, // max requests on this connection
+};
+
+/// Parse Keep-Alive header value into structured parameters.
+/// Format: "timeout=5, max=100" or "timeout=5" or "max=100"
+pub fn parseKeepAliveHeader(value: []const u8) KeepAliveParams {
+    var params: KeepAliveParams = .{};
+
+    var it = std.mem.splitSequence(u8, value, ",");
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (std.mem.startsWith(u8, trimmed, "timeout=")) {
+            params.timeout = std.fmt.parseInt(u32, trimmed["timeout=".len..], 10) catch null;
+        } else if (std.mem.startsWith(u8, trimmed, "max=")) {
+            params.max = std.fmt.parseInt(u32, trimmed["max=".len..], 10) catch null;
+        }
+    }
+
+    return params;
+}
+
+test "parseKeepAliveHeader: both params" {
+    const params = parseKeepAliveHeader("timeout=5, max=100");
+    try std.testing.expectEqual(5, params.timeout);
+    try std.testing.expectEqual(100, params.max);
+}
+
+test "parseKeepAliveHeader: timeout only" {
+    const params = parseKeepAliveHeader("timeout=30");
+    try std.testing.expectEqual(30, params.timeout);
+    try std.testing.expectEqual(null, params.max);
+}
+
+test "parseKeepAliveHeader: max only" {
+    const params = parseKeepAliveHeader("max=10");
+    try std.testing.expectEqual(null, params.timeout);
+    try std.testing.expectEqual(10, params.max);
+}
+
+test "parseKeepAliveHeader: whitespace tolerance" {
+    const params = parseKeepAliveHeader("timeout=5 , max=100");
+    try std.testing.expectEqual(5, params.timeout);
+    try std.testing.expectEqual(100, params.max);
+}
+
+test "parseKeepAliveHeader: invalid values ignored" {
+    const params = parseKeepAliveHeader("timeout=abc, max=100");
+    try std.testing.expectEqual(null, params.timeout);
+    try std.testing.expectEqual(100, params.max);
+}
+
+test "parseKeepAliveHeader: empty string" {
+    const params = parseKeepAliveHeader("");
+    try std.testing.expectEqual(null, params.timeout);
+    try std.testing.expectEqual(null, params.max);
+}
+
 test "RequestParser: basic" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

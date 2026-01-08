@@ -11,6 +11,8 @@ const ContentType = http.ContentType;
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
 const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
+const KeepAliveParams = @import("parser.zig").KeepAliveParams;
+const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
 /// Configuration for the HTTP client.
 pub const ClientConfig = struct {
@@ -82,7 +84,9 @@ pub const ConnectionPool = struct {
     }
 
     /// Try to acquire an existing connection for the given host:port.
-    pub fn acquire(self: *ConnectionPool, remote_host: []const u8, remote_port: u16) ?*Connection {
+    pub fn acquire(self: *ConnectionPool, rt: *zio.Runtime, remote_host: []const u8, remote_port: u16) ?*Connection {
+        const now = rt.now();
+
         // Search from end (most recently used)
         var node = self.idle.last;
         while (node) |n| {
@@ -90,6 +94,18 @@ pub const ConnectionPool = struct {
             node = n.prev;
 
             if (conn.matches(remote_host, remote_port)) {
+                // Check if connection has expired due to idle timeout
+                if (conn.idle_deadline) |deadline| {
+                    if (now >= deadline) {
+                        // Connection expired, remove and close it
+                        self.idle.remove(n);
+                        self.idle_len -= 1;
+                        conn.deinit();
+                        self.allocator.destroy(conn);
+                        continue;
+                    }
+                }
+
                 self.idle.remove(n);
                 self.idle_len -= 1;
                 return conn;
@@ -144,6 +160,11 @@ pub const Connection = struct {
     port: u16 = 0,
     closing: bool = false,
 
+    // Keep-Alive tracking
+    request_count: u16 = 0,
+    keep_alive: KeepAliveParams = .{},
+    idle_deadline: ?u64 = null, // milliseconds from rt.now()
+
     /// Initialize the connection in place (required because parser stores internal pointers).
     pub fn init(self: *Connection, allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16) void {
         self.allocator = allocator;
@@ -151,6 +172,11 @@ pub const Connection = struct {
         self.arena = std.heap.ArenaAllocator.init(allocator);
         self.rt = rt;
         self.closing = false;
+
+        // Keep-Alive tracking
+        self.request_count = 0;
+        self.keep_alive = .{};
+        self.idle_deadline = null;
 
         // Store host for connection pooling
         const len: u8 = @intCast(@min(remote_host.len, self.host_buffer.len));
@@ -202,9 +228,36 @@ pub const ClientResponse = struct {
 
     /// Release the connection back to the pool (or close if not reusable).
     pub fn deinit(self: *ClientResponse) void {
-        // Set closing flag based on keep-alive
-        self.conn.closing = !self.conn.parser.shouldKeepAlive();
-        self.pool.release(self.conn);
+        const conn = self.conn;
+
+        // Increment request count
+        conn.request_count +|= 1;
+
+        // Check basic keep-alive from Connection header
+        if (!conn.parser.shouldKeepAlive()) {
+            conn.closing = true;
+        } else {
+            // Parse Keep-Alive header on first response
+            if (conn.request_count == 1) {
+                if (conn.parsed_response.headers.get("Keep-Alive")) |keep_alive| {
+                    conn.keep_alive = parseKeepAliveHeader(keep_alive);
+                }
+            }
+
+            // Update idle deadline after each request
+            if (conn.keep_alive.timeout) |timeout| {
+                conn.idle_deadline = conn.rt.now() + @as(u64, timeout) * 1000;
+            }
+
+            // Check if we've reached max requests
+            if (conn.keep_alive.max) |max| {
+                if (conn.request_count >= max) {
+                    conn.closing = true;
+                }
+            }
+        }
+
+        self.pool.release(conn);
     }
 
     /// Get response status.
@@ -309,7 +362,7 @@ pub const Client = struct {
         const port = try uriPort(uri);
 
         // Try to get a connection from the pool
-        const conn = self.pool.acquire(host, port) orelse blk: {
+        const conn = self.pool.acquire(rt, host, port) orelse blk: {
             // No pooled connection, create a new one
             const addr = try zio.net.IpAddress.parseIp(host, port);
             const stream = try addr.connect(rt);
