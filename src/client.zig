@@ -381,8 +381,7 @@ pub const Client = struct {
         // Try to get a connection from the pool
         const conn = self.pool.acquire(rt, host, port) orelse blk: {
             // No pooled connection, create a new one
-            const addr = try zio.net.IpAddress.parseIp(host, port);
-            const stream = try addr.connect(rt);
+            const stream = try zio.net.tcpConnectToHost(rt, host, port);
             errdefer stream.close(rt);
 
             const new_conn = try self.allocator.create(Connection);

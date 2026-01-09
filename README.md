@@ -63,10 +63,10 @@ pub fn main() !void {
     var client = http.Client.init(allocator, .{});
     defer client.deinit();
 
-    var response = try client.fetch(rt, "http://example.com/api", .{});
+    var response = try client.fetch(rt, "http://httpbin.org/get", .{});
     defer response.deinit();
 
-    std.debug.print("Status: {d}\n", .{@intFromEnum(response.status())});
+    std.debug.print("Status: {t}\n", .{response.status()});
 
     if (try response.body()) |body| {
         std.debug.print("Body: {s}\n", .{body});
