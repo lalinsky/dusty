@@ -1,8 +1,5 @@
-Dusty is a simple HTTP server built on top of [zio](https://github.com/lalinsky/zio) (coroutine/async engine) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
-The API is very much inspired by Karl Seguin's [http.zig](https://github.com/karlseguin/http.zig), which is a great project and
-I would be happy using that, if I didn't need to run multiple network services inside the same application. 
-
-This project is in very early stages, don't use it unless you want to experiment or perhaps even contribute.
+Dusty is a HTTP client/server library built on top of [zio](https://github.com/lalinsky/zio) (coroutine/async engine) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
+The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlseguin/http.zig), and tries to be as compatible as possible. By using a coroutine scheduler under the hood, it's very easy to efficiently wait for a HTTP client request in a HTTP server handler, or perhaps have a long-runing WebSocket session and don't worry about state management between callbacks.
 
 ## Features
 - Asynchronous I/O for multiple concurrent connections on a single CPU thread
