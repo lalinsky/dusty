@@ -86,8 +86,8 @@ pub const ConnectionPool = struct {
     }
 
     /// Try to acquire an existing connection for the given host:port.
-    pub fn acquire(self: *ConnectionPool, rt: *zio.Runtime, remote_host: []const u8, remote_port: u16) ?*Connection {
-        const now = rt.now();
+    pub fn acquire(self: *ConnectionPool, io: *zio.Runtime, remote_host: []const u8, remote_port: u16) ?*Connection {
+        const now = io.now();
 
         // Search from end (most recently used)
         var node = self.idle.last;
@@ -152,7 +152,7 @@ pub const Connection = struct {
     write_buffer: [4096]u8,
     reader: zio.net.Stream.Reader,
     writer: zio.net.Stream.Writer,
-    rt: *zio.Runtime,
+    io: *zio.Runtime,
     buffer_size: usize,
 
     // Connection pool metadata
@@ -168,11 +168,11 @@ pub const Connection = struct {
     idle_deadline: ?u64 = null, // milliseconds from rt.now()
 
     /// Initialize the connection in place (required because parser stores internal pointers).
-    pub fn init(self: *Connection, allocator: std.mem.Allocator, rt: *zio.Runtime, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16, buffer_size: usize) !void {
+    pub fn init(self: *Connection, allocator: std.mem.Allocator, io: *zio.Runtime, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16, buffer_size: usize) !void {
         self.allocator = allocator;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
-        self.rt = rt;
+        self.io = io;
         self.closing = false;
         self.buffer_size = buffer_size;
 
@@ -189,8 +189,8 @@ pub const Connection = struct {
 
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.init(&self.parsed_response);
-        self.reader = stream.reader(rt, &.{});
-        self.writer = stream.writer(rt, &self.write_buffer);
+        self.reader = stream.reader(io, &.{});
+        self.writer = stream.writer(io, &self.write_buffer);
 
         // Allocate initial read buffer from arena
         try self.allocReadBuffer();
@@ -205,7 +205,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        self.stream.close(self.rt);
+        self.stream.close(self.io);
         self.arena.deinit();
     }
 
@@ -263,7 +263,7 @@ pub const ClientResponse = struct {
 
             // Update idle deadline after each request
             if (conn.keep_alive.timeout) |timeout| {
-                conn.idle_deadline = conn.rt.now() + @as(u64, timeout) * 1000;
+                conn.idle_deadline = conn.io.now() + @as(u64, timeout) * 1000;
             }
 
             // Check if we've reached max requests
@@ -358,18 +358,18 @@ pub const Client = struct {
     /// Perform an HTTP request.
     pub fn fetch(
         self: *Client,
-        rt: *zio.Runtime,
+        io: *zio.Runtime,
         url: []const u8,
         options: FetchOptions,
     ) !ClientResponse {
         const uri = try parseUrl(url);
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
-        return self.fetchInternal(rt, uri, options, max_redirects);
+        return self.fetchInternal(io, uri, options, max_redirects);
     }
 
     fn fetchInternal(
         self: *Client,
-        rt: *zio.Runtime,
+        io: *zio.Runtime,
         uri: Uri,
         options: FetchOptions,
         redirects_remaining: u8,
@@ -379,14 +379,14 @@ pub const Client = struct {
         const port = try uriPort(uri);
 
         // Try to get a connection from the pool
-        const conn = self.pool.acquire(rt, host, port) orelse blk: {
+        const conn = self.pool.acquire(io, host, port) orelse blk: {
             // No pooled connection, create a new one
-            const stream = try zio.net.tcpConnectToHost(rt, host, port);
-            errdefer stream.close(rt);
+            const stream = try zio.net.tcpConnectToHost(io, host, port);
+            errdefer stream.close(io);
 
             const new_conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(new_conn);
-            try new_conn.init(self.allocator, rt, stream, host, port, self.config.buffer_size);
+            try new_conn.init(self.allocator, io, stream, host, port, self.config.buffer_size);
 
             break :blk new_conn;
         };
@@ -420,7 +420,7 @@ pub const Client = struct {
                     redirect_options.body = null;
                 }
 
-                return self.fetchInternal(rt, redirect_uri, redirect_options, redirects_remaining - 1);
+                return self.fetchInternal(io, redirect_uri, redirect_options, redirects_remaining - 1);
             }
         }
 
