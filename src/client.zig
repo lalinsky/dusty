@@ -33,6 +33,8 @@ pub const FetchOptions = struct {
     body: ?[]const u8 = null,
     /// Override default redirect limit for this request.
     max_redirects: ?u8 = null,
+    /// Decompress response body automatically (sends Accept-Encoding header).
+    decompress: bool = true,
 };
 
 /// Parse a URL string into a std.Uri.
@@ -274,11 +276,21 @@ pub const ClientResponse = struct {
     conn: *std.Io.Reader,
     parsed: *ParsedResponse,
     max_response_size: usize,
+    decompress: bool = true,
 
     // Cached body (read lazily)
     _body: ?[]const u8 = null,
     _body_read: bool = false,
-    body_reader_buffer: [1024]u8 = undefined,
+
+    // Body reader state (stored here for stable address needed by decompressor)
+    _body_reader: ResponseBodyReader = undefined,
+    _body_reader_buffer: [1024]u8 = undefined,
+    _body_reader_init: bool = false,
+
+    // Decompression state
+    _decompressor: std.compress.flate.Decompress = undefined,
+    _decompressor_buffer: [std.compress.flate.max_window_len]u8 = undefined,
+    _decompressor_init: bool = false,
 
     // Connection reference for cleanup (optional for testing)
     owner: ?*Connection = null,
@@ -320,8 +332,8 @@ pub const ClientResponse = struct {
             return self._body;
         }
 
-        var r = self.reader();
-        const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
+        const r = self.reader();
+        const result = r.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
             else => return err,
         };
@@ -335,18 +347,38 @@ pub const ClientResponse = struct {
         return result;
     }
 
-    /// Get a streaming body reader.
-    pub fn reader(self: *ClientResponse) ResponseBodyReader {
+    /// Get a streaming body reader. Returns decompressed data if server sent
+    /// compressed response and decompress option was enabled.
+    pub fn reader(self: *ClientResponse) *std.Io.Reader {
         // If body has already been read, return a reader for the cached body
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
-            var r = ResponseBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
-            r.interface = std.Io.Reader.fixed(cached_body);
-            return r;
+            self._body_reader = ResponseBodyReader.init(self.parser, self.conn, &self._body_reader_buffer);
+            self._body_reader.interface = std.Io.Reader.fixed(cached_body);
+            return &self._body_reader.interface;
         }
 
-        // Return the streaming body reader
-        return ResponseBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
+        // Initialize body reader if not already done
+        if (!self._body_reader_init) {
+            self._body_reader = ResponseBodyReader.init(self.parser, self.conn, &self._body_reader_buffer);
+            self._body_reader_init = true;
+        }
+
+        // If decompression enabled and response is compressed, wrap with decompressor
+        if (self.decompress and self.parsed.content_encoding != .identity and !self._decompressor_init) {
+            self._decompressor = std.compress.flate.Decompress.init(
+                &self._body_reader.interface,
+                if (self.parsed.content_encoding == .gzip) .gzip else .zlib,
+                &self._decompressor_buffer,
+            );
+            self._decompressor_init = true;
+        }
+
+        if (self._decompressor_init) {
+            return &self._decompressor.reader;
+        }
+
+        return &self._body_reader.interface;
     }
 };
 
@@ -406,10 +438,23 @@ pub const Client = struct {
         errdefer self.pool.release(conn);
 
         // Send request
-        try writeRequest(&conn.writer.interface, options.method, uri, host, port, options.headers, options.body);
+        try writeRequest(&conn.writer.interface, .{
+            .method = options.method,
+            .uri = uri,
+            .host = host,
+            .port = port,
+            .headers = options.headers,
+            .body = options.body,
+            .decompress = options.decompress,
+        });
 
         // Parse response headers
         try parseResponseHeaders(&conn.reader.interface, &conn.parser);
+
+        // Check for unsupported content encoding
+        if (options.decompress and conn.parsed_response.content_encoding == .unknown) {
+            return error.UnsupportedContentEncoding;
+        }
 
         // Check for redirects
         const status_code = @intFromEnum(conn.parsed_response.status);
@@ -444,57 +489,67 @@ pub const Client = struct {
             .conn = &conn.reader.interface,
             .parsed = &conn.parsed_response,
             .max_response_size = self.config.max_response_size,
+            .decompress = options.decompress,
             .owner = conn,
         };
     }
 };
 
-fn writeRequest(
-    writer: *std.Io.Writer,
+const WriteRequestOptions = struct {
     method: Method,
     uri: Uri,
     host: []const u8,
     port: u16,
-    headers_opt: ?*const Headers,
-    body_content: ?[]const u8,
-) !void {
+    headers: ?*const Headers = null,
+    body: ?[]const u8 = null,
+    decompress: bool = true,
+};
+
+fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     // Request line - path with query
-    const path = uriPath(uri);
-    if (uri.query) |query| {
-        try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ method.name(), path, query.percent_encoded });
+    const path = uriPath(opts.uri);
+    if (opts.uri.query) |query| {
+        try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ opts.method.name(), path, query.percent_encoded });
     } else {
-        try writer.print("{s} {s} HTTP/1.1\r\n", .{ method.name(), path });
+        try writer.print("{s} {s} HTTP/1.1\r\n", .{ opts.method.name(), path });
     }
 
     // Host header
-    if (port == 80) {
-        try writer.print("Host: {s}\r\n", .{host});
+    if (opts.port == 80) {
+        try writer.print("Host: {s}\r\n", .{opts.host});
     } else {
-        try writer.print("Host: {s}:{d}\r\n", .{ host, port });
+        try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
     }
 
     // Content-Length for body
-    if (body_content) |b| {
+    if (opts.body) |b| {
         try writer.print("Content-Length: {d}\r\n", .{b.len});
     }
 
     // User-provided headers
-    if (headers_opt) |h| {
+    var has_accept_encoding = false;
+    if (opts.headers) |h| {
         var it = h.iterator();
         while (it.next()) |entry| {
             // Skip headers we already set
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host")) continue;
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Accept-Encoding")) has_accept_encoding = true;
 
             try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
+    }
+
+    // Add default Accept-Encoding if decompress enabled and user didn't provide one
+    if (opts.decompress and !has_accept_encoding) {
+        try writer.writeAll("Accept-Encoding: gzip, deflate\r\n");
     }
 
     // End of headers
     try writer.writeAll("\r\n");
 
     // Body
-    if (body_content) |b| {
+    if (opts.body) |b| {
         try writer.writeAll(b);
     }
 
@@ -736,17 +791,17 @@ test "ClientResponse.reader: streaming read" {
         .max_response_size = 1024,
     };
 
-    var body_reader = response.reader();
+    const body_reader = response.reader();
 
     // Read in chunks
     var buf: [5]u8 = undefined;
-    var n = try body_reader.interface.readSliceShort(&buf);
+    var n = try body_reader.readSliceShort(&buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
 
-    n = try body_reader.interface.readSliceShort(&buf);
+    n = try body_reader.readSliceShort(&buf);
     try std.testing.expectEqualStrings(" worl", buf[0..n]);
 
-    n = try body_reader.interface.readSliceShort(&buf);
+    n = try body_reader.readSliceShort(&buf);
     try std.testing.expectEqualStrings("d", buf[0..n]);
 }
 
@@ -776,7 +831,65 @@ test "ClientResponse.reader: after body() returns cached data" {
     try std.testing.expectEqualStrings("hello", body.?);
 
     // Now reader should return cached body
-    var body_reader = response.reader();
-    const cached = try body_reader.interface.allocRemaining(arena.allocator(), .unlimited);
+    const body_reader = response.reader();
+    const cached = try body_reader.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("hello", cached);
+}
+
+test "ClientResponse.body: gzip decompression" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "hello" gzip compressed
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+        .decompress = true,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse.body: gzip decompression disabled" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "hello" gzip compressed
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+        .decompress = false,
+    };
+
+    // With decompress disabled, we should get the raw gzip bytes
+    const body = try response.body();
+    try std.testing.expectEqual(25, body.?.len);
+    try std.testing.expectEqualStrings(gzip_hello, body.?);
 }

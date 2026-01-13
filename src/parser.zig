@@ -8,6 +8,7 @@ const Method = @import("http.zig").Method;
 const Status = @import("http.zig").Status;
 const Headers = @import("http.zig").Headers;
 const ContentType = @import("http.zig").ContentType;
+const ContentEncoding = @import("http.zig").ContentEncoding;
 const Request = @import("request.zig").Request;
 
 pub const ParseError = error{
@@ -258,6 +259,7 @@ pub const ParsedResponse = struct {
     version_minor: u8 = 0,
     headers: Headers = .{},
     content_type: ?ContentType = null,
+    content_encoding: ContentEncoding = .identity,
     arena: std.mem.Allocator,
 };
 
@@ -426,6 +428,10 @@ pub const ResponseParser = struct {
 
         if (self.response.headers.get("Content-Type")) |content_type| {
             self.response.content_type = ContentType.fromContentType(content_type);
+        }
+
+        if (self.response.headers.get("Content-Encoding")) |content_encoding| {
+            self.response.content_encoding = ContentEncoding.fromString(content_encoding);
         }
 
         self.state.headers_complete = true;

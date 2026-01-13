@@ -409,3 +409,28 @@ test "ContentType: parse from file extension" {
     try std.testing.expectEqual(ContentType.jpeg, ContentType.fromExtension(".jpeg"));
     try std.testing.expectEqual(ContentType.unknown, ContentType.fromExtension(""));
 }
+
+pub const ContentEncoding = enum {
+    identity,
+    gzip,
+    deflate,
+    unknown,
+
+    pub fn fromString(value: []const u8) ContentEncoding {
+        if (std.ascii.eqlIgnoreCase(value, "gzip")) return .gzip;
+        if (std.ascii.eqlIgnoreCase(value, "x-gzip")) return .gzip;
+        if (std.ascii.eqlIgnoreCase(value, "deflate")) return .deflate;
+        if (std.ascii.eqlIgnoreCase(value, "identity")) return .identity;
+        return .unknown;
+    }
+};
+
+test "ContentEncoding: fromString" {
+    try std.testing.expectEqual(ContentEncoding.identity, ContentEncoding.fromString("identity"));
+    try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("gzip"));
+    try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("x-gzip"));
+    try std.testing.expectEqual(ContentEncoding.gzip, ContentEncoding.fromString("GZIP"));
+    try std.testing.expectEqual(ContentEncoding.deflate, ContentEncoding.fromString("deflate"));
+    try std.testing.expectEqual(ContentEncoding.unknown, ContentEncoding.fromString("br"));
+    try std.testing.expectEqual(ContentEncoding.unknown, ContentEncoding.fromString("zstd"));
+}
