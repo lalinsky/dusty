@@ -48,7 +48,7 @@ pub fn Server(comptime Ctx: type) type {
         fn handleNotFound(self: *Self, req: *Request, res: *Response) void {
             if (comptime Ctx != void and std.meta.hasFn(Ctx, "notFound")) {
                 self.ctx.notFound(req, res) catch |err| {
-                    self.handleError(req, req, err);
+                    self.handleError(req, res, err);
                 };
             } else {
                 defaultNotFound(req, res);
