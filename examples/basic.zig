@@ -3,7 +3,7 @@ const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
-    rt: *zio.Runtime,
+    io: *zio.Runtime,
     counter: usize = 0,
 
     pub fn uncaughtError(self: *AppContext, req: *http.Request, res: *http.Response, err: anyerror) void {
@@ -23,7 +23,7 @@ const AppContext = struct {
 
 fn handleSlow(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     _ = req;
-    try ctx.rt.sleep(10);
+    try ctx.io.sleep(10);
     res.body = "Hello World!\n";
 }
 
@@ -143,8 +143,8 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
     }, .{});
 }
 
-pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
-    var ctx: AppContext = .{ .rt = rt };
+pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
+    var ctx: AppContext = .{ .io = io };
     const AppServer = http.Server(AppContext);
 
     const config: http.ServerConfig = .{
@@ -176,19 +176,18 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
 
-    var task = try rt.spawn(AppServer.listen, .{ &server, rt, addr }, .{});
-    defer task.cancel(rt);
+    var task = try io.spawn(AppServer.listen, .{ &server, io, addr }, .{});
+    defer task.cancel(io);
 
-    while (true) {
-        const result = try zio.select(rt, .{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
-        switch (result) {
-            .task => |r| {
-                return r;
-            },
-            .sigint, .sigterm => {
-                server.stop();
-            },
-        }
+    const result = try zio.select(io, .{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
+    switch (result) {
+        .task => |r| {
+            return r;
+        },
+        .sigint, .sigterm => {
+            task.cancel(io);
+            return;
+        },
     }
 }
 
@@ -197,9 +196,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var rt = try zio.Runtime.init(allocator, .{});
-    defer rt.deinit();
+    var io = try zio.Runtime.init(allocator, .{});
+    defer io.deinit();
 
-    var task = try rt.spawn(runServer, .{ allocator, rt }, .{});
-    try task.join(rt);
+    var task = try io.spawn(runServer, .{ allocator, io }, .{});
+    try task.join(io);
 }

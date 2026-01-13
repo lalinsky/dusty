@@ -71,7 +71,6 @@ pub fn Server(comptime Ctx: type) type {
         active_connections: std.atomic.Value(usize),
         address: zio.net.Address,
         ready: zio.ResetEvent,
-        shutdown: zio.ResetEvent,
         last_connection_closed: zio.Notify,
 
         pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
@@ -83,7 +82,6 @@ pub fn Server(comptime Ctx: type) type {
                 .active_connections = std.atomic.Value(usize).init(0),
                 .address = undefined,
                 .ready = .init,
-                .shutdown = .init,
                 .last_connection_closed = .init,
             };
         }
@@ -92,59 +90,43 @@ pub fn Server(comptime Ctx: type) type {
             self.router.deinit();
         }
 
-        pub fn stop(self: *Self) void {
-            log.info("Shutting down", .{});
-            self.shutdown.set();
-        }
-
-        pub fn listen(self: *Self, rt: *zio.Runtime, addr: zio.net.IpAddress) !void {
-            const server = try addr.listen(rt, .{ .reuse_address = true });
-            defer server.close(rt);
+        pub fn listen(self: *Self, io: *zio.Runtime, addr: zio.net.IpAddress) !void {
+            const server = try addr.listen(io, .{ .reuse_address = true });
+            defer server.close(io);
 
             self.address = server.socket.address;
             self.ready.set();
 
             log.info("Listening on {f}", .{self.address});
 
-            var listener = try rt.spawn(acceptLoop, .{ self, rt, server }, .{});
-            defer listener.cancel(rt);
+            var group: zio.Group = .init;
+            defer group.cancel(io);
 
-            const selected = try zio.select(rt, .{ .done = &listener, .shutdown = &self.shutdown });
-            switch (selected) {
-                .done => |result| {
-                    result catch |err| {
-                        log.err("Failed to accept connection: {}", .{err});
-                    };
-                },
-                .shutdown => {},
-            }
-
-            var active_connections = self.active_connections.load(.acquire);
-            while (active_connections > 0) {
-                log.info("Waiting for {} remaining connections to close", .{active_connections});
-                try self.last_connection_closed.timedWait(rt, 100 * std.time.ns_per_ms);
-                active_connections = self.active_connections.load(.acquire);
-            }
-        }
-
-        pub fn acceptLoop(self: *Self, rt: *zio.Runtime, server: zio.net.Server) !void {
             while (true) {
-                const stream = try server.accept(rt);
-                errdefer stream.close(rt);
+                const stream = server.accept(io) catch |err| {
+                    if (err == error.Canceled) {
+                        log.info("Graceful shutdown requested", .{});
+                        while (true) { // TODO: add graceful shutdown timeout
+                            const remaining = self.active_connections.load(.acquire);
+                            if (remaining == 0) break;
+                            log.info("Waiting for {} remaining connections to close", .{remaining});
+                            try self.last_connection_closed.timedWait(io, 100 * std.time.ns_per_ms);
+                        }
+                        return err;
+                    }
+                    return err;
+                };
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
-                errdefer _ = self.active_connections.fetchSub(1, .acq_rel);
-
-                var handler = try rt.spawn(handleConnection, .{ self, rt, stream }, .{});
-                handler.detach(rt);
+                group.spawn(io, handleConnection, .{ self, io, stream }) catch |err| {
+                    log.err("Failed to accept connection: {}", .{err});
+                    _ = self.active_connections.fetchSub(1, .acq_rel);
+                    stream.close(io);
+                };
             }
         }
 
-        pub fn handleConnection(self: *Self, rt: *zio.Runtime, stream: zio.net.Stream) !void {
-            // Close connection if it's already closed
-            defer stream.close(rt);
-
-            // Mark connection as inactive
+        pub fn handleConnection(self: *Self, io: *zio.Runtime, stream: zio.net.Stream) !void {
             defer {
                 const v = self.active_connections.fetchSub(1, .acq_rel);
                 if (v == 1) {
@@ -152,15 +134,17 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
+            defer stream.close(io);
+
             var needs_shutdown = true;
-            defer if (needs_shutdown) stream.shutdown(rt, .both) catch |err| {
+            defer if (needs_shutdown) stream.shutdown(io, .both) catch |err| {
                 log.warn("Failed to shutdown client connection: {}", .{err});
             };
 
-            var reader = stream.reader(rt, &.{});
+            var reader = stream.reader(io, &.{});
 
             var write_buffer: [4096]u8 = undefined;
-            var writer = stream.writer(rt, &write_buffer);
+            var writer = stream.writer(io, &write_buffer);
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -191,9 +175,9 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 request_count += 1;
 
-                defer timeout.clear(rt);
+                defer timeout.clear(io);
                 if (self.config.timeout.request) |timeout_ms| {
-                    timeout.set(rt, timeout_ms * std.time.ns_per_ms);
+                    timeout.set(io, timeout_ms * std.time.ns_per_ms);
                 }
 
                 // TODO: handle error.Canceled caused by timeout and return 504
@@ -259,7 +243,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 // Activate keepalive timeout
                 if (self.config.timeout.keepalive) |timeout_ms| {
-                    timeout.set(rt, timeout_ms * std.time.ns_per_ms);
+                    timeout.set(io, timeout_ms * std.time.ns_per_ms);
                 }
 
                 // Fill some data here, while the the keepalive timeout is active
