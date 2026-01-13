@@ -34,6 +34,10 @@ const Node = struct {
     handler: ?*const anyopaque,
 };
 
+pub fn Action(comptime ActionContext: type) type {
+    return Router(ActionContext).Handler;
+}
+
 pub fn Router(comptime Ctx: type) type {
     return struct {
         const Self = @This();

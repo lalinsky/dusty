@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Server = @import("server.zig").Server;
 pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const Router = @import("router.zig").Router;
+pub const Action = @import("router.zig").Action;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 pub const EventStream = @import("response.zig").EventStream;
