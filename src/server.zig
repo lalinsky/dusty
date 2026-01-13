@@ -27,6 +27,34 @@ pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
+        fn handleDispatch(self: *Self, req: *Request, res: *Response, handler: *const Router(Ctx).Handler) void {
+            if (comptime Ctx != void and std.meta.hasFn(Ctx, "dispatch")) {
+                self.ctx.dispatch(self.ctx, req, res, handler) catch |err| {
+                    self.handleError(req, res, err);
+                };
+            } else {
+                if (comptime Ctx == void) {
+                    handler(req, res) catch |err| {
+                        self.handleError(req, res, err);
+                    };
+                } else {
+                    handler(self.ctx, req, res) catch |err| {
+                        self.handleError(req, res, err);
+                    };
+                }
+            }
+        }
+
+        fn handleNotFound(self: *Self, req: *Request, res: *Response) void {
+            if (comptime Ctx != void and std.meta.hasFn(Ctx, "notFound")) {
+                self.ctx.notFound(req, res) catch |err| {
+                    self.handleError(req, req, err);
+                };
+            } else {
+                defaultNotFound(req, res);
+            }
+        }
+
         fn handleError(self: *Self, req: *Request, res: *Response, err: anyerror) void {
             if (comptime Ctx != void and std.meta.hasFn(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(req, res, err);
@@ -194,23 +222,9 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 if (try self.router.findHandler(&request)) |handler| {
-                    if (comptime Ctx == void) {
-                        handler(&request, &response) catch |err| {
-                            self.handleError(&request, &response, err);
-                        };
-                    } else {
-                        handler(self.ctx, &request, &response) catch |err| {
-                            self.handleError(&request, &response, err);
-                        };
-                    }
+                    self.handleDispatch(&request, &response, handler);
                 } else {
-                    if (comptime Ctx != void and std.meta.hasFn(Ctx, "notFound")) {
-                        self.ctx.notFound(&request, &response) catch |err| {
-                            self.handleError(&request, &response, err);
-                        };
-                    } else {
-                        defaultNotFound(&request, &response);
-                    }
+                    self.handleNotFound(&request, &response);
                 }
 
                 if (!parser.isBodyComplete()) {
