@@ -13,6 +13,9 @@ pub const Method = @import("http.zig").Method;
 pub const ContentType = @import("http.zig").ContentType;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
+pub const Middleware = @import("middleware.zig").Middleware;
+pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
+pub const Executor = @import("middleware.zig").Executor;
 
 // Client
 pub const Client = @import("client.zig").Client;
@@ -30,4 +33,5 @@ comptime {
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");
+    _ = @import("middleware.zig");
 }

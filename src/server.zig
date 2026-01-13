@@ -8,61 +8,15 @@ const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
+const Executor = @import("middleware.zig").Executor;
+const Middleware = @import("middleware.zig").Middleware;
+const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 
 const log = std.log.scoped(.dusty);
-
-fn defaultUncaughtError(req: *Request, res: *Response, err: anyerror) void {
-    _ = req;
-    log.err("Handler failed: {}", .{err});
-    res.status = .internal_server_error;
-    res.body = "500 Internal Server Error\n";
-}
-
-fn defaultNotFound(req: *Request, res: *Response) void {
-    log.info("No handler found for {s}", .{req.url});
-    res.status = .not_found;
-    res.body = "404 Not Found\n";
-}
 
 pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
-
-        fn handleDispatch(self: *Self, action: Action(Ctx), req: *Request, res: *Response) void {
-            if (comptime Ctx != void and std.meta.hasFn(Ctx, "dispatch")) {
-                self.ctx.dispatch(action, req, res) catch |err| {
-                    self.handleError(req, res, err);
-                };
-            } else {
-                if (comptime Ctx == void) {
-                    action(req, res) catch |err| {
-                        self.handleError(req, res, err);
-                    };
-                } else {
-                    action(self.ctx, req, res) catch |err| {
-                        self.handleError(req, res, err);
-                    };
-                }
-            }
-        }
-
-        fn handleNotFound(self: *Self, req: *Request, res: *Response) void {
-            if (comptime Ctx != void and std.meta.hasFn(Ctx, "notFound")) {
-                self.ctx.notFound(req, res) catch |err| {
-                    self.handleError(req, res, err);
-                };
-            } else {
-                defaultNotFound(req, res);
-            }
-        }
-
-        fn handleError(self: *Self, req: *Request, res: *Response, err: anyerror) void {
-            if (comptime Ctx != void and std.meta.hasFn(Ctx, "uncaughtError")) {
-                self.ctx.uncaughtError(req, res, err);
-            } else {
-                defaultUncaughtError(req, res, err);
-            }
-        }
 
         allocator: std.mem.Allocator,
         router: Router(Ctx),
@@ -73,6 +27,7 @@ pub fn Server(comptime Ctx: type) type {
         address: zio.net.Address,
         ready: zio.ResetEvent,
         last_connection_closed: zio.Notify,
+        _middleware_registry: std.SinglyLinkedList,
 
         pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
             return .{
@@ -85,11 +40,43 @@ pub fn Server(comptime Ctx: type) type {
                 .address = undefined,
                 .ready = .init,
                 .last_connection_closed = .init,
+                ._middleware_registry = .{},
             };
         }
 
         pub fn deinit(self: *Self) void {
+            // Call deinit on all registered middlewares
+            var it = self._middleware_registry.first;
+            while (it) |node| {
+                it = node.next;
+                const mw: *Middleware(Ctx) = @fieldParentPtr("node", node);
+                mw.deinit();
+            }
             self.router.deinit();
+        }
+
+        /// Creates a middleware instance managed by the server.
+        /// The middleware is allocated on the router's arena and will be freed when the server is deinit'd.
+        /// Supports middlewares with init(Config) or init(Config, MiddlewareConfig) signatures.
+        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !*Middleware(Ctx) {
+            const arena = self.router.arena.allocator();
+            const m = try arena.create(M);
+            m.* = switch (@typeInfo(@TypeOf(M.init)).@"fn".params.len) {
+                1 => try M.init(config),
+                2 => try M.init(config, MiddlewareConfig{
+                    .arena = arena,
+                    .allocator = self.allocator,
+                }),
+                else => @compileError(@typeName(M) ++ ".init must accept 1 or 2 parameters"),
+            };
+
+            const mw = try arena.create(Middleware(Ctx));
+            mw.* = Middleware(Ctx).init(m);
+
+            // Register for cleanup on deinit
+            self._middleware_registry.prepend(&mw.node);
+
+            return mw;
         }
 
         pub fn listen(self: *Self, io: *zio.Runtime, addr: zio.net.IpAddress) !void {
@@ -212,11 +199,14 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
 
-                if (try self.router.findHandler(&request)) |handler| {
-                    self.handleDispatch(handler, &request, &response);
-                } else {
-                    self.handleNotFound(&request, &response);
-                }
+                var executor = Executor(Ctx){
+                    .req = &request,
+                    .res = &response,
+                    .ctx = self.ctx,
+                    .action = try self.router.findHandler(&request),
+                    .middlewares = self.router.middlewares,
+                };
+                try executor.run();
 
                 if (!parser.isBodyComplete()) {
                     // TODO maybe we should drain the body here?
