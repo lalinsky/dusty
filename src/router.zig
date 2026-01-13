@@ -34,8 +34,8 @@ const Node = struct {
     handler: ?*const anyopaque,
 };
 
-pub fn Action(comptime ActionContext: type) type {
-    return Router(ActionContext).Handler;
+pub fn Action(comptime Ctx: type) type {
+    return *const Router(Ctx).Handler;
 }
 
 pub fn Router(comptime Ctx: type) type {

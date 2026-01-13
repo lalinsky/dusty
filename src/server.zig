@@ -28,7 +28,7 @@ pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
-        fn handleDispatch(self: *Self, action: *const Action(Ctx), req: *Request, res: *Response) void {
+        fn handleDispatch(self: *Self, action: Action(Ctx), req: *Request, res: *Response) void {
             if (comptime Ctx != void and std.meta.hasFn(Ctx, "dispatch")) {
                 self.ctx.dispatch(action, req, res) catch |err| {
                     self.handleError(req, res, err);
