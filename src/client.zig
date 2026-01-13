@@ -154,6 +154,7 @@ pub const Connection = struct {
     writer: zio.net.Stream.Writer,
     io: *zio.Runtime,
     buffer_size: usize,
+    pool: *ConnectionPool,
 
     // Connection pool metadata
     pool_node: std.DoublyLinkedList.Node = .{},
@@ -168,11 +169,12 @@ pub const Connection = struct {
     idle_deadline: ?u64 = null, // milliseconds from rt.now()
 
     /// Initialize the connection in place (required because parser stores internal pointers).
-    pub fn init(self: *Connection, allocator: std.mem.Allocator, io: *zio.Runtime, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16, buffer_size: usize) !void {
+    pub fn init(self: *Connection, allocator: std.mem.Allocator, io: *zio.Runtime, pool: *ConnectionPool, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16, buffer_size: usize) !void {
         self.allocator = allocator;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
         self.io = io;
+        self.pool = pool;
         self.closing = false;
         self.buffer_size = buffer_size;
 
@@ -229,13 +231,48 @@ pub const Connection = struct {
     pub fn matches(self: *const Connection, match_host: []const u8, match_port: u16) bool {
         return self.port == match_port and std.ascii.eqlIgnoreCase(self.host(), match_host);
     }
+
+    /// Release this connection back to its pool, handling keep-alive logic.
+    pub fn release(self: *Connection) void {
+        // Increment request count
+        self.request_count +|= 1;
+
+        // Check basic keep-alive from Connection header
+        if (!self.parser.shouldKeepAlive()) {
+            self.closing = true;
+        } else {
+            // Parse Keep-Alive header on first response
+            if (self.request_count == 1) {
+                if (self.parsed_response.headers.get("Keep-Alive")) |keep_alive| {
+                    self.keep_alive = parseKeepAliveHeader(keep_alive);
+                }
+            }
+
+            // Update idle deadline after each request
+            if (self.keep_alive.timeout) |timeout| {
+                self.idle_deadline = self.io.now() + @as(u64, timeout) * 1000;
+            }
+
+            // Check if we've reached max requests
+            if (self.keep_alive.max) |max| {
+                if (self.request_count >= max) {
+                    self.closing = true;
+                }
+            }
+        }
+
+        self.pool.release(self);
+    }
 };
 
 /// HTTP client response.
 /// Call deinit() when done to release the connection.
 pub const ClientResponse = struct {
-    conn: *Connection,
-    pool: *ConnectionPool,
+    // Direct pointers for reading (testable without full connection)
+    arena: std.mem.Allocator,
+    parser: *ResponseParser,
+    conn: *std.Io.Reader,
+    parsed: *ParsedResponse,
     max_response_size: usize,
 
     // Cached body (read lazily)
@@ -243,61 +280,37 @@ pub const ClientResponse = struct {
     _body_read: bool = false,
     body_reader_buffer: [1024]u8 = undefined,
 
+    // Connection reference for cleanup (optional for testing)
+    owner: ?*Connection = null,
+
     /// Release the connection back to the pool (or close if not reusable).
     pub fn deinit(self: *ClientResponse) void {
-        const conn = self.conn;
-
-        // Increment request count
-        conn.request_count +|= 1;
-
-        // Check basic keep-alive from Connection header
-        if (!conn.parser.shouldKeepAlive()) {
-            conn.closing = true;
-        } else {
-            // Parse Keep-Alive header on first response
-            if (conn.request_count == 1) {
-                if (conn.parsed_response.headers.get("Keep-Alive")) |keep_alive| {
-                    conn.keep_alive = parseKeepAliveHeader(keep_alive);
-                }
-            }
-
-            // Update idle deadline after each request
-            if (conn.keep_alive.timeout) |timeout| {
-                conn.idle_deadline = conn.io.now() + @as(u64, timeout) * 1000;
-            }
-
-            // Check if we've reached max requests
-            if (conn.keep_alive.max) |max| {
-                if (conn.request_count >= max) {
-                    conn.closing = true;
-                }
-            }
+        if (self.owner) |conn| {
+            conn.release();
         }
-
-        self.pool.release(conn);
     }
 
     /// Get response status.
     pub fn status(self: *const ClientResponse) Status {
-        return self.conn.parsed_response.status;
+        return self.parsed.status;
     }
 
     /// Get response headers.
     pub fn headers(self: *const ClientResponse) *const Headers {
-        return &self.conn.parsed_response.headers;
+        return &self.parsed.headers;
     }
 
     /// Get HTTP version.
     pub fn version(self: *const ClientResponse) struct { major: u8, minor: u8 } {
         return .{
-            .major = self.conn.parsed_response.version_major,
-            .minor = self.conn.parsed_response.version_minor,
+            .major = self.parsed.version_major,
+            .minor = self.parsed.version_minor,
         };
     }
 
     /// Get content type if present.
     pub fn contentType(self: *const ClientResponse) ?ContentType {
-        return self.conn.parsed_response.content_type;
+        return self.parsed.content_type;
     }
 
     /// Read the entire response body into memory.
@@ -308,7 +321,7 @@ pub const ClientResponse = struct {
         }
 
         var r = self.reader();
-        const result = r.interface.allocRemaining(self.conn.arena.allocator(), .limited(self.max_response_size)) catch |err| switch (err) {
+        const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
             else => return err,
         };
@@ -327,13 +340,13 @@ pub const ClientResponse = struct {
         // If body has already been read, return a reader for the cached body
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
-            var r = ResponseBodyReader.init(&self.conn.parser, &self.conn.reader.interface, &self.body_reader_buffer);
+            var r = ResponseBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
             r.interface = std.Io.Reader.fixed(cached_body);
             return r;
         }
 
         // Return the streaming body reader
-        return ResponseBodyReader.init(&self.conn.parser, &self.conn.reader.interface, &self.body_reader_buffer);
+        return ResponseBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
     }
 };
 
@@ -386,7 +399,7 @@ pub const Client = struct {
 
             const new_conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(new_conn);
-            try new_conn.init(self.allocator, io, stream, host, port, self.config.buffer_size);
+            try new_conn.init(self.allocator, io, &self.pool, stream, host, port, self.config.buffer_size);
 
             break :blk new_conn;
         };
@@ -424,11 +437,14 @@ pub const Client = struct {
             }
         }
 
-        // Build response (references connection and pool)
+        // Build response with direct pointers for reading
         return ClientResponse{
-            .conn = conn,
-            .pool = &self.pool,
+            .arena = conn.arena.allocator(),
+            .parser = &conn.parser,
+            .conn = &conn.reader.interface,
+            .parsed = &conn.parsed_response,
             .max_response_size = self.config.max_response_size,
+            .owner = conn,
         };
     }
 };
@@ -619,4 +635,148 @@ test "Uri.resolveInPlace: relative path" {
         try std.testing.expectEqualStrings("other.com", resolved.host.?.percent_encoded);
         try std.testing.expectEqualStrings("/different", resolved.path.percent_encoded);
     }
+}
+
+test "ClientResponse.body: basic response" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse.body: large body over 128 bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const body_content = "A" ** 256;
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n" ++ body_content;
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqual(256, body.?.len);
+    try std.testing.expectEqualStrings(body_content, body.?);
+}
+
+test "ClientResponse.body: no body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqual(null, body);
+    try std.testing.expectEqual(.no_content, response.status());
+}
+
+test "ClientResponse.reader: streaming read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    var body_reader = response.reader();
+
+    // Read in chunks
+    var buf: [5]u8 = undefined;
+    var n = try body_reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings("hello", buf[0..n]);
+
+    n = try body_reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings(" worl", buf[0..n]);
+
+    n = try body_reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings("d", buf[0..n]);
+}
+
+test "ClientResponse.reader: after body() returns cached data" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    parser.init(&parsed);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // First read body fully
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // Now reader should return cached body
+    var body_reader = response.reader();
+    const cached = try body_reader.interface.allocRemaining(arena.allocator(), .unlimited);
+    try std.testing.expectEqualStrings("hello", cached);
 }
