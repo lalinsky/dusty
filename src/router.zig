@@ -2,6 +2,7 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Method = @import("http.zig").Method;
+const Middleware = @import("middleware.zig").Middleware;
 
 const NodeKind = enum {
     static,
@@ -50,6 +51,8 @@ pub fn Router(comptime Ctx: type) type {
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree
         trees: [256]?*Node,
+        // Global middlewares applied to all routes
+        middlewares: []const Middleware(Ctx) = &.{},
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
