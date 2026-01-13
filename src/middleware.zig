@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
@@ -70,9 +71,10 @@ pub fn Executor(comptime Ctx: type) type {
         action: ?Action(Ctx),
         middlewares: []const Middleware(Ctx),
 
-        pub fn run(self: *Self) void {
+        pub fn run(self: *Self) zio.Cancelable!void {
             self.next() catch |err| {
                 self.handleError(err);
+                if (err == error.Canceled) return error.Canceled;
             };
         }
 
@@ -328,7 +330,7 @@ test "Executor: default 500 handler on action error" {
         .middlewares = &.{},
     };
 
-    executor.run();
+    try executor.run();
 
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
@@ -388,7 +390,7 @@ test "Executor: custom notFound handler" {
         .middlewares = &.{},
     };
 
-    executor.run();
+    try executor.run();
 
     try std.testing.expect(ctx.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
@@ -408,7 +410,7 @@ test "Executor: custom uncaughtError handler" {
         .middlewares = &.{},
     };
 
-    executor.run();
+    try executor.run();
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.CustomError, ctx.last_error.?);
@@ -429,7 +431,7 @@ test "Executor: custom dispatch method" {
         .middlewares = &.{},
     };
 
-    executor.run();
+    try executor.run();
 
     try std.testing.expect(ctx.dispatch_called);
     try std.testing.expectEqualStrings("custom handler", res.body);
@@ -451,7 +453,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
         .middlewares = &middlewares,
     };
 
-    executor.run();
+    try executor.run();
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);

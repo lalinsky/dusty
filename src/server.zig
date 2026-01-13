@@ -200,7 +200,7 @@ pub fn Server(comptime Ctx: type) type {
                     .action = try self.router.findHandler(&request),
                     .middlewares = self.router.middlewares,
                 };
-                executor.run();
+                try executor.run();
 
                 if (!parser.isBodyComplete()) {
                     // TODO maybe we should drain the body here?
