@@ -2,6 +2,7 @@ const std = @import("std");
 const zio = @import("zio");
 
 const Router = @import("router.zig").Router;
+const Action = @import("router.zig").Action;
 const RequestParser = @import("parser.zig").RequestParser;
 const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
@@ -27,18 +28,18 @@ pub fn Server(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
-        fn handleDispatch(self: *Self, req: *Request, res: *Response, handler: *const Router(Ctx).Handler) void {
+        fn handleDispatch(self: *Self, action: Action(Ctx), req: *Request, res: *Response) void {
             if (comptime Ctx != void and std.meta.hasFn(Ctx, "dispatch")) {
-                self.ctx.dispatch(req, res, handler) catch |err| {
+                self.ctx.dispatch(action, req, res) catch |err| {
                     self.handleError(req, res, err);
                 };
             } else {
                 if (comptime Ctx == void) {
-                    handler(req, res) catch |err| {
+                    action(req, res) catch |err| {
                         self.handleError(req, res, err);
                     };
                 } else {
-                    handler(self.ctx, req, res) catch |err| {
+                    action(self.ctx, req, res) catch |err| {
                         self.handleError(req, res, err);
                     };
                 }
@@ -222,7 +223,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 if (try self.router.findHandler(&request)) |handler| {
-                    self.handleDispatch(&request, &response, handler);
+                    self.handleDispatch(@ptrCast(handler), &request, &response);
                 } else {
                     self.handleNotFound(&request, &response);
                 }
