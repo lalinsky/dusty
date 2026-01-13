@@ -29,7 +29,7 @@ pub fn Server(comptime Ctx: type) type {
 
         fn handleDispatch(self: *Self, req: *Request, res: *Response, handler: *const Router(Ctx).Handler) void {
             if (comptime Ctx != void and std.meta.hasFn(Ctx, "dispatch")) {
-                self.ctx.dispatch(self.ctx, req, res, handler) catch |err| {
+                self.ctx.dispatch(req, res, handler) catch |err| {
                     self.handleError(req, res, err);
                 };
             } else {
