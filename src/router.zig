@@ -35,11 +35,7 @@ const Node = struct {
 };
 
 pub fn Action(comptime ActionContext: type) type {
-    if (ActionContext == void) {
-        return *const fn (*Request, *Response) anyerror!void;
-    }
-
-    return *const fn (*ActionContext, *Request, *Response) anyerror!void;
+    return Router(ActionContext).Handler;
 }
 
 pub fn Router(comptime Ctx: type) type {
