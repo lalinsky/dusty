@@ -179,16 +179,15 @@ pub fn runServer(allocator: std.mem.Allocator, rt: *zio.Runtime) !void {
     var task = try rt.spawn(AppServer.listen, .{ &server, rt, addr }, .{});
     defer task.cancel(rt);
 
-    while (true) {
-        const result = try zio.select(rt, .{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
-        switch (result) {
-            .task => |r| {
-                return r;
-            },
-            .sigint, .sigterm => {
-                server.stop();
-            },
-        }
+    const result = try zio.select(rt, .{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
+    switch (result) {
+        .task => |r| {
+            return r;
+        },
+        .sigint, .sigterm => {
+            task.cancel(rt);
+            return;
+        },
     }
 }
 
