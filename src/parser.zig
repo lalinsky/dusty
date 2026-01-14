@@ -22,7 +22,6 @@ pub const ParseError = error{
     UnexpectedContentLength,
     ClosedConnection,
     ParseFailed,
-    Paused,
 };
 
 fn mapError(err: c.llhttp_errno_t) ParseError {
@@ -95,7 +94,7 @@ pub const RequestParser = struct {
         c.llhttp_reset(&self.parser);
     }
 
-    pub fn feed(self: *RequestParser, data: []const u8) !void {
+    pub fn feed(self: *RequestParser, data: []const u8) (ParseError || error{Paused})!void {
         const err = c.llhttp_execute(&self.parser, data.ptr, data.len);
 
         if (err == c.HPE_OK) {
@@ -109,7 +108,7 @@ pub const RequestParser = struct {
         return mapError(err);
     }
 
-    pub fn finish(self: *RequestParser) !void {
+    pub fn finish(self: *RequestParser) ParseError!void {
         const err = c.llhttp_finish(&self.parser);
         if (err != c.HPE_OK) {
             return mapError(err);

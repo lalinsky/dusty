@@ -71,10 +71,10 @@ pub fn Executor(comptime Ctx: type) type {
         action: ?Action(Ctx),
         middlewares: []const Middleware(Ctx),
 
-        pub fn run(self: *Self) zio.Cancelable!void {
+        pub fn run(self: *Self) !void {
             self.next() catch |err| {
                 self.handleError(err);
-                if (err == error.Canceled) return error.Canceled;
+                return err;
             };
         }
 
@@ -330,7 +330,7 @@ test "Executor: default 500 handler on action error" {
         .middlewares = &.{},
     };
 
-    try executor.run();
+    executor.run() catch {};
 
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
@@ -390,7 +390,7 @@ test "Executor: custom notFound handler" {
         .middlewares = &.{},
     };
 
-    try executor.run();
+    executor.run() catch {};
 
     try std.testing.expect(ctx.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
@@ -410,7 +410,7 @@ test "Executor: custom uncaughtError handler" {
         .middlewares = &.{},
     };
 
-    try executor.run();
+    executor.run() catch {};
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.CustomError, ctx.last_error.?);
@@ -453,7 +453,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
         .middlewares = &middlewares,
     };
 
-    try executor.run();
+    executor.run() catch {};
 
     try std.testing.expect(ctx.uncaught_error_called);
     try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);
