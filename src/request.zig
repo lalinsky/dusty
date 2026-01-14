@@ -3,6 +3,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
+const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
 pub const Cookie = @import("cookie.zig").Cookie;
 
@@ -450,10 +451,12 @@ const MultipartForm = struct {
     // End of chunk.
 };
 
+const ParseHeadersError = std.Io.Reader.Error || ParseError || error{IncompleteRequest};
+
 /// Parse HTTP headers from a reader and prepare for body reading.
 /// Returns error.EndOfStream if connection closed cleanly with no data.
 /// Returns error.IncompleteRequest if connection closed mid-request.
-pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) !void {
+pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeadersError!void {
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {
         const buffered = reader.buffered();
@@ -465,7 +468,7 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) !void {
                     parsed_len += consumed;
                     continue;
                 },
-                else => return err,
+                else => |e| return e,
             };
             parsed_len += unparsed.len;
             continue;
@@ -475,7 +478,7 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) !void {
                 if (parsed_len == 0) return error.EndOfStream;
                 return error.IncompleteRequest;
             },
-            else => return err,
+            else => |e| return e,
         };
     }
     reader.toss(parsed_len);
@@ -492,7 +495,7 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) !void {
     // Feed empty buffer to advance state machine for bodyless requests
     parser.feed(&.{}) catch |err| switch (err) {
         error.Paused => {},
-        else => return err,
+        else => |e| return e,
     };
 }
 

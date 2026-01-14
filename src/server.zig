@@ -180,7 +180,8 @@ pub fn Server(comptime Ctx: type) type {
                         needs_shutdown = false;
                         return;
                     },
-                    else => return err,
+                    error.ReadFailed => return reader.err orelse error.ReadFailed,
+                    else => |e| return e,
                 };
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
@@ -206,7 +207,11 @@ pub fn Server(comptime Ctx: type) type {
                     .action = try self.router.findHandler(&request),
                     .middlewares = self.router.middlewares,
                 };
-                try executor.run();
+                executor.run() catch |err| switch (err) {
+                    error.ReadFailed => return reader.err orelse error.ReadFailed,
+                    error.WriteFailed => return writer.err orelse error.WriteFailed,
+                    else => |e| return e,
+                };
 
                 if (!parser.isBodyComplete()) {
                     // TODO maybe we should drain the body here?
@@ -252,10 +257,7 @@ pub fn Server(comptime Ctx: type) type {
                         needs_shutdown = false;
                         return;
                     },
-                    else => {
-                        // TODO: handle error.Canceled caused by timeout and return cleanly
-                        return err;
-                    },
+                    error.ReadFailed => return reader.err orelse error.ReadFailed,
                 };
             }
         }
