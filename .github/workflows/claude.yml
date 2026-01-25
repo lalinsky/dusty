@@ -52,5 +52,5 @@ jobs:
           # prompt: 'Update the pull request description to include a summary of changes.'
 
           # Allow Claude to run zig commands and check.sh
-          allowed_tools: "Bash(zig:*),Bash(./check.sh:*)"
+          claude_args: '--allowedTools "Bash(zig:*)" "Bash(./check.sh:*)"'
 
