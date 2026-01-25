@@ -10,7 +10,7 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 - Server-Sent Events (SSE) for streaming responses
 - WebSocket support (RFC 6455)
 - Request/keepalive timeouts via coroutine auto-cancellation
-- HTTP client with connection pooling
+- HTTP/HTTPS client with connection pooling
 
 ## Server Example
 
