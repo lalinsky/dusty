@@ -584,6 +584,7 @@ pub const Client = struct {
             .uri = uri,
             .host = host,
             .port = port,
+            .protocol = protocol,
             .headers = options.headers,
             .body = options.body,
             .decompress = options.decompress,
@@ -650,6 +651,7 @@ const WriteRequestOptions = struct {
     uri: Uri,
     host: []const u8,
     port: u16,
+    protocol: Protocol,
     headers: ?*const Headers = null,
     body: ?[]const u8 = null,
     decompress: bool = true,
@@ -665,7 +667,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     }
 
     // Host header
-    if (opts.port == 80 or opts.port == 443) {
+    if ((opts.protocol == .http and opts.port == 80) or (opts.protocol == .https and opts.port == 443)) {
         try writer.print("Host: {s}\r\n", .{opts.host});
     } else {
         try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
