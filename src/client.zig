@@ -14,6 +14,25 @@ const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
 const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
+/// Protocol type for HTTP/HTTPS connections.
+pub const Protocol = enum {
+    http,
+    https,
+
+    pub fn defaultPort(self: Protocol) u16 {
+        return switch (self) {
+            .http => 80,
+            .https => 443,
+        };
+    }
+
+    pub fn fromScheme(scheme: []const u8) error{UnsupportedScheme}!Protocol {
+        if (std.mem.eql(u8, scheme, "http")) return .http;
+        if (std.mem.eql(u8, scheme, "https")) return .https;
+        return error.UnsupportedScheme;
+    }
+};
+
 /// Configuration for the HTTP client.
 pub const ClientConfig = struct {
     /// Maximum number of redirects to follow (0 = disabled).
@@ -24,6 +43,8 @@ pub const ClientConfig = struct {
     max_idle_connections: u8 = 8,
     /// Buffer size (bytes) for reading response headers.
     buffer_size: usize = 4096,
+    /// Use system CA bundle for HTTPS connections.
+    use_system_ca_bundle: bool = true,
 };
 
 /// Options for a single fetch request.
@@ -42,12 +63,11 @@ fn parseUrl(url: []const u8) !Uri {
     return Uri.parse(url) catch return error.InvalidUrl;
 }
 
-/// Get port from URI, defaulting based on scheme.
-fn uriPort(uri: Uri) error{UnsupportedScheme}!u16 {
-    if (uri.port) |p| return p;
-    if (std.mem.eql(u8, uri.scheme, "http")) return 80;
-    if (std.mem.eql(u8, uri.scheme, "https")) return 443;
-    return error.UnsupportedScheme;
+/// Get port and protocol from URI.
+fn uriPortAndProtocol(uri: Uri) error{UnsupportedScheme}!struct { port: u16, protocol: Protocol } {
+    const protocol = try Protocol.fromScheme(uri.scheme);
+    const port = uri.port orelse protocol.defaultPort();
+    return .{ .port = port, .protocol = protocol };
 }
 
 /// Get host string from URI.
@@ -87,8 +107,8 @@ pub const ConnectionPool = struct {
         }
     }
 
-    /// Try to acquire an existing connection for the given host:port.
-    pub fn acquire(self: *ConnectionPool, io: *zio.Runtime, remote_host: []const u8, remote_port: u16) ?*Connection {
+    /// Try to acquire an existing connection for the given host:port and protocol.
+    pub fn acquire(self: *ConnectionPool, io: *zio.Runtime, remote_host: []const u8, remote_port: u16, protocol: Protocol) ?*Connection {
         const now = io.now();
 
         // Search from end (most recently used)
@@ -97,7 +117,7 @@ pub const ConnectionPool = struct {
             const conn: *Connection = @fieldParentPtr("pool_node", n);
             node = n.prev;
 
-            if (conn.matches(remote_host, remote_port)) {
+            if (conn.matches(remote_host, remote_port, protocol)) {
                 // Check if connection has expired due to idle timeout
                 if (conn.idle_deadline) |deadline| {
                     if (now >= deadline) {
@@ -151,12 +171,27 @@ pub const Connection = struct {
     arena: std.heap.ArenaAllocator,
     parser: ResponseParser,
     parsed_response: ParsedResponse,
-    write_buffer: [4096]u8,
-    reader: zio.net.Stream.Reader,
-    writer: zio.net.Stream.Writer,
     io: *zio.Runtime,
     buffer_size: usize,
     pool: *ConnectionPool,
+
+    // Protocol and TLS
+    protocol: Protocol,
+    tcp_reader: zio.net.Stream.Reader,
+    tcp_writer: zio.net.Stream.Writer,
+
+    // TLS TCP layer buffers (allocated from main allocator, persist across requests)
+    tls_tcp_read_buffer: []u8,
+    tls_tcp_write_buffer: []u8,
+    tls_client: ?std.crypto.tls.Client,
+
+    // HTTP layer buffers (allocated from main allocator, persist across requests)
+    read_buffer: []u8,
+    write_buffer: []u8,
+
+    // Pointers to the actual reader/writer interfaces used for HTTP I/O
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
 
     // Connection pool metadata
     pool_node: std.DoublyLinkedList.Node = .{},
@@ -171,7 +206,18 @@ pub const Connection = struct {
     idle_deadline: ?u64 = null, // milliseconds from rt.now()
 
     /// Initialize the connection in place (required because parser stores internal pointers).
-    pub fn init(self: *Connection, allocator: std.mem.Allocator, io: *zio.Runtime, pool: *ConnectionPool, stream: zio.net.Stream, remote_host: []const u8, remote_port: u16, buffer_size: usize) !void {
+    pub fn init(
+        self: *Connection,
+        allocator: std.mem.Allocator,
+        io: *zio.Runtime,
+        pool: *ConnectionPool,
+        stream: zio.net.Stream,
+        remote_host: []const u8,
+        remote_port: u16,
+        buffer_size: usize,
+        protocol: Protocol,
+        ca_bundle: ?*const std.crypto.Certificate.Bundle,
+    ) !void {
         self.allocator = allocator;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
@@ -193,23 +239,68 @@ pub const Connection = struct {
 
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.init(&self.parsed_response);
-        self.reader = stream.reader(io, &.{});
-        self.writer = stream.writer(io, &self.write_buffer);
 
-        // Allocate initial read buffer from arena
-        try self.allocReadBuffer();
-    }
+        // Protocol and TLS initialization
+        self.protocol = protocol;
 
-    /// Allocate read buffer from arena for parsing response headers.
-    fn allocReadBuffer(self: *Connection) !void {
-        const read_buffer = try self.arena.allocator().alloc(u8, self.buffer_size + 1024);
-        self.reader.interface.buffer = read_buffer;
-        self.reader.interface.seek = 0;
-        self.reader.interface.end = 0;
+        if (protocol == .https) {
+            const bundle = ca_bundle orelse return error.MissingCaBundle;
+
+            const tls_buffer_size = std.crypto.tls.Client.min_buffer_len;
+
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + tls_buffer_size + 1024);
+            errdefer allocator.free(self.read_buffer);
+            self.write_buffer = try allocator.alloc(u8, tls_buffer_size + 1024);
+            errdefer allocator.free(self.write_buffer);
+
+            self.tls_tcp_read_buffer = try allocator.alloc(u8, tls_buffer_size);
+            errdefer allocator.free(self.tls_tcp_read_buffer);
+            self.tls_tcp_write_buffer = try allocator.alloc(u8, tls_buffer_size);
+            errdefer allocator.free(self.tls_tcp_write_buffer);
+
+            self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
+            self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
+
+            self.tls_client = std.crypto.tls.Client.init(
+                &self.tcp_reader.interface,
+                &self.tcp_writer.interface,
+                .{
+                    .host = .{ .explicit = remote_host },
+                    .ca = .{ .bundle = bundle.* },
+                    .read_buffer = self.read_buffer,
+                    .write_buffer = self.write_buffer,
+                    .allow_truncation_attacks = true,
+                },
+            ) catch return error.TlsInitializationFailed;
+
+            self.reader = &self.tls_client.?.reader;
+            self.writer = &self.tls_client.?.writer;
+        } else {
+            self.tls_client = null;
+            self.tls_tcp_read_buffer = &.{};
+            self.tls_tcp_write_buffer = &.{};
+
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + 1024);
+            errdefer allocator.free(self.read_buffer);
+            self.write_buffer = try allocator.alloc(u8, 1024);
+            errdefer allocator.free(self.write_buffer);
+
+            self.tcp_reader = stream.reader(io, self.read_buffer);
+            self.tcp_writer = stream.writer(io, self.write_buffer);
+
+            self.reader = &self.tcp_reader.interface;
+            self.writer = &self.tcp_writer.interface;
+        }
     }
 
     pub fn deinit(self: *Connection) void {
         self.stream.close(self.io);
+        if (self.protocol == .https) {
+            self.allocator.free(self.tls_tcp_read_buffer);
+            self.allocator.free(self.tls_tcp_write_buffer);
+        }
+        self.allocator.free(self.read_buffer);
+        self.allocator.free(self.write_buffer);
         self.arena.deinit();
     }
 
@@ -221,17 +312,21 @@ pub const Connection = struct {
         self.parser.init(&self.parsed_response);
         self.closing = false;
 
-        // Allocate fresh read buffer after arena reset (can't fail - capacity retained)
-        self.allocReadBuffer() catch unreachable;
+        // As part of reading body, we shrank the buffer
+        const buffered = self.reader.buffered();
+        @memmove(self.read_buffer[0..buffered.len], buffered);
+        self.reader.buffer = self.read_buffer;
+        self.reader.seek = 0;
+        self.reader.end = buffered.len;
     }
 
     pub fn host(self: *const Connection) []const u8 {
         return self.host_buffer[0..self.host_len];
     }
 
-    /// Check if this connection matches the given host and port.
-    pub fn matches(self: *const Connection, match_host: []const u8, match_port: u16) bool {
-        return self.port == match_port and std.ascii.eqlIgnoreCase(self.host(), match_host);
+    /// Check if this connection matches the given host, port, and protocol.
+    pub fn matches(self: *const Connection, match_host: []const u8, match_port: u16, protocol: Protocol) bool {
+        return self.protocol == protocol and self.port == match_port and std.ascii.eqlIgnoreCase(self.host(), match_host);
     }
 
     /// Release this connection back to its pool, handling keep-alive logic.
@@ -387,17 +482,42 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     config: ClientConfig,
     pool: ConnectionPool,
+    ca_bundle: std.crypto.Certificate.Bundle,
+    ca_bundle_mutex: std.Thread.Mutex,
+    ca_bundle_initialized: bool,
 
     pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Client {
         return .{
             .allocator = allocator,
             .config = config,
             .pool = ConnectionPool.init(allocator, config.max_idle_connections),
+            .ca_bundle = .{},
+            .ca_bundle_mutex = .{},
+            .ca_bundle_initialized = false,
         };
     }
 
     pub fn deinit(self: *Client) void {
         self.pool.deinit();
+        if (self.ca_bundle_initialized) {
+            self.ca_bundle.deinit(self.allocator);
+        }
+    }
+
+    fn ensureCaBundleInitialized(self: *Client) !void {
+        if (@atomicLoad(bool, &self.ca_bundle_initialized, .acquire)) {
+            return;
+        }
+
+        self.ca_bundle_mutex.lock();
+        defer self.ca_bundle_mutex.unlock();
+
+        if (self.ca_bundle_initialized) {
+            return;
+        }
+
+        try self.ca_bundle.rescan(self.allocator);
+        @atomicStore(bool, &self.ca_bundle_initialized, true, .release);
     }
 
     /// Perform an HTTP request.
@@ -408,48 +528,78 @@ pub const Client = struct {
         options: FetchOptions,
     ) !ClientResponse {
         const uri = try parseUrl(url);
+        const info = try uriPortAndProtocol(uri);
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
-        return self.fetchInternal(io, uri, options, max_redirects);
+        return self.fetchInternal(io, uri, info.port, info.protocol, options, max_redirects);
     }
 
     fn fetchInternal(
         self: *Client,
         io: *zio.Runtime,
         uri: Uri,
+        port: u16,
+        protocol: Protocol,
         options: FetchOptions,
         redirects_remaining: u8,
     ) !ClientResponse {
         var host_buffer: [Uri.host_name_max]u8 = undefined;
         const host = try uriHost(uri, &host_buffer);
-        const port = try uriPort(uri);
+
+        // Initialize CA bundle for HTTPS
+        const ca_bundle: ?*const std.crypto.Certificate.Bundle = if (protocol == .https) blk: {
+            if (!self.config.use_system_ca_bundle) {
+                return error.TlsNotConfigured;
+            }
+            try self.ensureCaBundleInitialized();
+            break :blk &self.ca_bundle;
+        } else null;
 
         // Try to get a connection from the pool
-        const conn = self.pool.acquire(io, host, port) orelse blk: {
+        const conn = self.pool.acquire(io, host, port, protocol) orelse blk: {
             // No pooled connection, create a new one
             const stream = try zio.net.tcpConnectToHost(io, host, port);
             errdefer stream.close(io);
 
             const new_conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(new_conn);
-            try new_conn.init(self.allocator, io, &self.pool, stream, host, port, self.config.buffer_size);
+            try new_conn.init(
+                self.allocator,
+                io,
+                &self.pool,
+                stream,
+                host,
+                port,
+                self.config.buffer_size,
+                protocol,
+                ca_bundle,
+            );
 
             break :blk new_conn;
         };
         errdefer self.pool.release(conn);
 
         // Send request
-        try writeRequest(&conn.writer.interface, .{
+        try writeRequest(conn.writer, .{
             .method = options.method,
             .uri = uri,
             .host = host,
             .port = port,
+            .protocol = protocol,
             .headers = options.headers,
             .body = options.body,
             .decompress = options.decompress,
         });
 
+        // For HTTPS, flush the TCP writer to send encrypted data over network
+        if (protocol == .https) {
+            try conn.tcp_writer.interface.flush();
+        }
+
         // Parse response headers
-        try parseResponseHeaders(&conn.reader.interface, &conn.parser);
+        parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
+            error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+            else => |e| return e,
+        };
 
         // Check for unsupported content encoding
         if (options.decompress and conn.parsed_response.content_encoding == .unknown) {
@@ -466,6 +616,7 @@ pub const Client = struct {
                 @memcpy(resolve_buf[0..location.len], location);
                 var aux_buf: []u8 = resolve_buf[0..];
                 const redirect_uri = Uri.resolveInPlace(uri, location.len, &aux_buf) catch return error.InvalidUrl;
+                const redirect_info = try uriPortAndProtocol(redirect_uri);
 
                 // Release current connection back to pool
                 conn.closing = !conn.parser.shouldKeepAlive();
@@ -478,7 +629,7 @@ pub const Client = struct {
                     redirect_options.body = null;
                 }
 
-                return self.fetchInternal(io, redirect_uri, redirect_options, redirects_remaining - 1);
+                return self.fetchInternal(io, redirect_uri, redirect_info.port, redirect_info.protocol, redirect_options, redirects_remaining - 1);
             }
         }
 
@@ -486,7 +637,7 @@ pub const Client = struct {
         return ClientResponse{
             .arena = conn.arena.allocator(),
             .parser = &conn.parser,
-            .conn = &conn.reader.interface,
+            .conn = conn.reader,
             .parsed = &conn.parsed_response,
             .max_response_size = self.config.max_response_size,
             .decompress = options.decompress,
@@ -500,6 +651,7 @@ const WriteRequestOptions = struct {
     uri: Uri,
     host: []const u8,
     port: u16,
+    protocol: Protocol,
     headers: ?*const Headers = null,
     body: ?[]const u8 = null,
     decompress: bool = true,
@@ -515,7 +667,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     }
 
     // Host header
-    if (opts.port == 80) {
+    if ((opts.protocol == .http and opts.port == 80) or (opts.protocol == .https and opts.port == 443)) {
         try writer.print("Host: {s}\r\n", .{opts.host});
     } else {
         try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
@@ -579,7 +731,7 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
                 if (parsed_len == 0) return error.EndOfStream;
                 return error.IncompleteResponse;
             },
-            else => return err,
+            else => |e| return e,
         };
     }
     reader.toss(parsed_len);
@@ -607,7 +759,9 @@ test "parseUrl: basic URL" {
     var host_buf: [Uri.host_name_max]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
-    try std.testing.expectEqual(80, try uriPort(uri));
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(80, info.port);
+    try std.testing.expectEqual(Protocol.http, info.protocol);
     try std.testing.expectEqualStrings("/path", uriPath(uri));
 }
 
@@ -616,7 +770,9 @@ test "parseUrl: URL with port" {
     var host_buf: [Uri.host_name_max]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
-    try std.testing.expectEqual(8080, try uriPort(uri));
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(8080, info.port);
+    try std.testing.expectEqual(Protocol.http, info.protocol);
     try std.testing.expectEqualStrings("/path", uriPath(uri));
 }
 
@@ -625,7 +781,9 @@ test "parseUrl: URL without path" {
     var host_buf: [Uri.host_name_max]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
-    try std.testing.expectEqual(80, try uriPort(uri));
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(80, info.port);
+    try std.testing.expectEqual(Protocol.http, info.protocol);
     try std.testing.expectEqualStrings("/", uriPath(uri));
 }
 
@@ -635,12 +793,14 @@ test "parseUrl: URL without scheme is invalid" {
 
 test "parseUrl: HTTPS returns port 443" {
     const uri = try parseUrl("https://example.com/path");
-    try std.testing.expectEqual(443, try uriPort(uri));
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(443, info.port);
+    try std.testing.expectEqual(Protocol.https, info.protocol);
 }
 
 test "parseUrl: unknown scheme returns UnsupportedScheme" {
     const uri = try parseUrl("ftp://example.com/path");
-    try std.testing.expectError(error.UnsupportedScheme, uriPort(uri));
+    try std.testing.expectError(error.UnsupportedScheme, uriPortAndProtocol(uri));
 }
 
 test "parseUrl: URL with query string" {
@@ -892,4 +1052,33 @@ test "ClientResponse.body: gzip decompression disabled" {
     const body = try response.body();
     try std.testing.expectEqual(25, body.?.len);
     try std.testing.expectEqualStrings(gzip_hello, body.?);
+}
+
+test "Protocol.fromScheme: http" {
+    const proto = try Protocol.fromScheme("http");
+    try std.testing.expectEqual(Protocol.http, proto);
+}
+
+test "Protocol.fromScheme: https" {
+    const proto = try Protocol.fromScheme("https");
+    try std.testing.expectEqual(Protocol.https, proto);
+}
+
+test "Protocol.fromScheme: unsupported scheme" {
+    try std.testing.expectError(error.UnsupportedScheme, Protocol.fromScheme("ftp"));
+}
+
+test "Protocol.defaultPort: http" {
+    try std.testing.expectEqual(80, Protocol.http.defaultPort());
+}
+
+test "Protocol.defaultPort: https" {
+    try std.testing.expectEqual(443, Protocol.https.defaultPort());
+}
+
+test "uriPortAndProtocol: https default" {
+    const uri = try parseUrl("https://example.com/path");
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(443, info.port);
+    try std.testing.expectEqual(Protocol.https, info.protocol);
 }
