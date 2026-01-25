@@ -55,5 +55,5 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           # Allow Claude to run zig commands and check.sh
-          claude_args: '--allowedTools "Bash(zig:*)" "Bash(./check.sh:*)"'
+          claude_args: '--allowed-tools "Bash(zig:*)" "Bash(./check.sh:*)"'
 
