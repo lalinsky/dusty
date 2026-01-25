@@ -595,7 +595,10 @@ pub const Client = struct {
         }
 
         // Parse response headers
-        try parseResponseHeaders(conn.reader, &conn.parser);
+        parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
+            error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+            else => |e| return e,
+        };
 
         // Check for unsupported content encoding
         if (options.decompress and conn.parsed_response.content_encoding == .unknown) {
@@ -726,7 +729,7 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
                 if (parsed_len == 0) return error.EndOfStream;
                 return error.IncompleteResponse;
             },
-            else => return err,
+            else => |e| return e,
         };
     }
     reader.toss(parsed_len);
