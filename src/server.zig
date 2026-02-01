@@ -103,7 +103,7 @@ pub fn Server(comptime Ctx: type) type {
                             const remaining = self.active_connections.load(.acquire);
                             if (remaining == 0) break;
                             log.info("Waiting for {} remaining connections to close", .{remaining});
-                            try self.last_connection_closed.timedWait(io, 100 * std.time.ns_per_ms);
+                            try self.last_connection_closed.timedWait(io, .fromMilliseconds(100));
                         }
                         return err;
                     }
@@ -157,7 +157,7 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
-            var timeout = zio.Timeout.init;
+            var timeout = zio.AutoCancel.init;
 
             // Allocate initial buffer from arena
             reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
@@ -170,7 +170,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 defer timeout.clear(io);
                 if (self.config.timeout.request) |timeout_ms| {
-                    timeout.set(io, timeout_ms * std.time.ns_per_ms);
+                    timeout.set(io, .fromMilliseconds(timeout_ms));
                 }
 
                 // TODO: handle error.Canceled caused by timeout and return 504
@@ -248,7 +248,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 // Activate keepalive timeout
                 if (self.config.timeout.keepalive) |timeout_ms| {
-                    timeout.set(io, timeout_ms * std.time.ns_per_ms);
+                    timeout.set(io, .fromMilliseconds(timeout_ms));
                 }
 
                 // Fill some data here, while the the keepalive timeout is active

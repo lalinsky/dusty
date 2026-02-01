@@ -10,10 +10,10 @@ test "Client: simple GET request" {
 
             server.router.get("/test", handleGet);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server }, .{});
+            var server_task = try io.spawn(serverFn, .{ io, &server });
             defer server_task.cancel(io);
 
-            var client_task = try io.spawn(clientFn, .{ io, &server }, .{});
+            var client_task = try io.spawn(clientFn, .{ io, &server });
             defer client_task.cancel(io);
 
             try client_task.join(io);
@@ -28,7 +28,7 @@ test "Client: simple GET request" {
             try server.ready.wait(io);
 
             // Connect directly like server_test.zig does
-            const stream = try server.address.connect(io);
+            const stream = try server.address.connect(io, .{});
             defer stream.close(io);
             defer stream.shutdown(io, .both) catch {};
 
@@ -57,7 +57,7 @@ test "Client: simple GET request" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{io}, .{});
+    var task = try io.spawn(Test.mainFn, .{io});
     try task.join(io);
 }
 
@@ -69,10 +69,10 @@ test "Client: fetch GET request" {
 
             server.router.get("/api", handleGet);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server }, .{});
+            var server_task = try io.spawn(serverFn, .{ io, &server });
             defer server_task.cancel(io);
 
-            var client_task = try io.spawn(clientFn, .{ io, &server }, .{});
+            var client_task = try io.spawn(clientFn, .{ io, &server });
             defer client_task.cancel(io);
 
             try client_task.join(io);
@@ -121,7 +121,7 @@ test "Client: fetch GET request" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{io}, .{});
+    var task = try io.spawn(Test.mainFn, .{io});
     try task.join(io);
 }
 
@@ -133,10 +133,10 @@ test "Client: connection pooling" {
 
             server.router.get("/test", handleGet);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server }, .{});
+            var server_task = try io.spawn(serverFn, .{ io, &server });
             defer server_task.cancel(io);
 
-            var client_task = try io.spawn(clientFn, .{ io, &server }, .{});
+            var client_task = try io.spawn(clientFn, .{ io, &server });
             defer client_task.cancel(io);
 
             try client_task.join(io);
@@ -195,6 +195,6 @@ test "Client: connection pooling" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{io}, .{});
+    var task = try io.spawn(Test.mainFn, .{io});
     try task.join(io);
 }

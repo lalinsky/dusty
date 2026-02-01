@@ -33,7 +33,7 @@ fn handleEvents(ctx: *AppContext, _: *http.Request, res: *http.Response) !void {
 fn ticker(io: *zio.Runtime, channel: *BroadcastChannel(u64)) !void {
     var count: u64 = 0;
     while (true) {
-        try io.sleep(1000);
+        try io.sleep(.fromMilliseconds(1000));
         count += 1;
 
         channel.send(count) catch |err| switch (err) {
@@ -55,7 +55,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
 
-    var ticker_task = try io.spawn(ticker, .{ io, &channel }, .{});
+    var ticker_task = try io.spawn(ticker, .{ io, &channel });
     defer ticker_task.cancel(io);
 
     try server.listen(io, addr);
@@ -69,6 +69,6 @@ pub fn main() !void {
     var io = try zio.Runtime.init(allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(runServer, .{ allocator, io }, .{});
+    var task = try io.spawn(runServer, .{ allocator, io });
     try task.join(io);
 }

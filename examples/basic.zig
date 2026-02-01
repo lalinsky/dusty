@@ -23,7 +23,7 @@ const AppContext = struct {
 
 fn handleSlow(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     _ = req;
-    try ctx.io.sleep(10);
+    try ctx.io.sleep(.fromMilliseconds(10));
     res.body = "Hello World!\n";
 }
 
@@ -176,7 +176,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
 
-    var task = try io.spawn(AppServer.listen, .{ &server, io, addr }, .{});
+    var task = try io.spawn(AppServer.listen, .{ &server, io, addr });
     defer task.cancel(io);
 
     const result = try zio.select(io, .{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
@@ -199,6 +199,6 @@ pub fn main() !void {
     var io = try zio.Runtime.init(allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(runServer, .{ allocator, io }, .{});
+    var task = try io.spawn(runServer, .{ allocator, io });
     try task.join(io);
 }

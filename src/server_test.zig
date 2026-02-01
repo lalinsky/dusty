@@ -12,10 +12,10 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
 
             try test_ctx.setup(&server);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server }, .{});
+            var server_task = try io.spawn(serverFn, .{ io, &server });
             defer server_task.cancel(io);
 
-            var client_task = try io.spawn(clientFn, .{ io, &server, test_ctx }, .{});
+            var client_task = try io.spawn(clientFn, .{ io, &server, test_ctx });
             defer client_task.cancel(io);
 
             try client_task.join(io);
@@ -29,7 +29,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
         pub fn clientFn(io: *zio.Runtime, server: *TestServer, test_ctx: *Ctx) !void {
             try server.ready.wait(io);
 
-            const client = try server.address.connect(io);
+            const client = try server.address.connect(io, .{});
             defer client.close(io);
             defer client.shutdown(io, .both) catch {};
 
@@ -50,7 +50,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{ io, ctx }, .{});
+    var task = try io.spawn(Test.mainFn, .{ io, ctx });
     try task.join(io);
 }
 
@@ -307,10 +307,10 @@ test "Server: WebSocket echo" {
 
             try ctx.setup(&server);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server }, .{});
+            var server_task = try io.spawn(serverFn, .{ io, &server });
             defer server_task.cancel(io);
 
-            var client_task = try io.spawn(clientFn, .{ io, &server }, .{});
+            var client_task = try io.spawn(clientFn, .{ io, &server });
             defer client_task.cancel(io);
 
             try client_task.join(io);
@@ -324,7 +324,7 @@ test "Server: WebSocket echo" {
         pub fn clientFn(io: *zio.Runtime, server: *dusty.Server(TestContext)) !void {
             try server.ready.wait(io);
 
-            const client = try server.address.connect(io);
+            const client = try server.address.connect(io, .{});
             defer client.close(io);
             defer client.shutdown(io, .both) catch {};
 
@@ -429,7 +429,7 @@ test "Server: WebSocket echo" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{ io, &ctx }, .{});
+    var task = try io.spawn(Test.mainFn, .{ io, &ctx });
     try task.join(io);
 
     try std.testing.expect(ctx.ws_upgraded);
@@ -446,10 +446,10 @@ test "Server: void context handlers" {
             server.router.get("/test", handleGet);
             server.router.post("/echo", handlePost);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server }, .{});
+            var server_task = try io.spawn(serverFn, .{ io, &server });
             defer server_task.cancel(io);
 
-            var client_task = try io.spawn(clientFn, .{ io, &server }, .{});
+            var client_task = try io.spawn(clientFn, .{ io, &server });
             defer client_task.cancel(io);
 
             try client_task.join(io);
@@ -463,7 +463,7 @@ test "Server: void context handlers" {
         pub fn clientFn(io: *zio.Runtime, server: *dusty.Server(void)) !void {
             try server.ready.wait(io);
 
-            const client = try server.address.connect(io);
+            const client = try server.address.connect(io, .{});
             defer client.close(io);
             defer client.shutdown(io, .both) catch {};
 
@@ -499,6 +499,6 @@ test "Server: void context handlers" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{io}, .{});
+    var task = try io.spawn(Test.mainFn, .{io});
     try task.join(io);
 }

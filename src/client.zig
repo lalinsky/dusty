@@ -120,7 +120,7 @@ pub const ConnectionPool = struct {
             if (conn.matches(remote_host, remote_port, protocol)) {
                 // Check if connection has expired due to idle timeout
                 if (conn.idle_deadline) |deadline| {
-                    if (now >= deadline) {
+                    if (now.value >= deadline.value) {
                         // Connection expired, remove and close it
                         self.idle.remove(n);
                         self.idle_len -= 1;
@@ -203,7 +203,7 @@ pub const Connection = struct {
     // Keep-Alive tracking
     request_count: u16 = 0,
     keep_alive: KeepAliveParams = .{},
-    idle_deadline: ?u64 = null, // milliseconds from rt.now()
+    idle_deadline: ?zio.Timestamp = null,
 
     /// Initialize the connection in place (required because parser stores internal pointers).
     pub fn init(
@@ -347,7 +347,7 @@ pub const Connection = struct {
 
             // Update idle deadline after each request
             if (self.keep_alive.timeout) |timeout| {
-                self.idle_deadline = self.io.now() + @as(u64, timeout) * 1000;
+                self.idle_deadline = self.io.now().addDuration(.fromMilliseconds(timeout));
             }
 
             // Check if we've reached max requests
@@ -557,7 +557,7 @@ pub const Client = struct {
         // Try to get a connection from the pool
         const conn = self.pool.acquire(io, host, port, protocol) orelse blk: {
             // No pooled connection, create a new one
-            const stream = try zio.net.tcpConnectToHost(io, host, port);
+            const stream = try zio.net.tcpConnectToHost(io, host, port, .{});
             errdefer stream.close(io);
 
             const new_conn = try self.allocator.create(Connection);

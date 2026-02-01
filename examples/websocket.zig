@@ -94,6 +94,6 @@ pub fn main() !void {
     var io = try zio.Runtime.init(allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(runServer, .{ allocator, io }, .{});
+    var task = try io.spawn(runServer, .{ allocator, io });
     try task.join(io);
 }
