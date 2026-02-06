@@ -38,7 +38,7 @@ pub fn main() !void {
     server.router.get("/user/:id", handleUser);
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
-    try server.listen(rt, addr);
+    try server.listen(addr);
 }
 ```
 
@@ -60,7 +60,7 @@ pub fn main() !void {
     var client = http.Client.init(allocator, .{});
     defer client.deinit();
 
-    var response = try client.fetch(rt, "http://httpbin.org/get", .{});
+    var response = try client.fetch("http://httpbin.org/get", .{});
     defer response.deinit();
 
     std.debug.print("Status: {t}\n", .{response.status()});

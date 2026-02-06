@@ -83,7 +83,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
 
     std.log.info("WebSocket echo server running at http://127.0.0.1:8080", .{});
-    try server.listen(io, addr);
+    try server.listen(addr);
 }
 
 pub fn main() !void {
@@ -94,6 +94,6 @@ pub fn main() !void {
     var io = try zio.Runtime.init(allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(runServer, .{ allocator, io });
-    try task.join(io);
+    var task = try zio.spawn(runServer, .{ allocator, io });
+    try task.join();
 }

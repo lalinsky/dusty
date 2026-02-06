@@ -79,9 +79,9 @@ pub fn Server(comptime Ctx: type) type {
             return mw;
         }
 
-        pub fn listen(self: *Self, io: *zio.Runtime, addr: zio.net.IpAddress) !void {
-            const server = try addr.listen(io, .{ .reuse_address = true });
-            defer server.close(io);
+        pub fn listen(self: *Self, addr: zio.net.IpAddress) !void {
+            const server = try addr.listen(.{ .reuse_address = true });
+            defer server.close();
 
             self.address = server.socket.address;
             self.ready.set();
@@ -91,11 +91,11 @@ pub fn Server(comptime Ctx: type) type {
             var group: zio.Group = .init;
             defer {
                 self.shutting_down.store(true, .release);
-                group.cancel(io);
+                group.cancel();
             }
 
             while (true) {
-                const stream = server.accept(io) catch |err| {
+                const stream = server.accept() catch |err| {
                     if (err == error.Canceled) {
                         log.info("Graceful shutdown requested", .{});
                         self.shutting_down.store(true, .release);
@@ -103,7 +103,7 @@ pub fn Server(comptime Ctx: type) type {
                             const remaining = self.active_connections.load(.acquire);
                             if (remaining == 0) break;
                             log.info("Waiting for {} remaining connections to close", .{remaining});
-                            try self.last_connection_closed.timedWait(io, .fromMilliseconds(100));
+                            try self.last_connection_closed.timedWait(.fromMilliseconds(100));
                         }
                         return err;
                     }
@@ -111,15 +111,15 @@ pub fn Server(comptime Ctx: type) type {
                 };
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
-                group.spawn(io, handleConnection, .{ self, io, stream }) catch |err| {
+                group.spawn(handleConnection, .{ self, stream }) catch |err| {
                     log.err("Failed to accept connection: {}", .{err});
                     _ = self.active_connections.fetchSub(1, .acq_rel);
-                    stream.close(io);
+                    stream.close();
                 };
             }
         }
 
-        pub fn handleConnection(self: *Self, io: *zio.Runtime, stream: zio.net.Stream) !void {
+        pub fn handleConnection(self: *Self, stream: zio.net.Stream) !void {
             defer {
                 const v = self.active_connections.fetchSub(1, .acq_rel);
                 if (v == 1) {
@@ -127,17 +127,17 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
-            defer stream.close(io);
+            defer stream.close();
 
             var needs_shutdown = true;
-            defer if (needs_shutdown) stream.shutdown(io, .both) catch |err| {
+            defer if (needs_shutdown) stream.shutdown(.both) catch |err| {
                 log.warn("Failed to shutdown client connection: {}", .{err});
             };
 
-            var reader = stream.reader(io, &.{});
+            var reader = stream.reader(&.{});
 
             var write_buffer: [4096]u8 = undefined;
-            var writer = stream.writer(io, &write_buffer);
+            var writer = stream.writer(&write_buffer);
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -168,9 +168,9 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 request_count += 1;
 
-                defer timeout.clear(io);
+                defer timeout.clear();
                 if (self.config.timeout.request) |timeout_ms| {
-                    timeout.set(io, .fromMilliseconds(timeout_ms));
+                    timeout.set(.fromMilliseconds(timeout_ms));
                 }
 
                 // TODO: handle error.Canceled caused by timeout and return 504
@@ -248,7 +248,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 // Activate keepalive timeout
                 if (self.config.timeout.keepalive) |timeout_ms| {
-                    timeout.set(io, .fromMilliseconds(timeout_ms));
+                    timeout.set(.fromMilliseconds(timeout_ms));
                 }
 
                 // Fill some data here, while the the keepalive timeout is active

@@ -25,7 +25,7 @@ pub fn main() !void {
     var client = http.Client.init(allocator, .{});
     defer client.deinit();
 
-    var response = try client.fetch(rt, url, .{});
+    var response = try client.fetch(url, .{});
     defer response.deinit();
 
     std.debug.print("Status: {any}\n", .{response.status()});

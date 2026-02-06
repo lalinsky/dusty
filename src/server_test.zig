@@ -6,41 +6,41 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     const TestServer = dusty.Server(Ctx);
 
     const Test = struct {
-        pub fn mainFn(io: *zio.Runtime, test_ctx: *Ctx) !void {
+        pub fn mainFn(test_ctx: *Ctx) !void {
             var server = TestServer.init(std.testing.allocator, .{}, test_ctx);
             defer server.deinit();
 
             try test_ctx.setup(&server);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server });
-            defer server_task.cancel(io);
+            var server_task = try zio.spawn(serverFn, .{&server});
+            defer server_task.cancel();
 
-            var client_task = try io.spawn(clientFn, .{ io, &server, test_ctx });
-            defer client_task.cancel(io);
+            var client_task = try zio.spawn(clientFn, .{ &server, test_ctx });
+            defer client_task.cancel();
 
-            try client_task.join(io);
+            try client_task.join();
         }
 
-        pub fn serverFn(io: *zio.Runtime, server: *TestServer) !void {
+        pub fn serverFn(server: *TestServer) !void {
             const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
-            try server.listen(io, addr);
+            try server.listen(addr);
         }
 
-        pub fn clientFn(io: *zio.Runtime, server: *TestServer, test_ctx: *Ctx) !void {
-            try server.ready.wait(io);
+        pub fn clientFn(server: *TestServer, test_ctx: *Ctx) !void {
+            try server.ready.wait();
 
-            const client = try server.address.connect(io, .{});
-            defer client.close(io);
-            defer client.shutdown(io, .both) catch {};
+            const client = try server.address.connect(.{});
+            defer client.close();
+            defer client.shutdown(.both) catch {};
 
             var write_buf: [1024]u8 = undefined;
-            var writer = client.writer(io, &write_buf);
+            var writer = client.writer(&write_buf);
 
             try test_ctx.makeRequest(&writer.interface);
 
             // Read response
             var read_buf: [1024]u8 = undefined;
-            var reader = client.reader(io, &read_buf);
+            var reader = client.reader(&read_buf);
             const response = try reader.interface.takeDelimiterExclusive('\n');
 
             std.log.info("Response: {s}", .{response});
@@ -50,8 +50,8 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{ io, ctx });
-    try task.join(io);
+    var task = try zio.spawn(Test.mainFn, .{ctx});
+    try task.join();
 }
 
 test "Server: POST with body" {
@@ -301,39 +301,39 @@ test "Server: WebSocket echo" {
     };
 
     const Test = struct {
-        pub fn mainFn(io: *zio.Runtime, ctx: *TestContext) !void {
+        pub fn mainFn(ctx: *TestContext) !void {
             var server = dusty.Server(TestContext).init(std.testing.allocator, .{}, ctx);
             defer server.deinit();
 
             try ctx.setup(&server);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server });
-            defer server_task.cancel(io);
+            var server_task = try zio.spawn(serverFn, .{&server});
+            defer server_task.cancel();
 
-            var client_task = try io.spawn(clientFn, .{ io, &server });
-            defer client_task.cancel(io);
+            var client_task = try zio.spawn(clientFn, .{&server});
+            defer client_task.cancel();
 
-            try client_task.join(io);
+            try client_task.join();
         }
 
-        pub fn serverFn(io: *zio.Runtime, server: *dusty.Server(TestContext)) !void {
+        pub fn serverFn(server: *dusty.Server(TestContext)) !void {
             const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
-            try server.listen(io, addr);
+            try server.listen(addr);
         }
 
-        pub fn clientFn(io: *zio.Runtime, server: *dusty.Server(TestContext)) !void {
-            try server.ready.wait(io);
+        pub fn clientFn(server: *dusty.Server(TestContext)) !void {
+            try server.ready.wait();
 
-            const client = try server.address.connect(io, .{});
-            defer client.close(io);
-            defer client.shutdown(io, .both) catch {};
+            const client = try server.address.connect(.{});
+            defer client.close();
+            defer client.shutdown(.both) catch {};
 
             var write_buf: [1024]u8 = undefined;
-            var writer = client.writer(io, &write_buf);
+            var writer = client.writer(&write_buf);
             const w = &writer.interface;
 
             var read_buf: [1024]u8 = undefined;
-            var reader = client.reader(io, &read_buf);
+            var reader = client.reader(&read_buf);
             const r = &reader.interface;
 
             // Send WebSocket upgrade request
@@ -429,8 +429,8 @@ test "Server: WebSocket echo" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{ io, &ctx });
-    try task.join(io);
+    var task = try zio.spawn(Test.mainFn, .{&ctx});
+    try task.join();
 
     try std.testing.expect(ctx.ws_upgraded);
     try std.testing.expect(ctx.message_received);
@@ -439,36 +439,36 @@ test "Server: WebSocket echo" {
 
 test "Server: void context handlers" {
     const Test = struct {
-        pub fn mainFn(io: *zio.Runtime) !void {
+        pub fn mainFn() !void {
             var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
             defer server.deinit();
 
             server.router.get("/test", handleGet);
             server.router.post("/echo", handlePost);
 
-            var server_task = try io.spawn(serverFn, .{ io, &server });
-            defer server_task.cancel(io);
+            var server_task = try zio.spawn(serverFn, .{&server});
+            defer server_task.cancel();
 
-            var client_task = try io.spawn(clientFn, .{ io, &server });
-            defer client_task.cancel(io);
+            var client_task = try zio.spawn(clientFn, .{&server});
+            defer client_task.cancel();
 
-            try client_task.join(io);
+            try client_task.join();
         }
 
-        pub fn serverFn(io: *zio.Runtime, server: *dusty.Server(void)) !void {
+        pub fn serverFn(server: *dusty.Server(void)) !void {
             const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
-            try server.listen(io, addr);
+            try server.listen(addr);
         }
 
-        pub fn clientFn(io: *zio.Runtime, server: *dusty.Server(void)) !void {
-            try server.ready.wait(io);
+        pub fn clientFn(server: *dusty.Server(void)) !void {
+            try server.ready.wait();
 
-            const client = try server.address.connect(io, .{});
-            defer client.close(io);
-            defer client.shutdown(io, .both) catch {};
+            const client = try server.address.connect(.{});
+            defer client.close();
+            defer client.shutdown(.both) catch {};
 
             var write_buf: [1024]u8 = undefined;
-            var writer = client.writer(io, &write_buf);
+            var writer = client.writer(&write_buf);
 
             // Test GET request
             try writer.interface.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -476,7 +476,7 @@ test "Server: void context handlers" {
 
             // Read response - just verify we get something back
             var read_buf: [1024]u8 = undefined;
-            var reader = client.reader(io, &read_buf);
+            var reader = client.reader(&read_buf);
             const status_line = try reader.interface.takeDelimiterExclusive('\n');
 
             std.log.info("Response: {s}", .{status_line});
@@ -499,6 +499,6 @@ test "Server: void context handlers" {
     var io = try zio.Runtime.init(std.testing.allocator, .{});
     defer io.deinit();
 
-    var task = try io.spawn(Test.mainFn, .{io});
-    try task.join(io);
+    var task = try zio.spawn(Test.mainFn, .{});
+    try task.join();
 }

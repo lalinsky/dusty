@@ -108,8 +108,8 @@ pub const ConnectionPool = struct {
     }
 
     /// Try to acquire an existing connection for the given host:port and protocol.
-    pub fn acquire(self: *ConnectionPool, io: *zio.Runtime, remote_host: []const u8, remote_port: u16, protocol: Protocol) ?*Connection {
-        const now = io.now();
+    pub fn acquire(self: *ConnectionPool, remote_host: []const u8, remote_port: u16, protocol: Protocol) ?*Connection {
+        const now = zio.Timestamp.now(.monotonic);
 
         // Search from end (most recently used)
         var node = self.idle.last;
@@ -171,7 +171,6 @@ pub const Connection = struct {
     arena: std.heap.ArenaAllocator,
     parser: ResponseParser,
     parsed_response: ParsedResponse,
-    io: *zio.Runtime,
     buffer_size: usize,
     pool: *ConnectionPool,
 
@@ -209,7 +208,6 @@ pub const Connection = struct {
     pub fn init(
         self: *Connection,
         allocator: std.mem.Allocator,
-        io: *zio.Runtime,
         pool: *ConnectionPool,
         stream: zio.net.Stream,
         remote_host: []const u8,
@@ -221,7 +219,6 @@ pub const Connection = struct {
         self.allocator = allocator;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
-        self.io = io;
         self.pool = pool;
         self.closing = false;
         self.buffer_size = buffer_size;
@@ -258,8 +255,8 @@ pub const Connection = struct {
             self.tls_tcp_write_buffer = try allocator.alloc(u8, tls_buffer_size);
             errdefer allocator.free(self.tls_tcp_write_buffer);
 
-            self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
-            self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
+            self.tcp_reader = stream.reader(self.tls_tcp_read_buffer);
+            self.tcp_writer = stream.writer(self.tls_tcp_write_buffer);
 
             self.tls_client = std.crypto.tls.Client.init(
                 &self.tcp_reader.interface,
@@ -285,8 +282,8 @@ pub const Connection = struct {
             self.write_buffer = try allocator.alloc(u8, 1024);
             errdefer allocator.free(self.write_buffer);
 
-            self.tcp_reader = stream.reader(io, self.read_buffer);
-            self.tcp_writer = stream.writer(io, self.write_buffer);
+            self.tcp_reader = stream.reader(self.read_buffer);
+            self.tcp_writer = stream.writer(self.write_buffer);
 
             self.reader = &self.tcp_reader.interface;
             self.writer = &self.tcp_writer.interface;
@@ -294,7 +291,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        self.stream.close(self.io);
+        self.stream.close();
         if (self.protocol == .https) {
             self.allocator.free(self.tls_tcp_read_buffer);
             self.allocator.free(self.tls_tcp_write_buffer);
@@ -347,7 +344,7 @@ pub const Connection = struct {
 
             // Update idle deadline after each request
             if (self.keep_alive.timeout) |timeout| {
-                self.idle_deadline = self.io.now().addDuration(.fromMilliseconds(timeout));
+                self.idle_deadline = zio.Timestamp.now(.monotonic).addDuration(.fromMilliseconds(timeout));
             }
 
             // Check if we've reached max requests
@@ -523,19 +520,17 @@ pub const Client = struct {
     /// Perform an HTTP request.
     pub fn fetch(
         self: *Client,
-        io: *zio.Runtime,
         url: []const u8,
         options: FetchOptions,
     ) !ClientResponse {
         const uri = try parseUrl(url);
         const info = try uriPortAndProtocol(uri);
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
-        return self.fetchInternal(io, uri, info.port, info.protocol, options, max_redirects);
+        return self.fetchInternal(uri, info.port, info.protocol, options, max_redirects);
     }
 
     fn fetchInternal(
         self: *Client,
-        io: *zio.Runtime,
         uri: Uri,
         port: u16,
         protocol: Protocol,
@@ -555,16 +550,15 @@ pub const Client = struct {
         } else null;
 
         // Try to get a connection from the pool
-        const conn = self.pool.acquire(io, host, port, protocol) orelse blk: {
+        const conn = self.pool.acquire(host, port, protocol) orelse blk: {
             // No pooled connection, create a new one
-            const stream = try zio.net.tcpConnectToHost(io, host, port, .{});
-            errdefer stream.close(io);
+            const stream = try zio.net.tcpConnectToHost(host, port, .{});
+            errdefer stream.close();
 
             const new_conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(new_conn);
             try new_conn.init(
                 self.allocator,
-                io,
                 &self.pool,
                 stream,
                 host,
@@ -629,7 +623,7 @@ pub const Client = struct {
                     redirect_options.body = null;
                 }
 
-                return self.fetchInternal(io, redirect_uri, redirect_info.port, redirect_info.protocol, redirect_options, redirects_remaining - 1);
+                return self.fetchInternal(redirect_uri, redirect_info.port, redirect_info.protocol, redirect_options, redirects_remaining - 1);
             }
         }
 
