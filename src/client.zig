@@ -8,6 +8,8 @@ const Status = http.Status;
 const Headers = http.Headers;
 const ContentType = http.ContentType;
 
+const WebSocket = @import("websocket.zig").WebSocket;
+
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
 const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
@@ -27,8 +29,8 @@ pub const Protocol = enum {
     }
 
     pub fn fromScheme(scheme: []const u8) error{UnsupportedScheme}!Protocol {
-        if (std.mem.eql(u8, scheme, "http")) return .http;
-        if (std.mem.eql(u8, scheme, "https")) return .https;
+        if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "ws")) return .http;
+        if (std.mem.eql(u8, scheme, "https") or std.mem.eql(u8, scheme, "wss")) return .https;
         return error.UnsupportedScheme;
     }
 };
@@ -56,6 +58,39 @@ pub const FetchOptions = struct {
     max_redirects: ?u8 = null,
     /// Decompress response body automatically (sends Accept-Encoding header).
     decompress: bool = true,
+};
+
+/// Options for a WebSocket upgrade request.
+pub const WebSocketUpgradeOptions = struct {
+    headers: ?*const Headers = null,
+};
+
+/// A WebSocket connection established via client upgrade.
+pub const WebSocketClient = struct {
+    ws: WebSocket,
+    conn: *Connection,
+
+    pub fn send(self: *WebSocketClient, msg_type: WebSocket.MessageType, data: []const u8) !void {
+        try self.ws.send(msg_type, data);
+    }
+
+    pub fn receive(self: *WebSocketClient) !WebSocket.Message {
+        return self.ws.receive();
+    }
+
+    pub fn ping(self: *WebSocketClient, data: []const u8) !void {
+        try self.ws.ping(data);
+    }
+
+    pub fn close(self: *WebSocketClient, code: WebSocket.CloseCode, reason: []const u8) !void {
+        try self.ws.close(code, reason);
+    }
+
+    pub fn deinit(self: *WebSocketClient) void {
+        self.ws.deinit();
+        self.conn.deinit();
+        self.conn.pool.allocator.destroy(self.conn);
+    }
 };
 
 /// Parse a URL string into a std.Uri.
@@ -527,6 +562,121 @@ pub const Client = struct {
         const info = try uriPortAndProtocol(uri);
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
         return self.fetchInternal(uri, info.port, info.protocol, options, max_redirects);
+    }
+
+    /// Upgrade an HTTP connection to a WebSocket connection.
+    pub fn upgradeWebSocket(
+        self: *Client,
+        url: []const u8,
+        options: WebSocketUpgradeOptions,
+    ) !WebSocketClient {
+        const uri = try parseUrl(url);
+        const info = try uriPortAndProtocol(uri);
+        var host_buffer: [Uri.host_name_max]u8 = undefined;
+        const host = try uriHost(uri, &host_buffer);
+
+        // Initialize CA bundle for HTTPS
+        const ca_bundle: ?*const std.crypto.Certificate.Bundle = if (info.protocol == .https) blk: {
+            if (!self.config.use_system_ca_bundle) {
+                return error.TlsNotConfigured;
+            }
+            try self.ensureCaBundleInitialized();
+            break :blk &self.ca_bundle;
+        } else null;
+
+        // Acquire or create a connection
+        const conn = self.pool.acquire(host, info.port, info.protocol) orelse blk: {
+            const stream = try zio.net.tcpConnectToHost(host, info.port, .{});
+            errdefer stream.close();
+
+            const new_conn = try self.allocator.create(Connection);
+            errdefer self.allocator.destroy(new_conn);
+            try new_conn.init(
+                self.allocator,
+                &self.pool,
+                stream,
+                host,
+                info.port,
+                self.config.buffer_size,
+                info.protocol,
+                ca_bundle,
+            );
+            break :blk new_conn;
+        };
+        errdefer {
+            conn.deinit();
+            self.allocator.destroy(conn);
+        }
+
+        // Generate Sec-WebSocket-Key: 16 random bytes -> base64
+        var key_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&key_bytes);
+        var key_buf: [24]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&key_buf, &key_bytes);
+
+        // Write upgrade request
+        const path = uriPath(uri);
+        if (uri.query) |query| {
+            try conn.writer.print("GET {s}?{s} HTTP/1.1\r\n", .{ path, query.percent_encoded });
+        } else {
+            try conn.writer.print("GET {s} HTTP/1.1\r\n", .{path});
+        }
+
+        if ((info.protocol == .http and info.port == 80) or (info.protocol == .https and info.port == 443)) {
+            try conn.writer.print("Host: {s}\r\n", .{host});
+        } else {
+            try conn.writer.print("Host: {s}:{d}\r\n", .{ host, info.port });
+        }
+
+        try conn.writer.writeAll("Upgrade: websocket\r\n");
+        try conn.writer.writeAll("Connection: Upgrade\r\n");
+        try conn.writer.print("Sec-WebSocket-Key: {s}\r\n", .{&key_buf});
+        try conn.writer.writeAll("Sec-WebSocket-Version: 13\r\n");
+
+        // User-provided headers
+        if (options.headers) |h| {
+            var it = h.iterator();
+            while (it.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Upgrade")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Connection")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Sec-WebSocket-Key")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Sec-WebSocket-Version")) continue;
+                try conn.writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            }
+        }
+
+        try conn.writer.writeAll("\r\n");
+        try conn.writer.flush();
+
+        // For HTTPS, flush the TCP writer
+        if (info.protocol == .https) {
+            try conn.tcp_writer.interface.flush();
+        }
+
+        // Parse response headers
+        parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
+            error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+            else => |e| return e,
+        };
+
+        // Validate 101 Switching Protocols
+        if (conn.parsed_response.status != .switching_protocols) {
+            return error.WebSocketUpgradeFailed;
+        }
+
+        // Validate Sec-WebSocket-Accept
+        const accept = conn.parsed_response.headers.get("Sec-WebSocket-Accept") orelse
+            return error.WebSocketUpgradeFailed;
+        var expected_accept: [28]u8 = undefined;
+        WebSocket.computeAcceptKey(&key_buf, &expected_accept);
+        if (!std.mem.eql(u8, accept, &expected_accept)) {
+            return error.WebSocketUpgradeFailed;
+        }
+
+        var ws = WebSocket.init(conn.writer, conn.reader, conn.arena.allocator());
+        ws.is_client = true;
+        return .{ .ws = ws, .conn = conn };
     }
 
     fn fetchInternal(
