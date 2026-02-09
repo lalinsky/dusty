@@ -31,7 +31,8 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
             std.ascii.eqlIgnoreCase(key, "keep-alive") or
             std.ascii.eqlIgnoreCase(key, "transfer-encoding") or
             std.ascii.eqlIgnoreCase(key, "upgrade") or
-            std.ascii.eqlIgnoreCase(key, "proxy-connection"))
+            std.ascii.eqlIgnoreCase(key, "proxy-connection") or
+            std.ascii.eqlIgnoreCase(key, "host"))
         {
             continue;
         }
