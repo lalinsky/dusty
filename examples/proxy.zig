@@ -102,13 +102,8 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime, upstream_url: [
     var server = http.Server(AppContext).init(allocator, .{}, &ctx);
     defer server.deinit();
 
-    // Catch-all route - proxy everything
-    // Register for all common HTTP methods
-    server.router.get("/*", handleProxy);
-    server.router.post("/*", handleProxy);
-    server.router.put("/*", handleProxy);
-    server.router.delete("/*", handleProxy);
-    server.router.head("/*", handleProxy);
+    // Catch-all route - proxy everything for all common HTTP methods
+    server.router.any("/*", handleProxy);
 
     const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
 

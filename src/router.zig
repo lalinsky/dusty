@@ -48,6 +48,8 @@ pub fn Router(comptime Ctx: type) type {
         else
             fn (*Ctx, *Request, *Response) anyerror!void;
 
+        pub const all_methods = [_]Method{ .get, .post, .put, .delete, .head, .patch, .options };
+
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree
         trees: [256]?*Node,
@@ -269,6 +271,20 @@ pub fn Router(comptime Ctx: type) type {
             self.insert(path, .delete, handler) catch @panic("OOM");
         }
 
+        pub fn patch(self: *Self, path: []const u8, handler: Handler) void {
+            self.insert(path, .patch, handler) catch @panic("OOM");
+        }
+
+        pub fn options(self: *Self, path: []const u8, handler: Handler) void {
+            self.insert(path, .options, handler) catch @panic("OOM");
+        }
+
+        pub fn any(self: *Self, path: []const u8, handler: Handler) void {
+            inline for (all_methods) |method| {
+                self.insert(path, method, handler) catch @panic("OOM");
+            }
+        }
+
         fn parseQueryString(req: *Request, query_string: []const u8) !void {
             if (query_string.len == 0) return;
 
@@ -484,14 +500,9 @@ test "Router: all HTTP methods" {
     var router = TestRouter.init(std.testing.allocator);
     defer router.deinit();
 
-    router.get("/resource", testHandler);
-    router.post("/resource", testHandler);
-    router.put("/resource", testHandler);
-    router.delete("/resource", testHandler);
-    router.head("/resource", testHandler);
+    router.any("/resource", testHandler);
 
-    const methods = [_]Method{ .get, .post, .put, .delete, .head };
-    for (methods) |method| {
+    for (TestRouter.all_methods) |method| {
         var req = Request{
             .method = method,
             .url = "/resource",
