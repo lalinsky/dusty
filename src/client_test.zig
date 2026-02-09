@@ -232,7 +232,7 @@ test "Client: WebSocket upgrade" {
             var client = dusty.Client.init(std.testing.allocator, .{});
             defer client.deinit();
 
-            var ws = try client.upgradeWebSocket(url, .{});
+            var ws = try client.connectWebSocket(url, .{});
             defer ws.deinit();
 
             // Server sends "Welcome!" first

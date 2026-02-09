@@ -596,8 +596,8 @@ pub const Client = struct {
         return conn;
     }
 
-    /// Upgrade an HTTP connection to a WebSocket connection.
-    pub fn upgradeWebSocket(
+    /// Connect to a WebSocket server.
+    pub fn connectWebSocket(
         self: *Client,
         url: []const u8,
         options: WebSocketUpgradeOptions,
