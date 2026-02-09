@@ -564,6 +564,38 @@ pub const Client = struct {
         return self.fetchInternal(uri, info.port, info.protocol, options, max_redirects);
     }
 
+    /// Acquire a connection from the pool or create a new one.
+    fn acquireConnection(
+        self: *Client,
+        host: []const u8,
+        port: u16,
+        protocol: Protocol,
+        ca_bundle: ?*const std.crypto.Certificate.Bundle,
+    ) !*Connection {
+        // Try to get a connection from the pool
+        const conn = self.pool.acquire(host, port, protocol) orelse blk: {
+            // No pooled connection, create a new one
+            const stream = try zio.net.tcpConnectToHost(host, port, .{});
+            errdefer stream.close();
+
+            const new_conn = try self.allocator.create(Connection);
+            errdefer self.allocator.destroy(new_conn);
+            try new_conn.init(
+                self.allocator,
+                &self.pool,
+                stream,
+                host,
+                port,
+                self.config.buffer_size,
+                protocol,
+                ca_bundle,
+            );
+
+            break :blk new_conn;
+        };
+        return conn;
+    }
+
     /// Upgrade an HTTP connection to a WebSocket connection.
     pub fn upgradeWebSocket(
         self: *Client,
@@ -585,24 +617,7 @@ pub const Client = struct {
         } else null;
 
         // Acquire or create a connection
-        const conn = self.pool.acquire(host, info.port, info.protocol) orelse blk: {
-            const stream = try zio.net.tcpConnectToHost(host, info.port, .{});
-            errdefer stream.close();
-
-            const new_conn = try self.allocator.create(Connection);
-            errdefer self.allocator.destroy(new_conn);
-            try new_conn.init(
-                self.allocator,
-                &self.pool,
-                stream,
-                host,
-                info.port,
-                self.config.buffer_size,
-                info.protocol,
-                ca_bundle,
-            );
-            break :blk new_conn;
-        };
+        const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle);
         errdefer {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -704,27 +719,8 @@ pub const Client = struct {
             break :blk &self.ca_bundle;
         } else null;
 
-        // Try to get a connection from the pool
-        const conn = self.pool.acquire(host, port, protocol) orelse blk: {
-            // No pooled connection, create a new one
-            const stream = try zio.net.tcpConnectToHost(host, port, .{});
-            errdefer stream.close();
-
-            const new_conn = try self.allocator.create(Connection);
-            errdefer self.allocator.destroy(new_conn);
-            try new_conn.init(
-                self.allocator,
-                &self.pool,
-                stream,
-                host,
-                port,
-                self.config.buffer_size,
-                protocol,
-                ca_bundle,
-            );
-
-            break :blk new_conn;
-        };
+        // Acquire or create a connection
+        const conn = try self.acquireConnection(host, port, protocol, ca_bundle);
         errdefer self.pool.release(conn);
 
         // Send request
