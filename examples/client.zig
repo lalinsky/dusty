@@ -38,7 +38,10 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
 
-    if (try response.body()) |body| {
-        std.debug.print("{s}\n", .{body});
-    }
+    const body_reader = response.reader();
+    var write_buf: [8192]u8 = undefined;
+    var out = zio.stdout().writer(&write_buf);
+    const total_bytes = try body_reader.streamRemaining(&out.interface);
+    try out.interface.flush();
+    std.debug.print("Total bytes: {d}\n", .{total_bytes});
 }
