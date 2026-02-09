@@ -198,3 +198,86 @@ test "Client: connection pooling" {
     var task = try zio.spawn(Test.mainFn, .{});
     try task.join();
 }
+
+test "Client: WebSocket upgrade" {
+    const Test = struct {
+        pub fn mainFn() !void {
+            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+            defer server.deinit();
+
+            server.router.get("/ws", handleWebSocket);
+
+            var server_task = try zio.spawn(serverFn, .{&server});
+            defer server_task.cancel();
+
+            var client_task = try zio.spawn(clientFn, .{&server});
+            defer client_task.cancel();
+
+            try client_task.join();
+        }
+
+        pub fn serverFn(server: *dusty.Server(void)) !void {
+            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
+            try server.listen(addr);
+        }
+
+        pub fn clientFn(server: *dusty.Server(void)) !void {
+            try server.ready.wait();
+
+            const port = std.mem.bigToNative(u16, server.address.ip.in.port);
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/ws", .{port});
+
+            var client = dusty.Client.init(std.testing.allocator, .{});
+            defer client.deinit();
+
+            var ws = try client.connectWebSocket(url, .{});
+            defer ws.deinit();
+
+            // Server sends "Welcome!" first
+            const welcome = try ws.receive();
+            try std.testing.expectEqual(.text, welcome.type);
+            try std.testing.expectEqualStrings("Welcome!", welcome.data);
+
+            // Send a message
+            try ws.send(.text, "Hello WebSocket!");
+
+            // Receive echo
+            const echo = try ws.receive();
+            try std.testing.expectEqual(.text, echo.type);
+            try std.testing.expectEqualStrings("Hello WebSocket!", echo.data);
+
+            // Close
+            try ws.close(.normal, "done");
+        }
+
+        fn handleWebSocket(req: *dusty.Request, res: *dusty.Response) !void {
+            var ws = try res.upgradeWebSocket(req) orelse {
+                res.status = .bad_request;
+                return;
+            };
+
+            // Send welcome
+            try ws.send(.text, "Welcome!");
+
+            // Echo loop
+            while (true) {
+                const msg = ws.receive() catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    else => return err,
+                };
+                if (msg.type == .close) return;
+                if (msg.type == .text or msg.type == .binary) {
+                    try ws.send(msg.type, msg.data);
+                }
+            }
+        }
+    };
+
+    var io = try zio.Runtime.init(std.testing.allocator, .{});
+    defer io.deinit();
+
+    var task = try zio.spawn(Test.mainFn, .{});
+    try task.join();
+}

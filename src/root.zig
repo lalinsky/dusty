@@ -23,6 +23,8 @@ pub const Client = @import("client.zig").Client;
 pub const ClientConfig = @import("client.zig").ClientConfig;
 pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
+pub const WebSocketClient = @import("client.zig").WebSocketClient;
+pub const WebSocketUpgradeOptions = @import("client.zig").WebSocketUpgradeOptions;
 
 test {
     std.testing.refAllDecls(@This());

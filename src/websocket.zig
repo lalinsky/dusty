@@ -4,6 +4,8 @@ pub const WebSocket = struct {
     conn: *std.Io.Writer,
     reader: *std.Io.Reader,
     arena: std.mem.Allocator,
+    is_client: bool = false,
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     max_message_size: usize = default_max_message_size,
     closed: bool = false,
     fragmented_type: ?MessageType = null,
@@ -232,23 +234,35 @@ pub const WebSocket = struct {
         const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | @intFromEnum(opcode);
         try self.conn.writeByte(byte0);
 
-        // Second byte + extended length (server -> client is NOT masked)
+        // Second byte: mask bit + payload length
+        const mask_bit: u8 = if (self.is_client) 0x80 else 0x00;
         if (data.len < 126) {
-            try self.conn.writeByte(@intCast(data.len));
+            try self.conn.writeByte(mask_bit | @as(u8, @intCast(data.len)));
         } else if (data.len <= 65535) {
-            try self.conn.writeByte(126);
+            try self.conn.writeByte(mask_bit | 126);
             var len_buf: [2]u8 = undefined;
             std.mem.writeInt(u16, &len_buf, @intCast(data.len), .big);
             try self.conn.writeAll(&len_buf);
         } else {
-            try self.conn.writeByte(127);
+            try self.conn.writeByte(mask_bit | 127);
             var len_buf: [8]u8 = undefined;
             std.mem.writeInt(u64, &len_buf, @intCast(data.len), .big);
             try self.conn.writeAll(&len_buf);
         }
 
-        // Payload (unmasked for server -> client)
-        try self.conn.writeAll(data);
+        if (self.is_client) {
+            // Client frames must be masked (RFC 6455)
+            var mask_key: [4]u8 = undefined;
+            self.prng.random().bytes(&mask_key);
+            try self.conn.writeAll(&mask_key);
+
+            // XOR payload with mask key
+            for (data, 0..) |byte, i| {
+                try self.conn.writeByte(byte ^ mask_key[i % 4]);
+            }
+        } else {
+            try self.conn.writeAll(data);
+        }
         try self.conn.flush();
     }
 
@@ -451,4 +465,35 @@ test "WebSocket: readFrame rejects large control frame" {
 
     var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
     try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.readFrame());
+}
+
+test "WebSocket: writeFrame masked (client mode)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var reader: std.Io.Reader = .fixed("");
+
+    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    ws.is_client = true;
+    try ws.writeFrame(.text, "Hello", true);
+
+    const written = conn_writer.buffered();
+    // FIN + text opcode
+    try std.testing.expectEqual(0x81, written[0]);
+    // Mask bit set + length = 5
+    try std.testing.expectEqual(0x85, written[1]);
+    // Bytes 2-5 are the mask key
+    const mask_key = written[2..6];
+    // Bytes 6-10 are the masked payload
+    const masked_payload = written[6..11];
+    // Unmask and verify
+    var unmasked: [5]u8 = undefined;
+    for (&unmasked, 0..) |*byte, i| {
+        byte.* = masked_payload[i] ^ mask_key[i % 4];
+    }
+    try std.testing.expectEqualStrings("Hello", &unmasked);
+    // Total length: 1 (header) + 1 (len) + 4 (mask) + 5 (payload) = 11
+    try std.testing.expectEqual(11, written.len);
 }
