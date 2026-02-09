@@ -544,8 +544,7 @@ pub fn BodyReader(comptime Parser: type) type {
                 // Get buffered data
                 const buffered = conn.buffered();
                 if (buffered.len == 0) {
-                    // Shouldn't happen after successful fillMore
-                    return error.EndOfStream;
+                    return 0;
                 }
 
                 // Limit feed size to available dest space to avoid consuming more than we can store
