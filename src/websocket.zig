@@ -5,6 +5,7 @@ pub const WebSocket = struct {
     reader: *std.Io.Reader,
     arena: std.mem.Allocator,
     is_client: bool = false,
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     max_message_size: usize = default_max_message_size,
     closed: bool = false,
     fragmented_type: ?MessageType = null,
@@ -252,7 +253,7 @@ pub const WebSocket = struct {
         if (self.is_client) {
             // Client frames must be masked (RFC 6455)
             var mask_key: [4]u8 = undefined;
-            std.crypto.random.bytes(&mask_key);
+            self.prng.random().bytes(&mask_key);
             try self.conn.writeAll(&mask_key);
 
             // XOR payload with mask key

@@ -676,6 +676,11 @@ pub const Client = struct {
 
         var ws = WebSocket.init(conn.writer, conn.reader, conn.arena.allocator());
         ws.is_client = true;
+        ws.prng = std.Random.DefaultPrng.init(blk: {
+            var seed: u64 = undefined;
+            std.crypto.random.bytes(std.mem.asBytes(&seed));
+            break :blk seed;
+        });
         return .{ .ws = ws, .conn = conn };
     }
 
