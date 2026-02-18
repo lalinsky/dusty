@@ -1,6 +1,9 @@
+const zio = @import("zio");
+
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
+    listen: zio.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
 
     pub const Timeout = struct {
         /// Maximum time (ms) to receive a complete request

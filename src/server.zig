@@ -80,7 +80,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         pub fn listen(self: *Self, addr: zio.net.IpAddress) !void {
-            const server = try addr.listen(.{ .reuse_address = true });
+            const server = try addr.listen(self.config.listen);
             defer server.close();
 
             self.address = server.socket.address;
