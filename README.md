@@ -11,6 +11,7 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 - WebSocket support (RFC 6455)
 - Request/keepalive timeouts via coroutine auto-cancellation
 - HTTP/HTTPS client with connection pooling
+- Unix domain socket support for client connections
 
 ## Server Example
 
@@ -70,3 +71,15 @@ pub fn main() !void {
     }
 }
 ```
+
+### Unix Socket Example
+
+For communicating with services like Docker Engine:
+
+```zig
+var response = try client.fetch("http://localhost/v1.41/info", .{
+    .unix_socket_path = "/var/run/docker.sock",
+});
+defer response.deinit();
+```
+
