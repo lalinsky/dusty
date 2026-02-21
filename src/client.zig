@@ -383,9 +383,9 @@ pub const Connection = struct {
     /// Check if this connection matches the given host, port, protocol, and transport.
     pub fn matches(self: *const Connection, match_host: []const u8, match_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) bool {
         if (unix_socket_path) |path| {
-            // Unix socket connection: match only on the socket path
+            // Unix socket connection: match on the socket path and protocol
             if (self.unix_path_len == 0) return false;
-            return std.mem.eql(u8, self.unix_path_buffer[0..self.unix_path_len], path);
+            return self.protocol == protocol and std.mem.eql(u8, self.unix_path_buffer[0..self.unix_path_len], path);
         }
         // TCP connection: must not be a unix socket connection
         if (self.unix_path_len != 0) return false;
