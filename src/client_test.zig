@@ -281,3 +281,84 @@ test "Client: WebSocket upgrade" {
     var task = try zio.spawn(Test.mainFn, .{});
     try task.join();
 }
+
+test "Client: unix socket fetch" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!zio.net.has_unix_sockets) return error.SkipZigTest;
+
+    const Test = struct {
+        pub fn mainFn() !void {
+            const socket_path = "/tmp/dusty-client-test-unix.sock";
+            std.fs.cwd().deleteFile(socket_path) catch {};
+
+            var ready_buf: [1]bool = undefined;
+            var ready_ch = zio.Channel(bool).init(&ready_buf);
+
+            var server_task = try zio.spawn(serverFn, .{ socket_path, &ready_ch });
+            defer server_task.cancel();
+
+            var client_task = try zio.spawn(clientFn, .{ socket_path, &ready_ch });
+            defer client_task.cancel();
+
+            try client_task.join();
+        }
+
+        pub fn serverFn(socket_path: []const u8, ready: *zio.Channel(bool)) !void {
+            const unix_addr = try zio.net.UnixAddress.init(socket_path);
+            const server = try unix_addr.listen(.{});
+            defer server.close();
+            defer std.fs.cwd().deleteFile(socket_path) catch {};
+
+            try ready.send(true);
+
+            const stream = try server.accept();
+            defer stream.close();
+            defer stream.shutdown(.both) catch {};
+
+            // Consume request headers
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(&read_buf);
+            while (true) {
+                const line = try reader.interface.takeDelimiterExclusive('\n');
+                if (std.mem.trimRight(u8, line, "\r").len == 0) break;
+            }
+
+            // Write a minimal HTTP response
+            var write_buf: [512]u8 = undefined;
+            var writer = stream.writer(&write_buf);
+            try writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Length: 14\r\n" ++
+                    "Connection: close\r\n" ++
+                    "\r\n" ++
+                    "Hello, Docker!",
+            );
+            try writer.interface.flush();
+        }
+
+        pub fn clientFn(socket_path: []const u8, ready: *zio.Channel(bool)) !void {
+            _ = try ready.receive();
+
+            var client = dusty.Client.init(std.testing.allocator, .{});
+            defer client.deinit();
+
+            var response = try client.fetch("http://localhost/test", .{
+                .unix_socket_path = socket_path,
+            });
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+
+            const b = try response.body();
+            try std.testing.expect(b != null);
+            try std.testing.expectEqualStrings("Hello, Docker!", b.?);
+        }
+    };
+
+    var io = try zio.Runtime.init(std.testing.allocator, .{});
+    defer io.deinit();
+
+    var task = try zio.spawn(Test.mainFn, .{});
+    try task.join();
+}
