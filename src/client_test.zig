@@ -283,6 +283,8 @@ test "Client: WebSocket upgrade" {
 }
 
 test "Client: unix socket fetch" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!zio.net.has_unix_sockets) return error.SkipZigTest;
 
     const Test = struct {
