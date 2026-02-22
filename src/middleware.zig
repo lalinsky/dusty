@@ -23,7 +23,6 @@ pub fn Middleware(comptime Ctx: type) type {
             executor: *Executor(Ctx),
         ) anyerror!void,
         deinitFn: ?*const fn (ptr: *anyopaque) void,
-        node: std.SinglyLinkedList.Node = .{},
 
         pub fn init(impl: anytype) Self {
             const Ptr = @TypeOf(impl);

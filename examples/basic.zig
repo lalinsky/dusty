@@ -157,6 +157,14 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
     var server = AppServer.init(allocator, config, &ctx);
     defer server.deinit();
 
+    const cors = try server.middleware(http.middleware.Cors, .{
+        .origin = "*",
+        .headers = "Content-Type, Authorization",
+        .methods = "GET, POST, PUT, DELETE, OPTIONS",
+        .max_age = "86400",
+    });
+    server.router.middlewares = &.{cors};
+
     // Register routes
     server.router.get("/", handleRoot);
     server.router.get("/users/:id", handleUser);

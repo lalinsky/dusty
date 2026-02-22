@@ -14,6 +14,7 @@ pub const Headers = @import("http.zig").Headers;
 pub const ContentType = @import("http.zig").ContentType;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
+pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
@@ -37,4 +38,5 @@ comptime {
     _ = @import("client.zig");
     _ = @import("client_test.zig");
     _ = @import("middleware.zig");
+    _ = @import("middleware/middleware.zig");
 }

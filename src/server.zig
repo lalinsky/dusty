@@ -15,6 +15,11 @@ const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const log = std.log.scoped(.dusty);
 
 pub fn Server(comptime Ctx: type) type {
+    const MiddlewareItem = struct {
+        middleware: Middleware(Ctx),
+        node: std.SinglyLinkedList.Node = .{},
+    };
+
     return struct {
         const Self = @This();
 
@@ -49,8 +54,8 @@ pub fn Server(comptime Ctx: type) type {
             var it = self._middleware_registry.first;
             while (it) |node| {
                 it = node.next;
-                const mw: *Middleware(Ctx) = @fieldParentPtr("node", node);
-                mw.deinit();
+                const item: *MiddlewareItem = @fieldParentPtr("node", node);
+                item.middleware.deinit();
             }
             self.router.deinit();
         }
@@ -58,7 +63,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Creates a middleware instance managed by the server.
         /// The middleware is allocated on the router's arena and will be freed when the server is deinit'd.
         /// Supports middlewares with init(Config) or init(Config, MiddlewareConfig) signatures.
-        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !*Middleware(Ctx) {
+        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(Ctx) {
             const arena = self.router.arena.allocator();
             const m = try arena.create(M);
             m.* = switch (@typeInfo(@TypeOf(M.init)).@"fn".params.len) {
@@ -70,11 +75,12 @@ pub fn Server(comptime Ctx: type) type {
                 else => @compileError(@typeName(M) ++ ".init must accept 1 or 2 parameters"),
             };
 
-            const mw = try arena.create(Middleware(Ctx));
-            mw.* = Middleware(Ctx).init(m);
+            const mw = Middleware(Ctx).init(m);
 
             // Register for cleanup on deinit
-            self._middleware_registry.prepend(&mw.node);
+            const item = try arena.create(MiddlewareItem);
+            item.* = .{ .middleware = mw };
+            self._middleware_registry.prepend(&item.node);
 
             return mw;
         }
