@@ -31,8 +31,8 @@ const Node = struct {
     // For linked list of siblings (only used in static_children)
     next_sibling: ?*Node,
 
-    // Handler (opaque pointer) - only set on terminal nodes
-    handler: ?*const anyopaque,
+    // Route (opaque pointer to Route) - only set on terminal nodes
+    route: ?*const anyopaque,
 };
 
 pub fn Action(comptime Ctx: type) type {
@@ -47,6 +47,11 @@ pub fn Router(comptime Ctx: type) type {
             fn (*Request, *Response) anyerror!void
         else
             fn (*Ctx, *Request, *Response) anyerror!void;
+
+        pub const Route = struct {
+            action: *const Handler,
+            middlewares: []const Middleware(Ctx),
+        };
 
         pub const all_methods = [_]Method{ .get, .post, .put, .delete, .head, .patch, .options };
 
@@ -86,7 +91,7 @@ pub fn Router(comptime Ctx: type) type {
             }
         }
 
-        fn insert(self: *Self, path: []const u8, method: Method, handler: *const Handler) !void {
+        fn insertRoute(self: *Self, path: []const u8, method: Method, handler: *const Handler, middlewares: []const Middleware(Ctx)) !void {
             const method_idx = @intFromEnum(method);
             std.debug.assert(method_idx < 256);
 
@@ -101,7 +106,7 @@ pub fn Router(comptime Ctx: type) type {
                     .param_child = null,
                     .wildcard_child = null,
                     .next_sibling = null,
-                    .handler = null,
+                    .route = null,
                 };
                 self.trees[method_idx] = root;
             }
@@ -136,7 +141,7 @@ pub fn Router(comptime Ctx: type) type {
                         .param_child = null,
                         .wildcard_child = null,
                         .next_sibling = null,
-                        .handler = null,
+                        .route = null,
                     };
 
                     // Add to appropriate child field
@@ -156,15 +161,21 @@ pub fn Router(comptime Ctx: type) type {
                 current = child.?;
             }
 
-            // Store handler as opaque pointer
-            current.handler = @ptrCast(handler);
+            // Create and store route
+            const alloc = self.arena.allocator();
+            const route = try alloc.create(Route);
+            route.* = .{
+                .action = handler,
+                .middlewares = middlewares,
+            };
+            current.route = @ptrCast(route);
         }
 
         fn matchRecursive(node: *Node, req: *Request, path: []const u8, segments: []const []const u8, segment_offsets: []const usize, index: usize) !?*Node {
             // Terminal case: consumed all segments
             if (index >= segments.len) {
-                // Only return node if it has a handler registered
-                if (node.handler == null) return null;
+                // Only return node if it has a route registered
+                if (node.route == null) return null;
                 return node;
             }
 
@@ -207,7 +218,7 @@ pub fn Router(comptime Ctx: type) type {
             return null;
         }
 
-        pub fn findHandler(self: *const Self, req: *Request) !?*const Handler {
+        pub fn findHandler(self: *const Self, req: *Request) !?Route {
             // Get the tree for this method
             const method_idx = @intFromEnum(req.method);
             std.debug.assert(method_idx < 256);
@@ -244,46 +255,108 @@ pub fn Router(comptime Ctx: type) type {
 
             const node = try matchRecursive(root, req, path, segments.items, offsets.items, 0);
             if (node) |n| {
-                if (n.handler) |opaque_handler| {
-                    return @ptrCast(@alignCast(opaque_handler));
+                if (n.route) |opaque_route| {
+                    const route: *const Route = @ptrCast(@alignCast(opaque_route));
+                    return route.*;
                 }
             }
             return null;
         }
 
         pub fn get(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .get, handler) catch @panic("OOM");
+            self.insertRoute(path, .get, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn head(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .head, handler) catch @panic("OOM");
+            self.insertRoute(path, .head, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn post(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .post, handler) catch @panic("OOM");
+            self.insertRoute(path, .post, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn put(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .put, handler) catch @panic("OOM");
+            self.insertRoute(path, .put, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn delete(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .delete, handler) catch @panic("OOM");
+            self.insertRoute(path, .delete, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn patch(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .patch, handler) catch @panic("OOM");
+            self.insertRoute(path, .patch, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn options(self: *Self, path: []const u8, handler: Handler) void {
-            self.insert(path, .options, handler) catch @panic("OOM");
+            self.insertRoute(path, .options, handler, self.middlewares) catch @panic("OOM");
         }
 
         pub fn any(self: *Self, path: []const u8, handler: Handler) void {
             inline for (all_methods) |method| {
-                self.insert(path, method, handler) catch @panic("OOM");
+                self.insertRoute(path, method, handler, self.middlewares) catch @panic("OOM");
             }
         }
+
+        pub fn group(self: *Self, prefix: []const u8, middlewares: []const Middleware(Ctx)) Group {
+            return .{ .router = self, .prefix = prefix, .middlewares = middlewares };
+        }
+
+        pub const Group = struct {
+            router: *Self,
+            prefix: []const u8,
+            middlewares: []const Middleware(Ctx),
+
+            fn mergeMiddlewares(g: Group) []const Middleware(Ctx) {
+                if (g.router.middlewares.len == 0) return g.middlewares;
+                if (g.middlewares.len == 0) return g.router.middlewares;
+                const merged = g.router.arena.allocator().alloc(Middleware(Ctx), g.router.middlewares.len + g.middlewares.len) catch @panic("OOM");
+                @memcpy(merged[0..g.router.middlewares.len], g.router.middlewares);
+                @memcpy(merged[g.router.middlewares.len..], g.middlewares);
+                return merged;
+            }
+
+            fn concatPath(g: Group, path: []const u8) []const u8 {
+                return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}", .{ g.prefix, path }) catch @panic("OOM");
+            }
+
+            fn register(g: Group, method: Method, path: []const u8, handler: Handler) void {
+                g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares()) catch @panic("OOM");
+            }
+
+            pub fn get(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.get, path, handler);
+            }
+
+            pub fn head(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.head, path, handler);
+            }
+
+            pub fn post(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.post, path, handler);
+            }
+
+            pub fn put(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.put, path, handler);
+            }
+
+            pub fn delete(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.delete, path, handler);
+            }
+
+            pub fn patch(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.patch, path, handler);
+            }
+
+            pub fn options(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.options, path, handler);
+            }
+
+            pub fn any(g: Group, path: []const u8, handler: Handler) void {
+                inline for (all_methods) |method| {
+                    g.register(method, path, handler);
+                }
+            }
+        };
 
         fn parseQueryString(req: *Request, query_string: []const u8) !void {
             if (query_string.len == 0) return;
@@ -356,7 +429,7 @@ test "Router: register and find GET route" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler);
+    try std.testing.expect(handler.?.action == testHandler);
 }
 
 test "Router: register and find POST route" {
@@ -378,7 +451,7 @@ test "Router: register and find POST route" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler);
+    try std.testing.expect(handler.?.action == testHandler);
 }
 
 test "Router: method mismatch returns null" {
@@ -442,7 +515,7 @@ test "Router: parameterized routes" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler);
+    try std.testing.expect(handler.?.action == testHandler);
 }
 
 test "Router: multiple routes" {
@@ -466,7 +539,7 @@ test "Router: multiple routes" {
     };
     const handler1 = try router.findHandler(&req1);
     try std.testing.expect(handler1 != null);
-    try std.testing.expect(handler1.? == testHandler);
+    try std.testing.expect(handler1.?.action == testHandler);
 
     // Find second route
     var req2 = Request{
@@ -478,7 +551,7 @@ test "Router: multiple routes" {
     };
     const handler2 = try router.findHandler(&req2);
     try std.testing.expect(handler2 != null);
-    try std.testing.expect(handler2.? == testHandler2);
+    try std.testing.expect(handler2.?.action == testHandler2);
 
     // Find third route
     var req3 = Request{
@@ -490,7 +563,7 @@ test "Router: multiple routes" {
     };
     const handler3 = try router.findHandler(&req3);
     try std.testing.expect(handler3 != null);
-    try std.testing.expect(handler3.? == testHandler2);
+    try std.testing.expect(handler3.?.action == testHandler2);
 }
 
 test "Router: all HTTP methods" {
@@ -616,7 +689,7 @@ test "Router: static route has precedence over param route" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler2);
+    try std.testing.expect(handler.?.action == testHandler2);
 
     // Params should be empty (no :id captured)
     try std.testing.expect(req.params.get("id") == null);
@@ -641,7 +714,7 @@ test "Router: wildcard route basic matching" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler);
+    try std.testing.expect(handler.?.action == testHandler);
 }
 
 test "Router: wildcard captures remaining path" {
@@ -689,7 +762,7 @@ test "Router: static route has precedence over wildcard" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler2);
+    try std.testing.expect(handler.?.action == testHandler2);
 
     // Wildcard param should not be captured
     try std.testing.expect(req.params.get("path") == null);
@@ -715,7 +788,7 @@ test "Router: param route has precedence over wildcard" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler2);
+    try std.testing.expect(handler.?.action == testHandler2);
 
     // Should capture :id param, not wildcard
     const id = req.params.get("id");
@@ -793,7 +866,7 @@ test "Router: static route with query parameters" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler);
+    try std.testing.expect(handler.?.action == testHandler);
 
     // Query parameters should be parsed
     try std.testing.expectEqualStrings("true", req.query.get("debug").?);
@@ -819,7 +892,7 @@ test "Router: param route with query parameters" {
 
     const handler = try router.findHandler(&req);
     try std.testing.expect(handler != null);
-    try std.testing.expect(handler.? == testHandler);
+    try std.testing.expect(handler.?.action == testHandler);
 
     // Parameter should not include query string
     const id = req.params.get("id");
@@ -1024,4 +1097,189 @@ test "Router: query with empty key-value pairs" {
     try std.testing.expectEqualStrings("1", req.query.get("a").?);
     try std.testing.expectEqualStrings("2", req.query.get("b").?);
     try std.testing.expectEqual(2, req.query.count());
+}
+
+// Group tests
+
+const TestVoidRouter = Router(void);
+
+fn voidHandler1(req: *Request, res: *Response) !void {
+    _ = req;
+    _ = res;
+}
+
+fn voidHandler2(req: *Request, res: *Response) !void {
+    _ = req;
+    _ = res;
+}
+
+test "Group: prefix concatenation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const api = router.group("/api/v1", &.{});
+    api.get("/users", testHandler);
+    api.post("/users", testHandler2);
+
+    var req1 = Request{
+        .method = .get,
+        .url = "/api/v1/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    const route1 = try router.findHandler(&req1);
+    try std.testing.expect(route1 != null);
+    try std.testing.expect(route1.?.action == testHandler);
+
+    var req2 = Request{
+        .method = .post,
+        .url = "/api/v1/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    const route2 = try router.findHandler(&req2);
+    try std.testing.expect(route2 != null);
+    try std.testing.expect(route2.?.action == testHandler2);
+}
+
+test "Group: routes without group middleware get global middlewares" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+    };
+
+    var mw1 = TestMw{ .id = 1 };
+    var mw2 = TestMw{ .id = 2 };
+    router.middlewares = &.{ Middleware(void).init(&mw1), Middleware(void).init(&mw2) };
+
+    router.get("/direct", voidHandler1);
+
+    var req = Request{
+        .method = .get,
+        .url = "/direct",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    const route = try router.findHandler(&req);
+    try std.testing.expect(route != null);
+    try std.testing.expectEqual(2, route.?.middlewares.len);
+}
+
+test "Group: group middlewares appended after global" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+    };
+
+    var mw_global = TestMw{ .id = 1 };
+    var mw_group = TestMw{ .id = 2 };
+    router.middlewares = &.{Middleware(void).init(&mw_global)};
+
+    const api = router.group("/api", &.{Middleware(void).init(&mw_group)});
+    api.get("/users", voidHandler1);
+
+    var req = Request{
+        .method = .get,
+        .url = "/api/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    const route = try router.findHandler(&req);
+    try std.testing.expect(route != null);
+    // Should have global + group middlewares
+    try std.testing.expectEqual(2, route.?.middlewares.len);
+    // Global middleware should come first
+    try std.testing.expect(route.?.middlewares[0].ptr == @as(*anyopaque, @ptrCast(@constCast(&mw_global))));
+    try std.testing.expect(route.?.middlewares[1].ptr == @as(*anyopaque, @ptrCast(@constCast(&mw_group))));
+}
+
+test "Group: no global middlewares, only group middlewares" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+    };
+
+    var mw_group = TestMw{ .id = 1 };
+    const api = router.group("/api", &.{Middleware(void).init(&mw_group)});
+    api.get("/users", voidHandler1);
+
+    var req = Request{
+        .method = .get,
+        .url = "/api/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    const route = try router.findHandler(&req);
+    try std.testing.expect(route != null);
+    try std.testing.expectEqual(1, route.?.middlewares.len);
+}
+
+test "Group: direct routes have no middlewares when none set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestVoidRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/health", voidHandler1);
+
+    var req = Request{
+        .method = .get,
+        .url = "/health",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    const route = try router.findHandler(&req);
+    try std.testing.expect(route != null);
+    try std.testing.expectEqual(0, route.?.middlewares.len);
+}
+
+test "Group: any method registers all methods" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const api = router.group("/api", &.{});
+    api.any("/resource", testHandler);
+
+    for (TestRouter.all_methods) |method| {
+        var req = Request{
+            .method = method,
+            .url = "/api/resource",
+            .arena = arena.allocator(),
+            .parser = undefined,
+            .conn = undefined,
+        };
+        const route = try router.findHandler(&req);
+        try std.testing.expect(route != null);
+    }
 }
