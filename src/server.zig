@@ -206,12 +206,13 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
 
+                const found = try self.router.findHandler(&request);
                 var executor = Executor(Ctx){
                     .req = &request,
                     .res = &response,
                     .ctx = self.ctx,
-                    .action = try self.router.findHandler(&request),
-                    .middlewares = self.router.middlewares,
+                    .action = if (found) |r| r.action else null,
+                    .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return reader.err orelse error.ReadFailed,
