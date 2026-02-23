@@ -102,13 +102,13 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
         if (req.session.len == 0) {
             // Session was cleared — delete the cookie
             var delete_opts = self.config.cookie_opts;
-            delete_opts.max_age = 0;
+            delete_opts.max_age = .zero;
             try res.setCookie(self.config.cookie_name, "", delete_opts);
         } else {
             const signed = try self.signSession(req.arena, &req.session, .now(.realtime));
             var opts = self.config.cookie_opts;
             if (self.config.max_age) |ma| {
-                opts.max_age = @intCast(ma.toSeconds());
+                opts.max_age = ma;
             }
             try res.setCookie(self.config.cookie_name, signed, opts);
         }

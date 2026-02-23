@@ -3,6 +3,7 @@
 // Copyright (c) 2024 Karl Seguin.
 
 const std = @import("std");
+const zio = @import("zio");
 
 /// Cookie parser for reading cookies from a request.
 /// Lazily parses the Cookie header on demand.
@@ -34,7 +35,7 @@ pub const Cookie = struct {
 pub const CookieOpts = struct {
     path: []const u8 = "",
     domain: []const u8 = "",
-    max_age: ?i32 = null,
+    max_age: ?zio.Duration = null,
     secure: bool = false,
     http_only: bool = false,
     partitioned: bool = false,
@@ -79,7 +80,7 @@ pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []cons
     if (opts.max_age) |ma| {
         try buf.appendSlice(arena, "; Max-Age=");
         var int_buf: [20]u8 = undefined;
-        const int_str = try std.fmt.bufPrint(&int_buf, "{d}", .{ma});
+        const int_str = try std.fmt.bufPrint(&int_buf, "{d}", .{ma.toSeconds()});
         try buf.appendSlice(arena, int_str);
     }
 
@@ -170,7 +171,7 @@ test "serializeCookie: all options" {
     const result = try serializeCookie(arena.allocator(), "cookie_name", "cookie value", .{
         .path = "/auth/",
         .domain = "www.example.com",
-        .max_age = 9001,
+        .max_age = .fromSeconds(9001),
         .secure = true,
         .http_only = true,
         .partitioned = true,
@@ -198,10 +199,10 @@ test "serializeCookie: same_site none" {
     try std.testing.expectEqualStrings("sess=abc; SameSite=None", result);
 }
 
-test "serializeCookie: negative max_age" {
+test "serializeCookie: zero max_age deletes cookie" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const result = try serializeCookie(arena.allocator(), "sess", "abc", .{ .max_age = -1 });
-    try std.testing.expectEqualStrings("sess=abc; Max-Age=-1", result);
+    const result = try serializeCookie(arena.allocator(), "sess", "abc", .{ .max_age = .zero });
+    try std.testing.expectEqualStrings("sess=abc; Max-Age=0", result);
 }
