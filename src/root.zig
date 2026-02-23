@@ -14,6 +14,7 @@ pub const Headers = @import("http.zig").Headers;
 pub const ContentType = @import("http.zig").ContentType;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
+pub const SessionData = @import("middleware/Session.zig").SessionData;
 pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;

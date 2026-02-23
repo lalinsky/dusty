@@ -6,6 +6,7 @@ const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
 pub const Cookie = @import("cookie.zig").Cookie;
+pub const SessionData = @import("middleware/Session.zig").SessionData;
 
 pub const Request = struct {
     method: http.Method = undefined,
@@ -30,6 +31,7 @@ pub const Request = struct {
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
     _mfd_read: bool = false,
+    session: SessionData = .{},
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
