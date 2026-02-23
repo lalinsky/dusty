@@ -33,11 +33,7 @@ pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anyty
         return executor.next();
     }
 
-    const mode = req.headers.get("Sec-Fetch-Mode") orelse {
-        return executor.next();
-    };
-
-    if (!std.mem.eql(u8, mode, "cors")) {
+    if (req.headers.get("Access-Control-Request-Method") == null) {
         return executor.next();
     }
 
