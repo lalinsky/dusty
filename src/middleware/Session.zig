@@ -135,7 +135,7 @@ fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, r
     base64url.Decoder.decode(decoded, raw) catch return error.InvalidEncoding;
 
     // Read and check header
-    const header: Header = @bitCast(decoded[0..header_size].*);
+    const header: Header = @bitCast(std.mem.readInt(u64, decoded[0..header_size], .little));
     if (header.version != 1) return error.UnsupportedVersion;
 
     // Verify signature (covers header + payload)
@@ -188,7 +188,7 @@ fn signSessionWithTimestamp(self: *const Session, arena: std.mem.Allocator, sess
     } else 0;
 
     const header = Header{ .expires_at = expires_at };
-    raw[0..header_size].* = @bitCast(header);
+    std.mem.writeInt(u64, raw[0..header_size], @bitCast(header), .little);
 
     // Write payload
     var pos: usize = overhead;
