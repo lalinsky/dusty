@@ -105,7 +105,7 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
             delete_opts.max_age = 0;
             try res.setCookie(self.config.cookie_name, "", delete_opts);
         } else {
-            const signed = try self.signSession(req.arena, &req.session);
+            const signed = try self.signSession(req.arena, &req.session, .now(.realtime));
             var opts = self.config.cookie_opts;
             if (self.config.max_age) |ma| {
                 opts.max_age = @intCast(ma.toSeconds());
@@ -167,11 +167,7 @@ fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, r
 
 /// Serialize session entries, sign, and base64-encode.
 /// Format: base64url([Header: 8 bytes][signature: 32 bytes][key\0value\0...])
-fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const SessionData) ![]const u8 {
-    return self.signSessionWithTimestamp(arena, session, null);
-}
-
-fn signSessionWithTimestamp(self: *const Session, arena: std.mem.Allocator, session: *const SessionData, now_override: ?u32) ![]const u8 {
+fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const SessionData, now: zio.Timestamp) ![]const u8 {
     // Calculate payload size
     var payload_size: usize = 0;
     for (session.items()) |entry| {
@@ -183,8 +179,8 @@ fn signSessionWithTimestamp(self: *const Session, arena: std.mem.Allocator, sess
 
     // Write header
     const expires_at: u32 = if (self.config.max_age) |ma| blk: {
-        const now: u32 = now_override orelse @intCast(zio.Timestamp.now(.realtime).toNanoseconds() / 1_000_000_000);
-        break :blk now +| @as(u32, @intCast(ma.toSeconds()));
+        const expires_s = now.addDuration(ma).toNanoseconds() / 1_000_000_000;
+        break :blk @min(expires_s, std.math.maxInt(u32));
     } else 0;
 
     const header = Header{ .expires_at = expires_at };
@@ -289,7 +285,7 @@ test "Session: sign and load round-trip" {
     try s.set("user_id", "42");
     try s.set("role", "admin");
 
-    const signed = try session.signSession(arena.allocator(), &s);
+    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
 
     var s2 = SessionData{};
     try session.load(arena.allocator(), &s2, signed);
@@ -312,7 +308,7 @@ test "Session: sign and load round-trip with max_age" {
     var s = SessionData{};
     try s.set("user_id", "42");
 
-    const signed = try session.signSession(arena.allocator(), &s);
+    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
 
     var s2 = SessionData{};
     try session.load(arena.allocator(), &s2, signed);
@@ -334,7 +330,7 @@ test "Session: load rejects expired session" {
     try s.set("user_id", "42");
 
     // Sign with a timestamp far in the past so expires_at is already passed
-    const signed = try session.signSessionWithTimestamp(arena.allocator(), &s, 1000);
+    const signed = try session.signSession(arena.allocator(), &s, .fromNanoseconds(1000 * 1_000_000_000));
 
     var s2 = SessionData{};
     try testing.expectError(error.Expired, session.load(arena.allocator(), &s2, signed));
@@ -351,7 +347,7 @@ test "Session: load rejects tampered payload" {
 
     var s = SessionData{};
     try s.set("user_id", "42");
-    const signed = try session.signSession(arena.allocator(), &s);
+    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
 
     var tampered = try arena.allocator().dupe(u8, signed);
     // Tamper near the end (payload region) to avoid corrupting the header/version
@@ -371,7 +367,7 @@ test "Session: load rejects wrong key" {
 
     var s = SessionData{};
     try s.set("data", "test");
-    const signed = try session1.signSession(arena.allocator(), &s);
+    const signed = try session1.signSession(arena.allocator(), &s, .now(.realtime));
 
     var s2 = SessionData{};
     try testing.expectError(error.InvalidSignature, session2.load(arena.allocator(), &s2, signed));
@@ -400,7 +396,7 @@ test "Session: empty session round-trip" {
     const session = Session{ .config = .{ .secret_key = "key", .cookie_name = "s" } };
 
     var s = SessionData{};
-    const signed = try session.signSession(arena.allocator(), &s);
+    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
 
     var s2 = SessionData{};
     try session.load(arena.allocator(), &s2, signed);
