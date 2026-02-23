@@ -29,6 +29,10 @@ pub fn init(config: Config) !Cors {
 pub fn execute(self: *const Cors, req: *Request, res: *Response, executor: anytype) !void {
     try res.header("Access-Control-Allow-Origin", self.origin);
 
+    if (!std.mem.eql(u8, self.origin, "*")) {
+        try res.header("Vary", "Origin");
+    }
+
     if (req.method != .options) {
         return executor.next();
     }
