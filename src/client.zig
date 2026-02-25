@@ -369,8 +369,10 @@ pub const Connection = struct {
     }
 
     pub fn unixPath(self: *const Connection) ?[]const u8 {
-        const addr = self.unix_addr orelse return null;
-        return std.mem.sliceTo(&addr.un.path, 0);
+        if (self.unix_addr) |*addr| {
+            return std.mem.sliceTo(&addr.un.path, 0);
+        }
+        return null;
     }
 
     /// Check if this connection matches the given host, port, protocol, and transport.
