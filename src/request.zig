@@ -5,6 +5,7 @@ const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
+const Response = @import("response.zig").Response;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
 
@@ -33,16 +34,22 @@ pub const Request = struct {
     _mfd_read: bool = false,
     session: SessionData = .{},
 
+    // 100-continue support
+    response: ?*Response = null,
+    expects_continue: bool = false,
+
     pub fn reset(self: *Request) void {
         const arena = self.arena;
         const parser = self.parser;
         const conn = self.conn;
         const cfg = self.config;
+        const res = self.response;
         self.* = .{
             .arena = arena,
             .parser = parser,
             .conn = conn,
             .config = cfg,
+            .response = res,
         };
     }
 
@@ -56,7 +63,9 @@ pub const Request = struct {
         }
 
         // Return the streaming body reader
-        return RequestBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
+        var r = RequestBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
+        r.request = self;
+        return r;
     }
 
     /// Read the entire body into memory. Result is cached for subsequent calls.

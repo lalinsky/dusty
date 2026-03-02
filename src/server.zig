@@ -193,6 +193,20 @@ pub fn Server(comptime Ctx: type) type {
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = Response.init(arena.allocator(), &writer.interface);
+                request.response = &response;
+
+                // Handle Expect header (100-continue)
+                if (request.headers.get("Expect")) |expect| {
+                    if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
+                        request.expects_continue = true;
+                    } else {
+                        // Unknown Expect value - return 417
+                        response.status = .expectation_failed;
+                        response.keepalive = false;
+                        try response.write();
+                        return;
+                    }
+                }
 
                 // Check if the connection allows keepalive
                 if (!parser.shouldKeepAlive()) {

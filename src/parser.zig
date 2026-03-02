@@ -472,6 +472,7 @@ pub fn BodyReader(comptime Parser: type) type {
         parser: *Parser,
         conn: *std.Io.Reader,
         interface: std.Io.Reader,
+        request: ?*Request = null,
 
         const Self = @This();
 
@@ -492,6 +493,17 @@ pub fn BodyReader(comptime Parser: type) type {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
             const parser = self.parser;
             const conn = self.conn;
+
+            // Send 100 Continue on first body read if client expects it
+            if (self.request) |req| {
+                if (req.expects_continue) {
+                    req.expects_continue = false;
+                    if (req.response) |res| {
+                        try res.conn.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+                        try res.conn.flush();
+                    }
+                }
+            }
 
             const dest = limit.slice(try w.writableSliceGreedy(1));
             if (dest.len == 0) return 0;
