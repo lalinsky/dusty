@@ -13,6 +13,28 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 - HTTP/HTTPS client with connection pooling
 - Unix domain socket support for client connections
 
+## Installation
+
+```sh
+zig fetch --save "git+https://github.com/lalinsky/dusty#v0.1.0"
+zig fetch --save "git+https://github.com/lalinsky/zio#v0.9.0"
+```
+
+Then in your `build.zig`, add the modules as dependencies:
+
+```zig
+const dusty = b.dependency("dusty", .{
+    .target = target,
+    .optimize = optimize,
+});
+const zio = b.dependency("zio", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("dusty", dusty.module("dusty"));
+exe.root_module.addImport("zio", zio.module("zio"));
+```
+
 ## Server Example
 
 ```zig
