@@ -502,3 +502,130 @@ test "Server: void context handlers" {
     var task = try zio.spawn(Test.mainFn, .{});
     try task.join();
 }
+
+test "Server: 100-continue" {
+    const Test = struct {
+        pub fn mainFn() !void {
+            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+            defer server.deinit();
+
+            server.router.post("/upload", handlePost);
+
+            var server_task = try zio.spawn(serverFn, .{&server});
+            defer server_task.cancel();
+
+            var client_task = try zio.spawn(clientFn, .{&server});
+            defer client_task.cancel();
+
+            try client_task.join();
+        }
+
+        pub fn serverFn(server: *dusty.Server(void)) !void {
+            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
+            try server.listen(addr);
+        }
+
+        pub fn clientFn(server: *dusty.Server(void)) !void {
+            try server.ready.wait();
+
+            const client = try server.address.connect(.{});
+            defer client.close();
+            defer client.shutdown(.both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = client.writer(&write_buf);
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = client.reader(&read_buf);
+
+            // Send headers with Expect: 100-continue, but don't send body yet
+            const body = "Hello, World!";
+            try writer.interface.print("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\nExpect: 100-continue\r\n\r\n", .{body.len});
+            try writer.interface.flush();
+
+            // Read 100 Continue response
+            const continue_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expect(std.mem.indexOf(u8, continue_line, "100 Continue") != null);
+            reader.interface.toss(1); // skip \n
+            _ = try reader.interface.takeDelimiterExclusive('\n'); // empty line
+            reader.interface.toss(1);
+
+            // Now send the body
+            try writer.interface.writeAll(body);
+            try writer.interface.flush();
+
+            // Read final response
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expect(std.mem.indexOf(u8, status_line, "200 OK") != null);
+        }
+
+        fn handlePost(req: *dusty.Request, res: *dusty.Response) !void {
+            // Reading the body triggers 100 Continue
+            const body = try req.body();
+            res.body = body orelse "";
+        }
+    };
+
+    var io = try zio.Runtime.init(std.testing.allocator, .{});
+    defer io.deinit();
+
+    var task = try zio.spawn(Test.mainFn, .{});
+    try task.join();
+}
+
+test "Server: 417 Expectation Failed for unknown Expect value" {
+    const Test = struct {
+        pub fn mainFn() !void {
+            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+            defer server.deinit();
+
+            server.router.post("/upload", handlePost);
+
+            var server_task = try zio.spawn(serverFn, .{&server});
+            defer server_task.cancel();
+
+            var client_task = try zio.spawn(clientFn, .{&server});
+            defer client_task.cancel();
+
+            try client_task.join();
+        }
+
+        pub fn serverFn(server: *dusty.Server(void)) !void {
+            const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 0);
+            try server.listen(addr);
+        }
+
+        pub fn clientFn(server: *dusty.Server(void)) !void {
+            try server.ready.wait();
+
+            const client = try server.address.connect(.{});
+            defer client.close();
+            defer client.shutdown(.both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = client.writer(&write_buf);
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = client.reader(&read_buf);
+
+            // Send request with unknown Expect value
+            try writer.interface.writeAll("POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nExpect: unknown-value\r\n\r\n");
+            try writer.interface.flush();
+
+            // Should get 417 Expectation Failed
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expect(std.mem.indexOf(u8, status_line, "417") != null);
+        }
+
+        fn handlePost(req: *dusty.Request, res: *dusty.Response) !void {
+            const body = try req.body();
+            res.body = body orelse "";
+        }
+    };
+
+    var io = try zio.Runtime.init(std.testing.allocator, .{});
+    defer io.deinit();
+
+    var task = try zio.spawn(Test.mainFn, .{});
+    try task.join();
+}
