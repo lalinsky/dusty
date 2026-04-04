@@ -78,6 +78,9 @@ pub const WebSocketClient = struct {
 
     pub fn send(self: *WebSocketClient, msg_type: WebSocket.MessageType, data: []const u8) !void {
         try self.ws.send(msg_type, data);
+        if (self.conn.protocol == .https) {
+            try self.conn.tcp_writer.interface.flush();
+        }
     }
 
     pub fn receive(self: *WebSocketClient) !WebSocket.Message {
