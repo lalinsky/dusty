@@ -82,7 +82,11 @@ pub const WebSocketClient = struct {
     }
 
     pub fn receive(self: *WebSocketClient) !WebSocket.Message {
-        return self.ws.receive();
+        const msg = try self.ws.receive();
+        if (self.ws.auto_responded) {
+            try self.conn.flush();
+        }
+        return msg;
     }
 
     pub fn ping(self: *WebSocketClient, data: []const u8) !void {

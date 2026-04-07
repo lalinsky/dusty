@@ -8,6 +8,7 @@ pub const WebSocket = struct {
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     max_message_size: usize = default_max_message_size,
     closed: bool = false,
+    auto_responded: bool = false,
     fragmented_type: ?MessageType = null,
     fragmented_data: std.ArrayListUnmanaged(u8) = .{},
 
@@ -72,6 +73,7 @@ pub const WebSocket = struct {
     /// Ping frames are handled automatically (pong sent).
     /// Pong frames are ignored.
     pub fn receive(self: *WebSocket) !Message {
+        self.auto_responded = false;
         while (true) {
             const frame = try self.readFrame();
 
@@ -79,6 +81,7 @@ pub const WebSocket = struct {
                 .ping => {
                     // Auto-respond with pong
                     try self.writeFrame(.pong, frame.payload, true);
+                    self.auto_responded = true;
                     continue;
                 },
                 .pong => {
@@ -96,6 +99,7 @@ pub const WebSocket = struct {
                     }
                     // Echo close frame back
                     try self.writeCloseFrame(close_code orelse .normal, reason);
+                    self.auto_responded = true;
                     return .{ .type = .close, .data = reason, .close_code = close_code };
                 },
                 .continuation => {
