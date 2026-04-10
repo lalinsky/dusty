@@ -889,8 +889,6 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     if (opts.body) |b| {
         try writer.writeAll(b);
     }
-
-    try writer.flush();
 }
 
 /// Parse HTTP response headers from a reader.
