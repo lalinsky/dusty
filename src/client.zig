@@ -82,7 +82,13 @@ pub const WebSocketClient = struct {
     }
 
     pub fn receive(self: *WebSocketClient) !WebSocket.Message {
-        const msg = try self.ws.receive();
+        const msg = self.ws.receive() catch |err| {
+            if (self.ws.auto_responded) {
+                // Best effort: flush queued control-frame reply before bubbling error.
+                self.conn.flush() catch {};
+            }
+            return err;
+        };
         if (self.ws.auto_responded) {
             try self.conn.flush();
         }
