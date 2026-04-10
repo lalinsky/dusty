@@ -78,21 +78,31 @@ pub const WebSocketClient = struct {
 
     pub fn send(self: *WebSocketClient, msg_type: WebSocket.MessageType, data: []const u8) !void {
         try self.ws.send(msg_type, data);
-        if (self.conn.protocol == .https) {
-            try self.conn.tcp_writer.interface.flush();
-        }
+        try self.conn.flush();
     }
 
     pub fn receive(self: *WebSocketClient) !WebSocket.Message {
-        return self.ws.receive();
+        const msg = self.ws.receive() catch |err| {
+            if (self.ws.auto_responded) {
+                // Best effort: flush queued control-frame reply before bubbling error.
+                self.conn.flush() catch {};
+            }
+            return err;
+        };
+        if (self.ws.auto_responded) {
+            try self.conn.flush();
+        }
+        return msg;
     }
 
     pub fn ping(self: *WebSocketClient, data: []const u8) !void {
         try self.ws.ping(data);
+        try self.conn.flush();
     }
 
     pub fn close(self: *WebSocketClient, code: WebSocket.CloseCode, reason: []const u8) !void {
         try self.ws.close(code, reason);
+        try self.conn.flush();
     }
 
     pub fn deinit(self: *WebSocketClient) void {
@@ -365,6 +375,13 @@ pub const Connection = struct {
         self.reader.buffer = self.read_buffer;
         self.reader.seek = 0;
         self.reader.end = buffered.len;
+    }
+
+    pub fn flush(self: *Connection) !void {
+        try self.writer.flush();
+        if (self.protocol == .https) {
+            try self.tcp_writer.interface.flush();
+        }
     }
 
     pub fn host(self: *const Connection) []const u8 {
@@ -693,12 +710,7 @@ pub const Client = struct {
         }
 
         try conn.writer.writeAll("\r\n");
-        try conn.writer.flush();
-
-        // For HTTPS, flush the TCP writer
-        if (info.protocol == .https) {
-            try conn.tcp_writer.interface.flush();
-        }
+        try conn.flush();
 
         // Parse response headers
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
@@ -766,10 +778,7 @@ pub const Client = struct {
             .decompress = options.decompress,
         });
 
-        // For HTTPS, flush the TCP writer to send encrypted data over network
-        if (protocol == .https) {
-            try conn.tcp_writer.interface.flush();
-        }
+        try conn.flush();
 
         // Parse response headers
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
@@ -880,8 +889,6 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     if (opts.body) |b| {
         try writer.writeAll(b);
     }
-
-    try writer.flush();
 }
 
 /// Parse HTTP response headers from a reader.
