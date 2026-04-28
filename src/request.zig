@@ -20,6 +20,7 @@ pub const Request = struct {
     query: std.StringHashMapUnmanaged([]const u8) = .{},
 
     arena: std.mem.Allocator,
+    io: std.Io = undefined,
 
     // Body reading support
     parser: *RequestParser,
@@ -40,12 +41,14 @@ pub const Request = struct {
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
+        const io = self.io;
         const parser = self.parser;
         const conn = self.conn;
         const cfg = self.config;
         const res = self.response;
         self.* = .{
             .arena = arena,
+            .io = io,
             .parser = parser,
             .conn = conn,
             .config = cfg,

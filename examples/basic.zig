@@ -21,8 +21,7 @@ const AppContext = struct {
 };
 
 fn handleSlow(_: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = req;
-    try zio.sleep(.fromMilliseconds(10));
+    try req.io.sleep(.fromMilliseconds(10), .real);
     res.body = "Hello World!\n";
 }
 
@@ -62,7 +61,6 @@ fn handleError(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
 
 fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response) !void {
     _ = ctx;
-    _ = req;
 
     // Set custom headers before first chunk
     try res.header("X-Demo", "Chunked-Response");
@@ -74,7 +72,7 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     try res.chunk("Third chunk of data\n");
 
     // Dynamic content in chunk
-    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{zio.Timestamp.now(.realtime).toSeconds()});
+    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{std.Io.Timestamp.now(req.io, .real).toSeconds()});
     try res.chunk(dynamic);
 
     try res.chunk("Final chunk!\n");
@@ -82,14 +80,13 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
 }
 
 fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = req;
 
     // Return a JSON response
     res.status = .ok;
     try res.json(.{
         .message = "Hello from Dusty!",
         .counter = ctx.counter,
-        .timestamp = zio.Timestamp.now(.realtime).toSeconds(),
+        .timestamp = std.Io.Timestamp.now(req.io, .real).toSeconds(),
         .server = "dusty-http",
         .data = .{
             .nested = true,
@@ -138,7 +135,7 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
         .name = user_data.name,
         .email = user_data.email,
         .age = user_data.age,
-        .created_at = zio.Timestamp.now(.realtime).toSeconds(),
+        .created_at = std.Io.Timestamp.now(req.io, .real).toSeconds(),
     }, .{});
 }
 

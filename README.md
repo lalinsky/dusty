@@ -16,8 +16,8 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 ## Installation
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/dusty#v0.1.0"
-zig fetch --save "git+https://github.com/lalinsky/zio#v0.9.0"
+zig fetch --save "git+https://github.com/lalinsky/dusty#v0.2.0"
+zig fetch --save "git+https://github.com/lalinsky/zio#v0.10.0"
 ```
 
 Then in your `build.zig`, add the modules as dependencies:
@@ -44,18 +44,15 @@ const http = @import("dusty");
 
 fn handleUser(req: *http.Request, res: *http.Response) !void {
     const user_id = req.params.get("id") orelse "guest";
+    try req.io.sleep(.fromMilliseconds(10), .real);
     try res.json(.{ .id = user_id, .name = "John Doe" }, .{});
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var rt = try zio.Runtime.init(allocator, .{});
+pub fn main(init: std.process.Init) !void {
+    var rt = try zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
 
-    var server = http.Server(void).init(allocator, .{}, {});
+    var server = http.Server(void).init(init.gpa, rt.io(), .{}, {});
     defer server.deinit();
 
     server.router.get("/user/:id", handleUser);
@@ -72,15 +69,11 @@ const std = @import("std");
 const zio = @import("zio");
 const http = @import("dusty");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var rt = try zio.Runtime.init(allocator, .{});
+pub fn main(init: std.process.Init) !void {
+    var rt = try zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
 
-    var client = http.Client.init(allocator, .{});
+    var client = http.Client.init(init.gpa, rt.io(), .{});
     defer client.deinit();
 
     var response = try client.fetch("http://httpbin.org/get", .{});

@@ -153,6 +153,7 @@ pub fn Server(comptime Ctx: type) type {
 
             var request: Request = .{
                 .arena = arena.allocator(),
+                .io = self.io,
                 .conn = &reader.interface,
                 .parser = undefined,
                 .config = self.config.request,
