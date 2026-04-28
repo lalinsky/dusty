@@ -112,6 +112,12 @@ pub const WebSocketClient = struct {
     }
 };
 
+const CaBundleRef = struct {
+    gpa: std.mem.Allocator,
+    lock: *std.Io.RwLock,
+    bundle: *std.crypto.Certificate.Bundle,
+};
+
 /// Parse a URL string into a std.Uri.
 fn parseUrl(url: []const u8) !Uri {
     return Uri.parse(url) catch return error.InvalidUrl;
@@ -125,8 +131,9 @@ fn uriPortAndProtocol(uri: Uri) error{UnsupportedScheme}!struct { port: u16, pro
 }
 
 /// Get host string from URI.
-fn uriHost(uri: Uri, buffer: []u8) ![]const u8 {
-    return uri.getHost(buffer) catch return error.InvalidUrl;
+fn uriHost(uri: Uri, buffer: *[255]u8) ![]const u8 {
+    const hostname = uri.getHost(buffer) catch return error.InvalidUrl;
+    return hostname.bytes;
 }
 
 /// Get path for HTTP request line.
@@ -221,6 +228,7 @@ pub const ConnectionPool = struct {
 /// A client connection that owns all resources for a request/response cycle.
 pub const Connection = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     stream: zio.net.Stream,
     arena: std.heap.ArenaAllocator,
     parser: ResponseParser,
@@ -248,7 +256,7 @@ pub const Connection = struct {
 
     // Connection pool metadata
     pool_node: std.DoublyLinkedList.Node = .{},
-    host_buffer: [Uri.host_name_max]u8 = undefined,
+    host_buffer: [255]u8 = undefined,
     host_len: u8 = 0,
     port: u16 = 0,
     closing: bool = false,
@@ -264,16 +272,18 @@ pub const Connection = struct {
     pub fn init(
         self: *Connection,
         allocator: std.mem.Allocator,
+        io: std.Io,
         pool: *ConnectionPool,
         stream: zio.net.Stream,
         remote_host: []const u8,
         remote_port: u16,
         buffer_size: usize,
         protocol: Protocol,
-        ca_bundle: ?*const std.crypto.Certificate.Bundle,
+        ca_bundle: ?CaBundleRef,
         unix_socket_path: ?[]const u8,
     ) !void {
         self.allocator = allocator;
+        self.io = io;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
         self.pool = pool;
@@ -318,12 +328,22 @@ pub const Connection = struct {
             self.tcp_reader = stream.reader(self.tls_tcp_read_buffer);
             self.tcp_writer = stream.writer(self.tls_tcp_write_buffer);
 
+            var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+            self.io.random(&entropy);
+
             self.tls_client = std.crypto.tls.Client.init(
                 &self.tcp_reader.interface,
                 &self.tcp_writer.interface,
                 .{
                     .host = .{ .explicit = remote_host },
-                    .ca = .{ .bundle = bundle.* },
+                    .ca = .{ .bundle = .{
+                        .gpa = bundle.gpa,
+                        .io = self.io,
+                        .lock = bundle.lock,
+                        .bundle = bundle.bundle,
+                    } },
+                    .entropy = &entropy,
+                    .realtime_now = std.Io.Timestamp.now(self.io, .real),
                     .read_buffer = self.read_buffer,
                     .write_buffer = self.write_buffer,
                     .allow_truncation_attacks = true,
@@ -555,44 +575,27 @@ pub const ClientResponse = struct {
 /// HTTP client for making requests.
 pub const Client = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     config: ClientConfig,
     pool: ConnectionPool,
     ca_bundle: std.crypto.Certificate.Bundle,
-    ca_bundle_mutex: std.Thread.Mutex,
-    ca_bundle_initialized: bool,
+    ca_bundle_lock: std.Io.RwLock,
 
-    pub fn init(allocator: std.mem.Allocator, config: ClientConfig) Client {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
+        _ = zio.Runtime.fromIo(io);
         return .{
             .allocator = allocator,
+            .io = io,
             .config = config,
             .pool = ConnectionPool.init(allocator, config.max_idle_connections),
-            .ca_bundle = .{},
-            .ca_bundle_mutex = .{},
-            .ca_bundle_initialized = false,
+            .ca_bundle = .empty,
+            .ca_bundle_lock = .init,
         };
     }
 
     pub fn deinit(self: *Client) void {
         self.pool.deinit();
-        if (self.ca_bundle_initialized) {
-            self.ca_bundle.deinit(self.allocator);
-        }
-    }
-
-    fn ensureCaBundleInitialized(self: *Client) !void {
-        if (@atomicLoad(bool, &self.ca_bundle_initialized, .acquire)) {
-            return;
-        }
-
-        self.ca_bundle_mutex.lock();
-        defer self.ca_bundle_mutex.unlock();
-
-        if (self.ca_bundle_initialized) {
-            return;
-        }
-
-        try self.ca_bundle.rescan(self.allocator);
-        @atomicStore(bool, &self.ca_bundle_initialized, true, .release);
+        self.ca_bundle.deinit(self.allocator);
     }
 
     /// Perform an HTTP request.
@@ -613,7 +616,7 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         protocol: Protocol,
-        ca_bundle: ?*const std.crypto.Certificate.Bundle,
+        ca_bundle: ?CaBundleRef,
         unix_socket_path: ?[]const u8,
     ) !*Connection {
         // Try to get a connection from the pool
@@ -629,6 +632,7 @@ pub const Client = struct {
             errdefer self.allocator.destroy(new_conn);
             try new_conn.init(
                 self.allocator,
+                self.io,
                 &self.pool,
                 stream,
                 host,
@@ -652,16 +656,19 @@ pub const Client = struct {
     ) !WebSocketClient {
         const uri = try parseUrl(url);
         const info = try uriPortAndProtocol(uri);
-        var host_buffer: [Uri.host_name_max]u8 = undefined;
+        var host_buffer: [255]u8 = undefined;
         const host = try uriHost(uri, &host_buffer);
 
         // Initialize CA bundle for HTTPS
-        const ca_bundle: ?*const std.crypto.Certificate.Bundle = if (info.protocol == .https) blk: {
+        const ca_bundle: ?CaBundleRef = if (info.protocol == .https) blk: {
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
-            try self.ensureCaBundleInitialized();
-            break :blk &self.ca_bundle;
+            break :blk .{
+                .gpa = self.allocator,
+                .lock = &self.ca_bundle_lock,
+                .bundle = &self.ca_bundle,
+            };
         } else null;
 
         // Acquire or create a connection
@@ -673,7 +680,7 @@ pub const Client = struct {
 
         // Generate Sec-WebSocket-Key: 16 random bytes -> base64
         var key_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&key_bytes);
+        self.io.random(&key_bytes);
         var key_buf: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_buf, &key_bytes);
 
@@ -736,7 +743,7 @@ pub const Client = struct {
         ws.is_client = true;
         ws.prng = std.Random.DefaultPrng.init(blk: {
             var seed: u64 = undefined;
-            std.crypto.random.bytes(std.mem.asBytes(&seed));
+            self.io.random(std.mem.asBytes(&seed));
             break :blk seed;
         });
         return .{ .ws = ws, .conn = conn };
@@ -750,16 +757,19 @@ pub const Client = struct {
         options: FetchOptions,
         redirects_remaining: u8,
     ) !ClientResponse {
-        var host_buffer: [Uri.host_name_max]u8 = undefined;
+        var host_buffer: [255]u8 = undefined;
         const host = try uriHost(uri, &host_buffer);
 
         // Initialize CA bundle for HTTPS
-        const ca_bundle: ?*const std.crypto.Certificate.Bundle = if (protocol == .https) blk: {
+        const ca_bundle: ?CaBundleRef = if (protocol == .https) blk: {
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
-            try self.ensureCaBundleInitialized();
-            break :blk &self.ca_bundle;
+            break :blk .{
+                .gpa = self.allocator,
+                .lock = &self.ca_bundle_lock,
+                .bundle = &self.ca_bundle,
+            };
         } else null;
 
         // Acquire or create a connection
@@ -939,7 +949,7 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
 
 test "parseUrl: basic URL" {
     const uri = try parseUrl("http://example.com/path");
-    var host_buf: [Uri.host_name_max]u8 = undefined;
+    var host_buf: [255]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
     const info = try uriPortAndProtocol(uri);
@@ -950,7 +960,7 @@ test "parseUrl: basic URL" {
 
 test "parseUrl: URL with port" {
     const uri = try parseUrl("http://example.com:8080/path");
-    var host_buf: [Uri.host_name_max]u8 = undefined;
+    var host_buf: [255]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
     const info = try uriPortAndProtocol(uri);
@@ -961,7 +971,7 @@ test "parseUrl: URL with port" {
 
 test "parseUrl: URL without path" {
     const uri = try parseUrl("http://example.com");
-    var host_buf: [Uri.host_name_max]u8 = undefined;
+    var host_buf: [255]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
     const info = try uriPortAndProtocol(uri);
@@ -988,7 +998,7 @@ test "parseUrl: unknown scheme returns UnsupportedScheme" {
 
 test "parseUrl: URL with query string" {
     const uri = try parseUrl("http://example.com/path?foo=bar&baz=qux");
-    var host_buf: [Uri.host_name_max]u8 = undefined;
+    var host_buf: [255]u8 = undefined;
     const host = try uriHost(uri, &host_buf);
     try std.testing.expectEqualStrings("example.com", host);
     try std.testing.expectEqualStrings("/path", uriPath(uri));

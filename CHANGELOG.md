@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-04-26
+
+- Support for Zig 0.16, still depends on zio, not using `std.Io` due to lack of timeout support.
+- Fix flushing in websocket client when using it over HTTPS.
+- Added support for 100-continue in the HTTP client.
+
 ## [0.1.0] - 2026-03-02
 
 Initial release.

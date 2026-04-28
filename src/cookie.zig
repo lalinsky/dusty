@@ -13,7 +13,7 @@ pub const Cookie = struct {
     pub fn get(self: Cookie, name: []const u8) ?[]const u8 {
         var it = std.mem.splitScalar(u8, self.header, ';');
         while (it.next()) |kv| {
-            const trimmed = std.mem.trimLeft(u8, kv, " ");
+            const trimmed = std.mem.trimStart(u8, kv, &.{' '});
             if (name.len >= trimmed.len) {
                 // need at least an '=' beyond the name
                 continue;
@@ -52,7 +52,7 @@ pub const CookieOpts = struct {
 pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []const u8, opts: CookieOpts) ![]u8 {
     // Estimate length: name=value + attributes (110 is typical for cookie attributes per Go's implementation)
     const estimated_len = name.len + value.len + opts.path.len + opts.domain.len + 110;
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
 
     try buf.ensureTotalCapacity(arena, estimated_len);
     buf.appendSliceAssumeCapacity(name);

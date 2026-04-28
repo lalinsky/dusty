@@ -14,14 +14,18 @@ pub const std_options = std.Options{
 const std = @import("std");
 const builtin = @import("builtin");
 
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const BORDER = "=" ** 80;
 
-// Log capture for suppressing logs in passing tests
+// Log capture for suppressing logs in passing tests.
+// The Io is stashed at startup so the global log callback can perform mutex
+// operations without having to thread `Io` through every call site.
 const LogCapture = struct {
     capture_writer: ?*std.Io.Writer = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = .init,
+    io: ?Io = null,
 
     pub fn logFn(
         self: *@This(),
@@ -30,8 +34,14 @@ const LogCapture = struct {
         comptime format: []const u8,
         args: anytype,
     ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = self.io orelse {
+            // No Io available yet — fall back to raw stderr.
+            const scope_prefix = "(" ++ @tagName(scope) ++ "/" ++ @tagName(level) ++ "): ";
+            std.debug.print(scope_prefix ++ format ++ "\n", args);
+            return;
+        };
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         const scope_prefix = "(" ++ @tagName(scope) ++ "/" ++ @tagName(level) ++ "): ";
 
@@ -39,20 +49,20 @@ const LogCapture = struct {
             // Write to capture buffer
             writer.print(scope_prefix ++ format ++ "\n", args) catch return;
         } else {
-            // Write to stderr (no locking needed, std.debug.print handles it)
+            // Write to stderr (std.debug.print handles its own locking)
             std.debug.print(scope_prefix ++ format ++ "\n", args);
         }
     }
 
-    pub fn startCapture(self: *@This(), writer: *std.Io.Writer) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn startCapture(self: *@This(), io: Io, writer: *std.Io.Writer) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         self.capture_writer = writer;
     }
 
-    pub fn stopCapture(self: *@This()) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn stopCapture(self: *@This(), io: Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         self.capture_writer = null;
     }
 };
@@ -71,25 +81,29 @@ pub fn customLogFn(
 // use in custom panic handler
 var current_test: ?[]const u8 = null;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
-    const allocator = gpa.allocator();
+    log_capture.io = io;
+    defer log_capture.io = null;
 
-    const env = Env.init(allocator);
-    defer env.deinit(allocator);
+    var env = Env.init(gpa, init.environ_map);
+    defer env.deinit(gpa);
 
-    var slowest = SlowTracker.init(allocator, 5);
-    defer slowest.deinit();
+    var slowest = SlowTracker.init(io, 5);
+    defer slowest.deinit(gpa);
 
     var pass: usize = 0;
     var fail: usize = 0;
     var skip: usize = 0;
     var leak: usize = 0;
 
-    var log_buffer: std.Io.Writer.Allocating = .init(allocator);
+    var log_buffer: std.Io.Writer.Allocating = .init(gpa);
     defer log_buffer.deinit();
+
+    var failed_tests: std.ArrayList([]const u8) = .empty;
+    defer failed_tests.deinit(gpa);
 
     Printer.fmt("\r\x1b[0K", .{}); // beginning of line and clear to end of line
 
@@ -102,51 +116,106 @@ pub fn main() !void {
         }
     }
 
+    // Count total tests to run
+    const test_count = blk: {
+        var count: usize = 0;
+        for (builtin.test_functions) |t| {
+            if (isSetup(t) or isTeardown(t)) continue;
+            const is_unnamed_test = isUnnamed(t);
+            if (env.filters.items.len > 0) {
+                if (is_unnamed_test) continue;
+                var matches = false;
+                for (env.filters.items) |f| {
+                    if (std.mem.indexOf(u8, t.name, f) != null) {
+                        matches = true;
+                        break;
+                    }
+                }
+                if (!matches) continue;
+            }
+            count += 1;
+        }
+        break :blk count;
+    };
+
+    const root_node = if (env.verbose == .off) std.Progress.start(io, .{
+        .root_name = "Running tests",
+        .estimated_total_items = test_count,
+    }) else std.Progress.Node.none;
+
+    var test_index: usize = 0;
+
     for (builtin.test_functions) |t| {
         if (isSetup(t) or isTeardown(t)) {
             continue;
         }
 
         var status = Status.pass;
-        slowest.startTiming();
+        slowest.startTiming(io);
 
         const is_unnamed_test = isUnnamed(t);
-        if (env.filter) |f| {
-            if (!is_unnamed_test and std.mem.indexOf(u8, t.name, f) == null) {
+        if (env.filters.items.len > 0) {
+            if (is_unnamed_test) {
+                continue;
+            }
+            var matches = false;
+            for (env.filters.items) |f| {
+                if (std.mem.indexOf(u8, t.name, f) != null) {
+                    matches = true;
+                    break;
+                }
+            }
+            if (!matches) {
                 continue;
             }
         }
 
         const friendly_name = t.name;
 
+        // Update progress
+        if (root_node.index != .none) {
+            root_node.setCompletedItems(test_index);
+            // Progress truncates at 40 chars, so show the end of long names
+            const display_name = if (friendly_name.len <= std.Progress.Node.max_name_len)
+                friendly_name
+            else
+                friendly_name[friendly_name.len - std.Progress.Node.max_name_len ..];
+            root_node.setName(display_name);
+        }
+
+        test_index += 1;
+
         current_test = friendly_name;
         std.testing.allocator_instance = .{};
 
         if (env.do_log_capture) {
             log_buffer.clearRetainingCapacity();
-            log_capture.startCapture(&log_buffer.writer);
+            log_capture.startCapture(io, &log_buffer.writer);
         }
 
-        // Print which test is starting (for debugging hangs)
-        if (env.verbose) {
-            Printer.fmt("Starting: {s}\n", .{friendly_name});
+        // Print test name before running (for debugging hangs)
+        switch (env.verbose) {
+            .naming => Printer.fmt("{s} .. ", .{friendly_name}),
+            .tracing => Printer.fmt("{s}\n", .{friendly_name}),
+            .off => {},
         }
 
         const result = t.func();
 
         if (env.do_log_capture) {
-            log_capture.stopCapture();
+            log_capture.stopCapture(io);
         }
 
         current_test = null;
 
-        const ns_taken = slowest.endTiming(friendly_name);
+        const ns_taken = slowest.endTiming(io, gpa, friendly_name);
 
         if (std.testing.allocator_instance.deinit() == .leak) {
             leak += 1;
             Printer.status(.fail, "\n{s}\n\"{s}\" - Memory Leak\n{s}\n", .{ BORDER, friendly_name, BORDER });
         }
 
+        var fail_err: ?anyerror = null;
         if (result) |_| {
             pass += 1;
         } else |err| switch (err) {
@@ -157,28 +226,48 @@ pub fn main() !void {
             else => {
                 status = .fail;
                 fail += 1;
-                Printer.status(.fail, "\n{s}\n\"{s}\" - {s}\n", .{ BORDER, friendly_name, @errorName(err) });
-
-                // Print captured logs for failed tests
-                if (log_buffer.written().len > 0) {
-                    Printer.fmt("Test output:\n{s}", .{log_buffer.written()});
-                }
-
-                Printer.fmt("{s}\n", .{BORDER});
-                if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
-                }
-                if (env.fail_first) {
-                    break;
-                }
+                fail_err = err;
+                failed_tests.append(gpa, friendly_name) catch {};
             },
         }
 
-        if (env.verbose) {
-            const ms = @as(f64, @floatFromInt(ns_taken)) / 1_000_000.0;
-            Printer.status(status, "{s} ({d:.2}ms)\n", .{ friendly_name, ms });
-        } else {
-            Printer.status(status, ".", .{});
+        const ms = @as(f64, @floatFromInt(ns_taken)) / 1_000_000.0;
+        const status_str = switch (status) {
+            .pass => "OK",
+            .fail => "FAIL",
+            .skip => "SKIP",
+            .text => "",
+        };
+        switch (env.verbose) {
+            .naming => {
+                Printer.status(status, "{s}", .{status_str});
+                Printer.fmt(" ({d:.2}ms)\n", .{ms});
+            },
+            .tracing => {
+                Printer.fmt("  ", .{});
+                Printer.status(status, "{s}", .{status_str});
+                Printer.fmt(" ({d:.2}ms)\n", .{ms});
+            },
+            .off => {},
+        }
+
+        // Print error details for failures (in non-verbose mode, progress will show above this)
+        if (fail_err) |err| {
+            Printer.fmt("{s}\n", .{BORDER});
+            Printer.status(.fail, "\"{s}\" - {s}\n", .{ friendly_name, @errorName(err) });
+
+            // Print captured logs for failed tests
+            if (log_buffer.written().len > 0) {
+                Printer.fmt("Test output:\n{s}", .{log_buffer.written()});
+            }
+
+            Printer.fmt("{s}\n", .{BORDER});
+            if (@errorReturnTrace()) |trace| {
+                std.debug.dumpErrorReturnTrace(trace);
+            }
+            if (env.fail_first) {
+                break;
+            }
         }
     }
 
@@ -191,6 +280,11 @@ pub fn main() !void {
         }
     }
 
+    // End progress before printing summary
+    if (root_node.index != .none) {
+        root_node.end();
+    }
+
     const total_tests = pass + fail;
     const status = if (fail == 0) Status.pass else Status.fail;
     Printer.status(status, "\n{d} of {d} test{s} passed\n", .{ pass, total_tests, if (total_tests != 1) "s" else "" });
@@ -200,10 +294,17 @@ pub fn main() !void {
     if (leak > 0) {
         Printer.status(.fail, "{d} test{s} leaked\n", .{ leak, if (leak != 1) "s" else "" });
     }
+    if (failed_tests.items.len > 0) {
+        Printer.fmt("\n", .{});
+        Printer.fmt("Failed tests:\n", .{});
+        for (failed_tests.items) |name| {
+            Printer.fmt("  {s}\n", .{name});
+        }
+    }
     Printer.fmt("\n", .{});
     try slowest.display();
     Printer.fmt("\n", .{});
-    std.posix.exit(if (fail == 0) 0 else 1);
+    std.process.exit(if (fail == 0) 0 else 1);
 }
 
 const Printer = struct {
@@ -233,16 +334,13 @@ const SlowTracker = struct {
     const SlowestQueue = std.PriorityDequeue(TestInfo, void, compareTiming);
     max: usize,
     slowest: SlowestQueue,
-    timer: std.time.Timer,
+    started: Io.Clock.Timestamp,
 
-    fn init(allocator: Allocator, count: u32) SlowTracker {
-        const timer = std.time.Timer.start() catch @panic("failed to start timer");
-        var slowest = SlowestQueue.init(allocator, {});
-        slowest.ensureTotalCapacity(count) catch @panic("OOM");
+    fn init(io: Io, count: u32) SlowTracker {
         return .{
             .max = count,
-            .timer = timer,
-            .slowest = slowest,
+            .started = .now(io, .awake),
+            .slowest = SlowestQueue.initContext({}),
         };
     }
 
@@ -251,24 +349,24 @@ const SlowTracker = struct {
         name: []const u8,
     };
 
-    fn deinit(self: SlowTracker) void {
-        self.slowest.deinit();
+    fn deinit(self: *SlowTracker, allocator: Allocator) void {
+        self.slowest.deinit(allocator);
     }
 
-    fn startTiming(self: *SlowTracker) void {
-        self.timer.reset();
+    fn startTiming(self: *SlowTracker, io: Io) void {
+        self.started = .now(io, .awake);
     }
 
-    fn endTiming(self: *SlowTracker, test_name: []const u8) u64 {
-        var timer = self.timer;
-        const ns = timer.lap();
+    fn endTiming(self: *SlowTracker, io: Io, allocator: Allocator, test_name: []const u8) u64 {
+        const now = Io.Clock.Timestamp.now(io, .awake);
+        const ns: u64 = @intCast(self.started.durationTo(now).raw.nanoseconds);
 
         var slowest = &self.slowest;
 
         if (slowest.count() < self.max) {
             // Capacity is fixed to the # of slow tests we want to track
             // If we've tracked fewer tests than this capacity, than always add
-            slowest.add(TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
+            slowest.push(allocator, TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
             return ns;
         }
 
@@ -283,8 +381,8 @@ const SlowTracker = struct {
         }
 
         // the previous fastest of our slow tests, has been pushed off.
-        _ = slowest.removeMin();
-        slowest.add(TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
+        _ = slowest.popMin();
+        slowest.push(allocator, TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
         return ns;
     }
 
@@ -292,7 +390,7 @@ const SlowTracker = struct {
         var slowest = self.slowest;
         const count = slowest.count();
         Printer.fmt("Slowest {d} test{s}: \n", .{ count, if (count != 1) "s" else "" });
-        while (slowest.removeMinOrNull()) |info| {
+        while (slowest.popMin()) |info| {
             const ms = @as(f64, @floatFromInt(info.ns)) / 1_000_000.0;
             Printer.fmt("  {d:.2}ms\t{s}\n", .{ ms, info.name });
         }
@@ -305,41 +403,52 @@ const SlowTracker = struct {
 };
 
 const Env = struct {
-    verbose: bool,
+    const Verbose = enum { off, naming, tracing };
+
+    verbose: Verbose,
     fail_first: bool,
-    filter: ?[]const u8,
+    filters: std.ArrayList([]const u8),
     do_log_capture: bool,
 
-    fn init(allocator: Allocator) Env {
+    fn init(allocator: Allocator, environ_map: *std.process.Environ.Map) Env {
+        var filters: std.ArrayList([]const u8) = .empty;
+
+        if (environ_map.get("TEST_FILTER")) |filter_str| {
+            var iter = std.mem.splitScalar(u8, filter_str, '|');
+            while (iter.next()) |part| {
+                const trimmed = std.mem.trim(u8, part, " \t");
+                if (trimmed.len > 0) {
+                    const owned = allocator.dupe(u8, trimmed) catch @panic("OOM");
+                    filters.append(allocator, owned) catch @panic("OOM");
+                }
+            }
+        }
+
         return .{
-            .verbose = readEnvBool(allocator, "TEST_VERBOSE", true),
-            .fail_first = readEnvBool(allocator, "TEST_FAIL_FIRST", false),
-            .filter = readEnv(allocator, "TEST_FILTER"),
-            .do_log_capture = readEnvBool(allocator, "TEST_LOG_CAPTURE", true),
+            .verbose = readEnvVerbose(environ_map),
+            .fail_first = readEnvBool(environ_map, "TEST_FAIL_FIRST", false),
+            .filters = filters,
+            .do_log_capture = readEnvBool(environ_map, "TEST_LOG_CAPTURE", true),
         };
     }
 
-    fn deinit(self: Env, allocator: Allocator) void {
-        if (self.filter) |f| {
+    fn deinit(self: *Env, allocator: Allocator) void {
+        for (self.filters.items) |f| {
             allocator.free(f);
         }
+        self.filters.deinit(allocator);
     }
 
-    fn readEnv(allocator: Allocator, key: []const u8) ?[]const u8 {
-        const v = std.process.getEnvVarOwned(allocator, key) catch |err| {
-            if (err == error.EnvironmentVariableNotFound) {
-                return null;
-            }
-            std.log.warn("failed to get env var {s} due to err {}", .{ key, err });
-            return null;
-        };
-        return v;
-    }
-
-    fn readEnvBool(allocator: Allocator, key: []const u8, deflt: bool) bool {
-        const value = readEnv(allocator, key) orelse return deflt;
-        defer allocator.free(value);
+    fn readEnvBool(environ_map: *std.process.Environ.Map, key: []const u8, deflt: bool) bool {
+        const value = environ_map.get(key) orelse return deflt;
         return std.ascii.eqlIgnoreCase(value, "true");
+    }
+
+    fn readEnvVerbose(environ_map: *std.process.Environ.Map) Verbose {
+        const value = environ_map.get("TEST_VERBOSE") orelse return .off;
+        if (std.ascii.eqlIgnoreCase(value, "2")) return .tracing;
+        if (std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1")) return .naming;
+        return .off;
     }
 };
 

@@ -2,12 +2,12 @@ const std = @import("std");
 const zio = @import("zio");
 const dusty = @import("root.zig");
 
-fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
+fn testClientServer(comptime Ctx: type, ctx: *Ctx, io: std.Io) !void {
     const TestServer = dusty.Server(Ctx);
 
     const Test = struct {
-        pub fn mainFn(test_ctx: *Ctx) !void {
-            var server = TestServer.init(std.testing.allocator, .{}, test_ctx);
+        pub fn mainFn(test_ctx: *Ctx, test_io: std.Io) !void {
+            var server = TestServer.init(std.testing.allocator, test_io, .{}, test_ctx);
             defer server.deinit();
 
             try test_ctx.setup(&server);
@@ -47,10 +47,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
-
-    var task = try zio.spawn(Test.mainFn, .{ctx});
+    var task = try zio.spawn(Test.mainFn, .{ ctx, io });
     try task.join();
 }
 
@@ -91,7 +88,11 @@ test "Server: POST with body" {
     };
 
     var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try testClientServer(TestContext, &ctx, rt.io());
 
     try std.testing.expect(ctx.body_received);
     try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
@@ -158,7 +159,11 @@ test "Server: POST with chunked encoding" {
     };
 
     var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try testClientServer(TestContext, &ctx, rt.io());
 
     try std.testing.expect(ctx.body_received);
     try std.testing.expectEqualStrings("Hello from chunked test!", ctx.received_body[0..ctx.received_len]);
@@ -204,7 +209,11 @@ test "Server: GET with no body" {
     };
 
     var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try testClientServer(TestContext, &ctx, rt.io());
 
     try std.testing.expect(ctx.reader_tested);
     try std.testing.expectEqual(0, ctx.read_len);
@@ -240,7 +249,11 @@ test "Server: HTTP/1.0 GET request" {
     };
 
     var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try testClientServer(TestContext, &ctx, rt.io());
 
     try std.testing.expect(ctx.request_handled);
     try std.testing.expectEqual(1, ctx.version_major);
@@ -301,8 +314,8 @@ test "Server: WebSocket echo" {
     };
 
     const Test = struct {
-        pub fn mainFn(ctx: *TestContext) !void {
-            var server = dusty.Server(TestContext).init(std.testing.allocator, .{}, ctx);
+        pub fn mainFn(ctx: *TestContext, io: std.Io) !void {
+            var server = dusty.Server(TestContext).init(std.testing.allocator, io, .{}, ctx);
             defer server.deinit();
 
             try ctx.setup(&server);
@@ -426,10 +439,10 @@ test "Server: WebSocket echo" {
 
     var ctx: TestContext = .{};
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{&ctx});
+    var task = try zio.spawn(Test.mainFn, .{ &ctx, rt.io() });
     try task.join();
 
     try std.testing.expect(ctx.ws_upgraded);
@@ -439,8 +452,8 @@ test "Server: WebSocket echo" {
 
 test "Server: void context handlers" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.get("/test", handleGet);
@@ -496,17 +509,17 @@ test "Server: void context handlers" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }
 
 test "Server: 100-continue" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.post("/upload", handlePost);
@@ -566,17 +579,17 @@ test "Server: 100-continue" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }
 
 test "Server: 417 Expectation Failed for unknown Expect value" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.post("/upload", handlePost);
@@ -623,9 +636,9 @@ test "Server: 417 Expectation Failed for unknown Expect value" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }

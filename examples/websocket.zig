@@ -2,9 +2,7 @@ const std = @import("std");
 const zio = @import("zio");
 const http = @import("dusty");
 
-const AppContext = struct {
-    io: *zio.Runtime,
-};
+const AppContext = struct {};
 
 fn handleWebSocket(_: *AppContext, req: *http.Request, res: *http.Response) !void {
     var ws = try res.upgradeWebSocket(req) orelse {
@@ -71,10 +69,10 @@ fn handleIndex(_: *AppContext, _: *http.Request, res: *http.Response) !void {
     ;
 }
 
-pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
-    var ctx: AppContext = .{ .io = io };
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
+    var ctx: AppContext = .{};
 
-    var server = http.Server(AppContext).init(allocator, .{}, &ctx);
+    var server = http.Server(AppContext).init(allocator, io, .{}, &ctx);
     defer server.deinit();
 
     server.router.get("/", handleIndex);
@@ -86,14 +84,11 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
     try server.listen(addr);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var io = try zio.Runtime.init(allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(runServer, .{ allocator, io });
-    try task.join();
+    try runServer(allocator, rt.io());
 }

@@ -3,7 +3,6 @@ const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
-    io: *zio.Runtime,
     client: *http.Client,
     upstream_url: []const u8,
 };
@@ -89,17 +88,16 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     std.log.info("Proxied response: {d} bytes", .{bytes_written});
 }
 
-pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime, upstream_url: []const u8) !void {
-    var client = http.Client.init(allocator, .{});
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const u8) !void {
+    var client = http.Client.init(allocator, io, .{});
     defer client.deinit();
 
     var ctx: AppContext = .{
-        .io = io,
         .client = &client,
         .upstream_url = upstream_url,
     };
 
-    var server = http.Server(AppContext).init(allocator, .{}, &ctx);
+    var server = http.Server(AppContext).init(allocator, io, .{}, &ctx);
     defer server.deinit();
 
     // Catch-all route - proxy everything for all common HTTP methods
@@ -116,23 +114,17 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime, upstream_url: [
     try server.listen(addr);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const upstream_url = if (args.len > 1)
         args[1]
     else
         "https://httpbin.org";
 
-    var io = try zio.Runtime.init(allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(runServer, .{ allocator, io, upstream_url });
-    try task.join();
+    try runServer(allocator, rt.io(), upstream_url);
 }

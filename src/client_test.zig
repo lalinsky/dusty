@@ -4,8 +4,8 @@ const dusty = @import("root.zig");
 
 test "Client: simple GET request" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.get("/test", handleGet);
@@ -54,17 +54,17 @@ test "Client: simple GET request" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }
 
 test "Client: fetch GET request" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.get("/api", handleGet);
@@ -72,7 +72,7 @@ test "Client: fetch GET request" {
             var server_task = try zio.spawn(serverFn, .{&server});
             defer server_task.cancel();
 
-            var client_task = try zio.spawn(clientFn, .{&server});
+            var client_task = try zio.spawn(clientFn, .{ &server, io });
             defer client_task.cancel();
 
             try client_task.join();
@@ -83,7 +83,7 @@ test "Client: fetch GET request" {
             try server.listen(addr);
         }
 
-        pub fn clientFn(server: *dusty.Server(void)) !void {
+        pub fn clientFn(server: *dusty.Server(void), io: std.Io) !void {
             try server.ready.wait();
 
             // Get the port
@@ -96,7 +96,7 @@ test "Client: fetch GET request" {
             std.log.info("Making request to: {s}", .{url});
 
             // Use our client
-            var client = dusty.Client.init(std.testing.allocator, .{});
+            var client = dusty.Client.init(std.testing.allocator, io, .{});
             defer client.deinit();
 
             var response = try client.fetch(url, .{});
@@ -118,17 +118,17 @@ test "Client: fetch GET request" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }
 
 test "Client: connection pooling" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.get("/test", handleGet);
@@ -136,7 +136,7 @@ test "Client: connection pooling" {
             var server_task = try zio.spawn(serverFn, .{&server});
             defer server_task.cancel();
 
-            var client_task = try zio.spawn(clientFn, .{&server});
+            var client_task = try zio.spawn(clientFn, .{ &server, io });
             defer client_task.cancel();
 
             try client_task.join();
@@ -147,7 +147,7 @@ test "Client: connection pooling" {
             try server.listen(addr);
         }
 
-        pub fn clientFn(server: *dusty.Server(void)) !void {
+        pub fn clientFn(server: *dusty.Server(void), io: std.Io) !void {
             try server.ready.wait();
 
             const port = std.mem.bigToNative(u16, server.address.ip.in.port);
@@ -155,7 +155,7 @@ test "Client: connection pooling" {
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
 
-            var client = dusty.Client.init(std.testing.allocator, .{});
+            var client = dusty.Client.init(std.testing.allocator, io, .{});
             defer client.deinit();
 
             // Pool should be empty initially
@@ -192,17 +192,17 @@ test "Client: connection pooling" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }
 
 test "Client: WebSocket upgrade" {
     const Test = struct {
-        pub fn mainFn() !void {
-            var server = dusty.Server(void).init(std.testing.allocator, .{}, {});
+        pub fn mainFn(io: std.Io) !void {
+            var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
             defer server.deinit();
 
             server.router.get("/ws", handleWebSocket);
@@ -210,7 +210,7 @@ test "Client: WebSocket upgrade" {
             var server_task = try zio.spawn(serverFn, .{&server});
             defer server_task.cancel();
 
-            var client_task = try zio.spawn(clientFn, .{&server});
+            var client_task = try zio.spawn(clientFn, .{ &server, io });
             defer client_task.cancel();
 
             try client_task.join();
@@ -221,7 +221,7 @@ test "Client: WebSocket upgrade" {
             try server.listen(addr);
         }
 
-        pub fn clientFn(server: *dusty.Server(void)) !void {
+        pub fn clientFn(server: *dusty.Server(void), io: std.Io) !void {
             try server.ready.wait();
 
             const port = std.mem.bigToNative(u16, server.address.ip.in.port);
@@ -229,7 +229,7 @@ test "Client: WebSocket upgrade" {
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/ws", .{port});
 
-            var client = dusty.Client.init(std.testing.allocator, .{});
+            var client = dusty.Client.init(std.testing.allocator, io, .{});
             defer client.deinit();
 
             var ws = try client.connectWebSocket(url, .{});
@@ -275,10 +275,10 @@ test "Client: WebSocket upgrade" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }
 
@@ -288,10 +288,10 @@ test "Client: unix socket fetch" {
     if (!zio.net.has_unix_sockets) return error.SkipZigTest;
 
     const Test = struct {
-        pub fn mainFn() !void {
+        pub fn mainFn(io: std.Io) !void {
             var path_buf: [64]u8 = undefined;
             const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/dusty-client-test-unix-{d}.sock", .{std.c.getpid()});
-            std.fs.cwd().deleteFile(socket_path) catch {};
+            zio.Dir.cwd().deleteFile(socket_path) catch {};
 
             var ready_buf: [1]bool = undefined;
             var ready_ch = zio.Channel(bool).init(&ready_buf);
@@ -299,7 +299,7 @@ test "Client: unix socket fetch" {
             var server_task = try zio.spawn(serverFn, .{ socket_path, &ready_ch });
             defer server_task.cancel();
 
-            var client_task = try zio.spawn(clientFn, .{ socket_path, &ready_ch });
+            var client_task = try zio.spawn(clientFn, .{ socket_path, &ready_ch, io });
             defer client_task.cancel();
 
             try client_task.join();
@@ -309,11 +309,11 @@ test "Client: unix socket fetch" {
             const unix_addr = try zio.net.UnixAddress.init(socket_path);
             const server = try unix_addr.listen(.{});
             defer server.close();
-            defer std.fs.cwd().deleteFile(socket_path) catch {};
+            defer zio.Dir.cwd().deleteFile(socket_path) catch {};
 
             try ready.send(true);
 
-            const stream = try server.accept();
+            const stream = try server.accept(.{});
             defer stream.close();
             defer stream.shutdown(.both) catch {};
 
@@ -323,7 +323,7 @@ test "Client: unix socket fetch" {
             while (true) {
                 const line = try reader.interface.takeDelimiterExclusive('\n');
                 reader.interface.toss(1);
-                if (std.mem.trimRight(u8, line, "\r").len == 0) break;
+                if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
             }
 
             // Write a minimal HTTP response
@@ -339,10 +339,10 @@ test "Client: unix socket fetch" {
             try writer.interface.flush();
         }
 
-        pub fn clientFn(socket_path: []const u8, ready: *zio.Channel(bool)) !void {
+        pub fn clientFn(socket_path: []const u8, ready: *zio.Channel(bool), io: std.Io) !void {
             _ = try ready.receive();
 
-            var client = dusty.Client.init(std.testing.allocator, .{});
+            var client = dusty.Client.init(std.testing.allocator, io, .{});
             defer client.deinit();
 
             var response = try client.fetch("http://localhost/test", .{
@@ -358,9 +358,9 @@ test "Client: unix socket fetch" {
         }
     };
 
-    var io = try zio.Runtime.init(std.testing.allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(Test.mainFn, .{});
+    var task = try zio.spawn(Test.mainFn, .{rt.io()});
     try task.join();
 }

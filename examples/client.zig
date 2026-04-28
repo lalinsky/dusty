@@ -2,14 +2,9 @@ const std = @import("std");
 const zio = @import("zio");
 const http = @import("dusty");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.debug.print("Usage: {s} <url>\n", .{args[0]});
@@ -22,7 +17,7 @@ pub fn main() !void {
     var rt = try zio.Runtime.init(allocator, .{});
     defer rt.deinit();
 
-    var client = http.Client.init(allocator, .{});
+    var client = http.Client.init(allocator, rt.io(), .{});
     defer client.deinit();
 
     var response = try client.fetch(url, .{});

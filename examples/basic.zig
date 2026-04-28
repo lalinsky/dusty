@@ -3,7 +3,6 @@ const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
-    io: *zio.Runtime,
     counter: usize = 0,
 
     pub fn uncaughtError(self: *AppContext, req: *http.Request, res: *http.Response, err: anyerror) void {
@@ -75,7 +74,7 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     try res.chunk("Third chunk of data\n");
 
     // Dynamic content in chunk
-    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{std.time.timestamp()});
+    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{zio.Timestamp.now(.realtime).toSeconds()});
     try res.chunk(dynamic);
 
     try res.chunk("Final chunk!\n");
@@ -90,7 +89,7 @@ fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     try res.json(.{
         .message = "Hello from Dusty!",
         .counter = ctx.counter,
-        .timestamp = std.time.timestamp(),
+        .timestamp = zio.Timestamp.now(.realtime).toSeconds(),
         .server = "dusty-http",
         .data = .{
             .nested = true,
@@ -139,12 +138,12 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
         .name = user_data.name,
         .email = user_data.email,
         .age = user_data.age,
-        .created_at = std.time.timestamp(),
+        .created_at = zio.Timestamp.now(.realtime).toSeconds(),
     }, .{});
 }
 
-pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
-    var ctx: AppContext = .{ .io = io };
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
+    var ctx: AppContext = .{};
     const AppServer = http.Server(AppContext);
 
     const config: http.ServerConfig = .{
@@ -154,7 +153,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
         },
     };
 
-    var server = AppServer.init(allocator, config, &ctx);
+    var server = AppServer.init(allocator, io, config, &ctx);
     defer server.deinit();
 
     const cors = try server.middleware(http.middleware.Cors, .{
@@ -199,14 +198,11 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var io = try zio.Runtime.init(allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(runServer, .{ allocator, io });
-    try task.join();
+    try runServer(allocator, rt.io());
 }

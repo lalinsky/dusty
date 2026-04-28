@@ -10,7 +10,7 @@ pub const WebSocket = struct {
     closed: bool = false,
     auto_responded: bool = false,
     fragmented_type: ?MessageType = null,
-    fragmented_data: std.ArrayListUnmanaged(u8) = .{},
+    fragmented_data: std.ArrayListUnmanaged(u8) = .empty,
 
     pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
 

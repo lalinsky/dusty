@@ -24,6 +24,7 @@ pub fn Server(comptime Ctx: type) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
+        io: std.Io,
         router: Router(Ctx),
         ctx: if (Ctx == void) void else *Ctx,
         config: ServerConfig,
@@ -34,9 +35,11 @@ pub fn Server(comptime Ctx: type) type {
         last_connection_closed: zio.Notify,
         _middleware_registry: std.SinglyLinkedList,
 
-        pub fn init(allocator: std.mem.Allocator, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
+            _ = zio.Runtime.fromIo(io);
             return .{
                 .allocator = allocator,
+                .io = io,
                 .router = Router(Ctx).init(allocator),
                 .ctx = ctx,
                 .config = config,
@@ -101,7 +104,7 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             while (true) {
-                const stream = server.accept() catch |err| {
+                const stream = server.accept(.{}) catch |err| {
                     if (err == error.Canceled) {
                         log.info("Graceful shutdown requested", .{});
                         self.shutting_down.store(true, .release);

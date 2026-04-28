@@ -5,7 +5,6 @@ const http = @import("dusty");
 const BroadcastChannel = zio.BroadcastChannel;
 
 const AppContext = struct {
-    io: *zio.Runtime,
     channel: *BroadcastChannel(u64),
 };
 
@@ -42,13 +41,13 @@ fn ticker(channel: *BroadcastChannel(u64)) !void {
     }
 }
 
-pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
+pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     var channel_buffer: [16]u64 = undefined;
     var channel = BroadcastChannel(u64).init(&channel_buffer);
 
-    var ctx: AppContext = .{ .io = io, .channel = &channel };
+    var ctx: AppContext = .{ .channel = &channel };
 
-    var server = http.Server(AppContext).init(allocator, .{}, &ctx);
+    var server = http.Server(AppContext).init(allocator, io, .{}, &ctx);
     defer server.deinit();
 
     server.router.get("/events", handleEvents);
@@ -61,14 +60,11 @@ pub fn runServer(allocator: std.mem.Allocator, io: *zio.Runtime) !void {
     try server.listen(addr);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var io = try zio.Runtime.init(allocator, .{});
-    defer io.deinit();
+    var rt = try zio.Runtime.init(allocator, .{});
+    defer rt.deinit();
 
-    var task = try zio.spawn(runServer, .{ allocator, io });
-    try task.join();
+    try runServer(allocator, rt.io());
 }
