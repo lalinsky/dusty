@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 const CookieOpts = @import("../cookie.zig").CookieOpts;
@@ -67,7 +66,7 @@ pub const SessionData = struct {
 pub const Config = struct {
     secret_key: []const u8,
     cookie_name: []const u8 = "session",
-    max_age: ?zio.Duration = null,
+    max_age: ?std.Io.Duration = null,
     cookie_opts: CookieOpts = .{
         .path = "/",
         .http_only = true,
@@ -87,7 +86,7 @@ pub fn init(config: Config) !Session {
 pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
     const cookie_value = req.cookies().get(self.config.cookie_name);
     if (cookie_value) |raw| {
-        self.load(req.arena, &req.session, raw) catch |err| switch (err) {
+        self.load(req.arena, &req.session, raw, req.io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| log.debug("session load failed: {}", .{e}),
         };
@@ -105,7 +104,7 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
             delete_opts.max_age = .zero;
             try res.setCookie(self.config.cookie_name, "", delete_opts);
         } else {
-            const signed = try self.signSession(req.arena, &req.session, .now(.realtime));
+            const signed = try self.signSession(req.arena, &req.session, std.Io.Timestamp.now(req.io, .real));
             var opts = self.config.cookie_opts;
             if (self.config.max_age) |ma| {
                 opts.max_age = ma;
@@ -128,7 +127,7 @@ const overhead = header_size + sig_size;
 /// Load a signed cookie value into a SessionData.
 /// Decodes the base64, verifies HMAC, then parses entries.
 /// Format: base64url([Header: 8 bytes][signature: 32 bytes][key\0value\0...])
-fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, raw: []const u8) !void {
+fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, raw: []const u8, io: std.Io) !void {
     const decoded_len = base64url.Decoder.calcSizeForSlice(raw) catch return error.InvalidEncoding;
     if (decoded_len < overhead) return error.InvalidEncoding;
     const decoded = try arena.alloc(u8, decoded_len);
@@ -151,7 +150,7 @@ fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, r
 
     // Check expiry
     if (header.expires_at != 0) {
-        const now: u32 = @intCast(zio.Timestamp.now(.realtime).toNanoseconds() / 1_000_000_000);
+        const now: u32 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_s));
         if (header.expires_at < now) return error.Expired;
     }
 
@@ -167,7 +166,7 @@ fn load(self: *const Session, arena: std.mem.Allocator, session: *SessionData, r
 
 /// Serialize session entries, sign, and base64-encode.
 /// Format: base64url([Header: 8 bytes][signature: 32 bytes][key\0value\0...])
-fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const SessionData, now: zio.Timestamp) ![]const u8 {
+fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const SessionData, now: std.Io.Timestamp) ![]const u8 {
     // Calculate payload size
     var payload_size: usize = 0;
     for (session.items()) |entry| {
@@ -179,8 +178,9 @@ fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const S
 
     // Write header
     const expires_at: u32 = if (self.config.max_age) |ma| blk: {
-        const expires_s = now.addDuration(ma).toNanoseconds() / 1_000_000_000;
-        break :blk @min(expires_s, std.math.maxInt(u32));
+        const expires_ns = now.addDuration(ma).nanoseconds;
+        const expires_s: i64 = @intCast(@divTrunc(expires_ns, std.time.ns_per_s));
+        break :blk @intCast(@min(expires_s, std.math.maxInt(u32)));
     } else 0;
 
     const header = Header{ .expires_at = expires_at };
@@ -285,10 +285,10 @@ test "Session: sign and load round-trip" {
     try s.set("user_id", "42");
     try s.set("role", "admin");
 
-    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
+    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
 
     var s2 = SessionData{};
-    try session.load(arena.allocator(), &s2, signed);
+    try session.load(arena.allocator(), &s2, signed, std.testing.io);
 
     try testing.expectEqualStrings("42", s2.get("user_id").?);
     try testing.expectEqualStrings("admin", s2.get("role").?);
@@ -308,10 +308,10 @@ test "Session: sign and load round-trip with max_age" {
     var s = SessionData{};
     try s.set("user_id", "42");
 
-    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
+    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
 
     var s2 = SessionData{};
-    try session.load(arena.allocator(), &s2, signed);
+    try session.load(arena.allocator(), &s2, signed, std.testing.io);
 
     try testing.expectEqualStrings("42", s2.get("user_id").?);
 }
@@ -333,7 +333,7 @@ test "Session: load rejects expired session" {
     const signed = try session.signSession(arena.allocator(), &s, .fromNanoseconds(1000 * 1_000_000_000));
 
     var s2 = SessionData{};
-    try testing.expectError(error.Expired, session.load(arena.allocator(), &s2, signed));
+    try testing.expectError(error.Expired, session.load(arena.allocator(), &s2, signed, std.testing.io));
 }
 
 test "Session: load rejects tampered payload" {
@@ -347,7 +347,7 @@ test "Session: load rejects tampered payload" {
 
     var s = SessionData{};
     try s.set("user_id", "42");
-    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
+    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
 
     var tampered = try arena.allocator().dupe(u8, signed);
     // Tamper near the end (payload region) to avoid corrupting the header/version
@@ -355,7 +355,7 @@ test "Session: load rejects tampered payload" {
     tampered[idx] = if (tampered[idx] == 'A') 'B' else 'A';
 
     var s2 = SessionData{};
-    try testing.expectError(error.InvalidSignature, session.load(arena.allocator(), &s2, tampered));
+    try testing.expectError(error.InvalidSignature, session.load(arena.allocator(), &s2, tampered, std.testing.io));
 }
 
 test "Session: load rejects wrong key" {
@@ -367,10 +367,10 @@ test "Session: load rejects wrong key" {
 
     var s = SessionData{};
     try s.set("data", "test");
-    const signed = try session1.signSession(arena.allocator(), &s, .now(.realtime));
+    const signed = try session1.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
 
     var s2 = SessionData{};
-    try testing.expectError(error.InvalidSignature, session2.load(arena.allocator(), &s2, signed));
+    try testing.expectError(error.InvalidSignature, session2.load(arena.allocator(), &s2, signed, std.testing.io));
 }
 
 test "Session: load rejects garbage" {
@@ -380,13 +380,13 @@ test "Session: load rejects garbage" {
     const session = Session{ .config = .{ .secret_key = "key", .cookie_name = "s" } };
 
     var s = SessionData{};
-    try testing.expectError(error.InvalidEncoding, session.load(arena.allocator(), &s, ""));
+    try testing.expectError(error.InvalidEncoding, session.load(arena.allocator(), &s, "", std.testing.io));
 
     s = .{};
-    try testing.expectError(error.InvalidEncoding, session.load(arena.allocator(), &s, "!!!invalid-base64!!!"));
+    try testing.expectError(error.InvalidEncoding, session.load(arena.allocator(), &s, "!!!invalid-base64!!!", std.testing.io));
 
     s = .{};
-    try testing.expectError(error.InvalidEncoding, session.load(arena.allocator(), &s, "AAAA"));
+    try testing.expectError(error.InvalidEncoding, session.load(arena.allocator(), &s, "AAAA", std.testing.io));
 }
 
 test "Session: empty session round-trip" {
@@ -396,10 +396,10 @@ test "Session: empty session round-trip" {
     const session = Session{ .config = .{ .secret_key = "key", .cookie_name = "s" } };
 
     var s = SessionData{};
-    const signed = try session.signSession(arena.allocator(), &s, .now(.realtime));
+    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
 
     var s2 = SessionData{};
-    try session.load(arena.allocator(), &s2, signed);
+    try session.load(arena.allocator(), &s2, signed, std.testing.io);
     try testing.expectEqual(0, s2.len);
 }
 

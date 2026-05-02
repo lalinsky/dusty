@@ -3,7 +3,6 @@
 // Copyright (c) 2024 Karl Seguin.
 
 const std = @import("std");
-const zio = @import("zio");
 
 /// Cookie parser for reading cookies from a request.
 /// Lazily parses the Cookie header on demand.
@@ -35,7 +34,7 @@ pub const Cookie = struct {
 pub const CookieOpts = struct {
     path: []const u8 = "",
     domain: []const u8 = "",
-    max_age: ?zio.Duration = null,
+    max_age: ?std.Io.Duration = null,
     secure: bool = false,
     http_only: bool = false,
     partitioned: bool = false,

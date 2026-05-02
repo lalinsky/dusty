@@ -14,19 +14,19 @@ test "Client: simple GET request" {
         }
     }.handle);
 
-    const server_future = try io.concurrent(struct {
+    var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
             try s.listen(addr);
         }
     }.run, .{&server});
-    defer server_future.cancel(io);
+    defer server_future.cancel(io) catch {};
 
-    const client_future = try io.concurrent(struct {
+    var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
             try s.ready.wait(_io);
 
-            const port = s.address.ip.port();
+            const port = s.address.ip.getPort();
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -63,19 +63,19 @@ test "Client: fetch GET request" {
         }
     }.handle);
 
-    const server_future = try io.concurrent(struct {
+    var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
             try s.listen(addr);
         }
     }.run, .{&server});
-    defer server_future.cancel(io);
+    defer server_future.cancel(io) catch {};
 
-    const client_future = try io.concurrent(struct {
+    var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
             try s.ready.wait(_io);
 
-            const port = s.address.ip.port();
+            const port = s.address.ip.getPort();
 
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api", .{port});
@@ -115,19 +115,19 @@ test "Client: connection pooling" {
         }
     }.handle);
 
-    const server_future = try io.concurrent(struct {
+    var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
             try s.listen(addr);
         }
     }.run, .{&server});
-    defer server_future.cancel(io);
+    defer server_future.cancel(io) catch {};
 
-    const client_future = try io.concurrent(struct {
+    var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
             try s.ready.wait(_io);
 
-            const port = s.address.ip.port();
+            const port = s.address.ip.getPort();
 
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
@@ -195,19 +195,19 @@ test "Client: WebSocket upgrade" {
         }
     }.handle);
 
-    const server_future = try io.concurrent(struct {
+    var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
             try s.listen(addr);
         }
     }.run, .{&server});
-    defer server_future.cancel(io);
+    defer server_future.cancel(io) catch {};
 
-    const client_future = try io.concurrent(struct {
+    var client_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
             try s.ready.wait(_io);
 
-            const port = s.address.ip.port();
+            const port = s.address.ip.getPort();
 
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}/ws", .{port});
@@ -244,16 +244,16 @@ test "Client: unix socket fetch" {
 
     var path_buf: [64]u8 = undefined;
     const socket_path = try std.fmt.bufPrint(&path_buf, "/tmp/dusty-client-test-unix-{d}.sock", .{std.c.getpid()});
-    std.fs.cwd().deleteFile(socket_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
 
     var ready: std.Io.Event = .unset;
 
-    const server_future = try io.concurrent(struct {
+    var server_future = try io.concurrent(struct {
         fn run(path: []const u8, r: *std.Io.Event, _io: std.Io) !void {
             const unix_addr = try std.Io.net.UnixAddress.init(path);
             var server = try unix_addr.listen(_io, .{});
             defer server.deinit(_io);
-            defer std.fs.cwd().deleteFile(path) catch {};
+            defer std.Io.Dir.cwd().deleteFile(_io, path) catch {};
 
             r.set(_io);
 
@@ -281,9 +281,9 @@ test "Client: unix socket fetch" {
             try writer.interface.flush();
         }
     }.run, .{ socket_path, &ready, io });
-    defer server_future.cancel(io);
+    defer server_future.cancel(io) catch {};
 
-    const client_future = try io.concurrent(struct {
+    var client_future = try io.concurrent(struct {
         fn run(path: []const u8, r: *std.Io.Event, _io: std.Io) !void {
             try r.wait(_io);
 
