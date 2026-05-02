@@ -142,14 +142,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     var ctx: AppContext = .{};
     const AppServer = http.Server(AppContext);
 
-    const config: http.ServerConfig = .{
-        .timeout = .{
-            .request = 60 * std.time.ms_per_s,
-            .keepalive = 300 * std.time.ms_per_s,
-        },
-    };
-
-    var server = AppServer.init(allocator, io, config, &ctx);
+    var server = AppServer.init(allocator, io, .{}, &ctx);
     defer server.deinit();
 
     const cors = try server.middleware(http.middleware.Cors, .{

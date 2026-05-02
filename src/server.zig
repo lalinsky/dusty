@@ -192,10 +192,15 @@ pub fn Server(comptime Ctx: type) type {
                 return err;
             };
 
+            if (self.config.timeout.request != null) {
+                @panic("request timeout not implemented");
+            }
+            if (self.config.timeout.keepalive != null) {
+                @panic("keepalive timeout not implemented");
+            }
+
             while (true) {
                 request_count += 1;
-
-                // TODO: implement request timeout (was zio.AutoCancel)
 
                 parseHeaders(&reader.interface, &parser) catch |err| switch (err) {
                     error.EndOfStream => {
@@ -283,7 +288,6 @@ pub fn Server(comptime Ctx: type) type {
                 reader.interface.seek = 0;
                 reader.interface.end = 0;
 
-                // TODO: implement keepalive timeout (was zio.AutoCancel)
                 // Fill some data here
                 reader.interface.fillMore() catch |err| switch (err) {
                     error.EndOfStream => {
