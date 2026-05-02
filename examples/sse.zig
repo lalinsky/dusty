@@ -52,7 +52,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
 
     server.router.get("/events", handleEvents);
 
-    const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
     var ticker_task = try zio.spawn(ticker, .{&channel});
     defer ticker_task.cancel();
@@ -61,10 +61,5 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var rt = try zio.Runtime.init(allocator, .{});
-    defer rt.deinit();
-
-    try runServer(allocator, rt.io());
+    try runServer(init.gpa, init.io);
 }

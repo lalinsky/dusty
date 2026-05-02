@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 
 const Router = @import("router.zig").Router;
 const Action = @import("router.zig").Action;
@@ -13,6 +12,18 @@ const Middleware = @import("middleware.zig").Middleware;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 
 const log = std.log.scoped(.dusty);
+
+pub const Address = union(enum) {
+    ip: std.Io.net.IpAddress,
+    unix: std.Io.net.UnixAddress,
+
+    pub fn format(self: Address, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .ip => |ip| try ip.format(w),
+            .unix => |unix| try w.writeAll(unix.path),
+        }
+    }
+};
 
 pub fn Server(comptime Ctx: type) type {
     const MiddlewareItem = struct {
@@ -30,13 +41,12 @@ pub fn Server(comptime Ctx: type) type {
         config: ServerConfig,
         shutting_down: std.atomic.Value(bool),
         active_connections: std.atomic.Value(usize),
-        address: zio.net.Address,
-        ready: zio.ResetEvent,
-        last_connection_closed: zio.Notify,
+        address: Address,
+        ready: std.Io.Event,
+        last_connection_closed: std.Io.Event,
         _middleware_registry: std.SinglyLinkedList,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
-            _ = zio.Runtime.fromIo(io);
             return .{
                 .allocator = allocator,
                 .io = io,
@@ -46,8 +56,8 @@ pub fn Server(comptime Ctx: type) type {
                 .shutting_down = std.atomic.Value(bool).init(false),
                 .active_connections = std.atomic.Value(usize).init(0),
                 .address = undefined,
-                .ready = .init,
-                .last_connection_closed = .init,
+                .ready = .unset,
+                .last_connection_closed = .unset,
                 ._middleware_registry = .{},
             };
         }
@@ -88,23 +98,29 @@ pub fn Server(comptime Ctx: type) type {
             return mw;
         }
 
-        pub fn listen(self: *Self, addr: zio.net.IpAddress) !void {
-            const server = try addr.listen(self.config.listen);
-            defer server.close();
+        pub fn listen(self: *Self, addr: Address) !void {
+            var server = switch (addr) {
+                .ip => |ip| try ip.listen(self.io, self.config.listen),
+                .unix => |unix| try unix.listen(self.io, .{}),
+            };
+            defer server.deinit(self.io);
 
-            self.address = server.socket.address;
-            self.ready.set();
+            self.address = switch (addr) {
+                .ip => .{ .ip = server.socket.address },
+                .unix => |unix| .{ .unix = unix },
+            };
+            self.ready.set(self.io);
 
             log.info("Listening on {f}", .{self.address});
 
-            var group: zio.Group = .init;
+            var group: std.Io.Group = .init;
             defer {
                 self.shutting_down.store(true, .release);
-                group.cancel();
+                group.cancel(self.io);
             }
 
             while (true) {
-                const stream = server.accept(.{}) catch |err| {
+                const stream = server.accept(self.io) catch |err| {
                     if (err == error.Canceled) {
                         log.info("Graceful shutdown requested", .{});
                         self.shutting_down.store(true, .release);
@@ -112,7 +128,7 @@ pub fn Server(comptime Ctx: type) type {
                             const remaining = self.active_connections.load(.acquire);
                             if (remaining == 0) break;
                             log.info("Waiting for {} remaining connections to close", .{remaining});
-                            try self.last_connection_closed.timedWait(.fromMilliseconds(100));
+                            self.last_connection_closed.waitTimeout(self.io, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } }) catch {};
                         }
                         return err;
                     }
@@ -120,33 +136,36 @@ pub fn Server(comptime Ctx: type) type {
                 };
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
-                group.spawn(handleConnection, .{ self, stream }) catch |err| {
-                    log.err("Failed to accept connection: {}", .{err});
-                    _ = self.active_connections.fetchSub(1, .acq_rel);
-                    stream.close();
-                };
+                group.async(self.io, handleConnectionWrapper, .{ self, stream });
             }
         }
 
-        pub fn handleConnection(self: *Self, stream: zio.net.Stream) !void {
+        fn handleConnectionWrapper(self: *Self, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+            handleConnection(self, stream) catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+                log.err("Connection error: {}", .{err});
+            };
+        }
+
+        pub fn handleConnection(self: *Self, stream: std.Io.net.Stream) !void {
             defer {
                 const v = self.active_connections.fetchSub(1, .acq_rel);
                 if (v == 1) {
-                    self.last_connection_closed.broadcast();
+                    self.last_connection_closed.set(self.io);
                 }
             }
 
-            defer stream.close();
+            defer stream.close(self.io);
 
             var needs_shutdown = true;
-            defer if (needs_shutdown) stream.shutdown(.both) catch |err| {
+            defer if (needs_shutdown) stream.shutdown(self.io, .both) catch |err| {
                 log.warn("Failed to shutdown client connection: {}", .{err});
             };
 
-            var reader = stream.reader(&.{});
+            var reader = stream.reader(self.io, &.{});
 
             var write_buffer: [4096]u8 = undefined;
-            var writer = stream.writer(&write_buffer);
+            var writer = stream.writer(self.io, &write_buffer);
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -167,8 +186,6 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
-            var timeout = zio.AutoCancel.init;
-
             // Allocate initial buffer from arena
             reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
                 log.err("Failed to allocate read buffer: {}", .{err});
@@ -178,12 +195,7 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 request_count += 1;
 
-                defer timeout.clear();
-                if (self.config.timeout.request) |timeout_ms| {
-                    timeout.set(.fromMilliseconds(timeout_ms));
-                }
-
-                // TODO: handle error.Canceled caused by timeout and return 504
+                // TODO: implement request timeout (was zio.AutoCancel)
 
                 parseHeaders(&reader.interface, &parser) catch |err| switch (err) {
                     error.EndOfStream => {
@@ -271,12 +283,8 @@ pub fn Server(comptime Ctx: type) type {
                 reader.interface.seek = 0;
                 reader.interface.end = 0;
 
-                // Activate keepalive timeout
-                if (self.config.timeout.keepalive) |timeout_ms| {
-                    timeout.set(.fromMilliseconds(timeout_ms));
-                }
-
-                // Fill some data here, while the the keepalive timeout is active
+                // TODO: implement keepalive timeout (was zio.AutoCancel)
+                // Fill some data here
                 reader.interface.fillMore() catch |err| switch (err) {
                     error.EndOfStream => {
                         needs_shutdown = false;
