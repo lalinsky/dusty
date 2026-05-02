@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
@@ -172,27 +171,10 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     server.router.get("/api/users/:id", handleApiUser);
     server.router.post("/api/users", handleCreateUser);
 
-    var sigint = try zio.Signal.init(.interrupt);
-    defer sigint.deinit();
-
-    var sigterm = try zio.Signal.init(.terminate);
-    defer sigterm.deinit();
-
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
-    var task = try zio.spawn(AppServer.listen, .{ &server, addr });
-    defer task.cancel();
-
-    const result = try zio.select(.{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
-    switch (result) {
-        .task => |r| {
-            return r;
-        },
-        .sigint, .sigterm => {
-            task.cancel();
-            return;
-        },
-    }
+    std.log.info("Starting server on http://127.0.0.1:8080", .{});
+    try server.listen(addr);
 }
 
 pub fn main(init: std.process.Init) !void {

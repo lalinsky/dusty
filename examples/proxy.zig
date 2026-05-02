@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {

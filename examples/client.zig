@@ -1,9 +1,9 @@
 const std = @import("std");
-const zio = @import("zio");
 const http = @import("dusty");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const io = init.io;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
@@ -14,10 +14,7 @@ pub fn main(init: std.process.Init) !void {
 
     const url = args[1];
 
-    var rt = try zio.Runtime.init(allocator, .{});
-    defer rt.deinit();
-
-    var client = http.Client.init(allocator, rt.io(), .{});
+    var client = http.Client.init(allocator, io, .{});
     defer client.deinit();
 
     var response = try client.fetch(url, .{});
@@ -35,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
 
     const body_reader = response.reader();
     var write_buf: [8192]u8 = undefined;
-    var out = zio.stdout().writer(&write_buf);
+    var out = std.Io.File.stdout().writer(io, &write_buf);
     const total_bytes = try body_reader.streamRemaining(&out.interface);
     try out.interface.flush();
     std.debug.print("Total bytes: {d}\n", .{total_bytes});
