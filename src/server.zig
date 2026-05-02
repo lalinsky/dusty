@@ -128,7 +128,7 @@ pub fn Server(comptime Ctx: type) type {
                             const remaining = self.active_connections.load(.acquire);
                             if (remaining == 0) break;
                             log.info("Waiting for {} remaining connections to close", .{remaining});
-                            self.last_connection_closed.waitTimeout(self.io, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } }) catch {};
+                            try self.last_connection_closed.waitTimeout(self.io, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } });
                         }
                         return err;
                     }
@@ -136,7 +136,7 @@ pub fn Server(comptime Ctx: type) type {
                 };
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
-                group.async(self.io, handleConnectionWrapper, .{ self, stream });
+                try group.concurrent(self.io, handleConnectionWrapper, .{ self, stream });
             }
         }
 

@@ -104,7 +104,7 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
             delete_opts.max_age = .zero;
             try res.setCookie(self.config.cookie_name, "", delete_opts);
         } else {
-            const signed = try self.signSession(req.arena, &req.session, std.Io.Timestamp.now(req.io, .real));
+            const signed = try self.signSession(req.arena, &req.session, .now(req.io, .real));
             var opts = self.config.cookie_opts;
             if (self.config.max_age) |ma| {
                 opts.max_age = ma;
@@ -285,7 +285,7 @@ test "Session: sign and load round-trip" {
     try s.set("user_id", "42");
     try s.set("role", "admin");
 
-    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
+    const signed = try session.signSession(arena.allocator(), &s, .now(std.testing.io, .real));
 
     var s2 = SessionData{};
     try session.load(arena.allocator(), &s2, signed, std.testing.io);
@@ -308,7 +308,7 @@ test "Session: sign and load round-trip with max_age" {
     var s = SessionData{};
     try s.set("user_id", "42");
 
-    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
+    const signed = try session.signSession(arena.allocator(), &s, .now(std.testing.io, .real));
 
     var s2 = SessionData{};
     try session.load(arena.allocator(), &s2, signed, std.testing.io);
@@ -347,7 +347,7 @@ test "Session: load rejects tampered payload" {
 
     var s = SessionData{};
     try s.set("user_id", "42");
-    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
+    const signed = try session.signSession(arena.allocator(), &s, .now(std.testing.io, .real));
 
     var tampered = try arena.allocator().dupe(u8, signed);
     // Tamper near the end (payload region) to avoid corrupting the header/version
@@ -367,7 +367,7 @@ test "Session: load rejects wrong key" {
 
     var s = SessionData{};
     try s.set("data", "test");
-    const signed = try session1.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
+    const signed = try session1.signSession(arena.allocator(), &s, .now(std.testing.io, .real));
 
     var s2 = SessionData{};
     try testing.expectError(error.InvalidSignature, session2.load(arena.allocator(), &s2, signed, std.testing.io));
@@ -396,7 +396,7 @@ test "Session: empty session round-trip" {
     const session = Session{ .config = .{ .secret_key = "key", .cookie_name = "s" } };
 
     var s = SessionData{};
-    const signed = try session.signSession(arena.allocator(), &s, std.Io.Timestamp.now(std.testing.io, .real));
+    const signed = try session.signSession(arena.allocator(), &s, .now(std.testing.io, .real));
 
     var s2 = SessionData{};
     try session.load(arena.allocator(), &s2, signed, std.testing.io);

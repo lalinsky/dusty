@@ -17,9 +17,9 @@ fn handleEvents(ctx: *AppContext, req: *http.Request, res: *http.Response) !void
             last_seen = current;
             var buf: [64]u8 = undefined;
             const msg = try std.fmt.bufPrint(&buf, "tick {d}", .{current});
-            stream.send(msg, .{ .event = "tick" }) catch break;
+            try stream.send(msg, .{ .event = "tick" });
         }
-        req.io.sleep(.fromMilliseconds(100), .real) catch break;
+        try req.io.sleep(.fromMilliseconds(100), .real);
     }
 }
 
@@ -40,7 +40,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     var ticker_future = try io.concurrent(struct {
         fn run(counter: *std.atomic.Value(u64), _io: std.Io) !void {
             while (true) {
-                _io.sleep(.fromMilliseconds(1000), .real) catch break;
+                try _io.sleep(.fromMilliseconds(1000), .real);
                 _ = counter.fetchAdd(1, .release);
             }
         }
