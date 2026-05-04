@@ -1,22 +1,24 @@
-Dusty is a HTTP client/server library built on top of Zig's standard library async I/O (`std.Io`) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
-The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlseguin/http.zig), and tries to be as compatible as possible. By using coroutines under the hood, it's very easy to efficiently wait for a HTTP client request in a HTTP server handler, or perhaps have a long-running WebSocket session and not worry about state management between callbacks.
+Dusty is a HTTP client/server library built on top of Zig's standard library I/O interface (`std.Io`) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
+
+The library was originally written for [zio](https://github.com/lalinsky/zio), and later ported to `std.Io`. It's still recommended to use it with zio's
+implementation of the `std.Io` interface, especially if you need to communicate with other services over the network in your HTTP request handlers,
+or if you are using WebSocket. However, it's usable with any implementation, even the default `std.Io.Threaded`.
+
+The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlseguin/http.zig), and tries to be as compatible as possible.
 
 ## Features
-- Asynchronous I/O for multiple concurrent connections on a single CPU thread
-- Requests handled in lightweight coroutines
 - Router with support for parameters and wildcards
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
 - Server-Sent Events (SSE) for streaming responses
 - WebSocket support (RFC 6455)
-- Request/keepalive timeouts via coroutine auto-cancellation
 - HTTP/HTTPS client with connection pooling
 - Unix domain socket support for client connections
 
 ## Installation
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/dusty#v0.2.0"
+zig fetch --save "git+https://github.com/lalinsky/dusty"
 ```
 
 Then in your `build.zig`, add the module as a dependency:
@@ -29,7 +31,9 @@ const dusty = b.dependency("dusty", .{
 exe.root_module.addImport("dusty", dusty.module("dusty"));
 ```
 
-## Server Example
+## Usage
+
+### Server Example
 
 ```zig
 const std = @import("std");
@@ -52,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-## Client Example
+### Client Example
 
 ```zig
 const std = @import("std");
@@ -73,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-### Unix Socket Example
+### Unix Socket Client Example
 
 For communicating with services like Docker Engine:
 
@@ -86,9 +90,14 @@ defer response.deinit();
 
 ## Selecting the I/O Backend
 
-The examples above use `init.io`, the threaded I/O provided by `std.process.Init`. This is suitable for small servers and scripts without long-running tasks.
+The examples above use `init.io`, the threaded I/O implementation from the stdlib. This is suitable for development or small servers.
 
-For production use, it's recommended to use [zio](https://github.com/lalinsky/zio), which provides a high-performance coroutine-based async runtime. Add it as a dependency:
+For production use, it's recommended to use [zio](https://github.com/lalinsky/zio), which provides a coroutine-based async I/O runtime.
+This allows you to serve many more requests using just a few OS threads. This is especially important if you need to wait on other
+network services inside your request handlers. In the future, you can also use `std.Io.Evented`, but that implementation is not finished yet,
+it's missing any networking functionality, so use zio for now.
+
+Add it as a dependency:
 
 ```sh
 zig fetch --save "git+https://github.com/lalinsky/zio#v0.10.0"
@@ -118,9 +127,6 @@ pub fn main(init: std.process.Init) !void {
     var server = http.Server(void).init(init.gpa, rt.io(), .{}, {});
     defer server.deinit();
 
-    // ... router setup ...
-
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    try server.listen(addr);
+    // ... continue as before ...
 }
 ```
