@@ -29,6 +29,47 @@ const dusty = b.dependency("dusty", .{
 exe.root_module.addImport("dusty", dusty.module("dusty"));
 ```
 
+## Selecting the I/O Backend
+
+By default, dusty uses the threaded I/O provided by `std.process.Init`. This is suitable for small servers and scripts that don't have long-running tasks.
+
+For production use, it's recommended to use [zio](https://github.com/lalinsky/zio), which provides a high-performance coroutine-based async runtime. Add it as a dependency:
+
+```sh
+zig fetch --save "git+https://github.com/lalinsky/zio#v0.10.0"
+```
+
+In `build.zig`, add the zio module:
+
+```zig
+const zio = b.dependency("zio", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("zio", zio.module("zio"));
+```
+
+Then initialize zio's runtime and pass it to dusty:
+
+```zig
+const std = @import("std");
+const zio = @import("zio");
+const http = @import("dusty");
+
+pub fn main(init: std.process.Init) !void {
+    var rt = try zio.Runtime.init(init.gpa, .{});
+    defer rt.deinit();
+
+    var server = http.Server(void).init(init.gpa, rt.io(), .{}, {});
+    defer server.deinit();
+
+    // ... router setup ...
+
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    try server.listen(addr);
+}
+```
+
 ## Server Example
 
 ```zig
