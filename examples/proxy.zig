@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
@@ -103,7 +102,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const
     // Catch-all route - proxy everything for all common HTTP methods
     server.router.any("/*", handleProxy);
 
-    const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
     std.log.info("Reverse proxy server running at http://127.0.0.1:8080", .{});
     std.log.info("Forwarding all requests to: {s}", .{upstream_url});
@@ -115,7 +114,6 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const upstream_url = if (args.len > 1)
@@ -123,8 +121,5 @@ pub fn main(init: std.process.Init) !void {
     else
         "https://httpbin.org";
 
-    var rt = try zio.Runtime.init(allocator, .{});
-    defer rt.deinit();
-
-    try runServer(allocator, rt.io(), upstream_url);
+    try runServer(init.gpa, init.io, upstream_url);
 }

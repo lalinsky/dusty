@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const http = @import("dusty");
 
 const AppContext = struct {
@@ -143,14 +142,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     var ctx: AppContext = .{};
     const AppServer = http.Server(AppContext);
 
-    const config: http.ServerConfig = .{
-        .timeout = .{
-            .request = 60 * std.time.ms_per_s,
-            .keepalive = 300 * std.time.ms_per_s,
-        },
-    };
-
-    var server = AppServer.init(allocator, io, config, &ctx);
+    var server = AppServer.init(allocator, io, .{}, &ctx);
     defer server.deinit();
 
     const cors = try server.middleware(http.middleware.Cors, .{
@@ -172,34 +164,12 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     server.router.get("/api/users/:id", handleApiUser);
     server.router.post("/api/users", handleCreateUser);
 
-    var sigint = try zio.Signal.init(.interrupt);
-    defer sigint.deinit();
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
-    var sigterm = try zio.Signal.init(.terminate);
-    defer sigterm.deinit();
-
-    const addr = try zio.net.IpAddress.parseIp("127.0.0.1", 8080);
-
-    var task = try zio.spawn(AppServer.listen, .{ &server, addr });
-    defer task.cancel();
-
-    const result = try zio.select(.{ .task = &task, .sigint = &sigint, .sigterm = &sigterm });
-    switch (result) {
-        .task => |r| {
-            return r;
-        },
-        .sigint, .sigterm => {
-            task.cancel();
-            return;
-        },
-    }
+    std.log.info("Starting server on http://127.0.0.1:8080", .{});
+    try server.listen(addr);
 }
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-
-    var rt = try zio.Runtime.init(allocator, .{});
-    defer rt.deinit();
-
-    try runServer(allocator, rt.io());
+    try runServer(init.gpa, init.io);
 }

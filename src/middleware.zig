@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;

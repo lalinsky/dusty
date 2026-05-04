@@ -1,6 +1,7 @@
 const std = @import("std");
-const zio = @import("zio");
 const Uri = std.Uri;
+
+const unix_path_max = 108;
 
 const http = @import("http.zig");
 const Method = http.Method;
@@ -162,26 +163,26 @@ pub const ConnectionPool = struct {
     pub fn deinit(self: *ConnectionPool) void {
         // Close and free all idle connections
         while (self.idle.popFirst()) |node| {
-            const conn: *Connection = @fieldParentPtr("pool_node", node);
+            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", node));
             conn.deinit();
             self.allocator.destroy(conn);
         }
     }
 
     /// Try to acquire an existing connection for the given host:port, protocol, and optional unix socket path.
-    pub fn acquire(self: *ConnectionPool, remote_host: []const u8, remote_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) ?*Connection {
-        const now = zio.Timestamp.now(.monotonic);
+    pub fn acquire(self: *ConnectionPool, io: std.Io, remote_host: []const u8, remote_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) ?*Connection {
+        const now = std.Io.Timestamp.now(io, .awake);
 
         // Search from end (most recently used)
         var node = self.idle.last;
         while (node) |n| {
-            const conn: *Connection = @fieldParentPtr("pool_node", n);
+            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
             node = n.prev;
 
             if (conn.matches(remote_host, remote_port, protocol, unix_socket_path)) {
                 // Check if connection has expired due to idle timeout
                 if (conn.idle_deadline) |deadline| {
-                    if (now.value >= deadline.value) {
+                    if (now.nanoseconds >= deadline.nanoseconds) {
                         // Connection expired, remove and close it
                         self.idle.remove(n);
                         self.idle_len -= 1;
@@ -211,7 +212,7 @@ pub const ConnectionPool = struct {
         // If pool is full, close the oldest connection
         if (self.idle_len >= self.max_idle) {
             if (self.idle.popFirst()) |old_node| {
-                const old: *Connection = @fieldParentPtr("pool_node", old_node);
+                const old: *Connection = @alignCast(@fieldParentPtr("pool_node", old_node));
                 old.deinit();
                 self.allocator.destroy(old);
                 self.idle_len -= 1;
@@ -229,7 +230,7 @@ pub const ConnectionPool = struct {
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    stream: zio.net.Stream,
+    stream: std.Io.net.Stream,
     arena: std.heap.ArenaAllocator,
     parser: ResponseParser,
     parsed_response: ParsedResponse,
@@ -238,8 +239,8 @@ pub const Connection = struct {
 
     // Protocol and TLS
     protocol: Protocol,
-    tcp_reader: zio.net.Stream.Reader,
-    tcp_writer: zio.net.Stream.Writer,
+    tcp_reader: std.Io.net.Stream.Reader,
+    tcp_writer: std.Io.net.Stream.Writer,
 
     // TLS TCP layer buffers (allocated from main allocator, persist across requests)
     tls_tcp_read_buffer: []u8,
@@ -260,13 +261,14 @@ pub const Connection = struct {
     host_len: u8 = 0,
     port: u16 = 0,
     closing: bool = false,
-    // Unix socket address (null means TCP connection)
-    unix_addr: ?zio.net.UnixAddress = null,
+    // Unix socket path (empty means TCP connection)
+    unix_path_buffer: [unix_path_max]u8 = undefined,
+    unix_path_len: u8 = 0,
 
     // Keep-Alive tracking
     request_count: u16 = 0,
     keep_alive: KeepAliveParams = .{},
-    idle_deadline: ?zio.Timestamp = null,
+    idle_deadline: ?std.Io.Timestamp = null,
 
     /// Initialize the connection in place (required because parser stores internal pointers).
     pub fn init(
@@ -274,7 +276,7 @@ pub const Connection = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         pool: *ConnectionPool,
-        stream: zio.net.Stream,
+        stream: std.Io.net.Stream,
         remote_host: []const u8,
         remote_port: u16,
         buffer_size: usize,
@@ -301,8 +303,15 @@ pub const Connection = struct {
         self.host_len = len;
         self.port = remote_port;
 
-        // Store unix socket address for connection pooling
-        self.unix_addr = if (unix_socket_path) |path| try zio.net.UnixAddress.init(path) else null;
+        // Store unix socket path for connection pooling
+        if (unix_socket_path) |path| {
+            if (path.len > unix_path_max) return error.NameTooLong;
+            const plen: u8 = @intCast(path.len);
+            @memcpy(self.unix_path_buffer[0..plen], path[0..plen]);
+            self.unix_path_len = plen;
+        } else {
+            self.unix_path_len = 0;
+        }
 
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.init(&self.parsed_response);
@@ -325,8 +334,8 @@ pub const Connection = struct {
             self.tls_tcp_write_buffer = try allocator.alloc(u8, tls_buffer_size);
             errdefer allocator.free(self.tls_tcp_write_buffer);
 
-            self.tcp_reader = stream.reader(self.tls_tcp_read_buffer);
-            self.tcp_writer = stream.writer(self.tls_tcp_write_buffer);
+            self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
+            self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
 
             var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
             self.io.random(&entropy);
@@ -362,8 +371,8 @@ pub const Connection = struct {
             self.write_buffer = try allocator.alloc(u8, 1024);
             errdefer allocator.free(self.write_buffer);
 
-            self.tcp_reader = stream.reader(self.read_buffer);
-            self.tcp_writer = stream.writer(self.write_buffer);
+            self.tcp_reader = stream.reader(io, self.read_buffer);
+            self.tcp_writer = stream.writer(io, self.write_buffer);
 
             self.reader = &self.tcp_reader.interface;
             self.writer = &self.tcp_writer.interface;
@@ -371,7 +380,7 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        self.stream.close();
+        self.stream.close(self.io);
         if (self.protocol == .https) {
             self.allocator.free(self.tls_tcp_read_buffer);
             self.allocator.free(self.tls_tcp_write_buffer);
@@ -409,10 +418,8 @@ pub const Connection = struct {
     }
 
     pub fn unixPath(self: *const Connection) ?[]const u8 {
-        if (self.unix_addr) |*addr| {
-            return std.mem.sliceTo(&addr.un.path, 0);
-        }
-        return null;
+        if (self.unix_path_len == 0) return null;
+        return self.unix_path_buffer[0..self.unix_path_len];
     }
 
     /// Check if this connection matches the given host, port, protocol, and transport.
@@ -420,7 +427,7 @@ pub const Connection = struct {
         if (unix_socket_path) |path| {
             return self.protocol == protocol and std.mem.eql(u8, self.unixPath() orelse return false, path);
         }
-        if (self.unix_addr != null) return false;
+        if (self.unix_path_len != 0) return false;
         return self.protocol == protocol and self.port == match_port and std.ascii.eqlIgnoreCase(self.host(), match_host);
     }
 
@@ -442,7 +449,7 @@ pub const Connection = struct {
 
             // Update idle deadline after each request
             if (self.keep_alive.timeout) |timeout| {
-                self.idle_deadline = zio.Timestamp.now(.monotonic).addDuration(.fromMilliseconds(timeout));
+                self.idle_deadline = std.Io.Timestamp.now(self.io, .awake).addDuration(.fromMilliseconds(@as(i64, timeout)));
             }
 
             // Check if we've reached max requests
@@ -582,7 +589,6 @@ pub const Client = struct {
     ca_bundle_lock: std.Io.RwLock,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
-        _ = zio.Runtime.fromIo(io);
         return .{
             .allocator = allocator,
             .io = io,
@@ -620,13 +626,15 @@ pub const Client = struct {
         unix_socket_path: ?[]const u8,
     ) !*Connection {
         // Try to get a connection from the pool
-        const conn = self.pool.acquire(host, port, protocol, unix_socket_path) orelse blk: {
+        const conn = self.pool.acquire(self.io, host, port, protocol, unix_socket_path) orelse blk: {
             // No pooled connection, create a new one
             const stream = if (unix_socket_path) |path| unix: {
-                const unix_addr = try zio.net.UnixAddress.init(path);
-                break :unix try unix_addr.connect(.{});
-            } else try zio.net.tcpConnectToHost(host, port, .{});
-            errdefer stream.close();
+                const unix_addr = try std.Io.net.UnixAddress.init(path);
+                break :unix try unix_addr.connect(self.io);
+            } else if (std.Io.net.IpAddress.parse(host, port)) |addr| tcp: {
+                break :tcp try addr.connect(self.io, .{ .mode = .stream });
+            } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
+            errdefer stream.close(self.io);
 
             const new_conn = try self.allocator.create(Connection);
             errdefer self.allocator.destroy(new_conn);

@@ -4,21 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zio_backend = b.option([]const u8, "zio_backend", "Override zio event loop backend (io_uring, epoll, kqueue, iocp, poll)");
-
-    const zio = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-        .backend = zio_backend,
-    });
-
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    mod.addImport("zio", zio.module("zio"));
 
+    mod.link_libc = true;
     mod.addCSourceFiles(.{
         .files = &[_][]const u8{
             "src/llhttp/llhttp.c",
@@ -50,7 +42,6 @@ pub fn build(b: *std.Build) void {
             }),
         });
         example.root_module.addImport("dusty", mod);
-        example.root_module.addImport("zio", zio.module("zio"));
         const install = b.addInstallArtifact(example, .{});
         examples_step.dependOn(&install.step);
         // Add to default install step so examples are built with plain `zig build`
