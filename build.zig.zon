@@ -31,7 +31,13 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
+    .dependencies = .{
+        .zio = .{
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.10.0#cb6b65042d5148078a386fcb41ae193015c7b2f1",
+            .hash = "zio-0.10.0-xHbVVL4_GwD6YOx2dijO51-Uz6hUzCjHsTA1FTgu8Qp0",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

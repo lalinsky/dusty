@@ -4,11 +4,23 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_zio = b.option(bool, "use_zio", "Use zio for timeout support (default: false)") orelse false;
+
+    const options = b.addOptions();
+    options.addOption(bool, "use_zio", use_zio);
+
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    mod.addOptions("dusty_options", options);
+    if (b.lazyDependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zio| {
+        mod.addImport("zio", zio.module("zio"));
+    }
 
     mod.link_libc = true;
     mod.addCSourceFiles(.{

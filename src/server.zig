@@ -1,4 +1,7 @@
 const std = @import("std");
+const root = @import("root");
+const dusty_options = if (@hasDecl(root, "dusty_options")) root.dusty_options else @import("dusty_options");
+const zio = if (dusty_options.use_zio) @import("zio") else struct {};
 
 const Router = @import("router.zig").Router;
 const Action = @import("router.zig").Action;
@@ -186,21 +189,32 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
+            var timeout: if (dusty_options.use_zio) zio.AutoCancel else void = if (dusty_options.use_zio) .init else {};
+
             // Allocate initial buffer from arena
             reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
                 log.err("Failed to allocate read buffer: {}", .{err});
                 return err;
             };
 
-            if (self.config.timeout.request != null) {
-                @panic("request timeout not implemented");
-            }
-            if (self.config.timeout.keepalive != null) {
-                @panic("keepalive timeout not implemented");
+            if (!dusty_options.use_zio) {
+                if (self.config.timeout.request != null) {
+                    @panic("request timeout requires use_zio");
+                }
+                if (self.config.timeout.keepalive != null) {
+                    @panic("keepalive timeout requires use_zio");
+                }
             }
 
             while (true) {
                 request_count += 1;
+
+                if (dusty_options.use_zio) {
+                    defer timeout.clear();
+                    if (self.config.timeout.request) |timeout_ms| {
+                        timeout.set(.fromMilliseconds(@intCast(timeout_ms)));
+                    }
+                }
 
                 parseHeaders(&reader.interface, &parser) catch |err| switch (err) {
                     error.EndOfStream => {
@@ -288,7 +302,14 @@ pub fn Server(comptime Ctx: type) type {
                 reader.interface.seek = 0;
                 reader.interface.end = 0;
 
-                // Fill some data here
+                // Activate keepalive timeout
+                if (dusty_options.use_zio) {
+                    if (self.config.timeout.keepalive) |timeout_ms| {
+                        timeout.set(.fromMilliseconds(@intCast(timeout_ms)));
+                    }
+                }
+
+                // Fill some data here, while the keepalive timeout is active
                 reader.interface.fillMore() catch |err| switch (err) {
                     error.EndOfStream => {
                         needs_shutdown = false;
