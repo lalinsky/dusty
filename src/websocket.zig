@@ -78,6 +78,7 @@ pub const WebSocket = struct {
         _ = self.msg_arena.reset(.retain_capacity);
         self.fragmented_data = .empty;
         self.auto_responded = false;
+        self.fragmented_type = null;
         while (true) {
             const frame = try self.readFrame();
 
