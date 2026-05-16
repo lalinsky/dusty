@@ -3,7 +3,7 @@ const std = @import("std");
 pub const WebSocket = struct {
     conn: *std.Io.Writer,
     reader: *std.Io.Reader,
-    arena: std.mem.Allocator,
+    msg_arena: std.heap.ArenaAllocator,
     is_client: bool = false,
     prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     max_message_size: usize = default_max_message_size,
@@ -57,22 +57,26 @@ pub const WebSocket = struct {
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-    pub fn init(conn: *std.Io.Writer, reader: *std.Io.Reader, arena: std.mem.Allocator) WebSocket {
+    pub fn init(conn: *std.Io.Writer, reader: *std.Io.Reader, gpa: std.mem.Allocator) WebSocket {
         return .{
             .conn = conn,
             .reader = reader,
-            .arena = arena,
+            .msg_arena = std.heap.ArenaAllocator.init(gpa),
         };
     }
 
+    /// Free resources. Must be called when done with the WebSocket.
     pub fn deinit(self: *WebSocket) void {
-        self.fragmented_data.deinit(self.arena);
+        self.msg_arena.deinit();
     }
 
     /// Receive next message. Blocks until message arrives.
     /// Ping frames are handled automatically (pong sent).
     /// Pong frames are ignored.
+    /// The returned message data is valid until the next call to receive().
     pub fn receive(self: *WebSocket) !Message {
+        _ = self.msg_arena.reset(.retain_capacity);
+        self.fragmented_data = .empty;
         self.auto_responded = false;
         while (true) {
             const frame = try self.readFrame();
@@ -109,10 +113,10 @@ pub const WebSocket = struct {
                     if (self.fragmented_data.items.len + frame.payload.len > self.max_message_size) {
                         return Error.MessageTooLarge;
                     }
-                    try self.fragmented_data.appendSlice(self.arena, frame.payload);
+                    try self.fragmented_data.appendSlice(self.msg_arena.allocator(), frame.payload);
                     if (frame.fin) {
                         const msg_type = self.fragmented_type.?;
-                        const data = try self.fragmented_data.toOwnedSlice(self.arena);
+                        const data = try self.fragmented_data.toOwnedSlice(self.msg_arena.allocator());
                         self.fragmented_type = null;
                         if (msg_type == .text and !std.unicode.utf8ValidateSlice(data)) {
                             return Error.InvalidUtf8;
@@ -137,7 +141,7 @@ pub const WebSocket = struct {
                         }
                         self.fragmented_type = frame.opcode;
                         self.fragmented_data.clearRetainingCapacity();
-                        try self.fragmented_data.appendSlice(self.arena, frame.payload);
+                        try self.fragmented_data.appendSlice(self.msg_arena.allocator(), frame.payload);
                     }
                 },
                 _ => return Error.InvalidOpcode,
@@ -216,7 +220,7 @@ pub const WebSocket = struct {
         if (payload_len > self.max_message_size) {
             return Error.MessageTooLarge;
         }
-        const payload = try self.arena.alloc(u8, @intCast(payload_len));
+        const payload = try self.msg_arena.allocator().alloc(u8, @intCast(payload_len));
         try self.reader.readSliceAll(payload);
 
         // Unmask if needed
@@ -302,6 +306,7 @@ test "WebSocket: writeFrame text" {
     var reader: std.Io.Reader = .fixed("");
 
     var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     try ws.writeFrame(.text, "Hello", true);
 
     const written = conn_writer.buffered();
@@ -319,6 +324,7 @@ test "WebSocket: writeFrame binary with medium length" {
     var reader: std.Io.Reader = .fixed("");
 
     var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
 
     const payload = "x" ** 200;
     try ws.writeFrame(.binary, payload, true);
@@ -338,6 +344,7 @@ test "WebSocket: writeCloseFrame" {
     var reader: std.Io.Reader = .fixed("");
 
     var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     try ws.writeCloseFrame(.normal, "goodbye");
 
     const written = conn_writer.buffered();
@@ -352,8 +359,6 @@ test "WebSocket: writeCloseFrame" {
 }
 
 test "WebSocket: readFrame unmasked" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
     // A simple unmasked text frame with "Hi"
     const frame_data = [_]u8{
@@ -367,7 +372,8 @@ test "WebSocket: readFrame unmasked" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     const frame = try ws.readFrame();
 
     try std.testing.expect(frame.fin);
@@ -376,8 +382,6 @@ test "WebSocket: readFrame unmasked" {
 }
 
 test "WebSocket: readFrame masked" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
     // A masked text frame with "Hi"
     // Mask key: 0x12, 0x34, 0x56, 0x78
@@ -393,7 +397,8 @@ test "WebSocket: readFrame masked" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     const frame = try ws.readFrame();
 
     try std.testing.expect(frame.fin);
@@ -402,8 +407,6 @@ test "WebSocket: readFrame masked" {
 }
 
 test "WebSocket: receive handles ping automatically" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
     // Ping frame followed by text frame
     const frame_data = [_]u8{
@@ -418,7 +421,8 @@ test "WebSocket: receive handles ping automatically" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     const msg = try ws.receive();
 
     // Should skip ping and return text message
@@ -433,8 +437,6 @@ test "WebSocket: receive handles ping automatically" {
 }
 
 test "WebSocket: readFrame rejects RSV bits" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
     // Frame with RSV1 bit set (0x40)
     const frame_data = [_]u8{
@@ -448,13 +450,12 @@ test "WebSocket: readFrame rejects RSV bits" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.readFrame());
 }
 
 test "WebSocket: readFrame rejects large control frame" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
 
     // Ping frame with 126-byte payload (uses extended length)
     const frame_data = [_]u8{
@@ -467,19 +468,18 @@ test "WebSocket: readFrame rejects large control frame" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.readFrame());
 }
 
 test "WebSocket: writeFrame masked (client mode)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(&conn_writer, &reader, arena.allocator());
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    defer ws.deinit();
     ws.is_client = true;
     try ws.writeFrame(.text, "Hello", true);
 

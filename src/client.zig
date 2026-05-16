@@ -747,7 +747,7 @@ pub const Client = struct {
             return error.WebSocketUpgradeFailed;
         }
 
-        var ws = WebSocket.init(conn.writer, conn.reader, conn.arena.allocator());
+        var ws = WebSocket.init(conn.writer, conn.reader, conn.allocator);
         ws.is_client = true;
         ws.prng = std.Random.DefaultPrng.init(blk: {
             var seed: u64 = undefined;

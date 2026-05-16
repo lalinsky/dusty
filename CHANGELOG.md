@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- Fix memory leak in WebSocket clients: message allocations are now freed before each `receive()` call instead of accumulating for the lifetime of the connection. Message data is valid until the next call to `receive()`.
+
 ## [0.2.0] - 2026-04-26
 
 - Support for Zig 0.16, still depends on zio, not using `std.Io` due to lack of timeout support.
