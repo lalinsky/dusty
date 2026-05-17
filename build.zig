@@ -10,6 +10,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Default `zio` import — a stub that no-ops `clear` and panics on `set`.
+    // Apps that want real timeouts override this in their own build.zig:
+    //   dusty_mod.addImport("zio", zio_dep.module("zio"));
+    mod.addAnonymousImport("zio", .{
+        .root_source_file = b.path("src/zio_stub.zig"),
+    });
+
     mod.link_libc = true;
     mod.addCSourceFiles(.{
         .files = &[_][]const u8{

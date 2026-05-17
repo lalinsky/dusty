@@ -6,10 +6,10 @@ pub const ServerConfig = struct {
     listen: std.Io.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
 
     pub const Timeout = struct {
-        /// Maximum time (ms) to receive a complete request
-        request: ?u64 = null,
-        /// Maximum time (ms) to keep idle connections open
-        keepalive: ?u64 = null,
+        /// Maximum time to receive a complete request
+        request: ?std.Io.Duration = null,
+        /// Maximum time to keep idle connections open
+        keepalive: ?std.Io.Duration = null,
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
     };

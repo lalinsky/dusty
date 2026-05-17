@@ -1,4 +1,5 @@
 const std = @import("std");
+const zio = @import("zio");
 
 const Router = @import("router.zig").Router;
 const Action = @import("router.zig").Action;
@@ -187,21 +188,21 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
+            var timeout: zio.AutoCancel = .init;
+            defer timeout.clear();
+
             // Allocate initial buffer from arena
             reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
                 log.err("Failed to allocate read buffer: {}", .{err});
                 return err;
             };
 
-            if (self.config.timeout.request != null) {
-                @panic("request timeout not implemented");
-            }
-            if (self.config.timeout.keepalive != null) {
-                @panic("keepalive timeout not implemented");
-            }
-
             while (true) {
                 request_count += 1;
+
+                if (self.config.timeout.request) |duration| {
+                    timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
+                }
 
                 parseHeaders(&reader.interface, &parser) catch |err| switch (err) {
                     error.EndOfStream => {
@@ -305,7 +306,11 @@ pub fn Server(comptime Ctx: type) type {
                 reader.interface.seek = 0;
                 reader.interface.end = 0;
 
-                // Fill some data here
+                if (self.config.timeout.keepalive) |duration| {
+                    timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
+                }
+
+                // Fill some data here, under the keepalive timeout
                 reader.interface.fillMore() catch |err| switch (err) {
                     error.EndOfStream => {
                         needs_shutdown = false;

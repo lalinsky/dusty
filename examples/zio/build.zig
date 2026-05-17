@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Override dusty's default `zio` stub with the real module so that
+    // request/keepalive timeouts use zio.AutoCancel.
+    const dusty_mod = dusty.module("dusty");
+    dusty_mod.addImport("zio", zio.module("zio"));
+
     const exe = b.addExecutable(.{
         .name = "server",
         .root_module = b.createModule(.{
@@ -22,7 +27,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("dusty", dusty.module("dusty"));
+    exe.root_module.addImport("dusty", dusty_mod);
     exe.root_module.addImport("zio", zio.module("zio"));
 
     b.installArtifact(exe);
