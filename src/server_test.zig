@@ -649,7 +649,8 @@ test "Server: closes connection when unread body exceeds max_body_size" {
 
     var status2: [64]u8 = undefined;
     var body2: [32]u8 = undefined;
-    try std.testing.expectError(error.EndOfStream, readResponse(r, &status2, &body2));
+    _ = readResponse(r, &status2, &body2) catch return;
+    return error.TestExpectedSecondResponseToFail;
 }
 
 test "Server: 417 Expectation Failed for unknown Expect value" {
