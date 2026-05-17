@@ -3,6 +3,7 @@ const std = @import("std");
 const Router = @import("router.zig").Router;
 const Action = @import("router.zig").Action;
 const RequestParser = @import("parser.zig").RequestParser;
+const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
 const Response = @import("response.zig").Response;
@@ -256,8 +257,12 @@ pub fn Server(comptime Ctx: type) type {
                 };
 
                 if (!parser.isBodyComplete()) {
-                    // TODO maybe we should drain the body here?
-                    response.keepalive = false;
+                    var scratch: [4096]u8 = undefined;
+                    var body_reader = RequestBodyReader.init(&parser, &reader.interface, &scratch);
+                    _ = body_reader.interface.discardRemaining() catch {
+                        if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                        response.keepalive = false;
+                    };
                 }
 
                 if (self.shutting_down.load(.acquire)) {
