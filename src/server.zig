@@ -257,12 +257,21 @@ pub fn Server(comptime Ctx: type) type {
                 };
 
                 if (!parser.isBodyComplete()) {
-                    var scratch: [4096]u8 = undefined;
-                    var body_reader = RequestBodyReader.init(&parser, &reader.interface, &scratch);
-                    _ = body_reader.interface.discardRemaining() catch {
-                        if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
-                        response.keepalive = false;
+                    const drainable = blk: {
+                        const cl = request.headers.get("Content-Length") orelse break :blk false;
+                        const n = std.fmt.parseInt(usize, cl, 10) catch break :blk false;
+                        break :blk n <= self.config.request.max_body_size;
                     };
+                    if (drainable) {
+                        var scratch: [4096]u8 = undefined;
+                        var body_reader = RequestBodyReader.init(&parser, &reader.interface, &scratch);
+                        _ = body_reader.interface.discardRemaining() catch {
+                            if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                            response.keepalive = false;
+                        };
+                    } else {
+                        response.keepalive = false;
+                    }
                 }
 
                 if (self.shutting_down.load(.acquire)) {
