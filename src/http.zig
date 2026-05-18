@@ -253,13 +253,25 @@ test "Headers: put/get case insenstive" {
 }
 
 // Bytes that would break "Name: Value\r\n" framing on the wire.
-// Names additionally reject whitespace and ':' per RFC 7230 tchar.
 const invalid_header_value_bytes = "\r\n\x00";
-const invalid_header_name_bytes = "\r\n\x00\t :";
+
+// RFC 7230 token chars (tchar): the only bytes allowed in a header field-name.
+const allowed_header_name_bytes = "!#$%&'*+-.^_`|~" ++
+    "0123456789" ++
+    "abcdefghijklmnopqrstuvwxyz" ++
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+const tchar_table: [256]bool = blk: {
+    var table = [_]bool{false} ** 256;
+    for (allowed_header_name_bytes) |byte| table[byte] = true;
+    break :blk table;
+};
 
 pub fn validateHeaderName(name: []const u8) error{InvalidHeaderName}!void {
     if (name.len == 0) return error.InvalidHeaderName;
-    if (std.mem.indexOfAny(u8, name, invalid_header_name_bytes) != null) return error.InvalidHeaderName;
+    for (name) |byte| {
+        if (!tchar_table[byte]) return error.InvalidHeaderName;
+    }
 }
 
 pub fn validateHeaderValue(value: []const u8) error{InvalidHeaderValue}!void {
@@ -279,6 +291,8 @@ test "validateHeaderName: rejects empty, whitespace, colon, control" {
     try std.testing.expectError(error.InvalidHeaderName, validateHeaderName("X-Foo:"));
     try std.testing.expectError(error.InvalidHeaderName, validateHeaderName("X Foo"));
     try std.testing.expectError(error.InvalidHeaderName, validateHeaderName("X-Foo\r"));
+    try std.testing.expectError(error.InvalidHeaderName, validateHeaderName("X(Foo)"));
+    try std.testing.expectError(error.InvalidHeaderName, validateHeaderName("X,Foo"));
     try validateHeaderName("X-Custom-Header");
 }
 
