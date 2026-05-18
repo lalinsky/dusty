@@ -15,9 +15,10 @@ pub const EventStream = struct {
     };
 
     pub fn send(self: EventStream, data: []const u8, opts: Options) !void {
-        if (std.debug.runtime_safety) {
-            std.debug.assert(std.mem.indexOfScalar(u8, data, '\n') == null); // data must not contain newlines
-        }
+        if (std.mem.indexOfAny(u8, data, "\r\n") != null) return error.InvalidEventField;
+        if (opts.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
+        if (opts.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
+
         if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
         if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
         if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
@@ -49,6 +50,8 @@ pub const Response = struct {
     }
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
+        try http.validateHeaderName(name);
+        try http.validateHeaderValue(value);
         try self.headers.put(self.arena, name, value);
     }
 
@@ -127,7 +130,9 @@ pub const Response = struct {
         try self.writeHeader();
         try self.conn.flush();
 
-        return WebSocket.init(self.conn, req.conn, self.arena);
+        var seed: u64 = undefined;
+        req.io.random(std.mem.asBytes(&seed));
+        return WebSocket.init(self.conn, req.conn, self.arena, seed);
     }
 
     pub fn writeHeader(self: *Response) !void {
@@ -755,4 +760,52 @@ test "Response: setCookie with options" {
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Set-Cookie: auth=token123; Path=/; HttpOnly; Secure; SameSite=Strict\r\n") != null);
+}
+
+test "Response: header() rejects CRLF in value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    try std.testing.expectError(error.InvalidHeaderValue, response.header("Location", "/ok\r\nX-Evil: 1"));
+    try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\nbaz"));
+    try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\x00baz"));
+}
+
+test "Response: header() rejects invalid name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    try std.testing.expectError(error.InvalidHeaderName, response.header("", "value"));
+    try std.testing.expectError(error.InvalidHeaderName, response.header("X-Bad\r\n", "value"));
+    try std.testing.expectError(error.InvalidHeaderName, response.header("X: Bad", "value"));
+    try std.testing.expectError(error.InvalidHeaderName, response.header("X Bad", "value"));
+}
+
+test "Response: setCookie rejects CRLF via header()" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+    try std.testing.expectError(error.InvalidHeaderValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
+}
+
+test "EventStream: rejects newline in data" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try std.testing.expectError(error.InvalidEventField, stream.send("line1\nline2", .{}));
+    try std.testing.expectError(error.InvalidEventField, stream.send("ok", .{ .event = "bad\nevent" }));
+    try std.testing.expectError(error.InvalidEventField, stream.send("ok", .{ .id = "bad\rid" }));
 }

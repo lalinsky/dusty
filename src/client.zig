@@ -679,6 +679,9 @@ pub const Client = struct {
             };
         } else null;
 
+        // Reject any CRLF/NUL smuggled in via the URL host.
+        try http.validateHeaderValue(host);
+
         // Acquire or create a connection
         const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle, options.unix_socket_path);
         errdefer {
@@ -720,6 +723,8 @@ pub const Client = struct {
                 if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Connection")) continue;
                 if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Sec-WebSocket-Key")) continue;
                 if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Sec-WebSocket-Version")) continue;
+                try http.validateHeaderName(entry.key_ptr.*);
+                try http.validateHeaderValue(entry.value_ptr.*);
                 try conn.writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
             }
         }
@@ -747,13 +752,10 @@ pub const Client = struct {
             return error.WebSocketUpgradeFailed;
         }
 
-        var ws = WebSocket.init(conn.writer, conn.reader, conn.allocator);
+        var seed: u64 = undefined;
+        self.io.random(std.mem.asBytes(&seed));
+        var ws = WebSocket.init(conn.writer, conn.reader, conn.allocator, seed);
         ws.is_client = true;
-        ws.prng = std.Random.DefaultPrng.init(blk: {
-            var seed: u64 = undefined;
-            self.io.random(std.mem.asBytes(&seed));
-            break :blk seed;
-        });
         return .{ .ws = ws, .conn = conn };
     }
 
@@ -861,6 +863,10 @@ const WriteRequestOptions = struct {
 };
 
 fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
+    // Reject any CRLF/NUL smuggled in via the URL host (a URL like
+    // "http://foo%0d%0aX-Evil:1/" would otherwise inject a header).
+    try http.validateHeaderValue(opts.host);
+
     // Request line - path with query
     const path = uriPath(opts.uri);
     if (opts.uri.query) |query| {
@@ -891,6 +897,8 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) continue;
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Accept-Encoding")) has_accept_encoding = true;
 
+            try http.validateHeaderName(entry.key_ptr.*);
+            try http.validateHeaderValue(entry.value_ptr.*);
             try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
     }

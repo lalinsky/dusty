@@ -5,7 +5,7 @@ pub const WebSocket = struct {
     reader: *std.Io.Reader,
     msg_arena: std.heap.ArenaAllocator,
     is_client: bool = false,
-    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
+    prng: std.Random.DefaultPrng,
     max_message_size: usize = default_max_message_size,
     closed: bool = false,
     auto_responded: bool = false,
@@ -57,11 +57,12 @@ pub const WebSocket = struct {
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-    pub fn init(conn: *std.Io.Writer, reader: *std.Io.Reader, gpa: std.mem.Allocator) WebSocket {
+    pub fn init(conn: *std.Io.Writer, reader: *std.Io.Reader, gpa: std.mem.Allocator, seed: u64) WebSocket {
         return .{
             .conn = conn,
             .reader = reader,
             .msg_arena = std.heap.ArenaAllocator.init(gpa),
+            .prng = std.Random.DefaultPrng.init(seed),
         };
     }
 
@@ -306,7 +307,7 @@ test "WebSocket: writeFrame text" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     try ws.writeFrame(.text, "Hello", true);
 
@@ -324,7 +325,7 @@ test "WebSocket: writeFrame binary with medium length" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
 
     const payload = "x" ** 200;
@@ -344,7 +345,7 @@ test "WebSocket: writeCloseFrame" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     try ws.writeCloseFrame(.normal, "goodbye");
 
@@ -373,7 +374,7 @@ test "WebSocket: readFrame unmasked" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     const frame = try ws.readFrame();
 
@@ -398,7 +399,7 @@ test "WebSocket: readFrame masked" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     const frame = try ws.readFrame();
 
@@ -422,7 +423,7 @@ test "WebSocket: receive handles ping automatically" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     const msg = try ws.receive();
 
@@ -451,7 +452,7 @@ test "WebSocket: readFrame rejects RSV bits" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.readFrame());
 }
@@ -469,7 +470,7 @@ test "WebSocket: readFrame rejects large control frame" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.readFrame());
 }
@@ -479,7 +480,7 @@ test "WebSocket: writeFrame masked (client mode)" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator);
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
     try ws.writeFrame(.text, "Hello", true);
