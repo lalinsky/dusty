@@ -402,7 +402,8 @@ const MultipartForm = struct {
                 while (pos < fields.len) {
                     switch (fields[pos]) {
                         '\\' => {
-                            if (pos == fields.len) {
+                            // Trailing backslash with no character to escape.
+                            if (pos + 1 >= fields.len) {
                                 return error.InvalidMultiPartEncoding;
                             }
                             // supposedly MSIE doesn't always escape \, so if the \ isn't escape
@@ -709,4 +710,40 @@ test "Request.multiFormData: entry with filename" {
 
     const form_data = try req.multiFormData();
     try std.testing.expectEqualStrings("foo.txt", form_data.get("foo").?.filename.?);
+}
+
+test "Request.multiFormData: trailing backslash in quoted attribute (regression)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Quoted name value ends with a backslash and no closing quote — the parser
+    // currently looks at fields[pos+1] without bounds-checking, panicking on
+    // safety-checked builds. Should return InvalidMultiPartEncoding instead.
+    const body = "----b\r\nContent-Disposition: form-data; name=\"x\\\r\n\r\nval\r\n----b--\r\n";
+    var cl_buf: [16]u8 = undefined;
+    const cl = try std.fmt.bufPrint(&cl_buf, "{d}", .{body.len});
+
+    var req_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer req_buf.deinit(std.testing.allocator);
+    try req_buf.appendSlice(std.testing.allocator, "POST /t HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--b\r\nContent-Length: ");
+    try req_buf.appendSlice(std.testing.allocator, cl);
+    try req_buf.appendSlice(std.testing.allocator, "\r\n\r\n");
+    try req_buf.appendSlice(std.testing.allocator, body);
+
+    var reader = std.Io.Reader.fixed(req_buf.items);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .conn = &reader,
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectError(error.InvalidMultiPartEncoding, req.multiFormData());
 }
