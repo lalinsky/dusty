@@ -53,6 +53,8 @@ pub const WebSocket = struct {
         NestedFragment,
         InvalidUtf8,
         MessageTooLarge,
+        UnmaskedClientFrame,
+        MaskedServerFrame,
     };
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -190,6 +192,12 @@ pub const WebSocket = struct {
         }
         const opcode: MessageType = @enumFromInt(@as(u4, @truncate(header[0] & 0x0F)));
         const masked = (header[1] & 0x80) != 0;
+
+        // RFC 6455 §5.1: server MUST close on unmasked frame from client;
+        // client MUST close on masked frame from server.
+        if (!self.is_client and !masked) return Error.UnmaskedClientFrame;
+        if (self.is_client and masked) return Error.MaskedServerFrame;
+
         var payload_len: u64 = header[1] & 0x7F;
 
         // Control frames (close, ping, pong) must have payload <= 125 bytes
@@ -360,9 +368,9 @@ test "WebSocket: writeCloseFrame" {
     try std.testing.expectEqualStrings("goodbye", written[4..11]);
 }
 
-test "WebSocket: readFrame unmasked" {
+test "WebSocket: readFrame unmasked (client mode)" {
 
-    // A simple unmasked text frame with "Hi"
+    // A simple unmasked text frame with "Hi" — only valid server-to-client.
     const frame_data = [_]u8{
         0x81, // FIN + text
         0x02, // length = 2
@@ -376,11 +384,40 @@ test "WebSocket: readFrame unmasked" {
 
     var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
+    ws.is_client = true;
     const frame = try ws.readFrame();
 
     try std.testing.expect(frame.fin);
     try std.testing.expectEqual(.text, frame.opcode);
     try std.testing.expectEqualStrings("Hi", frame.payload);
+}
+
+test "WebSocket: readFrame rejects unmasked client frame (server mode)" {
+    const frame_data = [_]u8{ 0x81, 0x02, 'H', 'i' };
+    var reader: std.Io.Reader = .fixed(&frame_data);
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
+    defer ws.deinit();
+    // is_client = false (default) — must reject unmasked input per RFC 6455 §5.1.
+    try std.testing.expectError(WebSocket.Error.UnmaskedClientFrame, ws.readFrame());
+}
+
+test "WebSocket: readFrame rejects masked server frame (client mode)" {
+    const frame_data = [_]u8{
+        0x81, 0x82, // FIN + text, masked + length = 2
+        0x12, 0x34, 0x56, 0x78, // mask key
+        0x5A, 0x5D, // masked payload
+    };
+    var reader: std.Io.Reader = .fixed(&frame_data);
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
+    defer ws.deinit();
+    ws.is_client = true;
+    try std.testing.expectError(WebSocket.Error.MaskedServerFrame, ws.readFrame());
 }
 
 test "WebSocket: readFrame masked" {
@@ -410,12 +447,13 @@ test "WebSocket: readFrame masked" {
 
 test "WebSocket: receive handles ping automatically" {
 
-    // Ping frame followed by text frame
+    // Masked ping + masked text (client->server frames per RFC 6455).
+    // Mask key: 0x00, 0x00, 0x00, 0x00 — payload bytes therefore equal plaintext.
     const frame_data = [_]u8{
-        // Ping frame
-        0x89, 0x04, 'p', 'i', 'n', 'g',
-        // Text frame
-        0x81, 0x05, 'H', 'e', 'l', 'l',
+        // Ping frame: FIN+ping, mask+len=4, mask key, masked payload
+        0x89, 0x84, 0x00, 0x00, 0x00, 0x00, 'p', 'i', 'n', 'g',
+        // Text frame: FIN+text, mask+len=5, mask key, masked payload
+        0x81, 0x85, 0x00, 0x00, 0x00, 0x00, 'H', 'e', 'l', 'l',
         'o',
     };
     var reader: std.Io.Reader = .fixed(&frame_data);
@@ -459,7 +497,9 @@ test "WebSocket: readFrame rejects RSV bits" {
 
 test "WebSocket: readFrame rejects large control frame" {
 
-    // Ping frame with 126-byte payload (uses extended length)
+    // Ping frame with 126-byte payload (uses extended length).
+    // Test the size limit independent of masking — use client mode so the
+    // unmasked frame is otherwise valid.
     const frame_data = [_]u8{
         0x89, // FIN + ping
         126, // extended length indicator
@@ -472,6 +512,7 @@ test "WebSocket: readFrame rejects large control frame" {
 
     var ws = WebSocket.init(&conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
+    ws.is_client = true;
     try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.readFrame());
 }
 

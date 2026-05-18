@@ -80,6 +80,11 @@ pub const Response = struct {
             try self.writeHeader();
         }
 
+        // A zero-length chunk is the chunked-encoding terminator; skip it so
+        // an accidental empty write doesn't end the response early (and let
+        // subsequent chunks land after the terminator on the wire).
+        if (data.len == 0) return;
+
         // Format: {size_hex}\r\n{data}\r\n
         // Buffer size: enough for a 1TB chunk (40 bits = 10 hex digits) + formatting
         var buf: [16]u8 = undefined;
@@ -556,6 +561,31 @@ test "Response: chunked flag defaults to false" {
 
     const response = Response.init(arena.allocator(), &conn_writer);
     try std.testing.expectEqual(false, response.chunked);
+}
+
+test "Response: chunk() skips empty data so it doesn't terminate the stream" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var response = Response.init(arena.allocator(), &conn_writer);
+
+    try response.chunk("first");
+    try response.chunk(""); // would be the chunked terminator if written; must be skipped
+    try response.chunk("second");
+    try response.write();
+
+    const written = conn_writer.buffered();
+    const expected =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\nfirst\r\n" ++
+        "6\r\nsecond\r\n" ++
+        "0\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, written);
 }
 
 test "Response: chunked mode doesn't write Content-Length" {
