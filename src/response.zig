@@ -5,6 +5,54 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 
+var no_buf: [0]u8 = .{};
+
+pub const EventWriter = struct {
+    conn: *std.Io.Writer,
+    line_in_progress: bool,
+    interface: std.Io.Writer,
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *EventWriter = @fieldParentPtr("interface", w);
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |segment| {
+            try writeLines(self, segment);
+            total += segment.len;
+        }
+        if (splat > 0) {
+            try writeLines(self, data[data.len - 1]);
+            total += data[data.len - 1].len;
+        }
+        return w.consume(total);
+    }
+
+    fn writeLines(self: *EventWriter, bytes: []const u8) !void {
+        var rest = bytes;
+        while (std.mem.findScalar(u8, rest, '\n')) |idx| {
+            if (!self.line_in_progress) try self.conn.writeAll("data: ");
+            const line_end = if (idx > 0 and rest[idx - 1] == '\r') idx - 1 else idx;
+            try self.conn.writeAll(rest[0..line_end]);
+            try self.conn.writeAll("\n");
+            self.line_in_progress = false;
+            rest = rest[idx + 1 ..];
+        }
+        if (rest.len > 0) {
+            if (!self.line_in_progress) {
+                try self.conn.writeAll("data: ");
+                self.line_in_progress = true;
+            }
+            try self.conn.writeAll(rest);
+        }
+    }
+
+    pub fn end(self: *EventWriter) !void {
+        try self.interface.flush();
+        if (self.line_in_progress) try self.conn.writeAll("\n");
+        try self.conn.writeAll("\n");
+        try self.conn.flush();
+    }
+};
+
 pub const EventStream = struct {
     conn: *std.Io.Writer,
 
@@ -14,15 +62,37 @@ pub const EventStream = struct {
         retry: ?u32 = null,
     };
 
-    pub fn send(self: EventStream, data: []const u8, opts: Options) !void {
-        if (std.mem.indexOfAny(u8, data, "\r\n") != null) return error.InvalidEventField;
+    pub fn startSend(self: EventStream, opts: Options) !EventWriter {
         if (opts.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
         if (opts.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
 
         if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
         if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
         if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
-        try self.conn.print("data: {s}\n\n", .{data});
+
+        return .{
+            .conn = self.conn,
+            .line_in_progress = false,
+            .interface = .{
+                .buffer = &no_buf,
+                .vtable = &.{ .drain = &EventWriter.drain },
+            },
+        };
+    }
+
+    pub fn send(self: EventStream, data: []const u8, opts: Options) !void {
+        if (opts.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
+        if (opts.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
+
+        if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
+        if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
+        if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const stripped = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+            try self.conn.print("data: {s}\n", .{stripped});
+        }
+        try self.conn.writeAll("\n");
         try self.conn.flush();
     }
 };
@@ -830,12 +900,120 @@ test "Response: setCookie rejects CRLF via header()" {
     try std.testing.expectError(error.InvalidHeaderValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
 }
 
-test "EventStream: rejects newline in data" {
+test "EventStream: rejects newline in event and id fields" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
     const stream = EventStream{ .conn = &conn_writer };
-    try std.testing.expectError(error.InvalidEventField, stream.send("line1\nline2", .{}));
     try std.testing.expectError(error.InvalidEventField, stream.send("ok", .{ .event = "bad\nevent" }));
     try std.testing.expectError(error.InvalidEventField, stream.send("ok", .{ .id = "bad\rid" }));
+}
+
+test "EventStream: multi-line data splits into multiple data lines" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try stream.send("line1\nline2", .{});
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
+}
+
+test "EventStream: CRLF line endings stripped in data" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    try stream.send("line1\r\nline2", .{});
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
+}
+
+test "EventWriter: basic write" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{});
+    try ew.interface.writeAll("hello");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: hello\n\n", conn_writer.buffered());
+}
+
+test "EventWriter: multi-line" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{});
+    try ew.interface.writeAll("line1\nline2");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", conn_writer.buffered());
+}
+
+test "EventWriter: print" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{});
+    try ew.interface.print("count: {d}", .{42});
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: count: 42\n\n", conn_writer.buffered());
+}
+
+test "EventWriter: with options" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{ .event = "update", .id = "42" });
+    try ew.interface.writeAll("payload");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("event: update\nid: 42\ndata: payload\n\n", conn_writer.buffered());
+}
+
+test "EventWriter: multiple writes merged into one event" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{});
+    try ew.interface.writeAll("foo");
+    try ew.interface.writeAll("bar");
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: foobar\n\n", conn_writer.buffered());
+}
+
+test "EventWriter: writeByte" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{});
+    try ew.interface.writeByte('A');
+    try ew.interface.writeByte('B');
+    try ew.interface.writeByte('C');
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: ABC\n\n", conn_writer.buffered());
+}
+
+test "EventWriter: splatBytesAll" {
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    const stream = EventStream{ .conn = &conn_writer };
+    var ew = try stream.startSend(.{});
+    try ew.interface.splatBytesAll("ab", 3);
+    try ew.end();
+
+    try std.testing.expectEqualStrings("data: ababab\n\n", conn_writer.buffered());
 }
