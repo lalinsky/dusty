@@ -4,6 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
+
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -17,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zio_stub.zig"),
     });
 
+    mod.addImport("tls", tls_dep.module("tls"));
     mod.link_libc = true;
     mod.addCSourceFiles(.{
         .files = &[_][]const u8{

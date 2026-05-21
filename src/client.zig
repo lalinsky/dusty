@@ -1,5 +1,6 @@
 const std = @import("std");
 const Uri = std.Uri;
+const tls = @import("tls");
 
 const unix_path_max = 108;
 
@@ -111,12 +112,6 @@ pub const WebSocketClient = struct {
         self.conn.deinit();
         self.conn.pool.allocator.destroy(self.conn);
     }
-};
-
-const CaBundleRef = struct {
-    gpa: std.mem.Allocator,
-    lock: *std.Io.RwLock,
-    bundle: *std.crypto.Certificate.Bundle,
 };
 
 /// Parse a URL string into a std.Uri.
@@ -245,7 +240,9 @@ pub const Connection = struct {
     // TLS TCP layer buffers (allocated from main allocator, persist across requests)
     tls_tcp_read_buffer: []u8,
     tls_tcp_write_buffer: []u8,
-    tls_client: ?std.crypto.tls.Client,
+    tls_conn: ?tls.Connection,
+    tls_reader_iface: ?tls.Connection.Reader,
+    tls_writer_iface: ?tls.Connection.Writer,
 
     // HTTP layer buffers (allocated from main allocator, persist across requests)
     read_buffer: []u8,
@@ -281,7 +278,7 @@ pub const Connection = struct {
         remote_port: u16,
         buffer_size: usize,
         protocol: Protocol,
-        ca_bundle: ?CaBundleRef,
+        ca_bundle: ?*const std.crypto.Certificate.Bundle,
         unix_socket_path: ?[]const u8,
     ) !void {
         self.allocator = allocator;
@@ -322,47 +319,37 @@ pub const Connection = struct {
         if (protocol == .https) {
             const bundle = ca_bundle orelse return error.MissingCaBundle;
 
-            const tls_buffer_size = std.crypto.tls.Client.min_buffer_len;
-
-            self.read_buffer = try allocator.alloc(u8, self.buffer_size + tls_buffer_size + 1024);
-            errdefer allocator.free(self.read_buffer);
-            self.write_buffer = try allocator.alloc(u8, tls_buffer_size + 1024);
-            errdefer allocator.free(self.write_buffer);
-
-            self.tls_tcp_read_buffer = try allocator.alloc(u8, tls_buffer_size);
+            self.tls_tcp_read_buffer = try allocator.alloc(u8, tls.input_buffer_len);
             errdefer allocator.free(self.tls_tcp_read_buffer);
-            self.tls_tcp_write_buffer = try allocator.alloc(u8, tls_buffer_size);
+            self.tls_tcp_write_buffer = try allocator.alloc(u8, tls.output_buffer_len);
             errdefer allocator.free(self.tls_tcp_write_buffer);
+
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size);
+            errdefer allocator.free(self.read_buffer);
+            self.write_buffer = try allocator.alloc(u8, 1024);
+            errdefer allocator.free(self.write_buffer);
 
             self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
             self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
 
-            var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-            self.io.random(&entropy);
-
-            self.tls_client = std.crypto.tls.Client.init(
-                &self.tcp_reader.interface,
-                &self.tcp_writer.interface,
-                .{
-                    .host = .{ .explicit = remote_host },
-                    .ca = .{ .bundle = .{
-                        .gpa = bundle.gpa,
-                        .io = self.io,
-                        .lock = bundle.lock,
-                        .bundle = bundle.bundle,
-                    } },
-                    .entropy = &entropy,
-                    .realtime_now = std.Io.Timestamp.now(self.io, .real),
-                    .read_buffer = self.read_buffer,
-                    .write_buffer = self.write_buffer,
-                    .allow_truncation_attacks = true,
-                },
-            ) catch return error.TlsInitializationFailed;
-
-            self.reader = &self.tls_client.?.reader;
-            self.writer = &self.tls_client.?.writer;
+            const rng_src: std.Random.IoSource = .{ .io = io };
+            self.tls_conn = tls.client(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
+                .host = remote_host,
+                .root_ca = bundle.*,
+                .now = std.Io.Clock.real.now(io),
+                .rng = rng_src.interface(),
+            }) catch |err| {
+                if (self.tcp_reader.err) |e| return e;
+                return err;
+            };
+            self.tls_reader_iface = self.tls_conn.?.reader(self.read_buffer);
+            self.tls_writer_iface = self.tls_conn.?.writer(self.write_buffer);
+            self.reader = &self.tls_reader_iface.?.interface;
+            self.writer = &self.tls_writer_iface.?.interface;
         } else {
-            self.tls_client = null;
+            self.tls_conn = null;
+            self.tls_reader_iface = null;
+            self.tls_writer_iface = null;
             self.tls_tcp_read_buffer = &.{};
             self.tls_tcp_write_buffer = &.{};
 
@@ -408,9 +395,6 @@ pub const Connection = struct {
 
     pub fn flush(self: *Connection) !void {
         try self.writer.flush();
-        if (self.protocol == .https) {
-            try self.tcp_writer.interface.flush();
-        }
     }
 
     pub fn host(self: *const Connection) []const u8 {
@@ -586,7 +570,7 @@ pub const Client = struct {
     config: ClientConfig,
     pool: ConnectionPool,
     ca_bundle: std.crypto.Certificate.Bundle,
-    ca_bundle_lock: std.Io.RwLock,
+    ca_bundle_loaded: bool,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
         return .{
@@ -595,7 +579,7 @@ pub const Client = struct {
             .config = config,
             .pool = ConnectionPool.init(allocator, config.max_idle_connections),
             .ca_bundle = .empty,
-            .ca_bundle_lock = .init,
+            .ca_bundle_loaded = false,
         };
     }
 
@@ -622,7 +606,7 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         protocol: Protocol,
-        ca_bundle: ?CaBundleRef,
+        ca_bundle: ?*const std.crypto.Certificate.Bundle,
         unix_socket_path: ?[]const u8,
     ) !*Connection {
         // Try to get a connection from the pool
@@ -667,16 +651,14 @@ pub const Client = struct {
         var host_buffer: [255]u8 = undefined;
         const host = try uriHost(uri, &host_buffer);
 
-        // Initialize CA bundle for HTTPS
-        const ca_bundle: ?CaBundleRef = if (info.protocol == .https) blk: {
-            if (!self.config.use_system_ca_bundle) {
-                return error.TlsNotConfigured;
+        // Load CA bundle lazily on first HTTPS request
+        const ca_bundle: ?*const std.crypto.Certificate.Bundle = if (info.protocol == .https) blk: {
+            if (!self.config.use_system_ca_bundle) return error.TlsNotConfigured;
+            if (!self.ca_bundle_loaded) {
+                try self.ca_bundle.rescan(self.allocator, self.io, std.Io.Clock.real.now(self.io));
+                self.ca_bundle_loaded = true;
             }
-            break :blk .{
-                .gpa = self.allocator,
-                .lock = &self.ca_bundle_lock,
-                .bundle = &self.ca_bundle,
-            };
+            break :blk &self.ca_bundle;
         } else null;
 
         // Reject any CRLF/NUL smuggled in via the URL host.
@@ -770,16 +752,14 @@ pub const Client = struct {
         var host_buffer: [255]u8 = undefined;
         const host = try uriHost(uri, &host_buffer);
 
-        // Initialize CA bundle for HTTPS
-        const ca_bundle: ?CaBundleRef = if (protocol == .https) blk: {
-            if (!self.config.use_system_ca_bundle) {
-                return error.TlsNotConfigured;
+        // Load CA bundle lazily on first HTTPS request
+        const ca_bundle: ?*const std.crypto.Certificate.Bundle = if (protocol == .https) blk: {
+            if (!self.config.use_system_ca_bundle) return error.TlsNotConfigured;
+            if (!self.ca_bundle_loaded) {
+                try self.ca_bundle.rescan(self.allocator, self.io, std.Io.Clock.real.now(self.io));
+                self.ca_bundle_loaded = true;
             }
-            break :blk .{
-                .gpa = self.allocator,
-                .lock = &self.ca_bundle_lock,
-                .bundle = &self.ca_bundle,
-            };
+            break :blk &self.ca_bundle;
         } else null;
 
         // Acquire or create a connection
