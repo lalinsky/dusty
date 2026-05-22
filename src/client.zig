@@ -839,11 +839,16 @@ pub const Client = struct {
                 conn.closing = !conn.parser.shouldKeepAlive();
                 self.pool.release(conn);
 
-                // For 303, always use GET and clear body
+                // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
+                // 307/308 preserve the original method and body.
                 var redirect_options = state.options;
-                if (status_code == 303) {
-                    redirect_options.method = .get;
-                    redirect_options.body = null;
+                if (status_code == 301 or status_code == 302 or status_code == 303) {
+                    if (redirect_options.method != .get and redirect_options.method != .head) {
+                        redirect_options.method = .get;
+                        redirect_options.body = null;
+                    } else if (status_code == 303) {
+                        redirect_options.body = null;
+                    }
                 }
 
                 // Strip sensitive headers when crossing to a different domain/host.
