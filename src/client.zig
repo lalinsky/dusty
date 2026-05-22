@@ -836,10 +836,21 @@ pub const Client = struct {
                 const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
                 const redirect_info = try uriPortAndProtocol(redirect_uri);
 
-                // Release current connection back to pool.
-                // If the redirect response has an unread body, closing the connection
-                // is safer than pooling it with leftover bytes on the socket.
-                conn.closing = !conn.parser.isBodyComplete() or !conn.parser.shouldKeepAlive();
+                // Drain small redirect bodies (up to 2KB) so the connection can
+                // be returned to the pool rather than closed.
+                if (!conn.parser.isBodyComplete()) {
+                    const max_drain = 2048;
+                    var drain_buf: [1024]u8 = undefined;
+                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.reader, &drain_buf);
+                    _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
+                        error.ReadFailed => {
+                            conn.closing = true;
+                            return conn.tcp_reader.err orelse error.ReadFailed;
+                        },
+                    };
+                    if (!conn.parser.isBodyComplete()) conn.closing = true;
+                }
+                if (!conn.parser.shouldKeepAlive()) conn.closing = true;
                 self.pool.release(conn);
 
                 // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
