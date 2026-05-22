@@ -820,6 +820,7 @@ pub const Client = struct {
 
         // Check for unsupported content encoding
         if (state.options.decompress and conn.parsed_response.content_encoding == .unknown) {
+            if (!conn.parser.isBodyComplete()) conn.closing = true;
             return error.UnsupportedContentEncoding;
         }
 
@@ -835,8 +836,10 @@ pub const Client = struct {
                 const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
                 const redirect_info = try uriPortAndProtocol(redirect_uri);
 
-                // Release current connection back to pool
-                conn.closing = !conn.parser.shouldKeepAlive();
+                // Release current connection back to pool.
+                // If the redirect response has an unread body, closing the connection
+                // is safer than pooling it with leftover bytes on the socket.
+                conn.closing = !conn.parser.isBodyComplete() or !conn.parser.shouldKeepAlive();
                 self.pool.release(conn);
 
                 // For 303, always use GET and clear body
