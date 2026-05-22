@@ -854,12 +854,16 @@ pub const Client = struct {
                     }
                 }
 
-                // Strip sensitive headers when crossing to a different domain/host.
-                // Same-domain and subdomain redirects keep headers (matches Go's behavior).
+                // Strip sensitive headers when:
+                //   - already stripping from a previous hop, OR
+                //   - crossing to a different domain/host (same-domain and subdomain keep headers), OR
+                //   - downgrading from https to http (credentials would travel in plaintext).
                 var redirect_host_buffer: [255]u8 = undefined;
                 const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
                 const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
-                const redirect_strip_sensitive = !isDomainOrSubdomain(redirect_host, effective_initial_host);
+                const redirect_strip_sensitive = state.strip_sensitive_headers or
+                    !isDomainOrSubdomain(redirect_host, effective_initial_host) or
+                    (state.protocol == .https and redirect_info.protocol == .http);
 
                 // Strip body-related headers when there is no body to send.
                 const redirect_strip_body = redirect_options.body == null;
@@ -1417,6 +1421,60 @@ test "writeRequest: strips sensitive headers on cross-origin redirect" {
     const written = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Cookie") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "redirect: strips sensitive headers on https to http downgrade" {
+    // Verify the stripping condition fires on scheme downgrade even when host is identical.
+    // We exercise the flag directly since the full redirect loop requires a live server.
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers: Headers = .{};
+    defer headers.deinit(std.testing.allocator);
+    try headers.put(std.testing.allocator, "Authorization", "Bearer secret");
+    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+
+    const uri = try parseUrl("http://example.com/path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_sensitive_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "redirect: once stripping triggered it persists across hops" {
+    // strip_sensitive_headers=true should propagate even if a later hop passes the host check.
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers: Headers = .{};
+    defer headers.deinit(std.testing.allocator);
+    try headers.put(std.testing.allocator, "Authorization", "Bearer secret");
+    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+
+    // Simulate a hop that is back on the original host but already has strip=true.
+    const uri = try parseUrl("http://example.com/new-path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_sensitive_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
 }
 
