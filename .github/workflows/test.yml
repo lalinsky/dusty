@@ -38,3 +38,17 @@ jobs:
       run: zig build
       working-directory: examples/zio
       timeout-minutes: 5
+
+    - name: Build examples
+      run: zig build examples
+      timeout-minutes: 5
+
+    - name: Run client example
+      run: ./zig-out/bin/client-example https://httpbin.org/get
+      timeout-minutes: 1
+      if: runner.os != 'Windows'
+
+    - name: Run client example (Windows)
+      run: .\zig-out\bin\client-example.exe https://httpbin.org/get
+      timeout-minutes: 1
+      if: runner.os == 'Windows'
