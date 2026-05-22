@@ -241,8 +241,9 @@ pub const Connection = struct {
     tls_tcp_read_buffer: []u8,
     tls_tcp_write_buffer: []u8,
     tls_conn: ?tls.Connection,
-    tls_reader_iface: ?tls.Connection.Reader,
-    tls_writer_iface: ?tls.Connection.Writer,
+    tls_reader: ?tls.Connection.Reader,
+    tls_writer: ?tls.Connection.Writer,
+    tls_random_source: std.Random.IoSource,
 
     // HTTP layer buffers (allocated from main allocator, persist across requests)
     read_buffer: []u8,
@@ -332,24 +333,24 @@ pub const Connection = struct {
             self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
             self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
 
-            const rng_src: std.Random.IoSource = .{ .io = io };
+            self.tls_random_source = .{ .io = io };
             self.tls_conn = tls.client(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
                 .host = remote_host,
                 .root_ca = bundle.*,
                 .now = std.Io.Clock.real.now(io),
-                .rng = rng_src.interface(),
+                .rng = self.tls_random_source.interface(),
             }) catch |err| {
                 if (self.tcp_reader.err) |e| return e;
                 return err;
             };
-            self.tls_reader_iface = self.tls_conn.?.reader(self.read_buffer);
-            self.tls_writer_iface = self.tls_conn.?.writer(self.write_buffer);
-            self.reader = &self.tls_reader_iface.?.interface;
-            self.writer = &self.tls_writer_iface.?.interface;
+            self.tls_reader = self.tls_conn.?.reader(self.read_buffer);
+            self.tls_writer = self.tls_conn.?.writer(self.write_buffer);
+            self.reader = &self.tls_reader.?.interface;
+            self.writer = &self.tls_writer.?.interface;
         } else {
             self.tls_conn = null;
-            self.tls_reader_iface = null;
-            self.tls_writer_iface = null;
+            self.tls_reader = null;
+            self.tls_writer = null;
             self.tls_tcp_read_buffer = &.{};
             self.tls_tcp_write_buffer = &.{};
 
