@@ -808,6 +808,7 @@ pub const Client = struct {
             .decompress = state.options.decompress,
             .strip_sensitive_headers = state.strip_sensitive_headers,
             .strip_body_headers = state.strip_body_headers,
+            .referer = state.referer,
         });
 
         try conn.flush();
@@ -879,6 +880,28 @@ pub const Client = struct {
                 // Strip body-related headers when there is no body to send.
                 const redirect_strip_body = redirect_options.body == null;
 
+                // Compute Referer for the next hop (RFC 7231 §5.5.2).
+                // Don't send Referer when downgrading https→http (would leak in plaintext).
+                // If the user already set a Referer header, forward it as-is.
+                var referer_buf: [2048]u8 = undefined;
+                const redirect_referer: ?[]const u8 = blk: {
+                    if (state.protocol == .https and redirect_info.protocol == .http) break :blk null;
+                    if (redirect_options.headers) |h| {
+                        if (h.get("Referer")) |existing| break :blk existing;
+                    }
+                    var w = std.Io.Writer.fixed(&referer_buf);
+                    state.uri.writeToStream(&w, .{
+                        .scheme = true,
+                        .authority = true,
+                        .authentication = false, // strip userinfo — never leak credentials in Referer
+                        .path = true,
+                        .query = true,
+                        .fragment = false, // strip fragment — not sent to servers per RFC 7231
+                        .port = true,
+                    }) catch break :blk null;
+                    break :blk w.buffered();
+                };
+
                 return self.fetchInternal(.{
                     .uri = redirect_uri,
                     .port = redirect_info.port,
@@ -888,6 +911,7 @@ pub const Client = struct {
                     .initial_host = effective_initial_host,
                     .strip_sensitive_headers = redirect_strip_sensitive,
                     .strip_body_headers = redirect_strip_body,
+                    .referer = redirect_referer,
                 });
             }
         }
@@ -914,6 +938,7 @@ const FetchState = struct {
     initial_host: []const u8 = "",
     strip_sensitive_headers: bool = false,
     strip_body_headers: bool = false,
+    referer: ?[]const u8 = null,
 };
 
 const WriteRequestOptions = struct {
@@ -927,6 +952,7 @@ const WriteRequestOptions = struct {
     decompress: bool = true,
     strip_sensitive_headers: bool = false,
     strip_body_headers: bool = false,
+    referer: ?[]const u8 = null,
 };
 
 fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
@@ -956,6 +982,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
 
     // User-provided headers
     var has_accept_encoding = false;
+    var has_referer = false;
     if (opts.headers) |h| {
         var it = h.iterator();
         while (it.next()) |entry| {
@@ -963,6 +990,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host")) continue;
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) continue;
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Accept-Encoding")) has_accept_encoding = true;
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Referer")) has_referer = true;
 
             if (opts.strip_sensitive_headers) {
                 if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Authorization")) continue;
@@ -985,6 +1013,14 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         }
     }
 
+    // Add auto-Referer from previous hop if user didn't provide one
+    if (opts.referer) |referer| {
+        if (!has_referer) {
+            try http.validateHeaderValue(referer);
+            try writer.print("Referer: {s}\r\n", .{referer});
+        }
+    }
+
     // Add default Accept-Encoding if decompress enabled and user didn't provide one
     if (opts.decompress and !has_accept_encoding) {
         try writer.writeAll("Accept-Encoding: gzip, deflate\r\n");
@@ -1004,8 +1040,8 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
 /// Matches Go's net/http shouldCopyHeaderOnRedirect logic.
 fn isDomainOrSubdomain(sub: []const u8, parent: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(sub, parent)) return true;
-    // Don't treat IPv6 addresses as subdomains.
-    if (std.mem.indexOfScalar(u8, sub, ':') != null) return false;
+    // Don't treat IPv6 addresses (including zone IDs like "::1%25.evil.com") as subdomains.
+    if (std.mem.indexOfAny(u8, sub, ":%") != null) return false;
     // sub must end with ".<parent>".
     if (sub.len <= parent.len + 1) return false;
     const dot_idx = sub.len - parent.len - 1;
@@ -1406,6 +1442,72 @@ test "isDomainOrSubdomain: different domain" {
 test "isDomainOrSubdomain: IPv6 never a subdomain" {
     try std.testing.expect(!isDomainOrSubdomain("::1", "example.com"));
     try std.testing.expect(!isDomainOrSubdomain("[::1]", "example.com"));
+}
+
+test "isDomainOrSubdomain: IPv6 zone ID never a subdomain" {
+    try std.testing.expect(!isDomainOrSubdomain("::1%25.example.com", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("fe80::1%eth0.example.com", "example.com"));
+}
+
+test "writeRequest: sets Referer on redirect" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://example.com/new");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .referer = "http://example.com/old",
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Referer: http://example.com/old\r\n") != null);
+}
+
+test "writeRequest: does not override user-provided Referer" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers: Headers = .{};
+    defer headers.deinit(std.testing.allocator);
+    try headers.put(std.testing.allocator, "Referer", "http://custom.example.com/");
+
+    const uri = try parseUrl("http://example.com/new");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .referer = "http://example.com/old",
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Referer: http://custom.example.com/\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "http://example.com/old") == null);
+}
+
+test "redirect: Referer strips userinfo and fragment" {
+    // Verify that writeToStream with authentication=false, fragment=false
+    // produces a clean Referer without credentials or fragment.
+    var referer_buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&referer_buf);
+    const uri = try parseUrl("http://user:pass@example.com/path?q=1#section");
+    try uri.writeToStream(&w, .{
+        .scheme = true,
+        .authority = true,
+        .authentication = false,
+        .path = true,
+        .query = true,
+        .fragment = false,
+        .port = true,
+    });
+    const referer = w.buffered();
+    try std.testing.expectEqualStrings("http://example.com/path?q=1", referer);
 }
 
 test "writeRequest: strips sensitive headers on cross-origin redirect" {
