@@ -890,7 +890,15 @@ pub const Client = struct {
                         if (h.get("Referer")) |existing| break :blk existing;
                     }
                     var w = std.Io.Writer.fixed(&referer_buf);
-                    state.uri.format(&w) catch break :blk null;
+                    state.uri.writeToStream(&w, .{
+                        .scheme = true,
+                        .authority = true,
+                        .authentication = false, // strip userinfo — never leak credentials in Referer
+                        .path = true,
+                        .query = true,
+                        .fragment = false, // strip fragment — not sent to servers per RFC 7231
+                        .port = true,
+                    }) catch break :blk null;
                     break :blk w.buffered();
                 };
 
@@ -1481,6 +1489,25 @@ test "writeRequest: does not override user-provided Referer" {
     const written = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Referer: http://custom.example.com/\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "http://example.com/old") == null);
+}
+
+test "redirect: Referer strips userinfo and fragment" {
+    // Verify that writeToStream with authentication=false, fragment=false
+    // produces a clean Referer without credentials or fragment.
+    var referer_buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&referer_buf);
+    const uri = try parseUrl("http://user:pass@example.com/path?q=1#section");
+    try uri.writeToStream(&w, .{
+        .scheme = true,
+        .authority = true,
+        .authentication = false,
+        .path = true,
+        .query = true,
+        .fragment = false,
+        .port = true,
+    });
+    const referer = w.buffered();
+    try std.testing.expectEqualStrings("http://example.com/path?q=1", referer);
 }
 
 test "writeRequest: strips sensitive headers on cross-origin redirect" {
