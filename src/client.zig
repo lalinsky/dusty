@@ -587,6 +587,7 @@ pub const Client = struct {
     pool: ConnectionPool,
     ca_bundle: std.crypto.Certificate.Bundle,
     ca_bundle_lock: std.Io.RwLock,
+    ca_bundle_loaded: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
         return .{
@@ -596,6 +597,24 @@ pub const Client = struct {
             .pool = ConnectionPool.init(allocator, config.max_idle_connections),
             .ca_bundle = .empty,
             .ca_bundle_lock = .init,
+            .ca_bundle_loaded = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    fn ensureCaBundle(self: *Client) !CaBundleRef {
+        if (!self.ca_bundle_loaded.load(.acquire)) {
+            try self.ca_bundle_lock.lock(self.io);
+            defer self.ca_bundle_lock.unlock(self.io);
+            if (!self.ca_bundle_loaded.load(.unordered)) {
+                const now = std.Io.Clock.real.now(self.io);
+                try self.ca_bundle.rescan(self.allocator, self.io, now);
+                self.ca_bundle_loaded.store(true, .release);
+            }
+        }
+        return .{
+            .gpa = self.allocator,
+            .lock = &self.ca_bundle_lock,
+            .bundle = &self.ca_bundle,
         };
     }
 
@@ -672,11 +691,7 @@ pub const Client = struct {
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
-            break :blk .{
-                .gpa = self.allocator,
-                .lock = &self.ca_bundle_lock,
-                .bundle = &self.ca_bundle,
-            };
+            break :blk try self.ensureCaBundle();
         } else null;
 
         // Reject any CRLF/NUL smuggled in via the URL host.
@@ -775,11 +790,7 @@ pub const Client = struct {
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
-            break :blk .{
-                .gpa = self.allocator,
-                .lock = &self.ca_bundle_lock,
-                .bundle = &self.ca_bundle,
-            };
+            break :blk try self.ensureCaBundle();
         } else null;
 
         // Acquire or create a connection
