@@ -632,7 +632,13 @@ pub const Client = struct {
         const uri = try parseUrl(url);
         const info = try uriPortAndProtocol(uri);
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
-        return self.fetchInternal(uri, info.port, info.protocol, options, max_redirects);
+        return self.fetchInternal(.{
+            .uri = uri,
+            .port = info.port,
+            .protocol = info.protocol,
+            .options = options,
+            .redirects_remaining = max_redirects,
+        });
     }
 
     /// Acquire a connection from the pool or create a new one.
@@ -774,19 +780,12 @@ pub const Client = struct {
         return .{ .ws = ws, .conn = conn };
     }
 
-    fn fetchInternal(
-        self: *Client,
-        uri: Uri,
-        port: u16,
-        protocol: Protocol,
-        options: FetchOptions,
-        redirects_remaining: u8,
-    ) !ClientResponse {
+    fn fetchInternal(self: *Client, state: FetchState) !ClientResponse {
         var host_buffer: [255]u8 = undefined;
-        const host = try uriHost(uri, &host_buffer);
+        const host = try uriHost(state.uri, &host_buffer);
 
         // Initialize CA bundle for HTTPS
-        const ca_bundle: ?CaBundleRef = if (protocol == .https) blk: {
+        const ca_bundle: ?CaBundleRef = if (state.protocol == .https) blk: {
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
@@ -794,19 +793,21 @@ pub const Client = struct {
         } else null;
 
         // Acquire or create a connection
-        const conn = try self.acquireConnection(host, port, protocol, ca_bundle, options.unix_socket_path);
+        const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path);
         errdefer self.pool.release(conn);
 
         // Send request
         try writeRequest(conn.writer, .{
-            .method = options.method,
-            .uri = uri,
+            .method = state.options.method,
+            .uri = state.uri,
             .host = host,
-            .port = port,
-            .protocol = protocol,
-            .headers = options.headers,
-            .body = options.body,
-            .decompress = options.decompress,
+            .port = state.port,
+            .protocol = state.protocol,
+            .headers = state.options.headers,
+            .body = state.options.body,
+            .decompress = state.options.decompress,
+            .strip_sensitive_headers = state.strip_sensitive_headers,
+            .strip_body_headers = state.strip_body_headers,
         });
 
         try conn.flush();
@@ -818,20 +819,20 @@ pub const Client = struct {
         };
 
         // Check for unsupported content encoding
-        if (options.decompress and conn.parsed_response.content_encoding == .unknown) {
+        if (state.options.decompress and conn.parsed_response.content_encoding == .unknown) {
             return error.UnsupportedContentEncoding;
         }
 
         // Check for redirects
         const status_code = @intFromEnum(conn.parsed_response.status);
-        if (status_code >= 300 and status_code < 400 and redirects_remaining > 0) {
+        if (status_code >= 300 and status_code < 400 and state.redirects_remaining > 0) {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
                 var resolve_buf: [2048]u8 = undefined;
                 if (location.len > resolve_buf.len) return error.InvalidUrl;
                 @memcpy(resolve_buf[0..location.len], location);
                 var aux_buf: []u8 = resolve_buf[0..];
-                const redirect_uri = Uri.resolveInPlace(uri, location.len, &aux_buf) catch return error.InvalidUrl;
+                const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
                 const redirect_info = try uriPortAndProtocol(redirect_uri);
 
                 // Release current connection back to pool
@@ -839,13 +840,32 @@ pub const Client = struct {
                 self.pool.release(conn);
 
                 // For 303, always use GET and clear body
-                var redirect_options = options;
+                var redirect_options = state.options;
                 if (status_code == 303) {
                     redirect_options.method = .get;
                     redirect_options.body = null;
                 }
 
-                return self.fetchInternal(redirect_uri, redirect_info.port, redirect_info.protocol, redirect_options, redirects_remaining - 1);
+                // Strip sensitive headers when crossing to a different domain/host.
+                // Same-domain and subdomain redirects keep headers (matches Go's behavior).
+                var redirect_host_buffer: [255]u8 = undefined;
+                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
+                const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
+                const redirect_strip_sensitive = !isDomainOrSubdomain(redirect_host, effective_initial_host);
+
+                // Strip body-related headers when there is no body to send.
+                const redirect_strip_body = redirect_options.body == null;
+
+                return self.fetchInternal(.{
+                    .uri = redirect_uri,
+                    .port = redirect_info.port,
+                    .protocol = redirect_info.protocol,
+                    .options = redirect_options,
+                    .redirects_remaining = state.redirects_remaining - 1,
+                    .initial_host = effective_initial_host,
+                    .strip_sensitive_headers = redirect_strip_sensitive,
+                    .strip_body_headers = redirect_strip_body,
+                });
             }
         }
 
@@ -856,10 +876,21 @@ pub const Client = struct {
             .conn = conn.reader,
             .parsed = &conn.parsed_response,
             .max_response_size = self.config.max_response_size,
-            .decompress = options.decompress,
+            .decompress = state.options.decompress,
             .owner = conn,
         };
     }
+};
+
+const FetchState = struct {
+    uri: Uri,
+    port: u16,
+    protocol: Protocol,
+    options: FetchOptions,
+    redirects_remaining: u8,
+    initial_host: []const u8 = "",
+    strip_sensitive_headers: bool = false,
+    strip_body_headers: bool = false,
 };
 
 const WriteRequestOptions = struct {
@@ -871,6 +902,8 @@ const WriteRequestOptions = struct {
     headers: ?*const Headers = null,
     body: ?[]const u8 = null,
     decompress: bool = true,
+    strip_sensitive_headers: bool = false,
+    strip_body_headers: bool = false,
 };
 
 fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
@@ -908,6 +941,21 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) continue;
             if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Accept-Encoding")) has_accept_encoding = true;
 
+            if (opts.strip_sensitive_headers) {
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Authorization")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Www-Authenticate")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Cookie")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Cookie2")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Proxy-Authorization")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Proxy-Authenticate")) continue;
+            }
+            if (opts.strip_body_headers) {
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Encoding")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Language")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Location")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Type")) continue;
+            }
+
             try http.validateHeaderName(entry.key_ptr.*);
             try http.validateHeaderValue(entry.value_ptr.*);
             try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
@@ -926,6 +974,19 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     if (opts.body) |b| {
         try writer.writeAll(b);
     }
+}
+
+/// Returns true if sub is the same domain as parent, or a subdomain of it.
+/// Used to decide whether to forward sensitive headers on redirect.
+/// Matches Go's net/http shouldCopyHeaderOnRedirect logic.
+fn isDomainOrSubdomain(sub: []const u8, parent: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(sub, parent)) return true;
+    // Don't treat IPv6 addresses as subdomains.
+    if (std.mem.indexOfScalar(u8, sub, ':') != null) return false;
+    // sub must end with ".<parent>".
+    if (sub.len <= parent.len + 1) return false;
+    const dot_idx = sub.len - parent.len - 1;
+    return sub[dot_idx] == '.' and std.ascii.eqlIgnoreCase(sub[dot_idx + 1 ..], parent);
 }
 
 /// Parse HTTP response headers from a reader.
@@ -1301,4 +1362,79 @@ test "uriPortAndProtocol: https default" {
     const info = try uriPortAndProtocol(uri);
     try std.testing.expectEqual(443, info.port);
     try std.testing.expectEqual(Protocol.https, info.protocol);
+}
+
+test "isDomainOrSubdomain: exact match" {
+    try std.testing.expect(isDomainOrSubdomain("example.com", "example.com"));
+    try std.testing.expect(isDomainOrSubdomain("EXAMPLE.COM", "example.com"));
+}
+
+test "isDomainOrSubdomain: subdomain" {
+    try std.testing.expect(isDomainOrSubdomain("sub.example.com", "example.com"));
+    try std.testing.expect(isDomainOrSubdomain("a.b.example.com", "example.com"));
+}
+
+test "isDomainOrSubdomain: different domain" {
+    try std.testing.expect(!isDomainOrSubdomain("other.com", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("notexample.com", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("example.com.evil.com", "example.com"));
+}
+
+test "isDomainOrSubdomain: IPv6 never a subdomain" {
+    try std.testing.expect(!isDomainOrSubdomain("::1", "example.com"));
+    try std.testing.expect(!isDomainOrSubdomain("[::1]", "example.com"));
+}
+
+test "writeRequest: strips sensitive headers on cross-origin redirect" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers: Headers = .{};
+    defer headers.deinit(std.testing.allocator);
+    try headers.put(std.testing.allocator, "Authorization", "Bearer secret");
+    try headers.put(std.testing.allocator, "Cookie", "session=abc");
+    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+
+    const uri = try parseUrl("http://other.com/path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "other.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_sensitive_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Cookie") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "writeRequest: strips body headers when body removed" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers: Headers = .{};
+    defer headers.deinit(std.testing.allocator);
+    try headers.put(std.testing.allocator, "Content-Type", "application/json");
+    try headers.put(std.testing.allocator, "Content-Language", "en");
+    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+
+    const uri = try parseUrl("http://example.com/path");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .strip_body_headers = true,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Language") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
 }
