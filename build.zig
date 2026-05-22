@@ -17,6 +17,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zio_stub.zig"),
     });
 
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/llhttp/llhttp.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.addIncludePath(b.path("src/llhttp"));
+    mod.addImport("llhttp", translate_c.createModule());
+
     mod.link_libc = true;
     mod.addCSourceFiles(.{
         .files = &[_][]const u8{

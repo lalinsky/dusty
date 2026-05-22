@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("llhttp.h");
-});
+const c = @import("llhttp");
 
 pub const Method = enum(c.llhttp_method_t) {
     delete = c.HTTP_DELETE,

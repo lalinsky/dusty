@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("llhttp.h");
-});
+const c = @import("llhttp");
 
 const Method = @import("http.zig").Method;
 const Status = @import("http.zig").Status;
