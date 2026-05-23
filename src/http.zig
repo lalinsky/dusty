@@ -217,12 +217,18 @@ pub const Headers = struct {
     const slice_size = @sizeOf([]const u8);
     const slice_align = @alignOf([]const u8);
 
+    const max_count = std.math.maxInt(usize) / (slice_size * 2 + 1);
+
     pub fn init(allocator: std.mem.Allocator, max: usize) !Headers {
         if (max == 0) return .{};
-        const buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(slice_align), max * slice_size * 2 + max);
-        const keys: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(buf.ptr)))[0..max];
-        const values: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(buf[max * slice_size ..].ptr)))[0..max];
-        return .{ .keys = keys, .values = values, .hashes = buf[max * slice_size * 2 ..] };
+        const capped = @min(max, max_count);
+        const keys_bytes = capped * slice_size;
+        const hashes_offset = keys_bytes * 2;
+        const total_size = hashes_offset + capped;
+        const buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(slice_align), total_size);
+        const keys: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(buf.ptr)))[0..capped];
+        const values: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(buf[keys_bytes..].ptr)))[0..capped];
+        return .{ .keys = keys, .values = values, .hashes = buf[hashes_offset..] };
     }
 
     pub fn deinit(self: *Headers, allocator: std.mem.Allocator) void {
