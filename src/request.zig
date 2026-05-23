@@ -469,12 +469,14 @@ const MultipartForm = struct {
     // End of chunk.
 };
 
-const ParseHeadersError = std.Io.Reader.Error || ParseError || error{IncompleteRequest};
+const ParseHeadersError = std.Io.Reader.Error || ParseError || error{ IncompleteRequest, OutOfMemory };
 
 /// Parse HTTP headers from a reader and prepare for body reading.
 /// Returns error.EndOfStream if connection closed cleanly with no data.
 /// Returns error.IncompleteRequest if connection closed mid-request.
 pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeadersError!void {
+    // Re-pre-allocate headers each call to handle keep-alive (arena was reset).
+    parser.request.headers = try http.Headers.init(parser.request.arena, parser.request.config.max_header_count);
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {
         const buffered = reader.buffered();

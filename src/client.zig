@@ -48,6 +48,8 @@ pub const ClientConfig = struct {
     buffer_size: usize = 4096,
     /// Use system CA bundle for HTTPS connections.
     use_system_ca_bundle: bool = true,
+    /// Maximum number of headers allowed in a response.
+    max_response_header_count: usize = 64,
 };
 
 /// Options for a single fetch request.
@@ -220,7 +222,11 @@ pub const ConnectionPool = struct {
         }
 
         // Reset and add to pool
-        conn.reset();
+        conn.reset() catch {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return;
+        };
         self.idle.append(&conn.pool_node);
         self.idle_len += 1;
     }
@@ -235,6 +241,7 @@ pub const Connection = struct {
     parser: ResponseParser,
     parsed_response: ParsedResponse,
     buffer_size: usize,
+    max_response_headers: usize,
     pool: *ConnectionPool,
 
     // Protocol and TLS
@@ -280,6 +287,7 @@ pub const Connection = struct {
         remote_host: []const u8,
         remote_port: u16,
         buffer_size: usize,
+        max_response_headers: usize,
         protocol: Protocol,
         ca_bundle: ?CaBundleRef,
         unix_socket_path: ?[]const u8,
@@ -291,6 +299,7 @@ pub const Connection = struct {
         self.pool = pool;
         self.closing = false;
         self.buffer_size = buffer_size;
+        self.max_response_headers = max_response_headers;
 
         // Keep-Alive tracking
         self.request_count = 0;
@@ -314,7 +323,7 @@ pub const Connection = struct {
         }
 
         self.parsed_response = .{ .arena = self.arena.allocator() };
-        self.parser.init(&self.parsed_response);
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
 
         // Protocol and TLS initialization
         self.protocol = protocol;
@@ -390,12 +399,12 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
-    pub fn reset(self: *Connection) void {
+    pub fn reset(self: *Connection) !void {
         // Reset for reuse (connection pooling)
         _ = self.arena.reset(.retain_capacity);
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.reset();
-        self.parser.init(&self.parsed_response);
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
         self.closing = false;
 
         // As part of reading body, we shrank the buffer
@@ -671,6 +680,7 @@ pub const Client = struct {
                 host,
                 port,
                 self.config.buffer_size,
+                self.config.max_response_header_count,
                 protocol,
                 ca_bundle,
                 unix_socket_path,
@@ -739,14 +749,14 @@ pub const Client = struct {
         if (options.headers) |h| {
             var it = h.iterator();
             while (it.next()) |entry| {
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Upgrade")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Connection")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Sec-WebSocket-Key")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Sec-WebSocket-Version")) continue;
-                try http.validateHeaderName(entry.key_ptr.*);
-                try http.validateHeaderValue(entry.value_ptr.*);
-                try conn.writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+                if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Upgrade")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Connection")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Key")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Version")) continue;
+                try http.validateHeaderName(entry.key);
+                try http.validateHeaderValue(entry.value);
+                try conn.writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
             }
         }
 
@@ -987,29 +997,29 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         var it = h.iterator();
         while (it.next()) |entry| {
             // Skip headers we already set
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host")) continue;
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) continue;
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Accept-Encoding")) has_accept_encoding = true;
-            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Referer")) has_referer = true;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Content-Length")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Accept-Encoding")) has_accept_encoding = true;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Referer")) has_referer = true;
 
             if (opts.strip_sensitive_headers) {
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Authorization")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Www-Authenticate")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Cookie")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Cookie2")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Proxy-Authorization")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Proxy-Authenticate")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Authorization")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Www-Authenticate")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Cookie")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Cookie2")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Proxy-Authorization")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Proxy-Authenticate")) continue;
             }
             if (opts.strip_body_headers) {
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Encoding")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Language")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Location")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Type")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Encoding")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Language")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Location")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Type")) continue;
             }
 
-            try http.validateHeaderName(entry.key_ptr.*);
-            try http.validateHeaderValue(entry.value_ptr.*);
-            try writer.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try http.validateHeaderName(entry.key);
+            try http.validateHeaderValue(entry.value);
+            try writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
         }
     }
 
@@ -1201,7 +1211,7 @@ test "ClientResponse.body: basic response" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1227,7 +1237,7 @@ test "ClientResponse.body: large body over 128 bytes" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1253,7 +1263,7 @@ test "ClientResponse.body: no body" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1279,7 +1289,7 @@ test "ClientResponse.reader: streaming read" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1314,7 +1324,7 @@ test "ClientResponse.reader: after body() returns cached data" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1347,7 +1357,7 @@ test "ClientResponse.body: gzip decompression" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1375,7 +1385,7 @@ test "ClientResponse.body: gzip decompression disabled" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    parser.init(&parsed);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1471,9 +1481,9 @@ test "writeRequest: does not override user-provided Referer" {
     var buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
 
-    var headers: Headers = .{};
+    var headers = try Headers.init(std.testing.allocator, 4);
     defer headers.deinit(std.testing.allocator);
-    try headers.put(std.testing.allocator, "Referer", "http://custom.example.com/");
+    try headers.put("Referer", "http://custom.example.com/");
 
     const uri = try parseUrl("http://example.com/new");
     try writeRequest(&writer, .{
@@ -1514,11 +1524,11 @@ test "writeRequest: strips sensitive headers on cross-origin redirect" {
     var buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
 
-    var headers: Headers = .{};
+    var headers = try Headers.init(std.testing.allocator, 4);
     defer headers.deinit(std.testing.allocator);
-    try headers.put(std.testing.allocator, "Authorization", "Bearer secret");
-    try headers.put(std.testing.allocator, "Cookie", "session=abc");
-    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("Cookie", "session=abc");
+    try headers.put("X-Custom", "keep-me");
 
     const uri = try parseUrl("http://other.com/path");
     try writeRequest(&writer, .{
@@ -1543,10 +1553,10 @@ test "redirect: strips sensitive headers on https to http downgrade" {
     var buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
 
-    var headers: Headers = .{};
+    var headers = try Headers.init(std.testing.allocator, 4);
     defer headers.deinit(std.testing.allocator);
-    try headers.put(std.testing.allocator, "Authorization", "Bearer secret");
-    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("X-Custom", "keep-me");
 
     const uri = try parseUrl("http://example.com/path");
     try writeRequest(&writer, .{
@@ -1569,10 +1579,10 @@ test "redirect: once stripping triggered it persists across hops" {
     var buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
 
-    var headers: Headers = .{};
+    var headers = try Headers.init(std.testing.allocator, 4);
     defer headers.deinit(std.testing.allocator);
-    try headers.put(std.testing.allocator, "Authorization", "Bearer secret");
-    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+    try headers.put("Authorization", "Bearer secret");
+    try headers.put("X-Custom", "keep-me");
 
     // Simulate a hop that is back on the original host but already has strip=true.
     const uri = try parseUrl("http://example.com/new-path");
@@ -1595,11 +1605,11 @@ test "writeRequest: strips body headers when body removed" {
     var buf: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buf);
 
-    var headers: Headers = .{};
+    var headers = try Headers.init(std.testing.allocator, 4);
     defer headers.deinit(std.testing.allocator);
-    try headers.put(std.testing.allocator, "Content-Type", "application/json");
-    try headers.put(std.testing.allocator, "Content-Language", "en");
-    try headers.put(std.testing.allocator, "X-Custom", "keep-me");
+    try headers.put("Content-Type", "application/json");
+    try headers.put("Content-Language", "en");
+    try headers.put("X-Custom", "keep-me");
 
     const uri = try parseUrl("http://example.com/path");
     try writeRequest(&writer, .{

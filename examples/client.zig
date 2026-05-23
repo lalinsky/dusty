@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Headers:\n", .{});
     var it = response.headers().iterator();
     while (it.next()) |entry| {
-        std.debug.print("  {s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        std.debug.print("  {s}: {s}\n", .{ entry.key, entry.value });
     }
 
     std.debug.print("\n", .{});

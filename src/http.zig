@@ -204,50 +204,135 @@ test "Status: format" {
     try std.testing.expectEqualStrings("NOT_FOUND", result);
 }
 
-const IgnoreCase = struct {
-    pub fn hash(self: @This(), s: []const u8) u64 {
-        _ = self;
-        var h = std.hash.Wyhash.init(0);
+/// Case-insensitive multi-value HTTP header map backed by parallel arrays in a
+/// single pre-allocated block.  A 1-byte hash filters most mismatches before
+/// the full case-insensitive string compare, keeping the linear scan cheap for
+/// the small number of headers in a typical HTTP message.
+pub const Headers = struct {
+    keys: [][]const u8 = &.{},
+    values: [][]const u8 = &.{},
+    hashes: []u8 = &.{},
+    len: usize = 0,
 
-        // Process in 48-byte chunks
-        var i: usize = 0;
-        const chunk_size = 48;
-        var lc: [chunk_size]u8 = undefined;
-        while (i + chunk_size <= s.len) : (i += chunk_size) {
-            inline for (0..chunk_size) |j| {
-                lc[j] = std.ascii.toLower(s[i + j]);
-            }
-            h.update(&lc);
-        }
+    const slice_size = @sizeOf([]const u8);
+    const slice_align = @alignOf([]const u8);
 
-        // Process remaining bytes
-        const remaining = s.len - i;
-        if (remaining > 0) {
-            for (0..remaining) |j| {
-                lc[j] = std.ascii.toLower(s[i + j]);
-            }
-            h.update(lc[0..remaining]);
-        }
-
-        return h.final();
+    pub fn init(allocator: std.mem.Allocator, max: usize) !Headers {
+        if (max == 0) return .{};
+        const buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(slice_align), max * slice_size * 2 + max);
+        const keys: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(buf.ptr)))[0..max];
+        const values: [][]const u8 = @as([*][]const u8, @ptrCast(@alignCast(buf[max * slice_size ..].ptr)))[0..max];
+        return .{ .keys = keys, .values = values, .hashes = buf[max * slice_size * 2 ..] };
     }
-    pub fn eql(self: @This(), a: []const u8, b: []const u8) bool {
-        _ = self;
-        return std.ascii.eqlIgnoreCase(a, b);
+
+    pub fn deinit(self: *Headers, allocator: std.mem.Allocator) void {
+        const max = self.keys.len;
+        if (max == 0) return;
+        const ptr: [*]align(slice_align) u8 = @ptrCast(@alignCast(self.keys.ptr));
+        allocator.free(ptr[0 .. max * slice_size * 2 + max]);
+        self.* = .{};
     }
+
+    inline fn hashFn(name: []const u8) u8 {
+        if (name.len == 0) return 0;
+        return @as(u8, @truncate(name.len)) | (std.ascii.toLower(name[0]) ^ std.ascii.toLower(name[name.len - 1]));
+    }
+
+    /// Replaces the value of the first entry matching name (case-insensitive),
+    /// or appends a new entry. Returns error.TooManyHeaders if at capacity.
+    pub fn put(self: *Headers, name: []const u8, value: []const u8) !void {
+        const h = hashFn(name);
+        for (self.hashes[0..self.len], 0..) |hh, i| {
+            if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) {
+                self.values[i] = value;
+                return;
+            }
+        }
+        try self.add(name, value);
+    }
+
+    /// Always appends a new entry regardless of existing keys.
+    /// Returns error.TooManyHeaders if at capacity.
+    pub fn add(self: *Headers, name: []const u8, value: []const u8) !void {
+        const i = self.len;
+        if (i >= self.keys.len) return error.TooManyHeaders;
+        self.keys[i] = name;
+        self.values[i] = value;
+        self.hashes[i] = hashFn(name);
+        self.len = i + 1;
+    }
+
+    /// Returns the value of the first matching entry (case-insensitive), or null.
+    pub fn get(self: *const Headers, name: []const u8) ?[]const u8 {
+        const h = hashFn(name);
+        for (self.hashes[0..self.len], 0..) |hh, i| {
+            if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) {
+                return self.values[i];
+            }
+        }
+        return null;
+    }
+
+    pub fn count(self: *const Headers) usize {
+        return self.len;
+    }
+
+    pub fn iterator(self: *const Headers) Iterator {
+        return .{ .keys = self.keys[0..self.len], .values = self.values[0..self.len], .pos = 0 };
+    }
+
+    pub const Iterator = struct {
+        keys: [][]const u8,
+        values: [][]const u8,
+        pos: usize,
+
+        pub const Entry = struct {
+            key: []const u8,
+            value: []const u8,
+        };
+
+        pub fn next(self: *Iterator) ?Entry {
+            if (self.pos >= self.keys.len) return null;
+            const i = self.pos;
+            self.pos += 1;
+            return .{ .key = self.keys[i], .value = self.values[i] };
+        }
+    };
 };
 
-pub const Headers = std.HashMapUnmanaged([]const u8, []const u8, IgnoreCase, 80);
-
-test "Headers: put/get case insenstive" {
-    var headers: Headers = .{};
+test "Headers: put/get case insensitive" {
+    var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
-    try headers.put(std.testing.allocator, "FOO", "bar");
+    try headers.put("FOO", "bar");
 
-    const val = headers.get("foo");
-    try std.testing.expect(val != null);
-    try std.testing.expectEqualStrings("bar", val.?);
+    try std.testing.expectEqualStrings("bar", headers.get("foo").?);
+    try std.testing.expectEqualStrings("bar", headers.get("FOO").?);
+}
+
+test "Headers: put replaces, add appends" {
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("Set-Cookie", "a=1");
+    try headers.add("Set-Cookie", "b=2");
+    try headers.put("Set-Cookie", "c=3"); // replaces first
+
+    try std.testing.expectEqualStrings("c=3", headers.get("set-cookie").?);
+    try std.testing.expectEqual(2, headers.count());
+
+    var it = headers.iterator();
+    try std.testing.expectEqualStrings("c=3", it.next().?.value);
+    try std.testing.expectEqualStrings("b=2", it.next().?.value);
+    try std.testing.expectEqual(null, it.next());
+}
+
+test "Headers: error on overflow" {
+    var headers = try Headers.init(std.testing.allocator, 1);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.add("A", "1");
+    try std.testing.expectError(error.TooManyHeaders, headers.add("B", "2"));
 }
 
 // Bytes that would break "Name: Value\r\n" framing on the wire.

@@ -66,6 +66,7 @@ pub const RequestParser = struct {
             .settings = undefined,
             .request = request,
         };
+        request.headers = try Headers.init(request.arena, request.config.max_header_count);
 
         self.settings = std.mem.zeroes(c.llhttp_settings_t);
         self.settings.on_method_complete = onMethod;
@@ -200,13 +201,8 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
-        // Check header count limit
-        if (self.request.headers.count() >= self.request.config.max_header_count) {
-            return -1;
-        }
-
         // Headers point directly into arena-allocated read buffer, no copy needed
-        self.request.headers.put(self.request.arena, self.state.header_field, self.state.header_value) catch return -1;
+        self.request.headers.add(self.state.header_field, self.state.header_value) catch return -1;
 
         self.state.header_value = "";
         self.state.header_field = "";
@@ -285,12 +281,13 @@ pub const ResponseParser = struct {
         body_dest_pos: usize = 0, // How much onBody has written
     };
 
-    pub fn init(self: *ResponseParser, response: *ParsedResponse) void {
+    pub fn init(self: *ResponseParser, response: *ParsedResponse, max_headers: usize) !void {
         self.* = .{
             .parser = undefined,
             .settings = undefined,
             .response = response,
         };
+        response.headers = try Headers.init(response.arena, max_headers);
 
         self.settings = std.mem.zeroes(c.llhttp_settings_t);
         self.settings.on_status_complete = onStatusComplete;
@@ -411,7 +408,7 @@ pub const ResponseParser = struct {
         std.debug.assert(self.state.has_header_field);
 
         // Headers point directly into arena-allocated read buffer, no copy needed
-        self.response.headers.put(self.response.arena, self.state.header_field, self.state.header_value) catch return -1;
+        self.response.headers.add(self.state.header_field, self.state.header_value) catch return -1;
 
         self.state.header_value = "";
         self.state.header_field = "";
@@ -698,7 +695,7 @@ test "ResponseParser: basic" {
     };
 
     var parser: ResponseParser = undefined;
-    parser.init(&response);
+    try parser.init(&response, 64);
     defer parser.deinit();
 
     const http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
@@ -738,7 +735,7 @@ test "ResponseParser: 404 status" {
     };
 
     var parser: ResponseParser = undefined;
-    parser.init(&response);
+    try parser.init(&response, 64);
     defer parser.deinit();
 
     const http_response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";

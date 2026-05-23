@@ -18,11 +18,11 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     };
 
     // Forward request headers (excluding hop-by-hop headers)
-    var headers: http.Headers = .{};
+    var headers = try http.Headers.init(req.arena, req.headers.count());
     var it = req.headers.iterator();
     while (it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        const value = entry.value_ptr.*;
+        const key = entry.key;
+        const value = entry.value;
 
         // Skip hop-by-hop headers that shouldn't be forwarded
         if (std.ascii.eqlIgnoreCase(key, "connection") or
@@ -35,7 +35,7 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
             continue;
         }
 
-        try headers.put(req.arena, key, value);
+        try headers.put(key, value);
     }
     upstream_req.headers = &headers;
 
@@ -63,8 +63,8 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     var upstream_headers = upstream_res.headers();
     var upstream_it = upstream_headers.iterator();
     while (upstream_it.next()) |entry| {
-        const key = entry.key_ptr.*;
-        const value = entry.value_ptr.*;
+        const key = entry.key;
+        const value = entry.value;
 
         // Skip hop-by-hop headers
         if (std.ascii.eqlIgnoreCase(key, "connection") or
