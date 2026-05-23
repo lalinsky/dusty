@@ -215,7 +215,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
-                var response = try Response.init(arena.allocator(), &writer.interface);
+                var response = try Response.init(arena.allocator(), &writer.interface, self.config.request.max_header_count);
                 request.response = &response;
 
                 // Handle Expect header (100-continue)
