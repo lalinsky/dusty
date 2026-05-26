@@ -138,7 +138,12 @@ pub fn Server(comptime Ctx: type) type {
                 };
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
-                try group.concurrent(self.io, handleConnectionWrapper, .{ self, stream });
+                group.concurrent(self.io, handleConnectionWrapper, .{ self, stream }) catch |err| {
+                    log.err("Failed to spawn connection handler: {}", .{err});
+                    _ = self.active_connections.fetchSub(1, .acq_rel);
+                    stream.close(self.io);
+                    continue;
+                };
             }
         }
 
