@@ -16,7 +16,7 @@ pub const ServerConfig = struct {
         key_path: []const u8,
         /// Directory the cert/key paths are resolved against. Defaults to the
         /// current working directory.
-        dir: std.Io.Dir = std.Io.Dir.cwd(),
+        dir: ?std.Io.Dir = null,
     };
 
     pub const Timeout = struct {

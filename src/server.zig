@@ -108,10 +108,11 @@ pub fn Server(comptime Ctx: type) type {
             // Load the server certificate/key once, shared across all connections.
             if (build_options.use_tls) {
                 if (self.config.tls) |tls_cfg| {
+                    const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
                     self.tls_auth = tls.config.CertKeyPair.fromFilePath(
                         self.allocator,
                         self.io,
-                        tls_cfg.dir,
+                        dir,
                         tls_cfg.cert_path,
                         tls_cfg.key_path,
                     ) catch |err| {
