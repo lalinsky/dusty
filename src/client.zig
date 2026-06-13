@@ -258,6 +258,7 @@ pub const Connection = struct {
     // pointer back to tls_conn, so the Connection must never be moved after init.
     tls_reader: tls.Connection.Reader,
     tls_writer: tls.Connection.Writer,
+    tls_rng: std.Random.IoSource,
 
     // HTTP layer buffers (allocated from main allocator, persist across requests)
     read_buffer: []u8,
@@ -353,7 +354,7 @@ pub const Connection = struct {
             self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
             self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
 
-            var rng_source: std.Random.IoSource = .{ .io = self.io };
+            self.tls_rng = .{ .io = self.io };
 
             self.tls_conn = tls.client(
                 &self.tcp_reader.interface,
@@ -362,7 +363,7 @@ pub const Connection = struct {
                     .host = remote_host,
                     .root_ca = ca.bundle.*,
                     .now = std.Io.Clock.real.now(self.io),
-                    .rng = rng_source.interface(),
+                    .rng = self.tls_rng.interface(),
                 },
             ) catch return error.TlsInitializationFailed;
 
