@@ -38,6 +38,9 @@ pub const Protocol = enum {
     }
 };
 
+/// Default User-Agent sent with requests unless overridden.
+pub const default_user_agent = "dusty/0.1.0";
+
 /// Configuration for the HTTP client.
 pub const ClientConfig = struct {
     /// Maximum number of redirects to follow (0 = disabled).
@@ -52,6 +55,9 @@ pub const ClientConfig = struct {
     use_system_ca_bundle: bool = true,
     /// Maximum number of headers allowed in a response.
     max_response_header_count: usize = 64,
+    /// User-Agent header sent with requests. Set to null to omit it.
+    /// A per-request User-Agent header takes precedence over this default.
+    user_agent: ?[]const u8 = default_user_agent,
 };
 
 /// Options for a single fetch request.
@@ -819,6 +825,7 @@ pub const Client = struct {
             .strip_sensitive_headers = state.strip_sensitive_headers,
             .strip_body_headers = state.strip_body_headers,
             .referer = state.referer,
+            .user_agent = self.config.user_agent,
         });
 
         try conn.flush();
@@ -963,6 +970,7 @@ const WriteRequestOptions = struct {
     strip_sensitive_headers: bool = false,
     strip_body_headers: bool = false,
     referer: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
 };
 
 fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
@@ -993,6 +1001,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     // User-provided headers
     var has_accept_encoding = false;
     var has_referer = false;
+    var has_user_agent = false;
     if (opts.headers) |h| {
         var it = h.iterator();
         while (it.next()) |entry| {
@@ -1001,6 +1010,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
             if (std.ascii.eqlIgnoreCase(entry.key, "Content-Length")) continue;
             if (std.ascii.eqlIgnoreCase(entry.key, "Accept-Encoding")) has_accept_encoding = true;
             if (std.ascii.eqlIgnoreCase(entry.key, "Referer")) has_referer = true;
+            if (std.ascii.eqlIgnoreCase(entry.key, "User-Agent")) has_user_agent = true;
 
             if (opts.strip_sensitive_headers) {
                 if (std.ascii.eqlIgnoreCase(entry.key, "Authorization")) continue;
@@ -1028,6 +1038,14 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         if (!has_referer) {
             try http.validateHeaderValue(referer);
             try writer.print("Referer: {s}\r\n", .{referer});
+        }
+    }
+
+    // Add default User-Agent if configured and user didn't provide one
+    if (opts.user_agent) |ua| {
+        if (!has_user_agent) {
+            try http.validateHeaderValue(ua);
+            try writer.print("User-Agent: {s}\r\n", .{ua});
         }
     }
 
@@ -1485,6 +1503,66 @@ test "isDomainOrSubdomain: IPv6 never a subdomain" {
 test "isDomainOrSubdomain: IPv6 zone ID never a subdomain" {
     try std.testing.expect(!isDomainOrSubdomain("::1%25.example.com", "example.com"));
     try std.testing.expect(!isDomainOrSubdomain("fe80::1%eth0.example.com", "example.com"));
+}
+
+test "writeRequest: sends default User-Agent" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://example.com/");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .user_agent = default_user_agent,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "User-Agent: " ++ default_user_agent ++ "\r\n") != null);
+}
+
+test "writeRequest: omits User-Agent when null" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://example.com/");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .user_agent = null,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "User-Agent:") == null);
+}
+
+test "writeRequest: user-provided User-Agent overrides default" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.put("User-Agent", "my-app/2.0");
+
+    const uri = try parseUrl("http://example.com/");
+    try writeRequest(&writer, .{
+        .method = .get,
+        .uri = uri,
+        .host = "example.com",
+        .port = 80,
+        .protocol = .http,
+        .headers = &headers,
+        .user_agent = default_user_agent,
+    });
+
+    const written = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "User-Agent: my-app/2.0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, default_user_agent) == null);
 }
 
 test "writeRequest: sets Referer on redirect" {
