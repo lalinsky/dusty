@@ -1,5 +1,7 @@
 const std = @import("std");
 const Uri = std.Uri;
+const tls = @import("tls");
+const build_options = @import("build_options");
 
 const unix_path_max = 108;
 
@@ -116,8 +118,6 @@ pub const WebSocketClient = struct {
 };
 
 const CaBundleRef = struct {
-    gpa: std.mem.Allocator,
-    lock: *std.Io.RwLock,
     bundle: *std.crypto.Certificate.Bundle,
 };
 
@@ -249,10 +249,15 @@ pub const Connection = struct {
     tcp_reader: std.Io.net.Stream.Reader,
     tcp_writer: std.Io.net.Stream.Writer,
 
-    // TLS TCP layer buffers (allocated from main allocator, persist across requests)
+    // TLS TCP layer buffers (allocated from main allocator, persist across requests).
+    // These hold the encrypted (ciphertext) data exchanged over the raw socket.
     tls_tcp_read_buffer: []u8,
     tls_tcp_write_buffer: []u8,
-    tls_client: ?std.crypto.tls.Client,
+    tls_conn: ?tls.Connection,
+    // Cleartext Reader/Writer adapters layered on top of tls_conn. They store a
+    // pointer back to tls_conn, so the Connection must never be moved after init.
+    tls_reader: tls.Connection.Reader,
+    tls_writer: tls.Connection.Writer,
 
     // HTTP layer buffers (allocated from main allocator, persist across requests)
     read_buffer: []u8,
@@ -329,49 +334,44 @@ pub const Connection = struct {
         self.protocol = protocol;
 
         if (protocol == .https) {
-            const bundle = ca_bundle orelse return error.MissingCaBundle;
+            if (!build_options.use_tls) return error.TlsNotConfigured;
+            const ca = ca_bundle orelse return error.MissingCaBundle;
 
-            const tls_buffer_size = std.crypto.tls.Client.min_buffer_len;
-
-            self.read_buffer = try allocator.alloc(u8, self.buffer_size + tls_buffer_size + 1024);
-            errdefer allocator.free(self.read_buffer);
-            self.write_buffer = try allocator.alloc(u8, tls_buffer_size + 1024);
-            errdefer allocator.free(self.write_buffer);
-
-            self.tls_tcp_read_buffer = try allocator.alloc(u8, tls_buffer_size);
+            // TCP-layer (ciphertext) buffers. tls.zig requires the input buffer to
+            // fit a full TLS record; the output buffer caps the produced record size.
+            self.tls_tcp_read_buffer = try allocator.alloc(u8, tls.input_buffer_len);
             errdefer allocator.free(self.tls_tcp_read_buffer);
-            self.tls_tcp_write_buffer = try allocator.alloc(u8, tls_buffer_size);
+            self.tls_tcp_write_buffer = try allocator.alloc(u8, tls.output_buffer_len);
             errdefer allocator.free(self.tls_tcp_write_buffer);
+
+            // HTTP-layer (cleartext) buffers, used by the tls.Connection reader/writer.
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + 1024);
+            errdefer allocator.free(self.read_buffer);
+            self.write_buffer = try allocator.alloc(u8, 1024);
+            errdefer allocator.free(self.write_buffer);
 
             self.tcp_reader = stream.reader(io, self.tls_tcp_read_buffer);
             self.tcp_writer = stream.writer(io, self.tls_tcp_write_buffer);
 
-            var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
-            self.io.random(&entropy);
+            var rng_source: std.Random.IoSource = .{ .io = self.io };
 
-            self.tls_client = std.crypto.tls.Client.init(
+            self.tls_conn = tls.client(
                 &self.tcp_reader.interface,
                 &self.tcp_writer.interface,
                 .{
-                    .host = .{ .explicit = remote_host },
-                    .ca = .{ .bundle = .{
-                        .gpa = bundle.gpa,
-                        .io = self.io,
-                        .lock = bundle.lock,
-                        .bundle = bundle.bundle,
-                    } },
-                    .entropy = &entropy,
-                    .realtime_now = std.Io.Timestamp.now(self.io, .real),
-                    .read_buffer = self.read_buffer,
-                    .write_buffer = self.write_buffer,
-                    .allow_truncation_attacks = true,
+                    .host = remote_host,
+                    .root_ca = ca.bundle.*,
+                    .now = std.Io.Clock.real.now(self.io),
+                    .rng = rng_source.interface(),
                 },
             ) catch return error.TlsInitializationFailed;
 
-            self.reader = &self.tls_client.?.reader;
-            self.writer = &self.tls_client.?.writer;
+            self.tls_reader = self.tls_conn.?.reader(self.read_buffer);
+            self.tls_writer = self.tls_conn.?.writer(self.write_buffer);
+            self.reader = &self.tls_reader.interface;
+            self.writer = &self.tls_writer.interface;
         } else {
-            self.tls_client = null;
+            self.tls_conn = null;
             self.tls_tcp_read_buffer = &.{};
             self.tls_tcp_write_buffer = &.{};
 
@@ -416,10 +416,9 @@ pub const Connection = struct {
     }
 
     pub fn flush(self: *Connection) !void {
+        // For HTTPS this drains the cleartext writer, which encrypts and flushes
+        // the underlying TCP writer in one step; for HTTP it flushes the socket directly.
         try self.writer.flush();
-        if (self.protocol == .https) {
-            try self.tcp_writer.interface.flush();
-        }
     }
 
     pub fn host(self: *const Connection) []const u8 {
@@ -621,8 +620,6 @@ pub const Client = struct {
             }
         }
         return .{
-            .gpa = self.allocator,
-            .lock = &self.ca_bundle_lock,
             .bundle = &self.ca_bundle,
         };
     }

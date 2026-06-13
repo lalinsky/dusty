@@ -4,11 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_tls = b.option(bool, "use_tls", "Build with TLS/HTTPS support via tls.zig") orelse true;
+
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "use_tls", use_tls);
+    mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a stub that no-ops `clear` and panics on `set`.
     // Apps that want real timeouts override this in their own build.zig:
@@ -16,6 +22,22 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("zio", .{
         .root_source_file = b.path("src/zio_stub.zig"),
     });
+
+    // TLS support is a lazy dependency: only fetched when `use_tls` is set (the
+    // default). When disabled, a stub is imported so the client still builds but
+    // HTTPS requests fail with error.TlsNotConfigured.
+    if (use_tls) {
+        if (b.lazyDependency("tls", .{
+            .target = target,
+            .optimize = optimize,
+        })) |tls_dep| {
+            mod.addImport("tls", tls_dep.module("tls"));
+        }
+    } else {
+        mod.addAnonymousImport("tls", .{
+            .root_source_file = b.path("src/tls_stub.zig"),
+        });
+    }
 
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/llhttp/llhttp.h"),
