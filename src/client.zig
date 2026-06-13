@@ -702,6 +702,7 @@ pub const Client = struct {
 
         // Initialize CA bundle for HTTPS
         const ca_bundle: ?CaBundleRef = if (info.protocol == .https) blk: {
+            if (!build_options.use_tls) return error.TlsNotConfigured;
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
@@ -794,6 +795,7 @@ pub const Client = struct {
 
         // Initialize CA bundle for HTTPS
         const ca_bundle: ?CaBundleRef = if (state.protocol == .https) blk: {
+            if (!build_options.use_tls) return error.TlsNotConfigured;
             if (!self.config.use_system_ca_bundle) {
                 return error.TlsNotConfigured;
             }
