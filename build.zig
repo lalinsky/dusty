@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         "client",
         "proxy",
         "sse",
+        "tls_server",
         "websocket",
     };
 
