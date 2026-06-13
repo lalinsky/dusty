@@ -4,6 +4,20 @@ pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
     listen: std.Io.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
+    /// TLS configuration. When set, the server performs a TLS handshake on every
+    /// accepted connection and speaks HTTPS. Requires the `use_tls` build option
+    /// (enabled by default); with TLS compiled out, setting this fails listen().
+    tls: ?Tls = null,
+
+    pub const Tls = struct {
+        /// Path to the PEM certificate (chain) file, resolved against `dir`.
+        cert_path: []const u8,
+        /// Path to the PEM private key file, resolved against `dir`.
+        key_path: []const u8,
+        /// Directory the cert/key paths are resolved against. Defaults to the
+        /// current working directory.
+        dir: ?std.Io.Dir = null,
+    };
 
     pub const Timeout = struct {
         /// Maximum time to receive a complete request
