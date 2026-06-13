@@ -14,6 +14,7 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 - WebSocket support (RFC 6455)
 - HTTP/HTTPS client with connection pooling
 - Unix domain socket support for client connections
+- Optional TLS support in both client and server (via [tls.zig](https://github.com/ianic/tls.zig))
 
 ## Installation
 
