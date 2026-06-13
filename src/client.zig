@@ -1280,6 +1280,34 @@ test "ClientResponse.body: no body" {
     try std.testing.expectEqual(.no_content, response.status());
 }
 
+test "ClientResponse.body: connection-close (EOF-delimited) body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // No Content-Length and no Transfer-Encoding: body is delimited by EOF.
+    const body_content = "body delimited by connection close, not length.";
+    const raw_response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nconnection: close\r\n\r\n" ++ body_content;
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .conn = &reader,
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings(body_content, body.?);
+    try std.testing.expectEqual(.forbidden, response.status());
+}
+
 test "ClientResponse.reader: streaming read" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

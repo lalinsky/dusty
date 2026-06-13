@@ -109,7 +109,9 @@ pub const RequestParser = struct {
 
     pub fn finish(self: *RequestParser) ParseError!void {
         const err = c.llhttp_finish(&self.parser);
-        if (err != c.HPE_OK) {
+        // HPE_PAUSED means our on_message_complete callback fired and paused,
+        // i.e. the message was completed by EOF (connection-close framing).
+        if (err != c.HPE_OK and err != c.HPE_PAUSED) {
             return mapError(err);
         }
     }
@@ -328,7 +330,9 @@ pub const ResponseParser = struct {
 
     pub fn finish(self: *ResponseParser) !void {
         const err = c.llhttp_finish(&self.parser);
-        if (err != c.HPE_OK) {
+        // HPE_PAUSED means our on_message_complete callback fired and paused,
+        // i.e. the message was completed by EOF (connection-close framing).
+        if (err != c.HPE_OK and err != c.HPE_PAUSED) {
             return mapError(err);
         }
     }
