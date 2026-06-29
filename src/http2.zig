@@ -91,6 +91,9 @@ pub const Stream = struct {
     req_headers: ?*const Headers,
     req_body: []const u8 = &.{},
     req_sent: usize = 0,
+    /// When set, sent as the "accept-encoding" header (unless the user already
+    /// provided one).
+    accept_encoding: ?[]const u8 = null,
 
     // Response (set by the session coroutine).
     parsed: ParsedResponse,
@@ -311,12 +314,17 @@ fn handleSubmit(conn: *Connection, s: *Stream) void {
     addNv(&nva, arena, ":scheme", s.scheme) catch return s.finish(error.Http2Init);
     addNv(&nva, arena, ":authority", s.authority) catch return s.finish(error.Http2Init);
     addNv(&nva, arena, ":path", s.path) catch return s.finish(error.Http2Init);
+    var user_has_accept_encoding = false;
     if (s.req_headers) |hs| {
         for (hs.keys[0..hs.len], hs.values[0..hs.len]) |k, v| {
             if (isSkippedHeader(k)) continue;
+            if (std.ascii.eqlIgnoreCase(k, "accept-encoding")) user_has_accept_encoding = true;
             const lower = std.ascii.allocLowerString(arena, k) catch return s.finish(error.Http2Init);
             addNv(&nva, arena, lower, v) catch return s.finish(error.Http2Init);
         }
+    }
+    if (!user_has_accept_encoding) {
+        if (s.accept_encoding) |ae| addNv(&nva, arena, "accept-encoding", ae) catch return s.finish(error.Http2Init);
     }
 
     var data_prd: c.nghttp2_data_provider = .{

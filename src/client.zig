@@ -853,6 +853,7 @@ pub const Client = struct {
                 .path = path,
                 .req_headers = state.options.headers,
                 .req_body = state.options.body orelse &.{},
+                .accept_encoding = if (state.options.decompress) "gzip, deflate" else null,
                 .parsed = .{ .arena = a, .version_major = 2, .version_minor = 0 },
                 .max_body = self.config.max_response_size,
             };
@@ -878,7 +879,33 @@ pub const Client = struct {
             if (stream.parsed.headers.get("Content-Type")) |ct| stream.parsed.content_type = ContentType.fromContentType(ct);
             if (stream.parsed.headers.get("Content-Encoding")) |ce| stream.parsed.content_encoding = http.ContentEncoding.fromString(ce);
 
-            const body = stream.body.items;
+            // Eagerly decompress the buffered body (the response is delivered in
+            // fixed-body mode, so decompression can't be deferred to reader()).
+            var body = stream.body.items;
+            if (state.options.decompress) {
+                switch (stream.parsed.content_encoding) {
+                    .identity => {},
+                    .unknown => {
+                        arena_ptr.deinit();
+                        self.allocator.destroy(arena_ptr);
+                        return error.UnsupportedContentEncoding;
+                    },
+                    .gzip, .deflate => |enc| {
+                        var in = std.Io.Reader.fixed(body);
+                        var win: [std.compress.flate.max_window_len]u8 = undefined;
+                        var dec = std.compress.flate.Decompress.init(&in, if (enc == .gzip) .gzip else .zlib, &win);
+                        body = dec.reader.allocRemaining(a, .limited(self.config.max_response_size)) catch |err| {
+                            arena_ptr.deinit();
+                            self.allocator.destroy(arena_ptr);
+                            return switch (err) {
+                                error.StreamTooLong => error.ResponseTooLarge,
+                                else => err,
+                            };
+                        };
+                        stream.parsed.content_encoding = .identity;
+                    },
+                }
+            }
             return ClientResponse{
                 .arena = a,
                 .parsed = &stream.parsed,
@@ -1053,7 +1080,13 @@ pub const Client = struct {
         // dialing a new one.
         if (build_options.use_http2 and self.config.http2 and state.protocol == .https) {
             if (self.acquireH2(host, state.port)) |h2conn| {
-                return self.requestHttp2(h2conn, state, host);
+                var resp = try self.requestHttp2(h2conn, state, host);
+                var resolve_buf: [2048]u8 = undefined;
+                var referer_buf: [2048]u8 = undefined;
+                if (try self.h2Redirect(&resp, state, host, &resolve_buf, &referer_buf)) |next| {
+                    return self.fetchInternal(next);
+                }
+                return resp;
             }
         }
 
@@ -1062,7 +1095,13 @@ pub const Client = struct {
 
         // Freshly negotiated HTTP/2: the h2 layer takes ownership of the transport.
         if (conn.http_version == .http_2) {
-            return self.startHttp2(conn, state, host);
+            var resp = try self.startHttp2(conn, state, host);
+            var resolve_buf: [2048]u8 = undefined;
+            var referer_buf: [2048]u8 = undefined;
+            if (try self.h2Redirect(&resp, state, host, &resolve_buf, &referer_buf)) |next| {
+                return self.fetchInternal(next);
+            }
+            return resp;
         }
 
         errdefer self.pool.release(conn);
@@ -1097,8 +1136,8 @@ pub const Client = struct {
             return error.UnsupportedContentEncoding;
         }
 
-        // Check for redirects
-        const status_code = @intFromEnum(conn.parsed_response.status);
+        // Check for redirects (capture before any pool release resets parsed_response)
+        const status_code: u16 = @intCast(@intFromEnum(conn.parsed_response.status));
         if (status_code >= 300 and status_code < 400 and state.redirects_remaining > 0) {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
@@ -1107,7 +1146,6 @@ pub const Client = struct {
                 @memcpy(resolve_buf[0..location.len], location);
                 var aux_buf: []u8 = resolve_buf[0..];
                 const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
-                const redirect_info = try uriPortAndProtocol(redirect_uri);
 
                 // Drain small redirect bodies (up to 2KB) so the connection can
                 // be returned to the pool rather than closed.
@@ -1126,65 +1164,9 @@ pub const Client = struct {
                 if (!conn.parser.shouldKeepAlive()) conn.closing = true;
                 self.pool.release(conn);
 
-                // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
-                // 307/308 preserve the original method and body.
-                var redirect_options = state.options;
-                if (status_code == 301 or status_code == 302 or status_code == 303) {
-                    if (redirect_options.method != .get and redirect_options.method != .head) {
-                        redirect_options.method = .get;
-                        redirect_options.body = null;
-                    } else if (status_code == 303) {
-                        redirect_options.body = null;
-                    }
-                }
-
-                // Strip sensitive headers when:
-                //   - already stripping from a previous hop, OR
-                //   - crossing to a different domain/host (same-domain and subdomain keep headers), OR
-                //   - downgrading from https to http (credentials would travel in plaintext).
-                var redirect_host_buffer: [255]u8 = undefined;
-                const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
-                const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
-                const redirect_strip_sensitive = state.strip_sensitive_headers or
-                    !isDomainOrSubdomain(redirect_host, effective_initial_host) or
-                    (state.protocol == .https and redirect_info.protocol == .http);
-
-                // Strip body-related headers when there is no body to send.
-                const redirect_strip_body = redirect_options.body == null;
-
-                // Compute Referer for the next hop (RFC 7231 §5.5.2).
-                // Don't send Referer when downgrading https→http (would leak in plaintext).
-                // If the user already set a Referer header, forward it as-is.
                 var referer_buf: [2048]u8 = undefined;
-                const redirect_referer: ?[]const u8 = blk: {
-                    if (state.protocol == .https and redirect_info.protocol == .http) break :blk null;
-                    if (redirect_options.headers) |h| {
-                        if (h.get("Referer")) |existing| break :blk existing;
-                    }
-                    var w = std.Io.Writer.fixed(&referer_buf);
-                    state.uri.writeToStream(&w, .{
-                        .scheme = true,
-                        .authority = true,
-                        .authentication = false, // strip userinfo — never leak credentials in Referer
-                        .path = true,
-                        .query = true,
-                        .fragment = false, // strip fragment — not sent to servers per RFC 7231
-                        .port = true,
-                    }) catch break :blk null;
-                    break :blk w.buffered();
-                };
-
-                return self.fetchInternal(.{
-                    .uri = redirect_uri,
-                    .port = redirect_info.port,
-                    .protocol = redirect_info.protocol,
-                    .options = redirect_options,
-                    .redirects_remaining = state.redirects_remaining - 1,
-                    .initial_host = effective_initial_host,
-                    .strip_sensitive_headers = redirect_strip_sensitive,
-                    .strip_body_headers = redirect_strip_body,
-                    .referer = redirect_referer,
-                });
+                const next = try self.buildRedirectState(state, host, status_code, redirect_uri, &referer_buf);
+                return self.fetchInternal(next);
             }
         }
 
@@ -1198,6 +1180,94 @@ pub const Client = struct {
             .decompress = state.options.decompress,
             .owner = conn,
         };
+    }
+
+    /// Compute the next request's FetchState from a 3xx redirect. Does NOT
+    /// recurse (the caller does, so fetchInternal stays the only recursion point
+    /// and the inferred error sets don't form a cycle). `redirect_uri` and
+    /// `referer_buf` must stay alive until the caller's recursive call returns.
+    /// Shared by both the HTTP/1.1 and HTTP/2 paths.
+    fn buildRedirectState(self: *Client, state: FetchState, host: []const u8, status_code: u16, redirect_uri: Uri, referer_buf: []u8) !FetchState {
+        _ = self;
+        const redirect_info = try uriPortAndProtocol(redirect_uri);
+
+        // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
+        // 307/308 preserve the original method and body.
+        var redirect_options = state.options;
+        if (status_code == 301 or status_code == 302 or status_code == 303) {
+            if (redirect_options.method != .get and redirect_options.method != .head) {
+                redirect_options.method = .get;
+                redirect_options.body = null;
+            } else if (status_code == 303) {
+                redirect_options.body = null;
+            }
+        }
+
+        // Strip sensitive headers when:
+        //   - already stripping from a previous hop, OR
+        //   - crossing to a different domain/host (same-domain and subdomain keep headers), OR
+        //   - downgrading from https to http (credentials would travel in plaintext).
+        var redirect_host_buffer: [255]u8 = undefined;
+        const redirect_host = try uriHost(redirect_uri, &redirect_host_buffer);
+        const effective_initial_host = if (state.initial_host.len == 0) host else state.initial_host;
+        const redirect_strip_sensitive = state.strip_sensitive_headers or
+            !isDomainOrSubdomain(redirect_host, effective_initial_host) or
+            (state.protocol == .https and redirect_info.protocol == .http);
+
+        // Strip body-related headers when there is no body to send.
+        const redirect_strip_body = redirect_options.body == null;
+
+        // Compute Referer for the next hop (RFC 7231 §5.5.2).
+        // Don't send Referer when downgrading https→http (would leak in plaintext).
+        // If the user already set a Referer header, forward it as-is.
+        const redirect_referer: ?[]const u8 = blk: {
+            if (state.protocol == .https and redirect_info.protocol == .http) break :blk null;
+            if (redirect_options.headers) |h| {
+                if (h.get("Referer")) |existing| break :blk existing;
+            }
+            var w = std.Io.Writer.fixed(referer_buf);
+            state.uri.writeToStream(&w, .{
+                .scheme = true,
+                .authority = true,
+                .authentication = false, // strip userinfo — never leak credentials in Referer
+                .path = true,
+                .query = true,
+                .fragment = false, // strip fragment — not sent to servers per RFC 7231
+                .port = true,
+            }) catch break :blk null;
+            break :blk w.buffered();
+        };
+
+        return FetchState{
+            .uri = redirect_uri,
+            .port = redirect_info.port,
+            .protocol = redirect_info.protocol,
+            .options = redirect_options,
+            .redirects_remaining = state.redirects_remaining - 1,
+            .initial_host = effective_initial_host,
+            .strip_sensitive_headers = redirect_strip_sensitive,
+            .strip_body_headers = redirect_strip_body,
+            .referer = redirect_referer,
+        };
+    }
+
+    /// If `resp` is a 3xx redirect we should follow, free it and return the next
+    /// FetchState; otherwise return null (the caller returns `resp` as-is). Does
+    /// not recurse. `resolve_buf`/`referer_buf` (caller-owned) must outlive the
+    /// caller's recursive fetchInternal call.
+    fn h2Redirect(self: *Client, resp: *ClientResponse, state: FetchState, host: []const u8, resolve_buf: []u8, referer_buf: []u8) !?FetchState {
+        const status_code: u16 = @intCast(@intFromEnum(resp.parsed.status));
+        if (!(status_code >= 300 and status_code < 400 and state.redirects_remaining > 0)) return null;
+        const location = resp.parsed.headers.get("Location") orelse return null;
+        if (location.len > resolve_buf.len) return null;
+        @memcpy(resolve_buf[0..location.len], location);
+        var aux_buf: []u8 = resolve_buf[0..];
+        const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return null;
+        // redirect_uri now lives in resolve_buf (caller's frame), so the response
+        // (and its arena, which `location` pointed into) can be freed.
+        const next = try self.buildRedirectState(state, host, status_code, redirect_uri, referer_buf);
+        resp.deinit();
+        return next;
     }
 };
 
