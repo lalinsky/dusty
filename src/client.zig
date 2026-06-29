@@ -702,6 +702,75 @@ pub const Client = struct {
     }
 
     /// Acquire a connection from the pool or create a new one.
+    /// Perform a request over an HTTP/2 (ALPN-negotiated) connection. The
+    /// response body is fully buffered. The `nghttp2` module is only referenced
+    /// when built with use_http2; otherwise this returns error.Http2NotImplemented
+    /// (unreachable in practice, since h2 is never negotiated without the option).
+    fn fetchHttp2(self: *Client, conn: *Connection, state: FetchState, host: []const u8) !ClientResponse {
+        if (build_options.use_http2) {
+            const http2 = @import("http2.zig");
+            const arena = conn.arena.allocator();
+
+            // Build the ":path" (path + optional query) and ":authority"
+            // (host, with port only when non-default) pseudo-headers.
+            const path = blk: {
+                const p = uriPath(state.uri);
+                if (state.uri.query) |q| {
+                    break :blk try std.fmt.allocPrint(arena, "{s}?{s}", .{ p, q.percent_encoded });
+                }
+                break :blk p;
+            };
+            const authority = blk: {
+                if (state.port == state.protocol.defaultPort()) break :blk host;
+                break :blk try std.fmt.allocPrint(arena, "{s}:{d}", .{ host, state.port });
+            };
+
+            const parsed = &conn.parsed_response;
+            parsed.* = .{ .arena = arena };
+
+            const body = http2.fetchBuffered(
+                conn.reader,
+                conn.writer,
+                arena,
+                .{
+                    .method = state.options.method,
+                    .authority = authority,
+                    .path = path,
+                    .scheme = "https",
+                    .body = state.options.body,
+                    .headers = state.options.headers,
+                },
+                parsed,
+                self.config.max_response_size,
+                self.config.max_response_header_count,
+            ) catch |err| {
+                // Leave conn for fetchInternal's errdefer to release; mark it
+                // non-poolable since the h2 session state is now indeterminate.
+                conn.closing = true;
+                return err;
+            };
+
+            // Stage A: a single request per connection (no multiplexing yet),
+            // so the connection is not returned to the pool.
+            conn.closing = true;
+
+            return ClientResponse{
+                .arena = arena,
+                .parser = &conn.parser, // unused in fixed-body mode
+                .conn = conn.reader, // unused in fixed-body mode
+                .parsed = parsed,
+                .max_response_size = self.config.max_response_size,
+                .decompress = state.options.decompress,
+                .owner = conn,
+                ._body = if (body.len > 0) body else null,
+                ._body_read = true,
+            };
+        } else {
+            conn.closing = true;
+            return error.Http2NotImplemented;
+        }
+    }
+
     fn acquireConnection(
         self: *Client,
         host: []const u8,
@@ -860,12 +929,9 @@ pub const Client = struct {
         const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path);
         errdefer self.pool.release(conn);
 
-        // HTTP/2 was negotiated via ALPN but the h2 path isn't implemented yet.
-        // The TLS connection is already committed to h2 (we can't speak HTTP/1.1
-        // over it), so don't pool it — mark closing so release() tears it down.
+        // HTTP/2 path: nghttp2 drives the request over the negotiated connection.
         if (conn.http_version == .http_2) {
-            conn.closing = true;
-            return error.Http2NotImplemented;
+            return self.fetchHttp2(conn, state, host);
         }
 
         // Send request
