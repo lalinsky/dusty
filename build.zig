@@ -5,6 +5,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const use_tls = b.option(bool, "use_tls", "Build with TLS/HTTPS support via tls.zig") orelse true;
+    // HTTP/2 support is gated behind this option (like use_tls) because it links
+    // the nghttp2 C library. Defaults off until the implementation lands. Requires
+    // use_tls, since h2 is negotiated via TLS ALPN.
+    const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -14,6 +18,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_tls", use_tls);
+    build_options.addOption(bool, "use_http2", use_http2);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a stub that no-ops `clear` and panics on `set`.
