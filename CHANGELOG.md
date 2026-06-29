@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Optional HTTP/2 client support, gated behind the `use_http2` build option and the `http2` client config flag. Built on the bundled nghttp2 library and negotiated over TLS ALPN; multiplexes concurrent requests over a single connection per origin, with HTTP/1.1 fallback, redirects, and gzip/deflate decompression. Response bodies are buffered.
 - Fix memory leak in WebSocket clients: message allocations are now freed before each `receive()` call instead of accumulating for the lifetime of the connection. Message data is valid until the next call to `receive()`.
 
 ## [0.2.0] - 2026-04-26

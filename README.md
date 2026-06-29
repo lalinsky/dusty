@@ -10,6 +10,7 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 - Router with support for parameters and wildcards
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
+- Optional HTTP/2 client (via [nghttp2](https://github.com/nghttp2/nghttp2)) with request multiplexing over a single connection
 - Server-Sent Events (SSE) for streaming responses
 - WebSocket support (RFC 6455)
 - HTTP/HTTPS client with connection pooling
@@ -88,6 +89,38 @@ var response = try client.fetch("http://localhost/v1.41/info", .{
 });
 defer response.deinit();
 ```
+
+## HTTP/2 (client)
+
+The client can speak HTTP/2, negotiated over TLS ALPN. It is gated behind the
+`use_http2` build option (off by default) because it links the bundled
+[nghttp2](https://github.com/nghttp2/nghttp2) C library:
+
+```zig
+const dusty = b.dependency("dusty", .{
+    .target = target,
+    .optimize = optimize,
+    .use_http2 = true,
+});
+```
+
+Then opt in per client via the `http2` config flag. When enabled, HTTPS
+connections advertise `h2` and, if the server agrees, requests are multiplexed
+over a single connection (one connection per origin, shared across concurrent
+and sequential requests). Servers that don't negotiate `h2` transparently fall
+back to HTTP/1.1.
+
+```zig
+var client = http.Client.init(allocator, io, .{ .http2 = true });
+defer client.deinit();
+
+var response = try client.fetch("https://nghttp2.org/", .{});
+defer response.deinit();
+// response.version() reports 2.0 when HTTP/2 was used
+```
+
+Redirects, gzip/deflate decompression, request bodies, and the rest of the
+client API work the same as on HTTP/1.1. Response bodies are currently buffered.
 
 ## Selecting the I/O Backend
 
