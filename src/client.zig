@@ -30,10 +30,29 @@ const http2 = if (build_options.use_http2) @import("http2.zig") else struct {
 /// A pooled, multiplexed HTTP/2 connection: the nghttp2 actor plus the
 /// underlying transport (socket + TLS) that backs it.
 const H2Entry = struct {
+    client: *Client,
     transport: *Connection,
     conn: *http2.Connection,
     node: std.DoublyLinkedList.Node = .{},
 };
+
+/// Reaper for HTTP/2 connections (a `http2.ReapFn`): invoked when a connection's
+/// last reference is dropped. Unlinks the pool entry and frees the connection,
+/// its nghttp2 session, and its transport.
+fn reapH2(conn: *http2.Connection) void {
+    if (build_options.use_http2) {
+        const entry: *H2Entry = @ptrCast(@alignCast(conn.owner.?));
+        const self = entry.client;
+        self.h2_pool.mutex.lockUncancelable(self.io);
+        self.h2_pool.entries.remove(&entry.node);
+        self.h2_pool.mutex.unlock(self.io);
+        conn.freeSession();
+        entry.transport.deinit();
+        self.allocator.destroy(entry.transport);
+        self.allocator.destroy(conn);
+        self.allocator.destroy(entry);
+    } else unreachable;
+}
 
 /// Pool of shared HTTP/2 connections, keyed by host:port. Unlike the HTTP/1.1
 /// idle pool, entries stay discoverable while in use so concurrent requests
@@ -694,6 +713,8 @@ pub const Client = struct {
     config: ClientConfig,
     pool: ConnectionPool,
     h2_pool: H2Pool,
+    /// Shared group for all HTTP/2 session coroutines (each owns its net-reader).
+    h2_group: std.Io.Group,
     ca_bundle: std.crypto.Certificate.Bundle,
     ca_bundle_lock: std.Io.RwLock,
     ca_bundle_loaded: std.atomic.Value(bool),
@@ -705,6 +726,7 @@ pub const Client = struct {
             .config = config,
             .pool = ConnectionPool.init(allocator, config.max_idle_connections),
             .h2_pool = .{},
+            .h2_group = .init,
             .ca_bundle = .empty,
             .ca_bundle_lock = .init,
             .ca_bundle_loaded = std.atomic.Value(bool).init(false),
@@ -728,16 +750,11 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         if (build_options.use_http2) {
-            // Tear down every multiplexed h2 connection and its transport.
-            var it = self.h2_pool.entries.first;
-            while (it) |node| {
-                it = node.next;
-                const entry: *H2Entry = @fieldParentPtr("node", node);
-                entry.conn.destroy();
-                entry.transport.deinit();
-                self.allocator.destroy(entry.transport);
-                self.allocator.destroy(entry);
-            }
+            // Cancel all h2 session coroutines; each joins its net-reader and
+            // drops its reference on the way out, self-reaping any connection
+            // whose responses have already been deinit'd. (Connections still
+            // referenced by un-deinit'd responses are intentionally left alone.)
+            self.h2_group.cancel(self.io);
         }
         self.pool.deinit();
         self.ca_bundle.deinit(self.allocator);
@@ -763,6 +780,9 @@ pub const Client = struct {
 
     /// Look up an existing, still-open multiplexed h2 connection for host:port.
     /// Closed entries encountered along the way are removed and torn down.
+    /// Find a reusable, open h2 connection for host:port and take a reference.
+    /// Closed connections are skipped (their reaper frees them); the CAS in
+    /// `tryAcquire` prevents resurrecting one that is racing with its reaper.
     fn acquireH2(self: *Client, host: []const u8, port: u16) ?*http2.Connection {
         if (!build_options.use_http2) return null;
         self.h2_pool.mutex.lockUncancelable(self.io);
@@ -772,60 +792,83 @@ pub const Client = struct {
         while (it) |node| {
             it = node.next;
             const entry: *H2Entry = @fieldParentPtr("node", node);
-            if (entry.conn.isClosed()) {
-                self.h2_pool.entries.remove(node);
-                entry.conn.destroy();
-                entry.transport.deinit();
-                self.allocator.destroy(entry.transport);
-                self.allocator.destroy(entry);
-                continue;
-            }
+            if (entry.conn.isClosed()) continue;
             if (entry.conn.port == port and std.ascii.eqlIgnoreCase(entry.conn.host_buf[0..entry.conn.host_len], host)) {
-                return entry.conn;
+                if (entry.conn.tryAcquire()) return entry.conn;
             }
         }
         return null;
     }
 
     /// Promote a freshly-dialed, h2-negotiated transport into a multiplexed
-    /// connection, register it for reuse, and issue the request. Takes ownership
-    /// of `conn`.
-    fn startHttp2(self: *Client, conn: *Connection, state: FetchState, host: []const u8) !ClientResponse {
+    /// connection, register it for reuse, spawn its session coroutine into the
+    /// shared group, and issue the request. Takes ownership of `transport`.
+    fn startHttp2(self: *Client, transport: *Connection, state: FetchState, host: []const u8) !ClientResponse {
         if (build_options.use_http2) {
-            const h2conn = http2.Connection.create(self.allocator, self.io, conn.reader, conn.writer, host, state.port) catch |err| {
-                conn.deinit();
-                self.allocator.destroy(conn);
+            const h2conn = http2.Connection.create(self.allocator, self.io, transport.reader, transport.writer, host, state.port) catch |err| {
+                transport.deinit();
+                self.allocator.destroy(transport);
                 return err;
             };
-
             const entry = self.allocator.create(H2Entry) catch {
-                h2conn.destroy();
-                conn.deinit();
-                self.allocator.destroy(conn);
+                h2conn.freeSession();
+                self.allocator.destroy(h2conn);
+                transport.deinit();
+                self.allocator.destroy(transport);
                 return error.OutOfMemory;
             };
-            entry.* = .{ .transport = conn, .conn = h2conn };
+            entry.* = .{ .client = self, .transport = transport, .conn = h2conn, .node = .{} };
+            h2conn.owner = entry;
+            h2conn.reaper = reapH2;
 
+            // Insert and spawn under the pool mutex: the entry must be linked
+            // before the session coroutine could reach its reaper, and spawns
+            // into the shared group are serialized.
             self.h2_pool.mutex.lockUncancelable(self.io);
             self.h2_pool.entries.append(&entry.node);
+            h2conn.spawn(&self.h2_group) catch {
+                self.h2_pool.entries.remove(&entry.node);
+                self.h2_pool.mutex.unlock(self.io);
+                h2conn.freeSession();
+                self.allocator.destroy(h2conn);
+                transport.deinit();
+                self.allocator.destroy(transport);
+                self.allocator.destroy(entry);
+                return error.Http2Init;
+            };
+            const acquired = h2conn.tryAcquire(); // caller reference (refs 1 -> 2)
             self.h2_pool.mutex.unlock(self.io);
+            if (!acquired) {
+                // Session died immediately and is reaping (was blocked on the
+                // mutex we just released); it now owns all teardown.
+                return error.Http2ConnectionClosed;
+            }
 
             return self.requestHttp2(h2conn, state, host);
         } else {
-            conn.deinit();
-            self.allocator.destroy(conn);
+            transport.deinit();
+            self.allocator.destroy(transport);
             return error.Http2NotImplemented;
         }
     }
 
-    /// Issue one request over a multiplexed h2 connection and return a
-    /// ClientResponse with a fully-buffered body. The per-request stream and its
-    /// arena are freed when the response is deinit'd.
+    /// Issue one request over a multiplexed h2 connection (whose caller reference
+    /// is already held) and return a ClientResponse with a fully-buffered body.
+    /// On any error the caller reference is dropped; on success it transfers to
+    /// the ClientResponse (released on deinit).
     fn requestHttp2(self: *Client, h2conn: *http2.Connection, state: FetchState, host: []const u8) !ClientResponse {
         if (build_options.use_http2) {
+            errdefer h2conn.dropRef();
+
             const arena_ptr = try self.allocator.create(std.heap.ArenaAllocator);
-            errdefer self.allocator.destroy(arena_ptr);
             arena_ptr.* = std.heap.ArenaAllocator.init(self.allocator);
+            // Free the arena on every exit except success and cancellation (on
+            // cancel the session coroutine may still reference the stream).
+            var keep_arena = false;
+            defer if (!keep_arena) {
+                arena_ptr.deinit();
+                self.allocator.destroy(arena_ptr);
+            };
             const a = arena_ptr.allocator();
 
             // Build ":path" (path + optional query) and ":authority" (host with
@@ -860,20 +903,11 @@ pub const Client = struct {
             stream.parsed.headers = try Headers.init(a, self.config.max_response_header_count);
 
             h2conn.request(stream) catch |err| {
-                // On cancellation the session coroutine may still reference the
-                // stream, so its arena must not be freed here.
-                if (err != error.Canceled) {
-                    arena_ptr.deinit();
-                    self.allocator.destroy(arena_ptr);
-                }
+                if (err == error.Canceled) keep_arena = true; // session may still touch it
                 return err;
             };
 
-            if (stream.err) |err| {
-                arena_ptr.deinit();
-                self.allocator.destroy(arena_ptr);
-                return err;
-            }
+            if (stream.err) |err| return err;
 
             // Derive content metadata exactly like the HTTP/1.1 parser does.
             if (stream.parsed.headers.get("Content-Type")) |ct| stream.parsed.content_type = ContentType.fromContentType(ct);
@@ -885,18 +919,12 @@ pub const Client = struct {
             if (state.options.decompress) {
                 switch (stream.parsed.content_encoding) {
                     .identity => {},
-                    .unknown => {
-                        arena_ptr.deinit();
-                        self.allocator.destroy(arena_ptr);
-                        return error.UnsupportedContentEncoding;
-                    },
+                    .unknown => return error.UnsupportedContentEncoding,
                     .gzip, .deflate => |enc| {
                         var in = std.Io.Reader.fixed(body);
                         var win: [std.compress.flate.max_window_len]u8 = undefined;
                         var dec = std.compress.flate.Decompress.init(&in, if (enc == .gzip) .gzip else .zlib, &win);
                         body = dec.reader.allocRemaining(a, .limited(self.config.max_response_size)) catch |err| {
-                            arena_ptr.deinit();
-                            self.allocator.destroy(arena_ptr);
                             return switch (err) {
                                 error.StreamTooLong => error.ResponseTooLarge,
                                 else => err,
@@ -906,6 +934,8 @@ pub const Client = struct {
                     },
                 }
             }
+
+            keep_arena = true; // success: arena + connection ref transfer to the response
             return ClientResponse{
                 .arena = a,
                 .parsed = &stream.parsed,

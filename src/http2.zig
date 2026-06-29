@@ -117,9 +117,21 @@ pub const Stream = struct {
     }
 };
 
+/// Called when a Connection's last reference is dropped, to release the
+/// Connection itself, its transport, and its pool entry. Provided by the owner
+/// (client.zig) since those types live there. Must call `conn.freeSession()`.
+pub const ReapFn = *const fn (conn: *Connection) void;
+
 /// A multiplexed HTTP/2 connection. Heap-allocated and never moved (coroutines
 /// hold its address). The underlying transport (socket + TLS) is owned by the
 /// caller (client.zig); this only borrows `reader`/`writer`.
+///
+/// Lifetime is reference-counted (`refs`): one reference is held by the session
+/// coroutine (dropped when it exits) and one by each caller from acquire until
+/// its response is deinit'd. When the count reaches zero the `reaper` frees
+/// everything. The session and net-reader coroutines are spawned into a shared,
+/// Client-owned group; the net-reader is a child of the session (spawned into a
+/// group on the session's stack), so the session joins it before reaping.
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -133,26 +145,28 @@ pub const Connection = struct {
     events_buf: [event_queue_cap]Event = undefined,
     /// session -> net-reader ack that the last net_data slice was consumed.
     consumed: std.Io.Event = .unset,
-    group: std.Io.Group = .init,
 
     /// In-flight streams, owned exclusively by the session coroutine.
     streams: std.DoublyLinkedList = .{},
 
-    /// Set true once the connection is unusable (GOAWAY/EOF/error/shutdown).
-    /// Read by the pool to decide reuse; written by the session coroutine.
+    /// Set true once the connection is unusable (GOAWAY/EOF/error). Read by the
+    /// pool to skip it for reuse; written by the session coroutine / on cancel.
     closed: std.atomic.Value(bool) = .init(false),
-    /// Count of in-flight streams, for pool bookkeeping.
-    active: std.atomic.Value(usize) = .init(0),
+    /// Reference count; starts at 1 for the session coroutine. The thread that
+    /// decrements it to zero invokes `reaper`.
+    refs: std.atomic.Value(usize) = .init(1),
+    reaper: ?ReapFn = null,
+    /// Opaque back-reference to the owner's pool entry, used by `reaper`.
+    owner: ?*anyopaque = null,
 
     // Pool key.
     host_buf: [255]u8 = undefined,
     host_len: u8 = 0,
     port: u16 = 0,
-    pool_node: std.DoublyLinkedList.Node = .{},
 
-    /// Create and start a multiplexed HTTP/2 connection over the given
-    /// (ALPN-negotiated) reader/writer. Spawns the session and net-reader
-    /// coroutines.
+    /// Allocate and initialize a connection over the given (ALPN-negotiated)
+    /// reader/writer. Does NOT spawn coroutines — call `spawn` once the reaper
+    /// and pool entry are wired up.
     pub fn create(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -185,58 +199,67 @@ pub const Connection = struct {
         c.nghttp2_session_callbacks_set_on_stream_close_callback(conn.callbacks, onStreamClose);
 
         if (c.nghttp2_session_client_new(&conn.session, conn.callbacks, conn) != 0) return error.Http2Init;
-        errdefer c.nghttp2_session_del(conn.session);
-
-        // Spawn the two long-lived coroutines. They run until cancelled by
-        // deinit() or until a fatal error makes them return.
-        conn.group.concurrent(io, sessionLoop, .{conn}) catch return error.Http2Init;
-        conn.group.concurrent(io, netReaderLoop, .{conn}) catch {
-            // Tear down the already-spawned session coroutine before failing.
-            conn.events.close(io);
-            conn.group.cancel(io);
-            return error.Http2Init;
-        };
 
         return conn;
     }
 
-    /// Stop the coroutines and free the session. The transport (socket/TLS) is
-    /// the caller's responsibility.
-    pub fn destroy(conn: *Connection) void {
-        conn.closed.store(true, .release);
-        conn.events.close(conn.io);
-        conn.consumed.set(conn.io); // unblock net-reader if waiting on the ack
-        conn.group.cancel(conn.io); // cancel + join both coroutines
+    /// Spawn the session coroutine into the (shared, Client-owned) group. The
+    /// session spawns and owns the net-reader itself. Must be called after the
+    /// reaper/owner are set.
+    pub fn spawn(conn: *Connection, group: *std.Io.Group) !void {
+        group.concurrent(conn.io, sessionLoop, .{conn}) catch return error.Http2Init;
+    }
+
+    /// Release the nghttp2 session/callbacks. Called by the reaper; the reaper
+    /// also frees the Connection struct and transport.
+    pub fn freeSession(conn: *Connection) void {
         if (conn.session) |s| c.nghttp2_session_del(s);
         if (conn.callbacks) |cb| c.nghttp2_session_callbacks_del(cb);
-        conn.allocator.destroy(conn);
     }
 
     pub fn isClosed(conn: *Connection) bool {
         return conn.closed.load(.acquire);
     }
 
+    /// Try to take a reference. Returns false if the connection is already being
+    /// reaped (refcount hit zero), which prevents resurrecting a dead conn that
+    /// is racing with its reaper. Callers hold the pool mutex.
+    pub fn tryAcquire(conn: *Connection) bool {
+        var r = conn.refs.load(.monotonic);
+        while (true) {
+            if (r == 0) return false;
+            r = conn.refs.cmpxchgWeak(r, r + 1, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+
+    /// Drop a reference; the dropper that reaches zero invokes the reaper.
+    pub fn dropRef(conn: *Connection) void {
+        if (conn.refs.fetchSub(1, .acq_rel) == 1) {
+            conn.reaper.?(conn);
+        }
+    }
+
     /// Submit a request on `stream` and block until the response is complete or
-    /// the stream fails. The caller owns `stream` and its arena.
+    /// the stream fails. The caller owns `stream` and its arena and must already
+    /// hold a connection reference.
     pub fn request(conn: *Connection, stream: *Stream) !void {
-        _ = conn.active.fetchAdd(1, .acq_rel);
         conn.events.putOne(conn.io, .{ .submit = stream }) catch {
-            _ = conn.active.fetchSub(1, .acq_rel);
             return error.Http2ConnectionClosed;
         };
         stream.done.wait(conn.io) catch |err| {
             // Cancellation while waiting: the session coroutine may still touch
-            // the stream, so the caller must not free it here. Mark the
-            // connection unusable so it is retired rather than reused.
+            // the stream, so the caller must not free it here. Retire the
+            // connection so it is not reused.
             conn.closed.store(true, .release);
             return err;
         };
     }
 
-    /// Release a completed stream. Must be called after `request` returns.
+    /// Drop the caller's reference once it is done with the connection. (Named
+    /// for symmetry with the request lifecycle; the stream arg is unused.)
     pub fn releaseStream(conn: *Connection, stream: *Stream) void {
-        _ = conn.active.fetchSub(1, .acq_rel);
         _ = stream;
+        conn.dropRef();
     }
 };
 
@@ -246,6 +269,22 @@ pub const Connection = struct {
 
 fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
     const io = conn.io;
+
+    // The net-reader is a child of this coroutine: spawning it into a group on
+    // our own stack lets us join it (cancel) before reaping, without making it a
+    // peer in the shared Client group.
+    var nr_group: std.Io.Group = .init;
+    defer {
+        // Join the net-reader (cancel interrupts its blocking read), then drop
+        // the session's reference — which reaps the connection if it was the
+        // last one. Nothing touches `conn` after dropRef.
+        nr_group.cancel(io);
+        conn.dropRef();
+    }
+    nr_group.concurrent(io, netReaderLoop, .{conn}) catch {
+        fatalAll(conn, error.Http2Init);
+        return;
+    };
 
     submitSettings(conn) catch {
         fatalAll(conn, error.Http2Init);
