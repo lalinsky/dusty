@@ -120,7 +120,8 @@ defer response.deinit();
 ```
 
 Redirects, gzip/deflate decompression, request bodies, and the rest of the
-client API work the same as on HTTP/1.1. Response bodies are currently buffered.
+client API work the same as on HTTP/1.1. Response bodies stream incrementally
+with HTTP/2 flow control providing backpressure (`response.reader()`).
 
 ## Selecting the I/O Backend
 
