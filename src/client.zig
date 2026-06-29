@@ -54,6 +54,17 @@ pub const HttpVersion = enum {
     }
 };
 
+test "nghttp2 links and reports a version" {
+    // Only when built with HTTP/2: the `nghttp2` module doesn't exist otherwise,
+    // and this comptime-false branch is skipped during analysis.
+    if (build_options.use_http2) {
+        const ng = @import("nghttp2");
+        const info = ng.nghttp2_version(0);
+        try std.testing.expect(info != null);
+        try std.testing.expect(info.*.version_num != 0);
+    }
+}
+
 /// Default User-Agent sent with requests unless overridden.
 pub const default_user_agent = "dusty/0.1.0";
 

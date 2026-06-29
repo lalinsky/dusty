@@ -63,6 +63,60 @@ pub fn build(b: *std.Build) void {
     });
     mod.addIncludePath(b.path("src/llhttp"));
 
+    // HTTP/2 via vendored nghttp2 (src/nghttp2), gated behind use_http2. The
+    // library is I/O-free (a pure protocol state machine), driven from Zig.
+    if (use_http2) {
+        const nghttp2_translate_c = b.addTranslateC(.{
+            .root_source_file = b.path("src/nghttp2/lib/includes/nghttp2/nghttp2.h"),
+            .target = target,
+            .optimize = optimize,
+        });
+        nghttp2_translate_c.addIncludePath(b.path("src/nghttp2/lib/includes"));
+        mod.addImport("nghttp2", nghttp2_translate_c.createModule());
+
+        mod.addCSourceFiles(.{
+            .files = &[_][]const u8{
+                "src/nghttp2/lib/nghttp2_alpn.c",
+                "src/nghttp2/lib/nghttp2_buf.c",
+                "src/nghttp2/lib/nghttp2_callbacks.c",
+                "src/nghttp2/lib/nghttp2_debug.c",
+                "src/nghttp2/lib/nghttp2_extpri.c",
+                "src/nghttp2/lib/nghttp2_frame.c",
+                "src/nghttp2/lib/nghttp2_hd.c",
+                "src/nghttp2/lib/nghttp2_hd_huffman.c",
+                "src/nghttp2/lib/nghttp2_hd_huffman_data.c",
+                "src/nghttp2/lib/nghttp2_helper.c",
+                "src/nghttp2/lib/nghttp2_http.c",
+                "src/nghttp2/lib/nghttp2_map.c",
+                "src/nghttp2/lib/nghttp2_mem.c",
+                "src/nghttp2/lib/nghttp2_option.c",
+                "src/nghttp2/lib/nghttp2_outbound_item.c",
+                "src/nghttp2/lib/nghttp2_pq.c",
+                "src/nghttp2/lib/nghttp2_priority_spec.c",
+                "src/nghttp2/lib/nghttp2_queue.c",
+                "src/nghttp2/lib/nghttp2_ratelim.c",
+                "src/nghttp2/lib/nghttp2_rcbuf.c",
+                "src/nghttp2/lib/nghttp2_session.c",
+                "src/nghttp2/lib/nghttp2_stream.c",
+                "src/nghttp2/lib/nghttp2_submit.c",
+                "src/nghttp2/lib/nghttp2_time.c",
+                "src/nghttp2/lib/nghttp2_version.c",
+                "src/nghttp2/lib/sfparse.c",
+            },
+            .flags = &.{
+                "-std=c99",
+                "-DNGHTTP2_STATICLIB",
+                "-D_POSIX_C_SOURCE=199309L",
+                "-DHAVE_ARPA_INET_H=1",
+                "-DHAVE_NETINET_IN_H=1",
+                "-DHAVE_CLOCK_GETTIME=1",
+                "-DHAVE_DECL_CLOCK_MONOTONIC=1",
+            },
+        });
+        mod.addIncludePath(b.path("src/nghttp2/lib"));
+        mod.addIncludePath(b.path("src/nghttp2/lib/includes"));
+    }
+
     // Examples
     const examples_step = b.step("examples", "Build all examples");
 
