@@ -587,6 +587,8 @@ pub const ClientResponse = struct {
     h2_conn: ?*http2.Connection = null,
     h2_stream: ?*http2.Stream = null,
     h2_arena: ?*std.heap.ArenaAllocator = null,
+    _h2_body_reader: if (build_options.use_http2) http2.BodyReader else void = undefined,
+    _h2_body_reader_init: bool = false,
 
     // Fixed reader over an already-buffered body (h2, or a cached h1 body).
     _fixed_reader: std.Io.Reader = undefined,
@@ -612,7 +614,16 @@ pub const ClientResponse = struct {
     pub fn deinit(self: *ClientResponse) void {
         if (build_options.use_http2) {
             if (self.h2_stream) |stream| {
-                if (self.h2_conn) |hc| hc.releaseStream(stream);
+                if (self.h2_conn) |hc| {
+                    // If the body wasn't fully read, ask the session to RST the
+                    // stream and wait until it's closed, so the session coroutine
+                    // is finished touching the stream before we free its arena.
+                    if (!stream.done.isSet()) {
+                        hc.cancelStream(stream.stream_id);
+                        stream.done.waitUncancelable(hc.io);
+                    }
+                    hc.releaseStream(stream);
+                }
                 if (self.h2_arena) |a| {
                     const base = a.child_allocator;
                     a.deinit();
@@ -674,12 +685,32 @@ pub const ClientResponse = struct {
     /// Get a streaming body reader. Returns decompressed data if server sent
     /// compressed response and decompress option was enabled.
     pub fn reader(self: *ClientResponse) *std.Io.Reader {
-        // If body has already been read (cached, or an h2 pre-buffered body),
-        // return a fixed reader over it. No llhttp parser is involved.
+        // If body has already been read (cached), return a fixed reader over it.
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
             self._fixed_reader = std.Io.Reader.fixed(cached_body);
             return &self._fixed_reader;
+        }
+
+        // HTTP/2: stream the body from the connection's pipe, decompressing on
+        // the fly if needed.
+        if (build_options.use_http2) {
+            if (self.h2_stream) |stream| {
+                if (!self._h2_body_reader_init) {
+                    self._h2_body_reader = http2.BodyReader.init(stream, self.h2_conn.?, &self._body_reader_buffer);
+                    self._h2_body_reader_init = true;
+                }
+                if (self.decompress and self.parsed.content_encoding != .identity and !self._decompressor_init) {
+                    self._decompressor = std.compress.flate.Decompress.init(
+                        &self._h2_body_reader.interface,
+                        if (self.parsed.content_encoding == .gzip) .gzip else .zlib,
+                        &self._decompressor_buffer,
+                    );
+                    self._decompressor_init = true;
+                }
+                if (self._decompressor_init) return &self._decompressor.reader;
+                return &self._h2_body_reader.interface;
+            }
         }
 
         // Initialize body reader if not already done
@@ -886,6 +917,10 @@ pub const Client = struct {
                 break :blk try std.fmt.allocPrint(a, "{s}:{d}", .{ host, state.port });
             };
 
+            // Body pipe buffer, sized to the stream window so the session
+            // coroutine never blocks pushing DATA frames.
+            const body_buf = try a.alloc(u8, http2.stream_window_bytes);
+
             const stream = try a.create(http2.Stream);
             stream.* = .{
                 .io = self.io,
@@ -898,10 +933,12 @@ pub const Client = struct {
                 .req_body = state.options.body orelse &.{},
                 .accept_encoding = if (state.options.decompress) "gzip, deflate" else null,
                 .parsed = .{ .arena = a, .version_major = 2, .version_minor = 0 },
-                .max_body = self.config.max_response_size,
+                .body = .init(body_buf),
             };
             stream.parsed.headers = try Headers.init(a, self.config.max_response_header_count);
 
+            // Returns once the response headers are available; the body then
+            // streams via the pipe (read through ClientResponse.reader()).
             h2conn.request(stream) catch |err| {
                 if (err == error.Canceled) keep_arena = true; // session may still touch it
                 return err;
@@ -909,30 +946,16 @@ pub const Client = struct {
 
             if (stream.err) |err| return err;
 
-            // Derive content metadata exactly like the HTTP/1.1 parser does.
+            // Derive content metadata exactly like the HTTP/1.1 parser does;
+            // decompression happens lazily in reader().
             if (stream.parsed.headers.get("Content-Type")) |ct| stream.parsed.content_type = ContentType.fromContentType(ct);
             if (stream.parsed.headers.get("Content-Encoding")) |ce| stream.parsed.content_encoding = http.ContentEncoding.fromString(ce);
-
-            // Eagerly decompress the buffered body (the response is delivered in
-            // fixed-body mode, so decompression can't be deferred to reader()).
-            var body = stream.body.items;
-            if (state.options.decompress) {
-                switch (stream.parsed.content_encoding) {
-                    .identity => {},
-                    .unknown => return error.UnsupportedContentEncoding,
-                    .gzip, .deflate => |enc| {
-                        var in = std.Io.Reader.fixed(body);
-                        var win: [std.compress.flate.max_window_len]u8 = undefined;
-                        var dec = std.compress.flate.Decompress.init(&in, if (enc == .gzip) .gzip else .zlib, &win);
-                        body = dec.reader.allocRemaining(a, .limited(self.config.max_response_size)) catch |err| {
-                            return switch (err) {
-                                error.StreamTooLong => error.ResponseTooLarge,
-                                else => err,
-                            };
-                        };
-                        stream.parsed.content_encoding = .identity;
-                    },
-                }
+            if (state.options.decompress and stream.parsed.content_encoding == .unknown) {
+                // The stream is live (headers received, body streaming); RST it
+                // and wait for the session to finish before the arena is freed.
+                h2conn.cancelStream(stream.stream_id);
+                stream.done.waitUncancelable(self.io);
+                return error.UnsupportedContentEncoding;
             }
 
             keep_arena = true; // success: arena + connection ref transfer to the response
@@ -944,8 +967,6 @@ pub const Client = struct {
                 .h2_conn = h2conn,
                 .h2_stream = stream,
                 .h2_arena = arena_ptr,
-                ._body = if (body.len > 0) body else null,
-                ._body_read = true,
             };
         } else {
             return error.Http2NotImplemented;

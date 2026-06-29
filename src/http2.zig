@@ -43,8 +43,17 @@ const c = @import("nghttp2");
 const log = std.log.scoped(.dusty_h2);
 
 /// Backing capacity of the per-connection event queue. Holds at most one
-/// in-flight net_data item plus queued submissions.
+/// in-flight net_data item plus queued submissions/consume/cancel events.
 const event_queue_cap = 256;
+
+/// Per-stream receive window, and the size of each stream's body pipe buffer.
+/// The buffer is sized to the window so the session coroutine's pipe writes
+/// never block: HTTP/2 flow control bounds outstanding data to the window, and
+/// the window only reopens (via `nghttp2_session_consume`) as the caller reads.
+pub const stream_window_bytes = 256 * 1024;
+/// Connection-level receive window — kept large so it isn't the bottleneck
+/// across multiplexed streams (per-stream windows provide the backpressure).
+const conn_window_bytes = 16 * 1024 * 1024;
 
 pub const Http2Error = error{
     /// Failed to allocate/initialize an nghttp2 session or callbacks.
@@ -67,6 +76,11 @@ pub const Http2Error = error{
 const Event = union(enum) {
     /// A caller wants to start a request on this stream.
     submit: *Stream,
+    /// A caller consumed `n` body bytes of `stream_id`; return that flow-control
+    /// credit to the peer (emits WINDOW_UPDATE).
+    consume: struct { stream_id: i32, n: usize },
+    /// A caller is abandoning `stream_id`; send RST_STREAM.
+    cancel: i32,
     /// Decrypted bytes from the socket; the slice points into the net-reader's
     /// buffer and stays valid until the session acks via `consumed`.
     net_data: []const u8,
@@ -97,22 +111,28 @@ pub const Stream = struct {
 
     // Response (set by the session coroutine).
     parsed: ParsedResponse,
-    body: std.ArrayListUnmanaged(u8) = .empty,
-    max_body: usize,
-    too_large: bool = false,
+    /// Body pipe: the session coroutine pushes DATA frames in, the caller's
+    /// reader pulls them out. Backed by a buffer on the request arena, sized to
+    /// the stream window so pushes never block. Closed (graceful) at end-of-body.
+    body: std.Io.Queue(u8),
     alloc_failed: bool = false,
     close_error: u32 = 0,
     err: ?anyerror = null,
     stream_id: i32 = -1,
 
-    /// Set once by the session coroutine when the response is complete (or
-    /// failed); awaited by the caller.
+    /// Set when the response headers are available (or the stream failed before
+    /// them); the caller blocks on this and then reads the body via the pipe.
+    headers_done: std.Io.Event = .unset,
+    /// Set once the stream is fully finished (END_STREAM, RST, or error).
     done: std.Io.Event = .unset,
     /// Intrusive node in Connection.streams; touched only by the session coro.
     node: std.DoublyLinkedList.Node = .{},
 
+    /// Mark the stream finished: record the error, then wake both a caller still
+    /// waiting on headers and one reading the body.
     fn finish(s: *Stream, err: ?anyerror) void {
         if (err != null and s.err == null) s.err = err;
+        s.headers_done.set(s.io);
         s.done.set(s.io);
     }
 };
@@ -195,10 +215,22 @@ pub const Connection = struct {
         if (c.nghttp2_session_callbacks_new(&conn.callbacks) != 0) return error.Http2Init;
         errdefer c.nghttp2_session_callbacks_del(conn.callbacks);
         c.nghttp2_session_callbacks_set_on_header_callback(conn.callbacks, onHeader);
+        c.nghttp2_session_callbacks_set_on_frame_recv_callback(conn.callbacks, onFrameRecv);
         c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(conn.callbacks, onDataChunk);
         c.nghttp2_session_callbacks_set_on_stream_close_callback(conn.callbacks, onStreamClose);
 
-        if (c.nghttp2_session_client_new(&conn.session, conn.callbacks, conn) != 0) return error.Http2Init;
+        // Manual flow control: nghttp2 must NOT auto-send WINDOW_UPDATE. We
+        // return credit via nghttp2_session_consume only as the caller reads,
+        // which is what bounds the body pipe and provides backpressure.
+        var option: ?*c.nghttp2_option = null;
+        if (c.nghttp2_option_new(&option) != 0) return error.Http2Init;
+        defer c.nghttp2_option_del(option);
+        c.nghttp2_option_set_no_auto_window_update(option, 1);
+
+        if (c.nghttp2_session_client_new2(&conn.session, conn.callbacks, conn, option) != 0) return error.Http2Init;
+        // Raise the connection-level receive window so it doesn't throttle
+        // multiplexed streams (per-stream windows handle backpressure).
+        _ = c.nghttp2_session_set_local_window_size(conn.session, @intCast(c.NGHTTP2_FLAG_NONE), 0, conn_window_bytes);
 
         return conn;
     }
@@ -239,14 +271,15 @@ pub const Connection = struct {
         }
     }
 
-    /// Submit a request on `stream` and block until the response is complete or
-    /// the stream fails. The caller owns `stream` and its arena and must already
-    /// hold a connection reference.
+    /// Submit a request on `stream` and block until the response headers are
+    /// available (or the stream fails). The body then streams via `stream.body`.
+    /// The caller owns `stream` and its arena and must already hold a connection
+    /// reference.
     pub fn request(conn: *Connection, stream: *Stream) !void {
         conn.events.putOne(conn.io, .{ .submit = stream }) catch {
             return error.Http2ConnectionClosed;
         };
-        stream.done.wait(conn.io) catch |err| {
+        stream.headers_done.wait(conn.io) catch |err| {
             // Cancellation while waiting: the session coroutine may still touch
             // the stream, so the caller must not free it here. Retire the
             // connection so it is not reused.
@@ -255,11 +288,65 @@ pub const Connection = struct {
         };
     }
 
+    /// Post flow-control credit for `n` consumed body bytes of `stream_id`.
+    pub fn consume(conn: *Connection, stream_id: i32, n: usize) void {
+        conn.events.putOne(conn.io, .{ .consume = .{ .stream_id = stream_id, .n = n } }) catch {};
+    }
+
+    /// Ask the session to RST a stream the caller is abandoning.
+    pub fn cancelStream(conn: *Connection, stream_id: i32) void {
+        conn.events.putOne(conn.io, .{ .cancel = stream_id }) catch {};
+    }
+
     /// Drop the caller's reference once it is done with the connection. (Named
     /// for symmetry with the request lifecycle; the stream arg is unused.)
     pub fn releaseStream(conn: *Connection, stream: *Stream) void {
         _ = stream;
         conn.dropRef();
+    }
+};
+
+/// Streaming reader over a stream's body pipe. Pulls DATA bytes the session
+/// coroutine pushed, and returns flow-control credit to the peer as it reads.
+pub const BodyReader = struct {
+    stream_obj: *Stream,
+    conn: *Connection,
+    interface: std.Io.Reader,
+
+    pub fn init(stream_obj: *Stream, conn: *Connection, buffer: []u8) BodyReader {
+        return .{
+            .stream_obj = stream_obj,
+            .conn = conn,
+            .interface = .{
+                .vtable = &.{ .stream = readStream },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn readStream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *BodyReader = @alignCast(@fieldParentPtr("interface", io_r));
+        const s = self.stream_obj;
+        const io = self.conn.io;
+
+        const dest = limit.slice(try w.writableSliceGreedy(1));
+        if (dest.len == 0) return 0;
+
+        const n = s.body.get(io, dest, 1) catch |err| switch (err) {
+            error.Closed => {
+                // Pipe drained and closed: end of body. Surface a stream error
+                // (e.g. RST mid-body) instead of a clean EOF if one was recorded.
+                if (s.err) |_| return error.ReadFailed;
+                return error.EndOfStream;
+            },
+            error.Canceled => return error.ReadFailed,
+        };
+        w.advance(n);
+        // Return the flow-control credit so the peer may send more.
+        self.conn.consume(s.stream_id, n);
+        return n;
     }
 };
 
@@ -299,6 +386,13 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
         const ev = conn.events.getOne(io) catch return; // Closed or Canceled
         switch (ev) {
             .submit => |s| handleSubmit(conn, s),
+            .consume => |x| {
+                // Ignore errors: the stream may already be closed.
+                _ = c.nghttp2_session_consume(conn.session, x.stream_id, x.n);
+            },
+            .cancel => |stream_id| {
+                _ = c.nghttp2_submit_rst_stream(conn.session, @intCast(c.NGHTTP2_FLAG_NONE), stream_id, @intCast(c.NGHTTP2_CANCEL));
+            },
             .net_data => |bytes| {
                 const rv = c.nghttp2_session_mem_recv2(conn.session, bytes.ptr, bytes.len);
                 conn.consumed.set(io); // let the net-reader toss and read more
@@ -335,10 +429,10 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
 
 fn submitSettings(conn: *Connection) !void {
     // Client preface SETTINGS (mandatory, first frame). Disable push and
-    // advertise a 1 MiB initial stream window.
+    // advertise the per-stream window that matches the body pipe size.
     const iv = [_]c.nghttp2_settings_entry{
         .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_ENABLE_PUSH), .value = 0 },
-        .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE), .value = 1 << 20 },
+        .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE), .value = stream_window_bytes },
     };
     if (c.nghttp2_submit_settings(conn.session, @intCast(c.NGHTTP2_FLAG_NONE), &iv, iv.len) != 0) {
         return error.Http2Init;
@@ -481,6 +575,23 @@ fn onHeader(
     return 0;
 }
 
+fn onFrameRecv(
+    session: ?*c.nghttp2_session,
+    frame: [*c]const c.nghttp2_frame,
+    user_data: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = user_data;
+    // Response headers complete: hand the response to the waiting caller. (1xx
+    // informational responses use a different category and don't wake it.)
+    if (frame.*.hd.type == @as(u8, @intCast(c.NGHTTP2_HEADERS)) and
+        frame.*.headers.cat == @as(c.nghttp2_headers_category, @intCast(c.NGHTTP2_HCAT_RESPONSE)))
+    {
+        const s = streamFor(session, frame.*.hd.stream_id) orelse return 0;
+        s.headers_done.set(s.io);
+    }
+    return 0;
+}
+
 fn onDataChunk(
     session: ?*c.nghttp2_session,
     flags: u8,
@@ -492,15 +603,17 @@ fn onDataChunk(
     _ = flags;
     _ = user_data;
     const s = streamFor(session, stream_id) orelse return 0;
-    if (s.too_large) return 0;
-    if (s.body.items.len + len > s.max_body) {
-        s.too_large = true;
-        return 0;
-    }
-    s.body.appendSlice(s.arena, data[0..len]) catch {
+    // Non-blocking push (min=0). Flow control keeps outstanding data within the
+    // window, which equals the pipe capacity, so everything fits; a short write
+    // would mean a flow-control accounting bug, so fail the stream rather than
+    // silently drop bytes.
+    const placed = s.body.putUncancelable(s.io, data[0..len], 0) catch |err| switch (err) {
+        error.Closed => return 0, // reader gone; drop
+    };
+    if (placed != len) {
         s.alloc_failed = true;
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
-    };
+    }
     return 0;
 }
 
@@ -520,9 +633,9 @@ fn onStreamClose(
         err = error.Http2Init;
     } else if (error_code != 0) {
         err = error.Http2StreamReset;
-    } else if (s.too_large) {
-        err = error.ResponseTooLarge;
     }
+    // Close the body pipe (graceful: the reader drains buffered bytes, then EOF).
+    s.body.close(s.io);
     s.finish(err);
     return 0;
 }
