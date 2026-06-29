@@ -19,6 +19,30 @@ const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
 const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
+// HTTP/2 support lives in http2.zig (which pulls in nghttp2). It is only
+// imported when built with use_http2; otherwise opaque placeholders stand in so
+// types referencing it still compile (the real code paths are comptime-gated).
+const http2 = if (build_options.use_http2) @import("http2.zig") else struct {
+    pub const Connection = opaque {};
+    pub const Stream = opaque {};
+};
+
+/// A pooled, multiplexed HTTP/2 connection: the nghttp2 actor plus the
+/// underlying transport (socket + TLS) that backs it.
+const H2Entry = struct {
+    transport: *Connection,
+    conn: *http2.Connection,
+    node: std.DoublyLinkedList.Node = .{},
+};
+
+/// Pool of shared HTTP/2 connections, keyed by host:port. Unlike the HTTP/1.1
+/// idle pool, entries stay discoverable while in use so concurrent requests
+/// multiplex onto one connection.
+const H2Pool = struct {
+    mutex: std.Io.Mutex = .init,
+    entries: std.DoublyLinkedList = .{},
+};
+
 /// Protocol type for HTTP/HTTPS connections.
 pub const Protocol = enum {
     http,
@@ -529,13 +553,24 @@ pub const Connection = struct {
 /// HTTP client response.
 /// Call deinit() when done to release the connection.
 pub const ClientResponse = struct {
-    // Direct pointers for reading (testable without full connection)
+    // Direct pointers for reading (testable without full connection).
+    // For HTTP/2 responses the body is pre-buffered and `parser`/`conn` are
+    // null (there is no llhttp parser); see the h2_* fields below.
     arena: std.mem.Allocator,
-    parser: *ResponseParser,
-    conn: *std.Io.Reader,
+    parser: ?*ResponseParser = null,
+    conn: ?*std.Io.Reader = null,
     parsed: *ParsedResponse,
     max_response_size: usize,
     decompress: bool = true,
+
+    // HTTP/2 backing (set only for h2 responses). The stream lives on h2_arena,
+    // which is freed on deinit; the connection stays in the pool for reuse.
+    h2_conn: ?*http2.Connection = null,
+    h2_stream: ?*http2.Stream = null,
+    h2_arena: ?*std.heap.ArenaAllocator = null,
+
+    // Fixed reader over an already-buffered body (h2, or a cached h1 body).
+    _fixed_reader: std.Io.Reader = undefined,
 
     // Cached body (read lazily)
     _body: ?[]const u8 = null,
@@ -556,6 +591,17 @@ pub const ClientResponse = struct {
 
     /// Release the connection back to the pool (or close if not reusable).
     pub fn deinit(self: *ClientResponse) void {
+        if (build_options.use_http2) {
+            if (self.h2_stream) |stream| {
+                if (self.h2_conn) |hc| hc.releaseStream(stream);
+                if (self.h2_arena) |a| {
+                    const base = a.child_allocator;
+                    a.deinit();
+                    base.destroy(a);
+                }
+                return;
+            }
+        }
         if (self.owner) |conn| {
             conn.release();
         }
@@ -609,17 +655,17 @@ pub const ClientResponse = struct {
     /// Get a streaming body reader. Returns decompressed data if server sent
     /// compressed response and decompress option was enabled.
     pub fn reader(self: *ClientResponse) *std.Io.Reader {
-        // If body has already been read, return a reader for the cached body
+        // If body has already been read (cached, or an h2 pre-buffered body),
+        // return a fixed reader over it. No llhttp parser is involved.
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
-            self._body_reader = ResponseBodyReader.init(self.parser, self.conn, &self._body_reader_buffer);
-            self._body_reader.interface = std.Io.Reader.fixed(cached_body);
-            return &self._body_reader.interface;
+            self._fixed_reader = std.Io.Reader.fixed(cached_body);
+            return &self._fixed_reader;
         }
 
         // Initialize body reader if not already done
         if (!self._body_reader_init) {
-            self._body_reader = ResponseBodyReader.init(self.parser, self.conn, &self._body_reader_buffer);
+            self._body_reader = ResponseBodyReader.init(self.parser.?, self.conn.?, &self._body_reader_buffer);
             self._body_reader_init = true;
         }
 
@@ -647,6 +693,7 @@ pub const Client = struct {
     io: std.Io,
     config: ClientConfig,
     pool: ConnectionPool,
+    h2_pool: H2Pool,
     ca_bundle: std.crypto.Certificate.Bundle,
     ca_bundle_lock: std.Io.RwLock,
     ca_bundle_loaded: std.atomic.Value(bool),
@@ -657,6 +704,7 @@ pub const Client = struct {
             .io = io,
             .config = config,
             .pool = ConnectionPool.init(allocator, config.max_idle_connections),
+            .h2_pool = .{},
             .ca_bundle = .empty,
             .ca_bundle_lock = .init,
             .ca_bundle_loaded = std.atomic.Value(bool).init(false),
@@ -679,6 +727,18 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
+        if (build_options.use_http2) {
+            // Tear down every multiplexed h2 connection and its transport.
+            var it = self.h2_pool.entries.first;
+            while (it) |node| {
+                it = node.next;
+                const entry: *H2Entry = @fieldParentPtr("node", node);
+                entry.conn.destroy();
+                entry.transport.deinit();
+                self.allocator.destroy(entry.transport);
+                self.allocator.destroy(entry);
+            }
+        }
         self.pool.deinit();
         self.ca_bundle.deinit(self.allocator);
     }
@@ -701,72 +761,136 @@ pub const Client = struct {
         });
     }
 
-    /// Acquire a connection from the pool or create a new one.
-    /// Perform a request over an HTTP/2 (ALPN-negotiated) connection. The
-    /// response body is fully buffered. The `nghttp2` module is only referenced
-    /// when built with use_http2; otherwise this returns error.Http2NotImplemented
-    /// (unreachable in practice, since h2 is never negotiated without the option).
-    fn fetchHttp2(self: *Client, conn: *Connection, state: FetchState, host: []const u8) !ClientResponse {
+    /// Look up an existing, still-open multiplexed h2 connection for host:port.
+    /// Closed entries encountered along the way are removed and torn down.
+    fn acquireH2(self: *Client, host: []const u8, port: u16) ?*http2.Connection {
+        if (!build_options.use_http2) return null;
+        self.h2_pool.mutex.lockUncancelable(self.io);
+        defer self.h2_pool.mutex.unlock(self.io);
+
+        var it = self.h2_pool.entries.first;
+        while (it) |node| {
+            it = node.next;
+            const entry: *H2Entry = @fieldParentPtr("node", node);
+            if (entry.conn.isClosed()) {
+                self.h2_pool.entries.remove(node);
+                entry.conn.destroy();
+                entry.transport.deinit();
+                self.allocator.destroy(entry.transport);
+                self.allocator.destroy(entry);
+                continue;
+            }
+            if (entry.conn.port == port and std.ascii.eqlIgnoreCase(entry.conn.host_buf[0..entry.conn.host_len], host)) {
+                return entry.conn;
+            }
+        }
+        return null;
+    }
+
+    /// Promote a freshly-dialed, h2-negotiated transport into a multiplexed
+    /// connection, register it for reuse, and issue the request. Takes ownership
+    /// of `conn`.
+    fn startHttp2(self: *Client, conn: *Connection, state: FetchState, host: []const u8) !ClientResponse {
         if (build_options.use_http2) {
-            const http2 = @import("http2.zig");
-            const arena = conn.arena.allocator();
-
-            // Build the ":path" (path + optional query) and ":authority"
-            // (host, with port only when non-default) pseudo-headers.
-            const path = blk: {
-                const p = uriPath(state.uri);
-                if (state.uri.query) |q| {
-                    break :blk try std.fmt.allocPrint(arena, "{s}?{s}", .{ p, q.percent_encoded });
-                }
-                break :blk p;
-            };
-            const authority = blk: {
-                if (state.port == state.protocol.defaultPort()) break :blk host;
-                break :blk try std.fmt.allocPrint(arena, "{s}:{d}", .{ host, state.port });
-            };
-
-            const parsed = &conn.parsed_response;
-            parsed.* = .{ .arena = arena };
-
-            const body = http2.fetchBuffered(
-                conn.reader,
-                conn.writer,
-                arena,
-                .{
-                    .method = state.options.method,
-                    .authority = authority,
-                    .path = path,
-                    .scheme = "https",
-                    .body = state.options.body,
-                    .headers = state.options.headers,
-                },
-                parsed,
-                self.config.max_response_size,
-                self.config.max_response_header_count,
-            ) catch |err| {
-                // Leave conn for fetchInternal's errdefer to release; mark it
-                // non-poolable since the h2 session state is now indeterminate.
-                conn.closing = true;
+            const h2conn = http2.Connection.create(self.allocator, self.io, conn.reader, conn.writer, host, state.port) catch |err| {
+                conn.deinit();
+                self.allocator.destroy(conn);
                 return err;
             };
 
-            // Stage A: a single request per connection (no multiplexing yet),
-            // so the connection is not returned to the pool.
-            conn.closing = true;
+            const entry = self.allocator.create(H2Entry) catch {
+                h2conn.destroy();
+                conn.deinit();
+                self.allocator.destroy(conn);
+                return error.OutOfMemory;
+            };
+            entry.* = .{ .transport = conn, .conn = h2conn };
 
+            self.h2_pool.mutex.lockUncancelable(self.io);
+            self.h2_pool.entries.append(&entry.node);
+            self.h2_pool.mutex.unlock(self.io);
+
+            return self.requestHttp2(h2conn, state, host);
+        } else {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            return error.Http2NotImplemented;
+        }
+    }
+
+    /// Issue one request over a multiplexed h2 connection and return a
+    /// ClientResponse with a fully-buffered body. The per-request stream and its
+    /// arena are freed when the response is deinit'd.
+    fn requestHttp2(self: *Client, h2conn: *http2.Connection, state: FetchState, host: []const u8) !ClientResponse {
+        if (build_options.use_http2) {
+            const arena_ptr = try self.allocator.create(std.heap.ArenaAllocator);
+            errdefer self.allocator.destroy(arena_ptr);
+            arena_ptr.* = std.heap.ArenaAllocator.init(self.allocator);
+            const a = arena_ptr.allocator();
+
+            // Build ":path" (path + optional query) and ":authority" (host with
+            // port only when non-default). Copy onto the request arena so they
+            // outlive `state`.
+            const path = blk: {
+                const p = uriPath(state.uri);
+                if (state.uri.query) |q| {
+                    break :blk try std.fmt.allocPrint(a, "{s}?{s}", .{ p, q.percent_encoded });
+                }
+                break :blk try a.dupe(u8, p);
+            };
+            const authority = blk: {
+                if (state.port == state.protocol.defaultPort()) break :blk try a.dupe(u8, host);
+                break :blk try std.fmt.allocPrint(a, "{s}:{d}", .{ host, state.port });
+            };
+
+            const stream = try a.create(http2.Stream);
+            stream.* = .{
+                .io = self.io,
+                .arena = a,
+                .method = state.options.method,
+                .scheme = "https",
+                .authority = authority,
+                .path = path,
+                .req_headers = state.options.headers,
+                .req_body = state.options.body orelse &.{},
+                .parsed = .{ .arena = a, .version_major = 2, .version_minor = 0 },
+                .max_body = self.config.max_response_size,
+            };
+            stream.parsed.headers = try Headers.init(a, self.config.max_response_header_count);
+
+            h2conn.request(stream) catch |err| {
+                // On cancellation the session coroutine may still reference the
+                // stream, so its arena must not be freed here.
+                if (err != error.Canceled) {
+                    arena_ptr.deinit();
+                    self.allocator.destroy(arena_ptr);
+                }
+                return err;
+            };
+
+            if (stream.err) |err| {
+                arena_ptr.deinit();
+                self.allocator.destroy(arena_ptr);
+                return err;
+            }
+
+            // Derive content metadata exactly like the HTTP/1.1 parser does.
+            if (stream.parsed.headers.get("Content-Type")) |ct| stream.parsed.content_type = ContentType.fromContentType(ct);
+            if (stream.parsed.headers.get("Content-Encoding")) |ce| stream.parsed.content_encoding = http.ContentEncoding.fromString(ce);
+
+            const body = stream.body.items;
             return ClientResponse{
-                .arena = arena,
-                .parser = &conn.parser, // unused in fixed-body mode
-                .conn = conn.reader, // unused in fixed-body mode
-                .parsed = parsed,
+                .arena = a,
+                .parsed = &stream.parsed,
                 .max_response_size = self.config.max_response_size,
                 .decompress = state.options.decompress,
-                .owner = conn,
+                .h2_conn = h2conn,
+                .h2_stream = stream,
+                .h2_arena = arena_ptr,
                 ._body = if (body.len > 0) body else null,
                 ._body_read = true,
             };
         } else {
-            conn.closing = true;
             return error.Http2NotImplemented;
         }
     }
@@ -925,14 +1049,23 @@ pub const Client = struct {
             break :blk try self.ensureCaBundle();
         } else null;
 
+        // Reuse an existing multiplexed HTTP/2 connection for this origin before
+        // dialing a new one.
+        if (build_options.use_http2 and self.config.http2 and state.protocol == .https) {
+            if (self.acquireH2(host, state.port)) |h2conn| {
+                return self.requestHttp2(h2conn, state, host);
+            }
+        }
+
         // Acquire or create a connection
         const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path);
-        errdefer self.pool.release(conn);
 
-        // HTTP/2 path: nghttp2 drives the request over the negotiated connection.
+        // Freshly negotiated HTTP/2: the h2 layer takes ownership of the transport.
         if (conn.http_version == .http_2) {
-            return self.fetchHttp2(conn, state, host);
+            return self.startHttp2(conn, state, host);
         }
+
+        errdefer self.pool.release(conn);
 
         // Send request
         try writeRequest(conn.writer, .{

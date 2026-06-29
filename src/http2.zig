@@ -4,9 +4,29 @@
 //! headers/data/stream events, and we pull bytes to write via
 //! `nghttp2_session_mem_send2`.
 //!
+//! Concurrency model (the "actor"): one `Connection` owns a single nghttp2
+//! session and multiplexes many concurrent request streams over one socket.
+//! Two coroutines run per connection:
+//!
+//!   * the session coroutine is the SOLE caller of every `nghttp2_*` function.
+//!     It blocks on one queue (`events`) carrying both inbound socket data and
+//!     request submissions, dispatches each, and drains nghttp2's output to the
+//!     socket. nghttp2's callbacks (run inside mem_recv on this coroutine) fill
+//!     per-stream response state and signal completion.
+//!   * the net-reader coroutine is the sole socket reader: it reads ciphertext,
+//!     hands the decrypted bytes to the session coroutine via `events`, and
+//!     waits for an ack before reading again.
+//!
+//! Caller coroutines (one per in-flight `fetch`) submit a `Stream` through the
+//! queue and block on its `done` event; they never touch the session directly.
+//! This keeps the non-reentrant nghttp2 session single-owner without a mutex.
+//!
+//! Concurrent read (net-reader) and write (session coroutine) touch disjoint
+//! TLS cipher state (separate encrypt/decrypt fields), so sharing one
+//! tls.Connection across the two coroutines is safe.
+//!
 //! This file is only compiled when the `use_http2` build option is set; callers
-//! must guard `@import("http2.zig")` behind `build_options.use_http2` so the
-//! `nghttp2` module (and this file) are never analyzed in builds without it.
+//! must guard `@import("http2.zig")` behind `build_options.use_http2`.
 
 const std = @import("std");
 
@@ -22,6 +42,10 @@ const c = @import("nghttp2");
 
 const log = std.log.scoped(.dusty_h2);
 
+/// Backing capacity of the per-connection event queue. Holds at most one
+/// in-flight net_data item plus queued submissions.
+const event_queue_cap = 256;
+
 pub const Http2Error = error{
     /// Failed to allocate/initialize an nghttp2 session or callbacks.
     Http2Init,
@@ -29,47 +53,344 @@ pub const Http2Error = error{
     Http2Protocol,
     /// The peer reset our stream (RST_STREAM with a non-zero error code).
     Http2StreamReset,
-    /// The peer closed the stream before a complete response was received.
+    /// The peer closed the stream/connection before a complete response.
     Http2IncompleteResponse,
+    /// The connection was torn down (GOAWAY, socket error, or shutdown).
+    Http2ConnectionClosed,
     /// Response body exceeded the configured maximum size.
     ResponseTooLarge,
 };
 
-/// The pieces of a request needed to build the HTTP/2 HEADERS frame.
-pub const RequestInfo = struct {
-    method: Method,
-    /// ":authority" pseudo-header, e.g. "example.com" or "example.com:8443".
-    authority: []const u8,
-    /// ":path" pseudo-header, e.g. "/index.html?q=1". Must be non-empty.
-    path: []const u8,
-    /// ":scheme" pseudo-header, normally "https".
-    scheme: []const u8 = "https",
-    /// Optional request body (fully buffered; sent via a DATA provider).
-    body: ?[]const u8 = null,
-    /// Optional user-supplied headers (names are lower-cased for h2).
-    headers: ?*const Headers = null,
+/// Items carried on a connection's single event queue. Producers are the caller
+/// coroutines (`submit`) and the net-reader coroutine (`net_*`); the sole
+/// consumer is the session coroutine.
+const Event = union(enum) {
+    /// A caller wants to start a request on this stream.
+    submit: *Stream,
+    /// Decrypted bytes from the socket; the slice points into the net-reader's
+    /// buffer and stays valid until the session acks via `consumed`.
+    net_data: []const u8,
+    /// The peer closed the connection cleanly (EOF).
+    net_eof,
+    /// A socket read error occurred.
+    net_err,
 };
 
-/// Per-request stream state, referenced from nghttp2 callbacks via the stream's
-/// user data pointer.
-const Stream = struct {
+/// Per-request stream state. Created and owned by the calling coroutine; the
+/// request fields are filled before `submit`, the response fields are filled by
+/// the session coroutine before `done` is set.
+pub const Stream = struct {
+    io: std.Io,
     arena: std.mem.Allocator,
-    parsed: *ParsedResponse,
-    body: std.ArrayListUnmanaged(u8) = .empty,
-    max_body: usize,
-    /// Set if the body exceeded max_body; further data is dropped.
-    too_large: bool = false,
-    /// Set by on_stream_close once the stream is fully finished.
-    done: bool = false,
-    /// RST_STREAM / abnormal close error code (0 == NO_ERROR/clean).
-    close_error: u32 = 0,
-    /// Set if a callback hit an allocation failure (aborts the session).
-    alloc_failed: bool = false,
 
-    // Request body provider state.
+    // Request (set by caller before submit).
+    method: Method,
+    scheme: []const u8,
+    authority: []const u8,
+    path: []const u8,
+    req_headers: ?*const Headers,
     req_body: []const u8 = &.{},
     req_sent: usize = 0,
+
+    // Response (set by the session coroutine).
+    parsed: ParsedResponse,
+    body: std.ArrayListUnmanaged(u8) = .empty,
+    max_body: usize,
+    too_large: bool = false,
+    alloc_failed: bool = false,
+    close_error: u32 = 0,
+    err: ?anyerror = null,
+    stream_id: i32 = -1,
+
+    /// Set once by the session coroutine when the response is complete (or
+    /// failed); awaited by the caller.
+    done: std.Io.Event = .unset,
+    /// Intrusive node in Connection.streams; touched only by the session coro.
+    node: std.DoublyLinkedList.Node = .{},
+
+    fn finish(s: *Stream, err: ?anyerror) void {
+        if (err != null and s.err == null) s.err = err;
+        s.done.set(s.io);
+    }
 };
+
+/// A multiplexed HTTP/2 connection. Heap-allocated and never moved (coroutines
+/// hold its address). The underlying transport (socket + TLS) is owned by the
+/// caller (client.zig); this only borrows `reader`/`writer`.
+pub const Connection = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+
+    session: ?*c.nghttp2_session = null,
+    callbacks: ?*c.nghttp2_session_callbacks = null,
+
+    events: std.Io.Queue(Event),
+    events_buf: [event_queue_cap]Event = undefined,
+    /// session -> net-reader ack that the last net_data slice was consumed.
+    consumed: std.Io.Event = .unset,
+    group: std.Io.Group = .init,
+
+    /// In-flight streams, owned exclusively by the session coroutine.
+    streams: std.DoublyLinkedList = .{},
+
+    /// Set true once the connection is unusable (GOAWAY/EOF/error/shutdown).
+    /// Read by the pool to decide reuse; written by the session coroutine.
+    closed: std.atomic.Value(bool) = .init(false),
+    /// Count of in-flight streams, for pool bookkeeping.
+    active: std.atomic.Value(usize) = .init(0),
+
+    // Pool key.
+    host_buf: [255]u8 = undefined,
+    host_len: u8 = 0,
+    port: u16 = 0,
+    pool_node: std.DoublyLinkedList.Node = .{},
+
+    /// Create and start a multiplexed HTTP/2 connection over the given
+    /// (ALPN-negotiated) reader/writer. Spawns the session and net-reader
+    /// coroutines.
+    pub fn create(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+        host: []const u8,
+        port: u16,
+    ) !*Connection {
+        const conn = try allocator.create(Connection);
+        errdefer allocator.destroy(conn);
+
+        conn.* = .{
+            .allocator = allocator,
+            .io = io,
+            .reader = reader,
+            .writer = writer,
+            .events = undefined,
+        };
+        conn.events = .init(&conn.events_buf);
+
+        const host_len: u8 = @intCast(@min(host.len, conn.host_buf.len));
+        @memcpy(conn.host_buf[0..host_len], host[0..host_len]);
+        conn.host_len = host_len;
+        conn.port = port;
+
+        if (c.nghttp2_session_callbacks_new(&conn.callbacks) != 0) return error.Http2Init;
+        errdefer c.nghttp2_session_callbacks_del(conn.callbacks);
+        c.nghttp2_session_callbacks_set_on_header_callback(conn.callbacks, onHeader);
+        c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(conn.callbacks, onDataChunk);
+        c.nghttp2_session_callbacks_set_on_stream_close_callback(conn.callbacks, onStreamClose);
+
+        if (c.nghttp2_session_client_new(&conn.session, conn.callbacks, conn) != 0) return error.Http2Init;
+        errdefer c.nghttp2_session_del(conn.session);
+
+        // Spawn the two long-lived coroutines. They run until cancelled by
+        // deinit() or until a fatal error makes them return.
+        conn.group.concurrent(io, sessionLoop, .{conn}) catch return error.Http2Init;
+        conn.group.concurrent(io, netReaderLoop, .{conn}) catch {
+            // Tear down the already-spawned session coroutine before failing.
+            conn.events.close(io);
+            conn.group.cancel(io);
+            return error.Http2Init;
+        };
+
+        return conn;
+    }
+
+    /// Stop the coroutines and free the session. The transport (socket/TLS) is
+    /// the caller's responsibility.
+    pub fn destroy(conn: *Connection) void {
+        conn.closed.store(true, .release);
+        conn.events.close(conn.io);
+        conn.consumed.set(conn.io); // unblock net-reader if waiting on the ack
+        conn.group.cancel(conn.io); // cancel + join both coroutines
+        if (conn.session) |s| c.nghttp2_session_del(s);
+        if (conn.callbacks) |cb| c.nghttp2_session_callbacks_del(cb);
+        conn.allocator.destroy(conn);
+    }
+
+    pub fn isClosed(conn: *Connection) bool {
+        return conn.closed.load(.acquire);
+    }
+
+    /// Submit a request on `stream` and block until the response is complete or
+    /// the stream fails. The caller owns `stream` and its arena.
+    pub fn request(conn: *Connection, stream: *Stream) !void {
+        _ = conn.active.fetchAdd(1, .acq_rel);
+        conn.events.putOne(conn.io, .{ .submit = stream }) catch {
+            _ = conn.active.fetchSub(1, .acq_rel);
+            return error.Http2ConnectionClosed;
+        };
+        stream.done.wait(conn.io) catch |err| {
+            // Cancellation while waiting: the session coroutine may still touch
+            // the stream, so the caller must not free it here. Mark the
+            // connection unusable so it is retired rather than reused.
+            conn.closed.store(true, .release);
+            return err;
+        };
+    }
+
+    /// Release a completed stream. Must be called after `request` returns.
+    pub fn releaseStream(conn: *Connection, stream: *Stream) void {
+        _ = conn.active.fetchSub(1, .acq_rel);
+        _ = stream;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Session coroutine
+// ---------------------------------------------------------------------------
+
+fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
+    const io = conn.io;
+
+    submitSettings(conn) catch {
+        fatalAll(conn, error.Http2Init);
+        return;
+    };
+    drainSend(conn) catch {
+        fatalAll(conn, error.Http2ConnectionClosed);
+        return;
+    };
+
+    while (true) {
+        const ev = conn.events.getOne(io) catch return; // Closed or Canceled
+        switch (ev) {
+            .submit => |s| handleSubmit(conn, s),
+            .net_data => |bytes| {
+                const rv = c.nghttp2_session_mem_recv2(conn.session, bytes.ptr, bytes.len);
+                conn.consumed.set(io); // let the net-reader toss and read more
+                if (rv < 0) {
+                    log.debug("mem_recv2 failed: {s}", .{c.nghttp2_strerror(@intCast(rv))});
+                    fatalAll(conn, error.Http2Protocol);
+                    return;
+                }
+            },
+            .net_eof => {
+                fatalAll(conn, error.Http2IncompleteResponse);
+                return;
+            },
+            .net_err => {
+                fatalAll(conn, error.Http2ConnectionClosed);
+                return;
+            },
+        }
+
+        drainSend(conn) catch {
+            fatalAll(conn, error.Http2ConnectionClosed);
+            return;
+        };
+
+        // The peer closed the session cleanly (e.g. GOAWAY then no more work).
+        if (c.nghttp2_session_want_read(conn.session) == 0 and
+            c.nghttp2_session_want_write(conn.session) == 0)
+        {
+            fatalAll(conn, error.Http2ConnectionClosed);
+            return;
+        }
+    }
+}
+
+fn submitSettings(conn: *Connection) !void {
+    // Client preface SETTINGS (mandatory, first frame). Disable push and
+    // advertise a 1 MiB initial stream window.
+    const iv = [_]c.nghttp2_settings_entry{
+        .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_ENABLE_PUSH), .value = 0 },
+        .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE), .value = 1 << 20 },
+    };
+    if (c.nghttp2_submit_settings(conn.session, @intCast(c.NGHTTP2_FLAG_NONE), &iv, iv.len) != 0) {
+        return error.Http2Init;
+    }
+}
+
+fn handleSubmit(conn: *Connection, s: *Stream) void {
+    const arena = s.arena;
+
+    var nva: std.ArrayListUnmanaged(c.nghttp2_nv) = .empty;
+    addNv(&nva, arena, ":method", s.method.name()) catch return s.finish(error.Http2Init);
+    addNv(&nva, arena, ":scheme", s.scheme) catch return s.finish(error.Http2Init);
+    addNv(&nva, arena, ":authority", s.authority) catch return s.finish(error.Http2Init);
+    addNv(&nva, arena, ":path", s.path) catch return s.finish(error.Http2Init);
+    if (s.req_headers) |hs| {
+        for (hs.keys[0..hs.len], hs.values[0..hs.len]) |k, v| {
+            if (isSkippedHeader(k)) continue;
+            const lower = std.ascii.allocLowerString(arena, k) catch return s.finish(error.Http2Init);
+            addNv(&nva, arena, lower, v) catch return s.finish(error.Http2Init);
+        }
+    }
+
+    var data_prd: c.nghttp2_data_provider = .{
+        .source = .{ .ptr = s },
+        .read_callback = readReqBody,
+    };
+    const prd_ptr: [*c]const c.nghttp2_data_provider =
+        if (s.req_body.len > 0) &data_prd else null;
+
+    const sid = c.nghttp2_submit_request(conn.session, null, nva.items.ptr, nva.items.len, prd_ptr, s);
+    if (sid < 0) {
+        log.debug("submit_request failed: {s}", .{c.nghttp2_strerror(sid)});
+        return s.finish(error.Http2Protocol);
+    }
+    s.stream_id = sid;
+    conn.streams.append(&s.node);
+}
+
+fn drainSend(conn: *Connection) !void {
+    while (c.nghttp2_session_want_write(conn.session) != 0) {
+        var data: [*c]const u8 = undefined;
+        const n = c.nghttp2_session_mem_send2(conn.session, &data);
+        if (n < 0) return error.Http2Protocol;
+        if (n == 0) break;
+        try conn.writer.writeAll(data[0..@intCast(n)]);
+    }
+    try conn.writer.flush();
+}
+
+/// Fail every in-flight stream and mark the connection closed.
+fn fatalAll(conn: *Connection, err: anyerror) void {
+    conn.closed.store(true, .release);
+    var it = conn.streams.first;
+    while (it) |node| {
+        it = node.next;
+        const s: *Stream = @fieldParentPtr("node", node);
+        conn.streams.remove(node);
+        s.finish(err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Net-reader coroutine
+// ---------------------------------------------------------------------------
+
+fn netReaderLoop(conn: *Connection) std.Io.Cancelable!void {
+    const io = conn.io;
+    while (true) {
+        const buffered = conn.reader.buffered();
+        if (buffered.len > 0) {
+            conn.events.putOne(io, .{ .net_data = buffered }) catch return; // Closed/Canceled
+            conn.consumed.wait(io) catch return;
+            conn.consumed.reset();
+            conn.reader.toss(buffered.len);
+        } else {
+            conn.reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => {
+                    conn.events.putOne(io, .net_eof) catch {};
+                    return;
+                },
+                // ReadFailed also covers cancellation during teardown; the real
+                // cause is stashed in the underlying reader. Either way we stop.
+                else => {
+                    conn.events.putOne(io, .net_err) catch {};
+                    return;
+                },
+            };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// nghttp2 callbacks (run on the session coroutine, inside mem_recv2)
+// ---------------------------------------------------------------------------
 
 fn streamFor(session: ?*c.nghttp2_session, stream_id: i32) ?*Stream {
     const ptr = c.nghttp2_session_get_stream_user_data(session, stream_id) orelse return null;
@@ -92,19 +413,15 @@ fn onHeader(
     const n = name[0..namelen];
     const v = value[0..valuelen];
 
-    // Pseudo-headers (":status", etc.) are not stored as regular headers.
     if (n.len > 0 and n[0] == ':') {
         if (std.mem.eql(u8, n, ":status")) {
             const code = std.fmt.parseInt(u16, v, 10) catch return 0;
-            // Status is an exhaustive enum; map unknown codes defensively rather
-            // than risk illegal behavior from a bare @enumFromInt.
             if (std.enums.fromInt(Status, code)) |st| s.parsed.status = st;
         }
         return 0;
     }
 
-    // Regular header: nghttp2's buffers are only valid during this callback, so
-    // copy into the response arena before storing.
+    // nghttp2's buffers are valid only during this callback; copy before storing.
     const name_copy = s.arena.dupe(u8, n) catch {
         s.alloc_failed = true;
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -113,8 +430,7 @@ fn onHeader(
         s.alloc_failed = true;
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     };
-    // Ignore overflow past max_header_count (matches HTTP/1.1 leniency).
-    s.parsed.headers.add(name_copy, value_copy) catch {};
+    s.parsed.headers.add(name_copy, value_copy) catch {}; // ignore overflow
     return 0;
 }
 
@@ -147,10 +463,20 @@ fn onStreamClose(
     error_code: u32,
     user_data: ?*anyopaque,
 ) callconv(.c) c_int {
-    _ = user_data;
+    const conn: *Connection = @ptrCast(@alignCast(user_data.?));
     const s = streamFor(session, stream_id) orelse return 0;
     s.close_error = error_code;
-    s.done = true;
+    conn.streams.remove(&s.node);
+
+    var err: ?anyerror = null;
+    if (s.alloc_failed) {
+        err = error.Http2Init;
+    } else if (error_code != 0) {
+        err = error.Http2StreamReset;
+    } else if (s.too_large) {
+        err = error.ResponseTooLarge;
+    }
+    s.finish(err);
     return 0;
 }
 
@@ -177,6 +503,10 @@ fn readReqBody(
     return @intCast(n);
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn addNv(
     list: *std.ArrayListUnmanaged(c.nghttp2_nv),
     arena: std.mem.Allocator,
@@ -196,8 +526,7 @@ fn addNv(
     });
 }
 
-/// Headers that must not be forwarded as HTTP/2 fields (carried as pseudo-headers
-/// or forbidden by RFC 9113 §8.2.2).
+/// Headers carried as pseudo-headers or forbidden as HTTP/2 fields (RFC 9113 §8.2.2).
 fn isSkippedHeader(name: []const u8) bool {
     const skip = [_][]const u8{
         "host",              "connection", "keep-alive", "proxy-connection",
@@ -207,138 +536,4 @@ fn isSkippedHeader(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, s)) return true;
     }
     return false;
-}
-
-/// Perform a single HTTP/2 request over an already-established (ALPN-negotiated)
-/// connection and return the fully-buffered response body. Status and headers
-/// are written into `parsed`. Drives the nghttp2 session synchronously: this
-/// owns the reader/writer for the duration of the call (one request at a time).
-pub fn fetchBuffered(
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-    arena: std.mem.Allocator,
-    info: RequestInfo,
-    parsed: *ParsedResponse,
-    max_body: usize,
-    max_header_count: usize,
-) (Http2Error || error{ ReadFailed, WriteFailed })![]const u8 {
-    parsed.headers = Headers.init(arena, max_header_count) catch return error.Http2Init;
-    parsed.version_major = 2;
-    parsed.version_minor = 0;
-
-    var callbacks: ?*c.nghttp2_session_callbacks = null;
-    if (c.nghttp2_session_callbacks_new(&callbacks) != 0) return error.Http2Init;
-    defer c.nghttp2_session_callbacks_del(callbacks);
-    c.nghttp2_session_callbacks_set_on_header_callback(callbacks, onHeader);
-    c.nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, onDataChunk);
-    c.nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, onStreamClose);
-
-    var stream: Stream = .{
-        .arena = arena,
-        .parsed = parsed,
-        .max_body = max_body,
-        .req_body = info.body orelse &.{},
-    };
-
-    var session: ?*c.nghttp2_session = null;
-    if (c.nghttp2_session_client_new(&session, callbacks, null) != 0) return error.Http2Init;
-    defer c.nghttp2_session_del(session);
-
-    // Client connection preface: SETTINGS is mandatory and must be the first
-    // frame. Disable server push (we don't support it) and advertise a 1 MiB
-    // stream window.
-    const iv = [_]c.nghttp2_settings_entry{
-        .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_ENABLE_PUSH), .value = 0 },
-        .{ .settings_id = @intCast(c.NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE), .value = 1 << 20 },
-    };
-    if (c.nghttp2_submit_settings(session, @intCast(c.NGHTTP2_FLAG_NONE), &iv, iv.len) != 0) {
-        return error.Http2Init;
-    }
-
-    // Build the request header list (pseudo-headers first, then user headers).
-    var nva: std.ArrayListUnmanaged(c.nghttp2_nv) = .empty;
-    addNv(&nva, arena, ":method", info.method.name()) catch return error.Http2Init;
-    addNv(&nva, arena, ":scheme", info.scheme) catch return error.Http2Init;
-    addNv(&nva, arena, ":authority", info.authority) catch return error.Http2Init;
-    addNv(&nva, arena, ":path", info.path) catch return error.Http2Init;
-    if (info.headers) |hs| {
-        for (hs.keys[0..hs.len], hs.values[0..hs.len]) |k, v| {
-            if (isSkippedHeader(k)) continue;
-            const lower = std.ascii.allocLowerString(arena, k) catch return error.Http2Init;
-            addNv(&nva, arena, lower, v) catch return error.Http2Init;
-        }
-    }
-
-    // Attach a DATA provider only when there is a request body.
-    var data_prd: c.nghttp2_data_provider = .{
-        .source = .{ .ptr = &stream },
-        .read_callback = readReqBody,
-    };
-    const prd_ptr: [*c]const c.nghttp2_data_provider = if (info.body != null) &data_prd else null;
-
-    const stream_id = c.nghttp2_submit_request(session, null, nva.items.ptr, nva.items.len, prd_ptr, &stream);
-    if (stream_id < 0) {
-        log.debug("nghttp2_submit_request failed: {s}", .{c.nghttp2_strerror(stream_id)});
-        return error.Http2Protocol;
-    }
-
-    try drive(session, &stream, reader, writer);
-
-    if (stream.alloc_failed) return error.Http2Init;
-    if (stream.too_large) return error.ResponseTooLarge;
-    if (stream.close_error != 0) return error.Http2StreamReset;
-
-    // Derive content metadata exactly like the HTTP/1.1 parser does.
-    if (parsed.headers.get("Content-Type")) |ct| parsed.content_type = ContentType.fromContentType(ct);
-    if (parsed.headers.get("Content-Encoding")) |ce| parsed.content_encoding = ContentEncoding.fromString(ce);
-
-    return stream.body.items;
-}
-
-/// The synchronous send/recv loop: flush everything nghttp2 wants to send, then
-/// read and feed bytes, until the stream completes.
-fn drive(
-    session: ?*c.nghttp2_session,
-    stream: *Stream,
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-) (Http2Error || error{ ReadFailed, WriteFailed })!void {
-    while (true) {
-        // Send: drain all pending output frames.
-        while (c.nghttp2_session_want_write(session) != 0) {
-            var data: [*c]const u8 = undefined;
-            const n = c.nghttp2_session_mem_send2(session, &data);
-            if (n < 0) return error.Http2Protocol;
-            if (n == 0) break;
-            writer.writeAll(data[0..@intCast(n)]) catch return error.WriteFailed;
-        }
-        writer.flush() catch return error.WriteFailed;
-
-        if (stream.done) return;
-        if (stream.alloc_failed) return;
-
-        if (c.nghttp2_session_want_read(session) == 0 and c.nghttp2_session_want_write(session) == 0) {
-            // Session is idle but the stream never completed.
-            return error.Http2IncompleteResponse;
-        }
-
-        // Receive: feed buffered bytes to nghttp2, or block for more.
-        const buffered = reader.buffered();
-        if (buffered.len > 0) {
-            const rv = c.nghttp2_session_mem_recv2(session, buffered.ptr, buffered.len);
-            if (rv < 0) {
-                log.debug("nghttp2_session_mem_recv2 failed: {s}", .{c.nghttp2_strerror(@intCast(rv))});
-                return error.Http2Protocol;
-            }
-            reader.toss(@intCast(rv));
-        } else {
-            reader.fillMore() catch |err| switch (err) {
-                error.EndOfStream => {
-                    if (stream.done) return;
-                    return error.Http2IncompleteResponse;
-                },
-                else => return error.ReadFailed,
-            };
-        }
-    }
 }
