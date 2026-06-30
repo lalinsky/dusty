@@ -92,19 +92,19 @@ defer response.deinit();
 
 ## HTTP/2 (client)
 
-The client can speak HTTP/2, negotiated over TLS ALPN. It is gated behind the
-`use_http2` build option (off by default) because it links the bundled
-[nghttp2](https://github.com/nghttp2/nghttp2) C library:
+The client can speak HTTP/2, negotiated over TLS ALPN. It links the bundled
+[nghttp2](https://github.com/nghttp2/nghttp2) C library and is on by default; to
+build without it, set the `use_http2` build option to false:
 
 ```zig
 const dusty = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
-    .use_http2 = true,
+    .use_http2 = false, // optional: omit HTTP/2 / nghttp2
 });
 ```
 
-Then opt in per client via the `http2` config flag. When enabled, HTTPS
+Opt in per client via the `http2` config flag. When enabled, HTTPS
 connections advertise `h2` and, if the server agrees, requests are multiplexed
 over a single connection (one connection per origin, shared across concurrent
 and sequential requests). Servers that don't negotiate `h2` transparently fall

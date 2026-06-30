@@ -5,10 +5,10 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const use_tls = b.option(bool, "use_tls", "Build with TLS/HTTPS support via tls.zig") orelse true;
-    // HTTP/2 support is gated behind this option (like use_tls) because it links
-    // the nghttp2 C library. Defaults off until the implementation lands. Requires
-    // use_tls, since h2 is negotiated via TLS ALPN.
-    const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
+    // HTTP/2 support links the vendored nghttp2 C library. On by default (like
+    // use_tls); set -Duse_http2=false to build without it. h2 is negotiated via
+    // TLS ALPN, so it's only effective together with use_tls.
+    const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse true;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
