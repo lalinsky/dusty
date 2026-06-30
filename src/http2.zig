@@ -588,7 +588,14 @@ fn onHeader(
         s.alloc_failed = true;
         return c.NGHTTP2_ERR_CALLBACK_FAILURE;
     };
-    s.parsed.headers.add(name_copy, value_copy) catch {}; // ignore overflow
+    s.parsed.headers.add(name_copy, value_copy) catch {
+        // Too many response headers (past max_response_header_count). Reset just
+        // this stream rather than failing the whole connection: returning
+        // CALLBACK_FAILURE here would tear down every multiplexed stream, so use
+        // TEMPORAL_CALLBACK_FAILURE, which makes nghttp2 RST only this stream.
+        if (s.err == null) s.err = error.TooManyHeaders;
+        return c.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    };
     return 0;
 }
 

@@ -814,7 +814,7 @@ pub const Client = struct {
     /// Find a reusable, open h2 connection for host:port and take a reference.
     /// Closed connections are skipped (their reaper frees them); the CAS in
     /// `tryAcquire` prevents resurrecting one that is racing with its reaper.
-    fn acquireH2(self: *Client, host: []const u8, port: u16) ?*http2.Connection {
+    fn acquireH2(self: *Client, host: []const u8, port: u16, unix_socket_path: ?[]const u8) ?*http2.Connection {
         if (!build_options.use_http2) return null;
         self.h2_pool.mutex.lockUncancelable(self.io);
         defer self.h2_pool.mutex.unlock(self.io);
@@ -824,7 +824,9 @@ pub const Client = struct {
             it = node.next;
             const entry: *H2Entry = @fieldParentPtr("node", node);
             if (entry.conn.isClosed()) continue;
-            if (entry.conn.port == port and std.ascii.eqlIgnoreCase(entry.conn.host_buf[0..entry.conn.host_len], host)) {
+            // Match on the transport too (TCP host:port vs unix socket path) so a
+            // unix-socket request can't reuse a TCP connection, or vice versa.
+            if (entry.transport.matches(host, port, .https, unix_socket_path)) {
                 if (entry.conn.tryAcquire()) return entry.conn;
             }
         }
@@ -1186,7 +1188,7 @@ pub const Client = struct {
         // Reuse an existing multiplexed HTTP/2 connection for this origin before
         // dialing a new one.
         if (build_options.use_http2 and self.config.http2 and state.protocol == .https) {
-            if (self.acquireH2(host, state.port)) |h2conn| {
+            if (self.acquireH2(host, state.port, state.options.unix_socket_path)) |h2conn| {
                 var resp = try self.requestHttp2(h2conn, state, host);
                 var resolve_buf: [2048]u8 = undefined;
                 var referer_buf: [2048]u8 = undefined;
