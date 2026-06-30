@@ -883,6 +883,52 @@ pub const Client = struct {
         }
     }
 
+    /// Build the outgoing header set for an HTTP/2 request, applying the same
+    /// policy as writeRequest: skip Host/Content-Length, strip sensitive/body
+    /// headers per the redirect rules, and add Referer, default User-Agent, and
+    /// Accept-Encoding. Allocated on `a`; returned as a stable pointer.
+    fn buildH2RequestHeaders(self: *Client, a: std.mem.Allocator, state: FetchState) !*const Headers {
+        var count: usize = 4; // Referer + User-Agent + Accept-Encoding + slack
+        if (state.options.headers) |h| count += h.len;
+
+        const headers = try a.create(Headers);
+        headers.* = try Headers.init(a, count);
+
+        var has_referer = false;
+        var has_user_agent = false;
+        var has_accept_encoding = false;
+        if (state.options.headers) |h| {
+            var it = h.iterator();
+            while (it.next()) |entry| {
+                if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Length")) continue;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Referer")) has_referer = true;
+                if (std.ascii.eqlIgnoreCase(entry.key, "User-Agent")) has_user_agent = true;
+                if (std.ascii.eqlIgnoreCase(entry.key, "Accept-Encoding")) has_accept_encoding = true;
+                if (shouldStripHeader(entry.key, state.strip_sensitive_headers, state.strip_body_headers)) continue;
+                try http.validateHeaderName(entry.key);
+                try http.validateHeaderValue(entry.value);
+                try headers.add(entry.key, entry.value);
+            }
+        }
+        if (state.referer) |referer| {
+            if (!has_referer) {
+                try http.validateHeaderValue(referer);
+                try headers.add("Referer", referer);
+            }
+        }
+        if (self.config.user_agent) |ua| {
+            if (!has_user_agent) {
+                try http.validateHeaderValue(ua);
+                try headers.add("User-Agent", ua);
+            }
+        }
+        if (state.options.decompress and !has_accept_encoding) {
+            try headers.add("Accept-Encoding", "gzip, deflate");
+        }
+        return headers;
+    }
+
     /// Issue one request over a multiplexed h2 connection (whose caller reference
     /// is already held) and return a ClientResponse with a fully-buffered body.
     /// On any error the caller reference is dropped; on success it transfers to
@@ -917,6 +963,13 @@ pub const Client = struct {
                 break :blk try std.fmt.allocPrint(a, "{s}:{d}", .{ host, state.port });
             };
 
+            // Apply the same outgoing-header policy as HTTP/1.1: drop Host /
+            // Content-Length (carried as :authority / framing), strip sensitive
+            // and body headers per the redirect rules, and add Referer, default
+            // User-Agent, and Accept-Encoding. The result is what the h2 layer
+            // emits (it additionally drops h2-forbidden connection headers).
+            const req_headers = try self.buildH2RequestHeaders(a, state);
+
             // Body pipe buffer, sized to the stream window so the session
             // coroutine never blocks pushing DATA frames.
             const body_buf = try a.alloc(u8, http2.stream_window_bytes);
@@ -929,9 +982,8 @@ pub const Client = struct {
                 .scheme = "https",
                 .authority = authority,
                 .path = path,
-                .req_headers = state.options.headers,
+                .req_headers = req_headers,
                 .req_body = state.options.body orelse &.{},
-                .accept_encoding = if (state.options.decompress) "gzip, deflate" else null,
                 .parsed = .{ .arena = a, .version_major = 2, .version_minor = 0 },
                 .body = .init(body_buf),
             };
@@ -1155,7 +1207,9 @@ pub const Client = struct {
             return resp;
         }
 
-        errdefer self.pool.release(conn);
+        // Released early on the redirect path; the errdefer must not release again.
+        var conn_released = false;
+        errdefer if (!conn_released) self.pool.release(conn);
 
         // Send request
         try writeRequest(conn.writer, .{
@@ -1214,6 +1268,7 @@ pub const Client = struct {
                 }
                 if (!conn.parser.shouldKeepAlive()) conn.closing = true;
                 self.pool.release(conn);
+                conn_released = true; // disarm the errdefer; conn is back in the pool
 
                 var referer_buf: [2048]u8 = undefined;
                 const next = try self.buildRedirectState(state, host, status_code, redirect_uri, &referer_buf);
@@ -1315,10 +1370,11 @@ pub const Client = struct {
         var aux_buf: []u8 = resolve_buf[0..];
         const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return null;
         // redirect_uri now lives in resolve_buf (caller's frame), so the response
-        // (and its arena, which `location` pointed into) can be freed.
-        const next = try self.buildRedirectState(state, host, status_code, redirect_uri, referer_buf);
+        // (and its arena, which `location` pointed into) can be freed. Release it
+        // before buildRedirectState, which can fail — otherwise the response would
+        // leak on that error path.
         resp.deinit();
-        return next;
+        return try self.buildRedirectState(state, host, status_code, redirect_uri, referer_buf);
     }
 };
 
@@ -1348,6 +1404,22 @@ const WriteRequestOptions = struct {
     referer: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
 };
+
+/// Redirect/cross-origin header policy, shared by the HTTP/1.1 and HTTP/2 request
+/// paths. Returns true if a user-supplied header must be dropped: sensitive
+/// credentials when crossing origins, and body-description headers when the body
+/// is dropped (e.g. on a 303).
+fn shouldStripHeader(name: []const u8, strip_sensitive: bool, strip_body: bool) bool {
+    if (strip_sensitive) {
+        const sensitive = [_][]const u8{ "Authorization", "Www-Authenticate", "Cookie", "Cookie2", "Proxy-Authorization", "Proxy-Authenticate" };
+        for (sensitive) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    if (strip_body) {
+        const body_headers = [_][]const u8{ "Content-Encoding", "Content-Language", "Content-Location", "Content-Type" };
+        for (body_headers) |h| if (std.ascii.eqlIgnoreCase(name, h)) return true;
+    }
+    return false;
+}
 
 fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     // Reject any CRLF/NUL smuggled in via the URL host (a URL like
@@ -1388,20 +1460,7 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
             if (std.ascii.eqlIgnoreCase(entry.key, "Referer")) has_referer = true;
             if (std.ascii.eqlIgnoreCase(entry.key, "User-Agent")) has_user_agent = true;
 
-            if (opts.strip_sensitive_headers) {
-                if (std.ascii.eqlIgnoreCase(entry.key, "Authorization")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Www-Authenticate")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Cookie")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Cookie2")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Proxy-Authorization")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Proxy-Authenticate")) continue;
-            }
-            if (opts.strip_body_headers) {
-                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Encoding")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Language")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Location")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Content-Type")) continue;
-            }
+            if (shouldStripHeader(entry.key, opts.strip_sensitive_headers, opts.strip_body_headers)) continue;
 
             try http.validateHeaderName(entry.key);
             try http.validateHeaderValue(entry.value);

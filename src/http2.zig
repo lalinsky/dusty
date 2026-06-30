@@ -102,12 +102,13 @@ pub const Stream = struct {
     scheme: []const u8,
     authority: []const u8,
     path: []const u8,
+    /// Final outgoing headers (the client already applied request/redirect
+    /// policy: Host/Content-Length removed, sensitive/body headers stripped,
+    /// Referer/User-Agent/Accept-Encoding added). This layer only drops
+    /// h2-forbidden connection headers and lower-cases names.
     req_headers: ?*const Headers,
     req_body: []const u8 = &.{},
     req_sent: usize = 0,
-    /// When set, sent as the "accept-encoding" header (unless the user already
-    /// provided one).
-    accept_encoding: ?[]const u8 = null,
 
     // Response (set by the session coroutine).
     parsed: ParsedResponse,
@@ -276,8 +277,9 @@ pub const Connection = struct {
     /// The caller owns `stream` and its arena and must already hold a connection
     /// reference.
     pub fn request(conn: *Connection, stream: *Stream) !void {
-        conn.events.putOne(conn.io, .{ .submit = stream }) catch {
-            return error.Http2ConnectionClosed;
+        conn.events.putOne(conn.io, .{ .submit = stream }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.Closed => return error.Http2ConnectionClosed,
         };
         stream.headers_done.wait(conn.io) catch |err| {
             // Cancellation while waiting: the session coroutine may still touch
@@ -383,7 +385,14 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
     };
 
     while (true) {
-        const ev = conn.events.getOne(io) catch return; // Closed or Canceled
+        // On cancel/close, wake any in-flight streams (callers may be blocked on
+        // headers_done/done or on a body read) before unwinding. Cancellation
+        // must still propagate — never swallow error.Canceled.
+        const ev = conn.events.getOne(io) catch |err| {
+            fatalAll(conn, error.Http2ConnectionClosed);
+            if (err == error.Canceled) return error.Canceled;
+            return; // error.Closed
+        };
         switch (ev) {
             .submit => |s| handleSubmit(conn, s),
             .consume => |x| {
@@ -447,17 +456,12 @@ fn handleSubmit(conn: *Connection, s: *Stream) void {
     addNv(&nva, arena, ":scheme", s.scheme) catch return s.finish(error.Http2Init);
     addNv(&nva, arena, ":authority", s.authority) catch return s.finish(error.Http2Init);
     addNv(&nva, arena, ":path", s.path) catch return s.finish(error.Http2Init);
-    var user_has_accept_encoding = false;
     if (s.req_headers) |hs| {
         for (hs.keys[0..hs.len], hs.values[0..hs.len]) |k, v| {
             if (isSkippedHeader(k)) continue;
-            if (std.ascii.eqlIgnoreCase(k, "accept-encoding")) user_has_accept_encoding = true;
             const lower = std.ascii.allocLowerString(arena, k) catch return s.finish(error.Http2Init);
             addNv(&nva, arena, lower, v) catch return s.finish(error.Http2Init);
         }
-    }
-    if (!user_has_accept_encoding) {
-        if (s.accept_encoding) |ae| addNv(&nva, arena, "accept-encoding", ae) catch return s.finish(error.Http2Init);
     }
 
     var data_prd: c.nghttp2_data_provider = .{
@@ -495,6 +499,9 @@ fn fatalAll(conn: *Connection, err: anyerror) void {
         it = node.next;
         const s: *Stream = @fieldParentPtr("node", node);
         conn.streams.remove(node);
+        // Close the body pipe too: a caller blocked in BodyReader.readStream is
+        // waiting on body.get(), not on the headers_done/done events.
+        s.body.close(s.io);
         s.finish(err);
     }
 }
@@ -508,20 +515,30 @@ fn netReaderLoop(conn: *Connection) std.Io.Cancelable!void {
     while (true) {
         const buffered = conn.reader.buffered();
         if (buffered.len > 0) {
-            conn.events.putOne(io, .{ .net_data = buffered }) catch return; // Closed/Canceled
-            conn.consumed.wait(io) catch return;
+            conn.events.putOne(io, .{ .net_data = buffered }) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.Closed => return, // session gone
+            };
+            try conn.consumed.wait(io); // propagate cancellation
             conn.consumed.reset();
             conn.reader.toss(buffered.len);
         } else {
             conn.reader.fillMore() catch |err| switch (err) {
+                // NOTE: std.Io.Reader maps a cancelled read to ReadFailed (not
+                // Canceled), so cancellation surfaces here as the `else` arm; the
+                // queue posts below still propagate Canceled if it races.
                 error.EndOfStream => {
-                    conn.events.putOne(io, .net_eof) catch {};
+                    conn.events.putOne(io, .net_eof) catch |e| switch (e) {
+                        error.Canceled => return error.Canceled,
+                        error.Closed => {},
+                    };
                     return;
                 },
-                // ReadFailed also covers cancellation during teardown; the real
-                // cause is stashed in the underlying reader. Either way we stop.
                 else => {
-                    conn.events.putOne(io, .net_err) catch {};
+                    conn.events.putOne(io, .net_err) catch |e| switch (e) {
+                        error.Canceled => return error.Canceled,
+                        error.Closed => {},
+                    };
                     return;
                 },
             };

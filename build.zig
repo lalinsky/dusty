@@ -74,6 +74,27 @@ pub fn build(b: *std.Build) void {
         nghttp2_translate_c.addIncludePath(b.path("src/nghttp2/lib/includes"));
         mod.addImport("nghttp2", nghttp2_translate_c.createModule());
 
+        // nghttp2 needs platform feature macros so the right headers/APIs are
+        // visible under -std=c99: a feature-test macro to un-hide POSIX/C99
+        // declarations (e.g. clock_gettime, vsnprintf) plus HAVE_* to select
+        // nghttp2's code paths. Windows uses nghttp2's own Win32 fallbacks
+        // (its inline htonl, windows.h time). Applying the POSIX set
+        // unconditionally breaks non-Unix builds (e.g. arpa/inet.h not found),
+        // and a too-strict _POSIX_C_SOURCE hides vsnprintf on Darwin.
+        const c99 = "-std=c99";
+        const staticlib = "-DNGHTTP2_STATICLIB";
+        const have_posix = [_][]const u8{
+            "-DHAVE_ARPA_INET_H=1",
+            "-DHAVE_NETINET_IN_H=1",
+            "-DHAVE_CLOCK_GETTIME=1",
+            "-DHAVE_DECL_CLOCK_MONOTONIC=1",
+        };
+        const nghttp2_flags: []const []const u8 = switch (target.result.os.tag) {
+            .windows => &.{ c99, staticlib, "-DWIN32", "-DHAVE_WINDOWS_H=1", "-DHAVE_GETTICKCOUNT64=1" },
+            .macos, .ios, .tvos, .watchos => &([_][]const u8{ c99, staticlib, "-D_DARWIN_C_SOURCE" } ++ have_posix),
+            else => &([_][]const u8{ c99, staticlib, "-D_GNU_SOURCE" } ++ have_posix),
+        };
+
         mod.addCSourceFiles(.{
             .files = &[_][]const u8{
                 "src/nghttp2/lib/nghttp2_alpn.c",
@@ -103,15 +124,7 @@ pub fn build(b: *std.Build) void {
                 "src/nghttp2/lib/nghttp2_version.c",
                 "src/nghttp2/lib/sfparse.c",
             },
-            .flags = &.{
-                "-std=c99",
-                "-DNGHTTP2_STATICLIB",
-                "-D_POSIX_C_SOURCE=199309L",
-                "-DHAVE_ARPA_INET_H=1",
-                "-DHAVE_NETINET_IN_H=1",
-                "-DHAVE_CLOCK_GETTIME=1",
-                "-DHAVE_DECL_CLOCK_MONOTONIC=1",
-            },
+            .flags = nghttp2_flags,
         });
         mod.addIncludePath(b.path("src/nghttp2/lib"));
         mod.addIncludePath(b.path("src/nghttp2/lib/includes"));
