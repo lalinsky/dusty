@@ -128,10 +128,11 @@ pub const ClientConfig = struct {
     /// User-Agent header sent with requests. Set to null to omit it.
     /// A per-request User-Agent header takes precedence over this default.
     user_agent: ?[]const u8 = default_user_agent,
-    /// Advertise HTTP/2 ("h2") via TLS ALPN on HTTPS connections. Only effective
-    /// when the library is built with the `use_http2` build option; ignored for
-    /// cleartext (http://) connections. Defaults off.
-    http2: bool = false,
+    /// Advertise HTTP/2 ("h2") via TLS ALPN on HTTPS connections, falling back to
+    /// HTTP/1.1 when the server doesn't negotiate it. On by default; only
+    /// effective when built with the `use_http2` build option, and ignored for
+    /// cleartext (http://) connections. Set false to force HTTP/1.1.
+    http2: bool = true,
 };
 
 /// Options for a single fetch request.

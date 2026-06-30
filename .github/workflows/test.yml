@@ -43,12 +43,14 @@ jobs:
       run: zig build examples
       timeout-minutes: 5
 
-    - name: Run client example
-      run: ./zig-out/bin/client-example https://httpbin.org/get
+    # Fetch over HTTP/2 (nghttp2.org serves an httpbin instance over h2; h2 is on
+    # by default). Exercises the full h2 client path on the whole OS matrix.
+    - name: Run client example (HTTP/2)
+      run: ./zig-out/bin/client-example https://nghttp2.org/httpbin/get
       timeout-minutes: 1
       if: runner.os != 'Windows'
 
-    - name: Run client example (Windows)
-      run: .\zig-out\bin\client-example.exe https://httpbin.org/get
+    - name: Run client example (HTTP/2, Windows)
+      run: .\zig-out\bin\client-example.exe https://nghttp2.org/httpbin/get
       timeout-minutes: 1
       if: runner.os == 'Windows'

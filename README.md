@@ -104,14 +104,14 @@ const dusty = b.dependency("dusty", .{
 });
 ```
 
-Opt in per client via the `http2` config flag. When enabled, HTTPS
+HTTP/2 is also enabled per client by default (the `http2` config flag). HTTPS
 connections advertise `h2` and, if the server agrees, requests are multiplexed
 over a single connection (one connection per origin, shared across concurrent
 and sequential requests). Servers that don't negotiate `h2` transparently fall
-back to HTTP/1.1.
+back to HTTP/1.1. Set `.http2 = false` to force HTTP/1.1.
 
 ```zig
-var client = http.Client.init(allocator, io, .{ .http2 = true });
+var client = http.Client.init(allocator, io, .{}); // h2 on by default
 defer client.deinit();
 
 var response = try client.fetch("https://nghttp2.org/", .{});

@@ -20,6 +20,8 @@ pub fn main(init: std.process.Init) !void {
     var response = try client.fetch(url, .{});
     defer response.deinit();
 
+    const v = response.version();
+    std.debug.print("HTTP/{d}.{d}\n", .{ v.major, v.minor });
     std.debug.print("Status: {any}\n", .{response.status()});
 
     std.debug.print("Headers:\n", .{});
