@@ -1032,6 +1032,9 @@ pub const Client = struct {
         protocol: Protocol,
         ca_bundle: ?CaBundleRef,
         unix_socket_path: ?[]const u8,
+        // Whether to offer HTTP/2 via TLS ALPN. Callers that can't speak h2
+        // (e.g. the WebSocket upgrade path) must pass false.
+        advertise_http2: bool,
     ) !*Connection {
         // Try to get a connection from the pool
         const conn = self.pool.acquire(self.io, host, port, protocol, unix_socket_path) orelse blk: {
@@ -1058,7 +1061,7 @@ pub const Client = struct {
                 protocol,
                 ca_bundle,
                 unix_socket_path,
-                build_options.use_http2 and self.config.http2 and protocol == .https,
+                advertise_http2,
             );
 
             break :blk new_conn;
@@ -1089,8 +1092,9 @@ pub const Client = struct {
         // Reject any CRLF/NUL smuggled in via the URL host.
         try http.validateHeaderValue(host);
 
-        // Acquire or create a connection
-        const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle, options.unix_socket_path);
+        // Acquire or create a connection. WebSocket upgrades are HTTP/1.1 only,
+        // so never advertise h2 here.
+        const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle, options.unix_socket_path, false);
         errdefer {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -1193,8 +1197,10 @@ pub const Client = struct {
             }
         }
 
-        // Acquire or create a connection
-        const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path);
+        // Acquire or create a connection. The h2 branch below takes ownership of
+        // the transport, so the errdefer release lives after it (with the
+        // conn_released guard), not here.
+        const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path, build_options.use_http2 and self.config.http2 and state.protocol == .https);
 
         // Freshly negotiated HTTP/2: the h2 layer takes ownership of the transport.
         if (conn.http_version == .http_2) {
