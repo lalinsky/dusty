@@ -38,6 +38,33 @@ pub const Protocol = enum {
     }
 };
 
+/// Negotiated HTTP wire version for a connection. Set after the TLS handshake
+/// from the ALPN-selected protocol; defaults to HTTP/1.1 (cleartext, or TLS
+/// without ALPN/with "http/1.1" selected).
+pub const HttpVersion = enum {
+    http_1_1,
+    http_2,
+
+    /// Maps a TLS ALPN protocol id ("h2", "http/1.1") to a version. An unknown
+    /// or missing id falls back to HTTP/1.1.
+    pub fn fromAlpn(alpn: ?[]const u8) HttpVersion {
+        const id = alpn orelse return .http_1_1;
+        if (std.mem.eql(u8, id, "h2")) return .http_2;
+        return .http_1_1;
+    }
+};
+
+test "nghttp2 links and reports a version" {
+    // Only when built with HTTP/2: the `nghttp2` module doesn't exist otherwise,
+    // and this comptime-false branch is skipped during analysis.
+    if (build_options.use_http2) {
+        const ng = @import("nghttp2");
+        const info = ng.nghttp2_version(0);
+        try std.testing.expect(info != null);
+        try std.testing.expect(info.*.version_num != 0);
+    }
+}
+
 /// Default User-Agent sent with requests unless overridden.
 pub const default_user_agent = "dusty/0.1.0";
 
@@ -58,6 +85,10 @@ pub const ClientConfig = struct {
     /// User-Agent header sent with requests. Set to null to omit it.
     /// A per-request User-Agent header takes precedence over this default.
     user_agent: ?[]const u8 = default_user_agent,
+    /// Advertise HTTP/2 ("h2") via TLS ALPN on HTTPS connections. Only effective
+    /// when the library is built with the `use_http2` build option; ignored for
+    /// cleartext (http://) connections. Defaults off.
+    http2: bool = false,
 };
 
 /// Options for a single fetch request.
@@ -252,6 +283,9 @@ pub const Connection = struct {
 
     // Protocol and TLS
     protocol: Protocol,
+    // Negotiated wire version. For HTTPS this is set from TLS ALPN after the
+    // handshake; otherwise it stays .http_1_1.
+    http_version: HttpVersion = .http_1_1,
     tcp_reader: std.Io.net.Stream.Reader,
     tcp_writer: std.Io.net.Stream.Writer,
 
@@ -303,6 +337,7 @@ pub const Connection = struct {
         protocol: Protocol,
         ca_bundle: ?CaBundleRef,
         unix_socket_path: ?[]const u8,
+        advertise_http2: bool,
     ) !void {
         self.allocator = allocator;
         self.io = io;
@@ -339,6 +374,7 @@ pub const Connection = struct {
 
         // Protocol and TLS initialization
         self.protocol = protocol;
+        self.http_version = .http_1_1;
 
         if (protocol == .https) {
             if (!build_options.use_tls) return error.TlsNotConfigured;
@@ -362,6 +398,13 @@ pub const Connection = struct {
 
             self.tls_rng = .{ .io = self.io };
 
+            // Offer h2 (preferred) and http/1.1 via ALPN when HTTP/2 is enabled;
+            // otherwise advertise nothing, preserving HTTP/1.1-only behavior.
+            const alpn_protocols: []const []const u8 = if (advertise_http2)
+                &.{ "h2", "http/1.1" }
+            else
+                &.{};
+
             self.tls_conn = tls.client(
                 &self.tcp_reader.interface,
                 &self.tcp_writer.interface,
@@ -370,8 +413,12 @@ pub const Connection = struct {
                     .root_ca = ca.bundle.*,
                     .now = std.Io.Clock.real.now(self.io),
                     .rng = self.tls_rng.interface(),
+                    .alpn_protocols = alpn_protocols,
                 },
             ) catch return error.TlsInitializationFailed;
+
+            // Record the negotiated wire version from the ALPN selection.
+            self.http_version = HttpVersion.fromAlpn(self.tls_conn.?.alpn_protocol);
 
             self.tls_reader = self.tls_conn.?.reader(self.read_buffer);
             self.tls_writer = self.tls_conn.?.writer(self.write_buffer);
@@ -662,6 +709,9 @@ pub const Client = struct {
         protocol: Protocol,
         ca_bundle: ?CaBundleRef,
         unix_socket_path: ?[]const u8,
+        // Whether to offer HTTP/2 via TLS ALPN. Callers that can't speak h2
+        // (e.g. the WebSocket upgrade path) must pass false.
+        advertise_http2: bool,
     ) !*Connection {
         // Try to get a connection from the pool
         const conn = self.pool.acquire(self.io, host, port, protocol, unix_socket_path) orelse blk: {
@@ -688,6 +738,7 @@ pub const Client = struct {
                 protocol,
                 ca_bundle,
                 unix_socket_path,
+                advertise_http2,
             );
 
             break :blk new_conn;
@@ -718,8 +769,9 @@ pub const Client = struct {
         // Reject any CRLF/NUL smuggled in via the URL host.
         try http.validateHeaderValue(host);
 
-        // Acquire or create a connection
-        const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle, options.unix_socket_path);
+        // Acquire or create a connection. WebSocket upgrades are HTTP/1.1 only,
+        // so never advertise h2 here.
+        const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle, options.unix_socket_path, false);
         errdefer {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -809,8 +861,16 @@ pub const Client = struct {
         } else null;
 
         // Acquire or create a connection
-        const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path);
+        const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path, build_options.use_http2 and self.config.http2 and state.protocol == .https);
         errdefer self.pool.release(conn);
+
+        // HTTP/2 was negotiated via ALPN but the h2 path isn't implemented yet.
+        // The TLS connection is already committed to h2 (we can't speak HTTP/1.1
+        // over it), so don't pool it — mark closing so release() tears it down.
+        if (conn.http_version == .http_2) {
+            conn.closing = true;
+            return error.Http2NotImplemented;
+        }
 
         // Send request
         try writeRequest(conn.writer, .{
