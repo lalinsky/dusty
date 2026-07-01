@@ -43,6 +43,17 @@ jobs:
       run: zig build examples
       timeout-minutes: 5
 
+    # Fetch over plain HTTP/1.1 (no TLS, so no ALPN -> h1).
+    - name: Run client example (HTTP/1.1)
+      run: ./zig-out/bin/client-example http://httpbin.org/get
+      timeout-minutes: 1
+      if: runner.os != 'Windows'
+
+    - name: Run client example (HTTP/1.1, Windows)
+      run: .\zig-out\bin\client-example.exe http://httpbin.org/get
+      timeout-minutes: 1
+      if: runner.os == 'Windows'
+
     # Fetch over HTTP/2 (nghttp2.org serves an httpbin instance over h2; h2 is on
     # by default). Exercises the full h2 client path on the whole OS matrix.
     - name: Run client example (HTTP/2)
