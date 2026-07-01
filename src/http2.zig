@@ -371,16 +371,16 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
         conn.dropRef();
     }
     nr_group.concurrent(io, netReaderLoop, .{conn}) catch {
-        fatalAll(conn, error.Http2Init);
+        shutdown(conn, error.Http2Init);
         return;
     };
 
     submitSettings(conn) catch {
-        fatalAll(conn, error.Http2Init);
+        shutdown(conn, error.Http2Init);
         return;
     };
     drainSend(conn) catch {
-        fatalAll(conn, error.Http2ConnectionClosed);
+        shutdown(conn, error.Http2ConnectionClosed);
         return;
     };
 
@@ -389,7 +389,7 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
         // headers_done/done or on a body read) before unwinding. Cancellation
         // must still propagate — never swallow error.Canceled.
         const ev = conn.events.getOne(io) catch |err| {
-            fatalAll(conn, error.Http2ConnectionClosed);
+            shutdown(conn, error.Http2ConnectionClosed);
             if (err == error.Canceled) return error.Canceled;
             return; // error.Closed
         };
@@ -407,22 +407,22 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
                 conn.consumed.set(io); // let the net-reader toss and read more
                 if (rv < 0) {
                     log.debug("mem_recv2 failed: {s}", .{c.nghttp2_strerror(@intCast(rv))});
-                    fatalAll(conn, error.Http2Protocol);
+                    shutdown(conn, error.Http2Protocol);
                     return;
                 }
             },
             .net_eof => {
-                fatalAll(conn, error.Http2IncompleteResponse);
+                shutdown(conn, error.Http2IncompleteResponse);
                 return;
             },
             .net_err => {
-                fatalAll(conn, error.Http2ConnectionClosed);
+                shutdown(conn, error.Http2ConnectionClosed);
                 return;
             },
         }
 
         drainSend(conn) catch {
-            fatalAll(conn, error.Http2ConnectionClosed);
+            shutdown(conn, error.Http2ConnectionClosed);
             return;
         };
 
@@ -430,7 +430,7 @@ fn sessionLoop(conn: *Connection) std.Io.Cancelable!void {
         if (c.nghttp2_session_want_read(conn.session) == 0 and
             c.nghttp2_session_want_write(conn.session) == 0)
         {
-            fatalAll(conn, error.Http2ConnectionClosed);
+            shutdown(conn, error.Http2ConnectionClosed);
             return;
         }
     }
@@ -489,6 +489,31 @@ fn drainSend(conn: *Connection) !void {
         try conn.writer.writeAll(data[0..@intCast(n)]);
     }
     try conn.writer.flush();
+}
+
+/// Terminal cleanup for any path where the session coroutine is about to
+/// return. Rejects further submits, fails every queued-but-unlinked `.submit`
+/// (whose caller is blocked on `headers_done` and would otherwise hang), then
+/// fails every in-flight (linked) stream.
+fn shutdown(conn: *Connection, err: anyerror) void {
+    // Close the queue so future `request()` puts return error.Closed (mapped to
+    // Http2ConnectionClosed) instead of enqueuing a submit no one will handle.
+    // Buffered events are still drained by getOne before Closed is reported.
+    conn.events.close(conn.io);
+    while (conn.events.getOneUncancelable(conn.io)) |ev| {
+        switch (ev) {
+            // A submit that never got linked into conn.streams: its caller is
+            // parked on headers_done. Fail it here or it waits forever.
+            .submit => |s| {
+                s.body.close(s.io);
+                s.finish(err);
+            },
+            // consume/cancel reference streams we're failing anyway; net_* are
+            // terminal signals we're already acting on. Nothing to drain.
+            else => {},
+        }
+    } else |_| {} // error.Closed: queue fully drained.
+    fatalAll(conn, err);
 }
 
 /// Fail every in-flight stream and mark the connection closed.
