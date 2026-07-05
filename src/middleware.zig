@@ -3,6 +3,8 @@ const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
 
+const log = std.log.scoped(.dusty);
+
 /// Configuration passed to middleware init functions that accept 2 parameters.
 /// Provides access to allocators for middlewares that need dynamic allocation.
 pub const MiddlewareConfig = struct {
@@ -78,7 +80,19 @@ pub fn Executor(comptime Ctx: type) type {
                 // the app's uncaughtError) and return normally so the server
                 // writes it, instead of tearing down the connection with no
                 // reply.
-                else => self.handleError(err),
+                else => {
+                    if (self.res.headers_written) {
+                        // The response already started (e.g. streaming/chunked
+                        // body or a WebSocket upgrade), so headers were sent
+                        // with framing that doesn't account for an error body.
+                        // We can't safely rewrite it as a 500; abort the
+                        // connection instead of corrupting the response.
+                        log.err("unhandled error after response headers were sent: {}", .{err});
+                        return err;
+                    }
+                    log.err("unhandled error in request handler: {}", .{err});
+                    self.handleError(err);
+                },
             };
         }
 
@@ -338,6 +352,29 @@ test "Executor: default 500 handler on action error" {
 
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
+}
+
+test "Executor: error after headers written propagates instead of rewriting the response" {
+    var req: Request = undefined;
+    var res = makeTestResponse();
+    // Simulate a response that already started (e.g. a streamed/chunked body
+    // or a WebSocket upgrade) before the handler failed.
+    res.headers_written = true;
+
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .ctx = {},
+        .action = errorHandler,
+        .middlewares = &.{},
+    };
+
+    try std.testing.expectError(error.TestError, executor.run());
+
+    // handleError() must not run: the already-sent headers can't be undone,
+    // so status/body are left untouched rather than rewritten to a 500.
+    try std.testing.expectEqual(.ok, res.status);
+    try std.testing.expectEqualStrings("", res.body);
 }
 
 const CustomCtx = struct {
