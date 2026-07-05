@@ -70,9 +70,15 @@ pub fn Executor(comptime Ctx: type) type {
         middlewares: []const Middleware(Ctx),
 
         pub fn run(self: *Self) !void {
-            self.next() catch |err| {
-                self.handleError(err);
-                return err;
+            self.next() catch |err| switch (err) {
+                // Connection-level failures can't produce a response; propagate
+                // so the connection loop aborts.
+                error.ReadFailed, error.WriteFailed, error.Canceled => return err,
+                // Handler/middleware errors: prepare an error response (500, or
+                // the app's uncaughtError) and return normally so the server
+                // writes it, instead of tearing down the connection with no
+                // reply.
+                else => self.handleError(err),
             };
         }
 
