@@ -392,6 +392,7 @@ pub const ContentType = enum(u32) {
     js,
     xml,
     json,
+    msgpack,
     yaml,
     png,
     jpeg,
@@ -444,6 +445,7 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/javascript")) and std.mem.eql(u8, main, "application/javascript")) return .js;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/xml")) and std.mem.eql(u8, main, "application/xml")) return .xml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/json")) and std.mem.eql(u8, main, "application/json")) return .json;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/vnd.msgpack")) and std.mem.eql(u8, main, "application/vnd.msgpack")) return .msgpack;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/yaml")) and std.mem.eql(u8, main, "application/yaml")) return .yaml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/png")) and std.mem.eql(u8, main, "image/png")) return .png;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/jpeg")) and std.mem.eql(u8, main, "image/jpeg")) return .jpeg;
@@ -508,6 +510,7 @@ pub const ContentType = enum(u32) {
             .js => "application/javascript; charset=UTF-8",
             .xml => "application/xml; charset=UTF-8",
             .json => "application/json; charset=UTF-8",
+            .msgpack => "application/vnd.msgpack",
             .yaml => "application/yaml; charset=UTF-8",
             .png => "image/png",
             .jpeg => "image/jpeg",
