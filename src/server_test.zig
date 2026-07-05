@@ -594,6 +594,140 @@ test "Server: keepalive after handler ignores request body" {
     try std.testing.expectEqualStrings("second", resp2.body);
 }
 
+test "Server: handler error yields 500 and keeps the connection alive" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/boom", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            _ = res;
+            return error.Boom;
+        }
+    }.handle);
+
+    server.router.get("/ok", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    // A handler that returns an error must still produce a written 500 response,
+    // not tear down the connection with no reply.
+    try w.writeAll("GET /boom HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    var status1: [64]u8 = undefined;
+    var body1: [64]u8 = undefined;
+    const resp1 = try readResponse(r, &status1, &body1);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.status, "500") != null);
+
+    // The connection stays alive, so a subsequent request still works.
+    try w.writeAll("GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    var status2: [64]u8 = undefined;
+    var body2: [64]u8 = undefined;
+    const resp2 = try readResponse(r, &status2, &body2);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.status, "200") != null);
+    try std.testing.expectEqualStrings("ok", resp2.body);
+}
+
+test "Server: handler error after streaming started aborts the connection" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/bad-stream", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            // Start a chunked response, then fail - headers/first chunk are
+            // already on the wire, so the error can't be turned into a 500.
+            try res.chunk("partial");
+            return error.Boom;
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    try w.writeAll("GET /bad-stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    // Read everything the server sends before closing the connection.
+    var received: [256]u8 = undefined;
+    var received_len: usize = 0;
+    while (received_len < received.len) {
+        r.fillMore() catch break;
+        const buffered = r.buffered();
+        if (buffered.len == 0) break;
+        const to_copy = @min(buffered.len, received.len - received_len);
+        @memcpy(received[received_len..][0..to_copy], buffered[0..to_copy]);
+        r.toss(to_copy);
+        received_len += to_copy;
+    }
+    const got = received[0..received_len];
+
+    // The partial chunk was already flushed before the handler errored...
+    try std.testing.expect(std.mem.indexOf(u8, got, "partial") != null);
+    // ...but the chunked terminator must be absent: the connection was
+    // aborted instead of silently completing a truncated, "successful" body.
+    try std.testing.expect(std.mem.indexOf(u8, got, "0\r\n\r\n") == null);
+
+    // The connection must not stay alive for reuse.
+    w.writeAll("GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n") catch {};
+    w.flush() catch {};
+    var status2: [64]u8 = undefined;
+    var body2: [32]u8 = undefined;
+    _ = readResponse(r, &status2, &body2) catch return;
+    return error.TestExpectedConnectionToBeClosed;
+}
+
 test "Server: closes connection when unread body exceeds max_body_size" {
     const io = std.testing.io;
 
