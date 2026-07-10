@@ -444,6 +444,92 @@ test "Server: void context handlers" {
     try client_future.await(io);
 }
 
+test "Server: graceful shutdown drain still blocks after an earlier connection closed" {
+    const io = std.testing.io;
+
+    // `last_connection_closed` latches once set. Before the fix, any
+    // connection closing at any earlier point in the server's life made the
+    // drain's waitTimeout return immediately forever, so the drain loop
+    // busy-spun instead of blocking, and the 100ms shutdown timeout could
+    // never fire. This test latches the event with a short-lived connection,
+    // then shuts down while a slow handler is active: the drain must block
+    // and propagate error.Timeout, not spin until the handler finishes.
+    const sync = struct {
+        var slow_started: std.Io.Event = .unset;
+    };
+    sync.slow_started = .unset;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/fast", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            sync.slow_started.set(req.io);
+            try req.io.sleep(.fromMilliseconds(2000), .awake);
+            res.body = "slow";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+
+    try server.ready.wait(io);
+
+    // A short-lived connection closes, latching last_connection_closed.
+    {
+        const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        defer stream.shutdown(io, .both) catch {};
+
+        var write_buf: [1024]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        try writer.interface.writeAll("GET /fast HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        try writer.interface.flush();
+
+        var read_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        const status_line = try reader.interface.takeDelimiterExclusive('\n');
+        try std.testing.expect(std.mem.indexOf(u8, status_line, "200 OK") != null);
+    }
+
+    // Wait until the server has fully torn down that connection.
+    while (server.active_connections.load(.acquire) != 0) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    // Park a slow handler so shutdown has an active connection to drain.
+    const slow_stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer slow_stream.close(io);
+    defer slow_stream.shutdown(io, .both) catch {};
+
+    var slow_write_buf: [1024]u8 = undefined;
+    var slow_writer = slow_stream.writer(io, &slow_write_buf);
+    try slow_writer.interface.writeAll("GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try slow_writer.interface.flush();
+
+    try sync.slow_started.wait(io);
+
+    // Graceful shutdown: the drain must block on the (re-armed) event and hit
+    // its 100ms timeout long before the 2s handler completes. Before the fix
+    // the latched event made the wait a no-op, so the drain spun hot until
+    // the handler finished and returned error.Canceled instead.
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, server_future.cancel(io));
+    const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+    try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
+}
+
 test "Server: 100-continue" {
     const io = std.testing.io;
 

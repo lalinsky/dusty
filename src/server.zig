@@ -157,6 +157,9 @@ pub fn Server(comptime Ctx: type) type {
                         log.info("Graceful shutdown requested", .{});
                         self.shutting_down.store(true, .release);
                         while (true) { // TODO: add graceful shutdown timeout
+                            // Re-arm the latched event, or waitTimeout returns
+                            // immediately forever once any connection has closed.
+                            self.last_connection_closed.reset();
                             const remaining = self.active_connections.load(.acquire);
                             if (remaining == 0) break;
                             log.info("Waiting for {} remaining connections to close", .{remaining});
