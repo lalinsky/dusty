@@ -495,6 +495,12 @@ pub const Connection = struct {
 
     /// Release this connection back to its pool, handling keep-alive logic.
     pub fn release(self: *Connection) void {
+        // A response body that wasn't fully read leaves the connection at an
+        // unknown stream position, so it must not be reused.
+        if (!self.parser.isBodyComplete()) {
+            self.closing = true;
+        }
+
         // Increment request count
         self.request_count +|= 1;
 
