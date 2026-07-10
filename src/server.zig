@@ -44,10 +44,9 @@ pub fn Server(comptime Ctx: type) type {
         ctx: if (Ctx == void) void else *Ctx,
         config: ServerConfig,
         shutting_down: std.atomic.Value(bool),
-        active_connections: std.atomic.Value(usize),
+        active_connections: std.atomic.Value(u32),
         address: Address,
         ready: std.Io.Event,
-        last_connection_closed: std.Io.Event,
         _middleware_registry: std.SinglyLinkedList,
         /// Server certificate/key, loaded once in listen() when config.tls is set.
         tls_auth: ?tls.config.CertKeyPair = null,
@@ -60,10 +59,9 @@ pub fn Server(comptime Ctx: type) type {
                 .ctx = ctx,
                 .config = config,
                 .shutting_down = std.atomic.Value(bool).init(false),
-                .active_connections = std.atomic.Value(usize).init(0),
+                .active_connections = std.atomic.Value(u32).init(0),
                 .address = undefined,
                 .ready = .unset,
-                .last_connection_closed = .unset,
                 ._middleware_registry = .{},
             };
         }
@@ -157,13 +155,15 @@ pub fn Server(comptime Ctx: type) type {
                         log.info("Graceful shutdown requested", .{});
                         self.shutting_down.store(true, .release);
                         while (true) { // TODO: add graceful shutdown timeout
-                            // Re-arm the latched event, or waitTimeout returns
-                            // immediately forever once any connection has closed.
-                            self.last_connection_closed.reset();
                             const remaining = self.active_connections.load(.acquire);
                             if (remaining == 0) break;
                             log.info("Waiting for {} remaining connections to close", .{remaining});
-                            try self.last_connection_closed.waitTimeout(self.io, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } });
+                            // Returns immediately if the count already changed, otherwise
+                            // blocks until a close wakes it or the timeout expires.
+                            try self.io.futexWaitTimeout(u32, &self.active_connections.raw, remaining, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } });
+                            // No connection closed within the timeout. Let the deferred
+                            // group.cancel tear down the remaining handlers.
+                            if (self.active_connections.load(.acquire) == remaining) return error.Timeout;
                         }
                         return err;
                     }
@@ -189,10 +189,8 @@ pub fn Server(comptime Ctx: type) type {
 
         pub fn handleConnection(self: *Self, stream: std.Io.net.Stream) !void {
             defer {
-                const v = self.active_connections.fetchSub(1, .acq_rel);
-                if (v == 1) {
-                    self.last_connection_closed.set(self.io);
-                }
+                _ = self.active_connections.fetchSub(1, .acq_rel);
+                self.io.futexWake(u32, &self.active_connections.raw, 1);
             }
 
             defer stream.close(self.io);
