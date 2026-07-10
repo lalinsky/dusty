@@ -225,6 +225,91 @@ test "Client: pool evicts dead connection after server goes away" {
     try std.testing.expectEqual(@as(usize, 0), client.pool.idle_len);
 }
 
+test "Client: redirect failing after connection release does not double-release" {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        location: []const u8,
+    };
+
+    // Find a port with no listener behind it: bind, note the port, close.
+    // Redirecting there makes the redirect fetch fail at dial time, after
+    // the first connection was already released back to the pool.
+    const dead_port = blk: {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        var listener = try addr.listen(io, .{});
+        const p = listener.socket.address.getPort();
+        listener.deinit(io);
+        break :blk p;
+    };
+
+    var location_buf: [64]u8 = undefined;
+    var ctx: Ctx = .{
+        .location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.1:{d}/", .{dead_port}),
+    };
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{}, &ctx);
+    defer server.deinit();
+
+    server.router.get("/redirect", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.status = .found;
+            try res.header("Location", c.location);
+        }
+    }.handle);
+
+    server.router.get("/ok", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            _ = c;
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const redirect_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/redirect", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var failed = false;
+    if (client.fetch(redirect_url, .{})) |response| {
+        var r = response;
+        r.deinit();
+    } else |_| {
+        failed = true;
+    }
+    try std.testing.expect(failed);
+
+    // The connection was released back to the pool before the redirect
+    // failed; the failure must not release it a second time.
+    try std.testing.expectEqual(1, client.pool.idle_len);
+
+    // The pooled connection is still usable.
+    var ok_url_buf: [64]u8 = undefined;
+    const ok_url = try std.fmt.bufPrint(&ok_url_buf, "http://127.0.0.1:{d}/ok", .{port});
+    {
+        var response = try client.fetch(ok_url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+        _ = try response.body();
+    }
+    try std.testing.expectEqual(1, client.pool.idle_len);
+}
+
 test "Client: WebSocket upgrade" {
     const io = std.testing.io;
 

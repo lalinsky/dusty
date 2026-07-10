@@ -860,9 +860,12 @@ pub const Client = struct {
             break :blk try self.ensureCaBundle();
         } else null;
 
-        // Acquire or create a connection
+        // Acquire or create a connection. The redirect path releases it early
+        // and continues with fallible work, so the errdefer must be disarmed
+        // after that release to avoid releasing the connection twice.
         const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path, build_options.use_http2 and self.config.http2 and state.protocol == .https);
-        errdefer self.pool.release(conn);
+        var conn_released = false;
+        errdefer if (!conn_released) self.pool.release(conn);
 
         // HTTP/2 was negotiated via ALPN but the h2 path isn't implemented yet.
         // The TLS connection is already committed to h2 (we can't speak HTTP/1.1
@@ -942,6 +945,7 @@ pub const Client = struct {
                 }
                 if (!conn.parser.shouldKeepAlive()) conn.closing = true;
                 self.pool.release(conn);
+                conn_released = true;
 
                 // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
                 // 307/308 preserve the original method and body.
