@@ -310,6 +310,58 @@ test "Client: redirect failing after connection release does not double-release"
     try std.testing.expectEqual(1, client.pool.idle_len);
 }
 
+test "Client: connection with unread response body is not pooled" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "some response body";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    // Deinit the response without reading the body: the connection sits at
+    // an unknown stream position and must be closed, not pooled, or the
+    // next request on it would read leftover body bytes as its response.
+    {
+        var response = try client.fetch(url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+    }
+    try std.testing.expectEqual(0, client.pool.idle_len);
+
+    // A fully read response is still pooled as usual.
+    {
+        var response = try client.fetch(url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+        _ = try response.body();
+    }
+    try std.testing.expectEqual(1, client.pool.idle_len);
+}
+
 test "Client: WebSocket upgrade" {
     const io = std.testing.io;
 
