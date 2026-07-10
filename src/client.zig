@@ -872,8 +872,10 @@ pub const Client = struct {
             return error.Http2NotImplemented;
         }
 
-        // Send request
-        try writeRequest(conn.writer, .{
+        // Send request. On write/flush failure the connection is dead or has
+        // a partially written request, so mark it closing before the errdefer
+        // releases it — otherwise it gets pooled again and poisons the pool.
+        writeRequest(conn.writer, .{
             .method = state.options.method,
             .uri = state.uri,
             .host = host,
@@ -886,14 +888,24 @@ pub const Client = struct {
             .strip_body_headers = state.strip_body_headers,
             .referer = state.referer,
             .user_agent = self.config.user_agent,
-        });
+        }) catch |err| {
+            conn.closing = true;
+            return err;
+        };
 
-        try conn.flush();
+        conn.flush() catch |err| {
+            conn.closing = true;
+            return err;
+        };
 
-        // Parse response headers
-        parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
-            error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
-            else => |e| return e,
+        // Parse response headers. Any failure leaves the connection at an
+        // unknown stream position, so it must not be pooled.
+        parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
+            conn.closing = true;
+            switch (err) {
+                error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+                else => |e| return e,
+            }
         };
 
         // Check for unsupported content encoding

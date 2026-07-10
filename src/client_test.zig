@@ -167,6 +167,64 @@ test "Client: connection pooling" {
     try client_future.await(io);
 }
 
+test "Client: pool evicts dead connection after server goes away" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    // A healthy fetch parks a keep-alive connection in the pool.
+    {
+        var response = try client.fetch(url, .{});
+        defer response.deinit();
+
+        try std.testing.expectEqual(.ok, response.status());
+        _ = try response.body();
+    }
+    try std.testing.expectEqual(@as(usize, 1), client.pool.idle_len);
+
+    // The server goes away, killing the pooled connection.
+    server_future.cancel(io) catch {};
+
+    // The fetch over the dead pooled connection fails...
+    var failed = false;
+    if (client.fetch(url, .{})) |response| {
+        var r = response;
+        r.deinit();
+    } else |_| {
+        failed = true;
+    }
+    try std.testing.expect(failed);
+
+    // ...and the dead connection must be evicted, not returned to the pool,
+    // so the next fetch dials fresh instead of re-acquiring it forever.
+    try std.testing.expectEqual(@as(usize, 0), client.pool.idle_len);
+}
+
 test "Client: WebSocket upgrade" {
     const io = std.testing.io;
 
