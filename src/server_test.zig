@@ -483,6 +483,9 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
             try s.listen(addr);
         }
     }.run, .{&server});
+    // cancel() is idempotent, so this is a no-op after the expectError below
+    // consumes the future; it only matters if the test fails early.
+    defer server_future.cancel(io) catch {};
 
     try server.ready.wait(io);
 
