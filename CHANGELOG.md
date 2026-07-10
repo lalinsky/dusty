@@ -4,7 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Fix memory leak in WebSocket clients: message allocations are now freed before each `receive()` call instead of accumulating for the lifetime of the connection. Message data is valid until the next call to `receive()`.
+- Remove hard dependency on `zio`, so you can use `dusty` with any `std.Io` implementation.
+- There is still a special opt-in support for `zio`, because it's the only way to do proper timeouts on `std.Io` streams.
+- Added TLS support to both the client and server.
+- Fix memory leak in WebSocket clients: message allocations are now freed before each `receive()` call instead of accumulating for the lifetime of the connection.
+- Added default `User-Agent` header to HTTP client.
 
 ## [0.2.0] - 2026-04-26
 
