@@ -447,13 +447,6 @@ test "Server: void context handlers" {
 test "Server: graceful shutdown drain still blocks after an earlier connection closed" {
     const io = std.testing.io;
 
-    // `last_connection_closed` latches once set. Before the fix, any
-    // connection closing at any earlier point in the server's life made the
-    // drain's waitTimeout return immediately forever, so the drain loop
-    // busy-spun instead of blocking, and the 100ms shutdown timeout could
-    // never fire. This test latches the event with a short-lived connection,
-    // then shuts down while a slow handler is active: the drain must block
-    // and propagate error.Timeout, not spin until the handler finishes.
     const sync = struct {
         var slow_started: std.Io.Event = .unset;
     };
@@ -489,7 +482,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
 
     try server.ready.wait(io);
 
-    // A short-lived connection closes, latching last_connection_closed.
+    // A connection closes before shutdown begins.
     {
         const stream = try server.address.ip.connect(io, .{ .mode = .stream });
         defer stream.close(io);
@@ -523,9 +516,8 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
 
     try sync.slow_started.wait(io);
 
-    // Graceful shutdown: the drain must block on the (re-armed) event and hit
-    // its 100ms timeout long before the 2s handler completes. Before the fix
-    // the latched event made the wait a no-op, so the drain spun hot until
+    // Graceful shutdown: the drain must block and hit its 100ms timeout long
+    // before the 2s handler completes. Before the fix the drain spun hot until
     // the handler finished and returned error.Canceled instead.
     const start = std.Io.Timestamp.now(io, .awake);
     try std.testing.expectError(error.Timeout, server_future.cancel(io));
