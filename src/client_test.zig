@@ -362,6 +362,84 @@ test "Client: connection with unread response body is not pooled" {
     try std.testing.expectEqual(1, client.pool.idle_len);
 }
 
+test "Client: pool survives concurrent fetches on a shared client" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/test", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const port = server.address.ip.getPort();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/test", .{port});
+
+    // More workers than idle slots, so releases keep racing against evictions.
+    const max_idle = 4;
+    const workers = 8;
+    const rounds = 20;
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .max_idle_connections = max_idle });
+    defer client.deinit();
+
+    const worker = struct {
+        fn run(c: *dusty.Client, u: []const u8) !void {
+            for (0..rounds) |_| {
+                var response = try c.fetch(u, .{});
+                defer response.deinit();
+
+                try std.testing.expectEqual(.ok, response.status());
+                const body = try response.body();
+                try std.testing.expectEqualStrings("OK", body.?);
+            }
+        }
+    }.run;
+
+    const WorkerFuture = std.Io.Future(@typeInfo(@TypeOf(worker)).@"fn".return_type.?);
+    var futures: [workers]WorkerFuture = undefined;
+    var started: usize = 0;
+    errdefer for (futures[0..started]) |*f| f.cancel(io) catch {};
+
+    while (started < workers) : (started += 1) {
+        futures[started] = try io.concurrent(worker, .{ &client, url });
+    }
+
+    var first_err: ?anyerror = null;
+    for (&futures) |*f| {
+        f.await(io) catch |err| {
+            if (first_err == null) first_err = err;
+        };
+    }
+    if (first_err) |err| return err;
+
+    // idle_len must still agree with the list, and must respect max_idle.
+    var counted: usize = 0;
+    var node = client.pool.idle.first;
+    while (node) |n| : (node = n.next) counted += 1;
+
+    try std.testing.expectEqual(counted, client.pool.idle_len);
+    try std.testing.expect(client.pool.idle_len <= max_idle);
+
+    // Guard against the invariants above passing on a pool that never pooled
+    // anything: connections must actually be getting reused.
+    try std.testing.expect(client.pool.idle_len > 0);
+}
+
 test "Client: WebSocket upgrade" {
     const io = std.testing.io;
 

@@ -184,15 +184,26 @@ fn uriPath(uri: Uri) []const u8 {
 }
 
 /// Pool of idle connections for reuse.
+///
+/// `acquire`/`release` are safe to call from multiple tasks running in
+/// parallel: `idle`/`idle_len` are guarded by `mutex`, and the critical
+/// sections only touch the list, so they never suspend. Closing an evicted
+/// connection does suspend, so that always happens after the lock has been
+/// dropped. `init`/`deinit` are not part of that contract — they must not run
+/// concurrently with `acquire`/`release`.
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex,
     idle: std.DoublyLinkedList,
     idle_len: usize,
     max_idle: u8,
 
-    pub fn init(allocator: std.mem.Allocator, max_idle: u8) ConnectionPool {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, max_idle: u8) ConnectionPool {
         return .{
             .allocator = allocator,
+            .io = io,
+            .mutex = .init,
             .idle = .{},
             .idle_len = 0,
             .max_idle = max_idle,
@@ -209,34 +220,49 @@ pub const ConnectionPool = struct {
     }
 
     /// Try to acquire an existing connection for the given host:port, protocol, and optional unix socket path.
-    pub fn acquire(self: *ConnectionPool, io: std.Io, remote_host: []const u8, remote_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) ?*Connection {
+    pub fn acquire(self: *ConnectionPool, remote_host: []const u8, remote_port: u16, protocol: Protocol, unix_socket_path: ?[]const u8) ?*Connection {
+        const io = self.io;
         const now = std.Io.Timestamp.now(io, .awake);
 
-        // Search from end (most recently used)
-        var node = self.idle.last;
-        while (node) |n| {
-            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
-            node = n.prev;
+        // Connections found expired along the way. They are already out of the
+        // pool and owned by us, so they get closed after the lock is dropped.
+        var expired: std.DoublyLinkedList = .{};
 
-            if (conn.matches(remote_host, remote_port, protocol, unix_socket_path)) {
-                // Check if connection has expired due to idle timeout
-                if (conn.idle_deadline) |deadline| {
-                    if (now.nanoseconds >= deadline.nanoseconds) {
-                        // Connection expired, remove and close it
-                        self.idle.remove(n);
-                        self.idle_len -= 1;
-                        conn.deinit();
-                        self.allocator.destroy(conn);
-                        continue;
+        const found = found: {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            // Search from end (most recently used)
+            var node = self.idle.last;
+            while (node) |n| {
+                const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
+                node = n.prev;
+
+                if (conn.matches(remote_host, remote_port, protocol, unix_socket_path)) {
+                    self.idle.remove(n);
+                    self.idle_len -= 1;
+
+                    // Check if connection has expired due to idle timeout
+                    if (conn.idle_deadline) |deadline| {
+                        if (now.nanoseconds >= deadline.nanoseconds) {
+                            expired.append(n);
+                            continue;
+                        }
                     }
-                }
 
-                self.idle.remove(n);
-                self.idle_len -= 1;
-                return conn;
+                    break :found conn;
+                }
             }
+            break :found null;
+        };
+
+        while (expired.popFirst()) |n| {
+            const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", n));
+            conn.deinit();
+            self.allocator.destroy(conn);
         }
-        return null;
+
+        return found;
     }
 
     /// Release a connection back to the pool, or close it if pool is full or connection is closing.
@@ -248,24 +274,36 @@ pub const ConnectionPool = struct {
             return;
         }
 
-        // If pool is full, close the oldest connection
-        if (self.idle_len >= self.max_idle) {
-            if (self.idle.popFirst()) |old_node| {
-                const old: *Connection = @alignCast(@fieldParentPtr("pool_node", old_node));
-                old.deinit();
-                self.allocator.destroy(old);
-                self.idle_len -= 1;
-            }
-        }
-
-        // Reset and add to pool
+        // Reset before taking the lock; it only touches this connection.
         conn.reset() catch {
             conn.deinit();
             self.allocator.destroy(conn);
             return;
         };
-        self.idle.append(&conn.pool_node);
-        self.idle_len += 1;
+
+        const evicted: ?*Connection = evicted: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            // If pool is full, evict the oldest connection
+            var old: ?*Connection = null;
+            if (self.idle_len >= self.max_idle) {
+                if (self.idle.popFirst()) |old_node| {
+                    old = @alignCast(@fieldParentPtr("pool_node", old_node));
+                    self.idle_len -= 1;
+                }
+            }
+
+            self.idle.append(&conn.pool_node);
+            self.idle_len += 1;
+            break :evicted old;
+        };
+
+        // Closing suspends, so it must happen outside the critical section.
+        if (evicted) |old| {
+            old.deinit();
+            self.allocator.destroy(old);
+        }
     }
 };
 
@@ -648,6 +686,15 @@ pub const ClientResponse = struct {
 };
 
 /// HTTP client for making requests.
+///
+/// A single client can be shared by tasks running in parallel: the connection
+/// pool and the CA bundle are both internally synchronized. Sharing one client
+/// is also what makes connection reuse and a single CA bundle scan possible.
+/// `init`/`deinit` are not part of that contract — they must not run
+/// concurrently with requests.
+///
+/// Parallel requests allocate and free concurrently, so `allocator` must be
+/// thread-safe when the client is shared that way.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -662,7 +709,7 @@ pub const Client = struct {
             .allocator = allocator,
             .io = io,
             .config = config,
-            .pool = ConnectionPool.init(allocator, config.max_idle_connections),
+            .pool = ConnectionPool.init(allocator, io, config.max_idle_connections),
             .ca_bundle = .empty,
             .ca_bundle_lock = .init,
             .ca_bundle_loaded = std.atomic.Value(bool).init(false),
@@ -720,7 +767,7 @@ pub const Client = struct {
         advertise_http2: bool,
     ) !*Connection {
         // Try to get a connection from the pool
-        const conn = self.pool.acquire(self.io, host, port, protocol, unix_socket_path) orelse blk: {
+        const conn = self.pool.acquire(host, port, protocol, unix_socket_path) orelse blk: {
             // No pooled connection, create a new one
             const stream = if (unix_socket_path) |path| unix: {
                 const unix_addr = try std.Io.net.UnixAddress.init(path);
