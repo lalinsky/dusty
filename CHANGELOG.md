@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file.
 - Added TLS support to both the client and server.
 - Fix memory leak in WebSocket clients: message allocations are now freed before each `receive()` call instead of accumulating for the lifetime of the connection.
 - Added default `User-Agent` header to HTTP client.
+- Fix connection pool corruption when a `Client` is shared by tasks running in parallel. `ConnectionPool` list and counter updates are now guarded by a mutex.
+- `ConnectionPool.init` now takes an `std.Io`, and `ConnectionPool.acquire` no longer does.
 
 ## [0.2.0] - 2026-04-26
 
