@@ -19,6 +19,31 @@ const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
 const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
+fn recoverAdapterError(marker: anyerror, fallback: anyerror, causes: []const ?anyerror) anyerror {
+    if (fallback != marker) return fallback;
+    // Prefer a concrete cause over another adapter marker. With TLS, for example,
+    // the TLS reader may hold ReadFailed while the underlying TCP reader holds
+    // Canceled.
+    for (causes) |cause| if (cause) |err| if (err != marker) return err;
+    for (causes) |cause| if (cause) |err| return err;
+    return fallback;
+}
+
+test "adapter errors recover the deepest concrete cause" {
+    try std.testing.expectEqual(error.Canceled, recoverAdapterError(
+        error.ReadFailed,
+        error.ReadFailed,
+        &.{ error.Canceled, error.ReadFailed },
+    ));
+    try std.testing.expectEqual(error.InvalidChunkSize, recoverAdapterError(
+        error.ReadFailed,
+        error.ReadFailed,
+        &.{ error.ReadFailed, error.InvalidChunkSize },
+    ));
+    try std.testing.expectEqual(error.ReadFailed, recoverAdapterError(error.ReadFailed, error.ReadFailed, &.{}));
+    try std.testing.expectEqual(error.OutOfMemory, recoverAdapterError(error.ReadFailed, error.OutOfMemory, &.{error.Canceled}));
+}
+
 /// Protocol type for HTTP/HTTPS connections.
 pub const Protocol = enum {
     http,
@@ -510,7 +535,17 @@ pub const Connection = struct {
     pub fn flush(self: *Connection) !void {
         // For HTTPS this drains the cleartext writer, which encrypts and flushes
         // the underlying TCP writer in one step; for HTTP it flushes the socket directly.
-        try self.writer.flush();
+        self.writer.flush() catch |err| return self.writeError(err);
+    }
+
+    pub fn readError(self: *const Connection, fallback: anyerror) anyerror {
+        const tls_err: ?anyerror = if (self.tls_conn != null) self.tls_reader.err else null;
+        return recoverAdapterError(error.ReadFailed, fallback, &.{ self.tcp_reader.err, tls_err });
+    }
+
+    pub fn writeError(self: *const Connection, fallback: anyerror) anyerror {
+        const tls_err: ?anyerror = if (self.tls_conn != null) self.tls_writer.err else null;
+        return recoverAdapterError(error.WriteFailed, fallback, &.{ self.tcp_writer.err, tls_err });
     }
 
     pub fn host(self: *const Connection) []const u8 {
@@ -615,6 +650,16 @@ pub const ClientResponse = struct {
         return &self.parsed.headers;
     }
 
+    /// Recover the concrete transport/parser error hidden by std.Io.Reader's
+    /// error.ReadFailed marker. Streaming callers should use this when an API fed
+    /// by reader() returns ReadFailed.
+    pub fn readError(self: *const ClientResponse, fallback: anyerror) anyerror {
+        if (fallback != error.ReadFailed) return fallback;
+        const transport_err = if (self.owner) |conn| conn.readError(fallback) else fallback;
+        const body_err: ?anyerror = if (self._body_reader_init) self._body_reader.cause else null;
+        return recoverAdapterError(error.ReadFailed, transport_err, &.{body_err});
+    }
+
     /// Get HTTP version.
     pub fn version(self: *const ClientResponse) struct { major: u8, minor: u8 } {
         return .{
@@ -638,7 +683,7 @@ pub const ClientResponse = struct {
         const r = self.reader();
         const result = r.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
-            else => return err,
+            else => return self.readError(err),
         };
 
         self._body_read = true;
@@ -875,7 +920,7 @@ pub const Client = struct {
 
         // Parse response headers
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
-            error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+            error.ReadFailed => return conn.readError(err),
             else => |e| return e,
         };
 
@@ -946,7 +991,7 @@ pub const Client = struct {
             .user_agent = self.config.user_agent,
         }) catch |err| {
             conn.closing = true;
-            return err;
+            return conn.writeError(err);
         };
 
         conn.flush() catch |err| {
@@ -959,7 +1004,7 @@ pub const Client = struct {
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
             conn.closing = true;
             switch (err) {
-                error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+                error.ReadFailed => return conn.readError(err),
                 else => |e| return e,
             }
         };
@@ -991,7 +1036,7 @@ pub const Client = struct {
                     _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
                         error.ReadFailed => {
                             conn.closing = true;
-                            return conn.tcp_reader.err orelse error.ReadFailed;
+                            return recoverAdapterError(error.ReadFailed, conn.readError(err), &.{body_reader.cause});
                         },
                     };
                     if (!conn.parser.isBodyComplete()) conn.closing = true;

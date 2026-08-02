@@ -472,6 +472,7 @@ pub fn BodyReader(comptime Parser: type) type {
         conn: *std.Io.Reader,
         interface: std.Io.Reader,
         request: ?*Request = null,
+        cause: ?anyerror = null,
 
         const Self = @This();
 
@@ -535,8 +536,9 @@ pub fn BodyReader(comptime Parser: type) type {
                     conn.fillMore() catch |err| switch (err) {
                         error.EndOfStream => {
                             // Connection closed - call finish() to complete the message
-                            parser.finish() catch {
+                            parser.finish() catch |finish_err| {
                                 // finish() failed - message was not complete
+                                self.cause = finish_err;
                                 return error.ReadFailed;
                             };
 
@@ -546,9 +548,13 @@ pub fn BodyReader(comptime Parser: type) type {
                             }
 
                             // Message not complete despite EOF
+                            self.cause = error.UnexpectedEndOfStream;
                             return error.ReadFailed;
                         },
-                        else => return error.ReadFailed,
+                        else => {
+                            self.cause = err;
+                            return error.ReadFailed;
+                        },
                     };
                 }
 
@@ -573,7 +579,10 @@ pub fn BodyReader(comptime Parser: type) type {
                             const consumed = parser.getConsumedBytes(buffered.ptr);
                             conn.toss(consumed);
                         },
-                        else => return error.ReadFailed,
+                        else => {
+                            self.cause = err;
+                            return error.ReadFailed;
+                        },
                     }
                 }
 

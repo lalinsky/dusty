@@ -102,6 +102,64 @@ test "Client: fetch GET request" {
     try client_future.await(io);
 }
 
+test "Client: cancellation while reading a response body stays Canceled" {
+    const io = std.testing.io;
+    const socket_path = "/tmp/dusty-client-canceled-body.sock";
+    std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
+
+    var ready: std.Io.Event = .unset;
+    var body_started: std.Io.Event = .unset;
+    var keep_open: std.Io.Event = .unset;
+
+    var server_future = try io.concurrent(struct {
+        fn run(path: []const u8, ready_event: *std.Io.Event, body_event: *std.Io.Event, wait_event: *std.Io.Event, task_io: std.Io) !void {
+            const addr = try std.Io.net.UnixAddress.init(path);
+            var server = try addr.listen(task_io, .{});
+            defer server.deinit(task_io);
+            ready_event.set(task_io);
+
+            const stream = try server.accept(task_io);
+            defer stream.close(task_io);
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(task_io, &read_buf);
+            while (true) {
+                const line = try reader.interface.takeDelimiterExclusive('\n');
+                reader.interface.toss(1);
+                if (std.mem.trimEnd(u8, line, "\r").len == 0) break;
+            }
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(task_io, &write_buf);
+            try writer.interface.writeAll(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Length: 100\r\n" ++
+                    "Connection: close\r\n\r\n" ++
+                    "partial",
+            );
+            try writer.interface.flush();
+            body_event.set(task_io);
+            try wait_event.wait(task_io);
+        }
+    }.run, .{ socket_path, &ready, &body_started, &keep_open, io });
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(path: []const u8, ready_event: *std.Io.Event, task_io: std.Io) !void {
+            try ready_event.wait(task_io);
+            var client = dusty.Client.init(std.testing.allocator, task_io, .{});
+            defer client.deinit();
+            var response = try client.fetch("http://localhost/test", .{ .unix_socket_path = path });
+            defer response.deinit();
+            _ = try response.body();
+        }
+    }.run, .{ socket_path, &ready, io });
+
+    try body_started.wait(io);
+    try std.testing.expectError(error.Canceled, client_future.cancel(io));
+}
+
 test "Client: connection pooling" {
     const io = std.testing.io;
 

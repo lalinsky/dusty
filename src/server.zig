@@ -322,7 +322,10 @@ pub fn Server(comptime Ctx: type) type {
                         // Unknown Expect value - return 417
                         response.status = .expectation_failed;
                         response.keepalive = false;
-                        try response.write();
+                        response.write() catch |err| switch (err) {
+                            error.WriteFailed => return writer.err orelse err,
+                            else => |e| return e,
+                        };
                         return;
                     }
                 }
@@ -378,7 +381,10 @@ pub fn Server(comptime Ctx: type) type {
                     response.keepalive = false;
                 }
 
-                try response.write();
+                response.write() catch |err| switch (err) {
+                    error.WriteFailed => return writer.err orelse err,
+                    else => |e| return e,
+                };
 
                 if (!response.keepalive) {
                     break;
