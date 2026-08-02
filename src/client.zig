@@ -538,12 +538,12 @@ pub const Connection = struct {
         self.writer.flush() catch |err| return self.writeError(err);
     }
 
-    pub fn readError(self: *const Connection, fallback: anyerror) anyerror {
+    fn readError(self: *const Connection, fallback: anyerror) anyerror {
         const tls_err: ?anyerror = if (self.tls_conn != null) self.tls_reader.err else null;
         return recoverAdapterError(error.ReadFailed, fallback, &.{ self.tcp_reader.err, tls_err });
     }
 
-    pub fn writeError(self: *const Connection, fallback: anyerror) anyerror {
+    fn writeError(self: *const Connection, fallback: anyerror) anyerror {
         const tls_err: ?anyerror = if (self.tls_conn != null) self.tls_writer.err else null;
         return recoverAdapterError(error.WriteFailed, fallback, &.{ self.tcp_writer.err, tls_err });
     }
@@ -650,14 +650,18 @@ pub const ClientResponse = struct {
         return &self.parsed.headers;
     }
 
-    /// Recover the concrete transport/parser error hidden by std.Io.Reader's
-    /// error.ReadFailed marker. Streaming callers should use this when an API fed
-    /// by reader() returns ReadFailed.
-    pub fn readError(self: *const ClientResponse, fallback: anyerror) anyerror {
+    fn readError(self: *const ClientResponse, fallback: anyerror) anyerror {
         if (fallback != error.ReadFailed) return fallback;
         const transport_err = if (self.owner) |conn| conn.readError(fallback) else fallback;
         const body_err: ?anyerror = if (self._body_reader_init) self._body_reader.cause else null;
         return recoverAdapterError(error.ReadFailed, transport_err, &.{body_err});
+    }
+
+    /// Run one streaming body operation and restore the concrete transport/parser
+    /// error before it crosses the response boundary. `args` is appended after the
+    /// reader argument when calling `readFn`.
+    pub fn withBodyReader(self: *ClientResponse, comptime readFn: anytype, args: anytype) @typeInfo(@TypeOf(readFn)).@"fn".return_type.? {
+        return @call(.auto, readFn, .{self.reader()} ++ args) catch |err| return self.readError(err);
     }
 
     /// Get HTTP version.
