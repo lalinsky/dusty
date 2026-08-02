@@ -650,18 +650,13 @@ pub const ClientResponse = struct {
         return &self.parsed.headers;
     }
 
-    fn readError(self: *const ClientResponse, fallback: anyerror) anyerror {
+    /// Recover the concrete transport/parser error after one complete streaming
+    /// operation using reader() returns a std.Io ReadFailed marker.
+    pub fn readError(self: *const ClientResponse, fallback: anyerror) anyerror {
         if (fallback != error.ReadFailed) return fallback;
         const transport_err = if (self.owner) |conn| conn.readError(fallback) else fallback;
         const body_err: ?anyerror = if (self._body_reader_init) self._body_reader.cause else null;
         return recoverAdapterError(error.ReadFailed, transport_err, &.{body_err});
-    }
-
-    /// Run one streaming body operation and restore the concrete transport/parser
-    /// error before it crosses the response boundary. `args` is appended after the
-    /// reader argument when calling `readFn`.
-    pub fn withBodyReader(self: *ClientResponse, comptime readFn: anytype, args: anytype) @typeInfo(@TypeOf(readFn)).@"fn".return_type.? {
-        return @call(.auto, readFn, .{self.reader()} ++ args) catch |err| return self.readError(err);
     }
 
     /// Get HTTP version.
