@@ -498,8 +498,8 @@ pub fn BodyReader(comptime Parser: type) type {
                 if (req.expects_continue) {
                     req.expects_continue = false;
                     if (req.response) |res| {
-                        try res.conn.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
-                        try res.conn.flush();
+                        try res.conn.writer.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+                        try res.conn.writer.flush();
                     }
                 }
             }

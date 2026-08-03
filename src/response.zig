@@ -4,6 +4,7 @@ const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
+const Connection = @import("server.zig").Connection;
 
 var no_buf: [0]u8 = .{};
 
@@ -104,14 +105,14 @@ pub const Response = struct {
     content_type: ?http.ContentType = null,
     arena: std.mem.Allocator,
     buffer: std.Io.Writer.Allocating,
-    conn: *std.Io.Writer,
+    conn: *Connection,
     written: bool = false,
     headers_written: bool = false,
     keepalive: bool = true,
     chunked: bool = false,
     streaming: bool = false,
 
-    pub fn init(arena: std.mem.Allocator, conn: *std.Io.Writer, max_headers: usize) !Response {
+    pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
             .buffer = .init(arena),
@@ -149,7 +150,7 @@ pub const Response = struct {
     pub fn chunk(self: *Response, data: []const u8) !void {
         if (!self.chunked) {
             self.chunked = true;
-            try self.writeHeader();
+            self.writeHeader() catch |err| return self.conn.checkWriteError(err);
         }
 
         // A zero-length chunk is the chunked-encoding terminator; skip it so
@@ -162,11 +163,15 @@ pub const Response = struct {
         var buf: [16]u8 = undefined;
         const chunk_header = try std.fmt.bufPrint(&buf, "{x}\r\n", .{data.len});
 
+        self.writeChunkBytes(chunk_header, data) catch |err| return self.conn.checkWriteError(err);
+    }
+
+    fn writeChunkBytes(self: *Response, chunk_header: []const u8, data: []const u8) !void {
         // Write chunk size header, data, and trailing CRLF
-        try self.conn.writeAll(chunk_header);
-        try self.conn.writeAll(data);
-        try self.conn.writeAll("\r\n");
-        try self.conn.flush();
+        try self.conn.writer.writeAll(chunk_header);
+        try self.conn.writer.writeAll(data);
+        try self.conn.writer.writeAll("\r\n");
+        try self.conn.writer.flush();
     }
 
     pub fn startEventStream(self: *Response) !EventStream {
@@ -175,8 +180,8 @@ pub const Response = struct {
         self.keepalive = false;
         self.streaming = true;
         try self.writeHeader();
-        try self.conn.flush();
-        return .{ .conn = self.conn };
+        try self.conn.writer.flush();
+        return .{ .conn = self.conn.writer };
     }
 
     /// Upgrade HTTP connection to WebSocket.
@@ -205,11 +210,11 @@ pub const Response = struct {
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
         try self.writeHeader();
-        try self.conn.flush();
+        try self.conn.writer.flush();
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
-        return WebSocket.init(self.conn, req.conn, self.arena, seed);
+        return WebSocket.init(self.conn.writer, req.conn, self.arena, seed);
     }
 
     pub fn writeHeader(self: *Response) !void {
@@ -219,7 +224,7 @@ pub const Response = struct {
         self.headers_written = true;
 
         // Write status line
-        try self.conn.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
+        try self.conn.writer.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
 
         // Set the Content-Type header
         if (self.content_type) |content_type| {
@@ -229,29 +234,29 @@ pub const Response = struct {
         // Write headers
         var iter = self.headers.iterator();
         while (iter.next()) |entry| {
-            try self.conn.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+            try self.conn.writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
         }
 
         // Write Connection header based on keepalive
         if (!self.keepalive) {
-            try self.conn.writeAll("Connection: close\r\n");
+            try self.conn.writer.writeAll("Connection: close\r\n");
         }
 
         // Write Transfer-Encoding or Content-Length
         if (self.chunked) {
-            try self.conn.writeAll("Transfer-Encoding: chunked\r\n");
+            try self.conn.writer.writeAll("Transfer-Encoding: chunked\r\n");
         } else if (!self.streaming) {
             // Write Content-Length if not manually set (skip for streaming responses like SSE)
             const has_content_length = self.headers.get("Content-Length") != null;
             if (!has_content_length) {
                 const buffer_end = self.buffer.writer.end;
                 const body_len = if (buffer_end > 0) buffer_end else self.body.len;
-                try self.conn.print("Content-Length: {d}\r\n", .{body_len});
+                try self.conn.writer.print("Content-Length: {d}\r\n", .{body_len});
             }
         }
 
         // End of headers (applies to both chunked and non-chunked)
-        try self.conn.writeAll("\r\n");
+        try self.conn.writer.writeAll("\r\n");
 
         // Don't flush here - let the caller flush after writing (the first part of) the body
     }
@@ -265,8 +270,8 @@ pub const Response = struct {
         if (self.chunked) {
             // For chunked responses, headers are already written by chunk()
             // We just need to write the final zero-length chunk terminator
-            try self.conn.writeAll("0\r\n\r\n");
-            try self.conn.flush();
+            try self.conn.writer.writeAll("0\r\n\r\n");
+            try self.conn.writer.flush();
             return;
         }
 
@@ -276,9 +281,9 @@ pub const Response = struct {
         // Write body (either from buffer or body field)
         const buffered = self.buffer.writer.buffered();
         const body = if (buffered.len > 0) buffered else self.body;
-        try self.conn.writeAll(body);
+        try self.conn.writer.writeAll(body);
 
-        try self.conn.flush();
+        try self.conn.writer.flush();
     }
 };
 
@@ -289,7 +294,10 @@ test "Response: basic writer usage" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     const w = response.writer();
 
     try w.writeAll("Hello, ");
@@ -306,7 +314,10 @@ test "Response: writer with formatted output" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     const w = response.writer();
 
     try w.print("Hello, {s}! You are {d} years old.", .{ "Alice", 30 });
@@ -322,7 +333,10 @@ test "Response: buffer takes precedence over body" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.body = "body content";
 
     const w = response.writer();
@@ -344,7 +358,10 @@ test "Response: body used when buffer is empty" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.body = "body content";
 
     // Don't write to buffer
@@ -363,7 +380,10 @@ test "Response: write() with body" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.body = "Hello World";
 
     try response.write();
@@ -381,7 +401,10 @@ test "Response: write() with writer buffer" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     const w = response.writer();
     try w.print("Count: {d}", .{42});
 
@@ -400,7 +423,10 @@ test "Response: write() only writes once" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.body = "First";
 
     try response.write();
@@ -421,7 +447,10 @@ test "Response: writeHeader() basic" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.status = .created;
     try response.header("X-Custom", "value");
     response.body = "Hello";
@@ -443,7 +472,10 @@ test "Response: writeHeader() only writes once" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.body = "Test";
 
     try response.writeHeader();
@@ -464,7 +496,10 @@ test "Response: write() after writeHeader() doesn't duplicate headers" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.body = "Body content";
 
     // Write headers first
@@ -491,7 +526,10 @@ test "Response: clearWriter()" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     const w = response.writer();
 
     try w.writeAll("First content");
@@ -511,7 +549,10 @@ test "Response: keepalive defaults to true" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectEqual(true, response.keepalive);
 
     response.body = "test";
@@ -529,7 +570,10 @@ test "Response: Connection close header when keepalive is false" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.keepalive = false;
     response.body = "test";
 
@@ -546,7 +590,10 @@ test "Response: chunked with single chunk" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.status = .ok;
 
     try response.chunk("Hello");
@@ -573,7 +620,10 @@ test "Response: chunked with multiple chunks" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
 
     try response.chunk("First");
     try response.chunk("Second chunk");
@@ -602,7 +652,10 @@ test "Response: chunked with custom headers" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.status = .created;
     try response.header("X-Custom", "value");
 
@@ -630,8 +683,10 @@ test "Response: chunked flag defaults to false" {
 
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
 
-    const response = try Response.init(arena.allocator(), &conn_writer, 32);
+    const response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectEqual(false, response.chunked);
 }
 
@@ -642,7 +697,10 @@ test "Response: chunk() skips empty data so it doesn't terminate the stream" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
 
     try response.chunk("first");
     try response.chunk(""); // would be the chunked terminator if written; must be skipped
@@ -660,6 +718,38 @@ test "Response: chunk() skips empty data so it doesn't terminate the stream" {
     try std.testing.expectEqualStrings(expected, written);
 }
 
+test "Response: chunk() surfaces the real error behind error.WriteFailed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Buffer too small to hold the headers, so the very first write fails.
+    var buf: [4]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    try std.testing.expectError(error.ConnectionResetByPeer, response.chunk("first"));
+}
+
+test "Response: chunk() falls back to error.WriteFailed when no real error was recorded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [4]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    try std.testing.expectError(error.WriteFailed, response.chunk("first"));
+}
+
 test "Response: chunked mode doesn't write Content-Length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -667,7 +757,10 @@ test "Response: chunked mode doesn't write Content-Length" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
 
     try response.chunk("test");
     try response.write();
@@ -688,7 +781,10 @@ test "Response: json() with simple object" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try response.json(.{ .name = "Alice", .age = 30 }, .{});
 
     const buffered = response.buffer.writer.buffered();
@@ -707,7 +803,10 @@ test "Response: json() writes complete response" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     response.status = .created;
     try response.json(.{ .id = 123, .message = "Created" }, .{});
     try response.write();
@@ -732,7 +831,10 @@ test "Response: json() with array" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     const items = [_]i32{ 1, 2, 3, 4, 5 };
     try response.json(items, .{});
 
@@ -747,7 +849,10 @@ test "Response: json() with nested object" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try response.json(.{
         .user = .{
             .name = "Bob",
@@ -812,7 +917,10 @@ test "Response: startEventStream" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     const stream = try response.startEventStream();
 
     try stream.send("connected", .{});
@@ -832,7 +940,10 @@ test "Response: setCookie basic" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try response.setCookie("session", "abc123", .{});
     response.body = "OK";
 
@@ -849,7 +960,10 @@ test "Response: setCookie with options" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try response.setCookie("auth", "token123", .{
         .path = "/",
         .http_only = true,
@@ -871,7 +985,10 @@ test "Response: header() rejects CRLF in value" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.InvalidHeaderValue, response.header("Location", "/ok\r\nX-Evil: 1"));
     try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\nbaz"));
     try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\x00baz"));
@@ -884,7 +1001,10 @@ test "Response: header() rejects invalid name" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.InvalidHeaderName, response.header("", "value"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("X-Bad\r\n", "value"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("X: Bad", "value"));
@@ -898,7 +1018,10 @@ test "Response: setCookie rejects CRLF via header()" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var response = try Response.init(arena.allocator(), &conn_writer, 32);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.InvalidHeaderValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
 }
 

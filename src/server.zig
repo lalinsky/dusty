@@ -17,6 +17,107 @@ const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 
 const log = std.log.scoped(.dusty);
 
+/// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
+/// layer) for one accepted connection. Initialized in place: `tls_conn`
+/// stores pointers into `tcp_reader`/`tcp_writer`, and `tls_reader`/
+/// `tls_writer` store a pointer back into `tls_conn`, so a `Connection` must
+/// never be moved after `initPlain`/`initTls` runs.
+pub const Connection = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+
+    tcp_reader: std.Io.net.Stream.Reader = undefined,
+    tcp_writer: std.Io.net.Stream.Writer = undefined,
+    write_buffer: [4096]u8 = undefined,
+
+    // TLS layer: tcp_reader/tcp_writer above carry ciphertext; tls_conn wraps
+    // them, and tls_reader/tls_writer expose the cleartext Reader/Writer used
+    // for HTTP I/O.
+    tls_conn: ?tls.Connection = null,
+    tls_rng: std.Random.IoSource = undefined,
+    tls_cleartext_write_buffer: [4096]u8 = undefined,
+    tls_reader: tls.Connection.Reader = undefined,
+    tls_writer: tls.Connection.Writer = undefined,
+
+    // Active reader/writer, whichever path is in use.
+    reader: *std.Io.Reader = undefined,
+    writer: *std.Io.Writer = undefined,
+
+    pub fn initPlain(self: *Connection, io: std.Io, stream: std.Io.net.Stream) void {
+        self.* = .{ .io = io, .stream = stream };
+        self.tcp_reader = stream.reader(io, &.{});
+        self.tcp_writer = stream.writer(io, &self.write_buffer);
+        self.reader = &self.tcp_reader.interface;
+        self.writer = &self.tcp_writer.interface;
+    }
+
+    pub fn initTls(
+        self: *Connection,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        tcp_read_buffer: []u8,
+        tcp_write_buffer: []u8,
+        auth: *tls.config.CertKeyPair,
+    ) !void {
+        self.* = .{ .io = io, .stream = stream };
+        self.tcp_reader = stream.reader(io, tcp_read_buffer);
+        self.tcp_writer = stream.writer(io, tcp_write_buffer);
+        self.tls_rng = .{ .io = io };
+        self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
+            .auth = auth,
+            .now = std.Io.Clock.real.now(io),
+            .rng = self.tls_rng.interface(),
+        });
+        self.tls_reader = self.tls_conn.?.reader(&.{});
+        self.tls_writer = self.tls_conn.?.writer(&self.tls_cleartext_write_buffer);
+        self.reader = &self.tls_reader.interface;
+        self.writer = &self.tls_writer.interface;
+    }
+
+    /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
+    /// `tcp_writer.err` is left settable so a test can simulate the real
+    /// error a write failure should surface.
+    pub fn initWriterForTesting(self: *Connection, w: *std.Io.Writer) void {
+        self.* = .{ .io = undefined, .stream = undefined, .reader = undefined, .writer = w };
+        self.tcp_writer.err = null;
+    }
+
+    /// If `err` is the generic `error.ReadFailed`, returns the real error
+    /// behind it (falling back to `err` itself if none was recorded);
+    /// otherwise returns `err` unchanged.
+    pub fn checkReadError(self: *Connection, err: anytype) !void {
+        if (err != error.ReadFailed) return err;
+        if (build_options.use_tls) {
+            if (self.tls_conn != null) {
+                if (self.tls_reader.err) |e| return e;
+                return err;
+            }
+        }
+        if (self.tcp_reader.err) |e| return e;
+        return err;
+    }
+
+    /// If `err` is the generic `error.WriteFailed`, returns the real error
+    /// behind it (falling back to `err` itself if none was recorded);
+    /// otherwise returns `err` unchanged. For TLS, a write can fail because
+    /// the TLS layer needed to read internally, so both the TLS reader and
+    /// writer (and the raw TCP pair underneath) are scanned.
+    pub fn checkWriteError(self: *Connection, err: anytype) !void {
+        if (err != error.WriteFailed) return err;
+        if (build_options.use_tls) {
+            if (self.tls_conn != null) {
+                if (self.tls_writer.err) |e| return e;
+                if (self.tcp_writer.err) |e| return e;
+                if (self.tls_reader.err) |e| return e;
+                if (self.tcp_reader.err) |e| return e;
+                return err;
+            }
+        }
+        if (self.tcp_writer.err) |e| return e;
+        return err;
+    }
+};
+
 pub const Address = union(enum) {
     ip: std.Io.net.IpAddress,
     unix: std.Io.net.UnixAddress,
@@ -203,6 +304,8 @@ pub fn Server(comptime Ctx: type) type {
             var conn_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer conn_arena.deinit();
 
+            var connection: Connection = undefined;
+
             // When TLS is configured, upgrade the accepted stream and run the
             // request loop over the cleartext reader/writer. Otherwise run it
             // directly over the raw stream.
@@ -224,54 +327,34 @@ pub fn Server(comptime Ctx: type) type {
                     const tcp_read_buffer = try conn_arena.allocator().alloc(u8, tls.input_buffer_len);
                     const tcp_write_buffer = try conn_arena.allocator().alloc(u8, tls.output_buffer_len);
 
-                    var tcp_reader = stream.reader(self.io, tcp_read_buffer);
-                    var tcp_writer = stream.writer(self.io, tcp_write_buffer);
-
-                    var rng_source: std.Random.IoSource = .{ .io = self.io };
-                    var conn = tls.server(&tcp_reader.interface, &tcp_writer.interface, .{
-                        .auth = auth,
-                        .now = std.Io.Clock.real.now(self.io),
-                        .rng = rng_source.interface(),
-                    }) catch |err| {
+                    connection.initTls(self.io, stream, tcp_read_buffer, tcp_write_buffer, auth) catch |err| {
                         log.err("TLS handshake failed: {}", .{err});
                         return;
                     };
-
-                    // Cleartext response buffer; same role and size as the plain
-                    // path's write_buffer, so it lives on the stack too.
-                    var cleartext_write_buffer: [4096]u8 = undefined;
-                    var reader = conn.reader(&.{});
-                    var writer = conn.writer(&cleartext_write_buffer);
 
                     // Per-request arena nested on the connection arena: resetting it
                     // between keepalive requests reuses the connection's memory
                     // without touching the TLS buffers carved above.
                     var request_arena = std.heap.ArenaAllocator.init(conn_arena.allocator());
-                    return self.handleRequests(&reader, &writer, &request_arena, &needs_shutdown);
+                    return self.handleRequests(&connection, &request_arena, &needs_shutdown);
                 }
             }
 
-            var reader = stream.reader(self.io, &.{});
-            var write_buffer: [4096]u8 = undefined;
-            var writer = stream.writer(self.io, &write_buffer);
-            return self.handleRequests(&reader, &writer, &conn_arena, &needs_shutdown);
+            connection.initPlain(self.io, stream);
+            return self.handleRequests(&connection, &conn_arena, &needs_shutdown);
         }
 
-        /// Runs the HTTP request/keepalive loop over a reader/writer pair.
-        /// `reader`/`writer` are pointers to either the raw stream's
-        /// Reader/Writer or a tls.Connection's — both expose `.interface` and
-        /// `.err`.
+        /// Runs the HTTP request/keepalive loop over a connection.
         fn handleRequests(
             self: *Self,
-            reader: anytype,
-            writer: anytype,
+            connection: *Connection,
             arena: *std.heap.ArenaAllocator,
             needs_shutdown: *bool,
         ) !void {
             var request: Request = .{
                 .arena = arena.allocator(),
                 .io = self.io,
-                .conn = &reader.interface,
+                .conn = connection.reader,
                 .parser = undefined,
                 .config = self.config.request,
             };
@@ -288,7 +371,7 @@ pub fn Server(comptime Ctx: type) type {
             defer timeout.clear();
 
             // Allocate initial buffer from arena
-            reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
+            connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
                 log.err("Failed to allocate read buffer: {}", .{err});
                 return err;
             };
@@ -300,18 +383,18 @@ pub fn Server(comptime Ctx: type) type {
                     timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
                 }
 
-                parseHeaders(&reader.interface, &parser) catch |err| switch (err) {
+                parseHeaders(connection.reader, &parser) catch |err| switch (err) {
                     error.EndOfStream => {
                         needs_shutdown.* = false;
                         return;
                     },
-                    error.ReadFailed => return reader.err orelse error.ReadFailed,
+                    error.ReadFailed => return connection.checkReadError(err),
                     else => |e| return e,
                 };
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
-                var response = try Response.init(arena.allocator(), &writer.interface, self.config.request.max_header_count);
+                var response = try Response.init(arena.allocator(), connection, self.config.request.max_header_count);
                 request.response = &response;
 
                 // Handle Expect header (100-continue)
@@ -348,8 +431,8 @@ pub fn Server(comptime Ctx: type) type {
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
                 executor.run() catch |err| switch (err) {
-                    error.ReadFailed => return reader.err orelse error.ReadFailed,
-                    error.WriteFailed => return writer.err orelse error.WriteFailed,
+                    error.ReadFailed => return connection.checkReadError(err),
+                    error.WriteFailed => return connection.checkWriteError(err),
                     else => |e| return e,
                 };
 
@@ -362,11 +445,11 @@ pub fn Server(comptime Ctx: type) type {
                     };
                     if (drainable) {
                         var scratch: [4096]u8 = undefined;
-                        var body_reader = RequestBodyReader.init(&parser, &reader.interface, &scratch);
+                        var body_reader = RequestBodyReader.init(&parser, connection.reader, &scratch);
                         if (body_reader.interface.discardShort(max + 1)) |consumed| {
                             if (consumed > max) response.keepalive = false;
-                        } else |_| {
-                            if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                        } else |drain_err| {
+                            connection.checkReadError(drain_err) catch |e| if (e == error.Canceled) return error.Canceled;
                             response.keepalive = false;
                         }
                     } else {
@@ -388,31 +471,31 @@ pub fn Server(comptime Ctx: type) type {
                 request.reset();
 
                 // If there's buffered data (pipelining), close connection - we don't support it
-                if (reader.interface.end > reader.interface.seek) {
+                if (connection.reader.end > connection.reader.seek) {
                     break;
                 }
 
                 _ = arena.reset(.retain_capacity);
 
                 // Allocate fresh buffer for keepalive wait (previous buffer was freed by arena reset)
-                reader.interface.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
+                connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
                     log.err("Failed to allocate read buffer: {}", .{err});
                     return err;
                 };
-                reader.interface.seek = 0;
-                reader.interface.end = 0;
+                connection.reader.seek = 0;
+                connection.reader.end = 0;
 
                 if (self.config.timeout.keepalive) |duration| {
                     timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
                 }
 
                 // Fill some data here, under the keepalive timeout
-                reader.interface.fillMore() catch |err| switch (err) {
+                connection.reader.fillMore() catch |err| switch (err) {
                     error.EndOfStream => {
                         needs_shutdown.* = false;
                         return;
                     },
-                    error.ReadFailed => return reader.err orelse error.ReadFailed,
+                    error.ReadFailed => return connection.checkReadError(err),
                 };
             }
         }
