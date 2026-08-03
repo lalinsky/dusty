@@ -150,7 +150,10 @@ pub const Response = struct {
     pub fn chunk(self: *Response, data: []const u8) !void {
         if (!self.chunked) {
             self.chunked = true;
-            self.writeHeader() catch |err| return self.conn.checkWriteError(err);
+            self.writeHeader() catch |err| switch (err) {
+                error.WriteFailed => return self.conn.getWriteError() orelse err,
+                else => |e| return e,
+            };
         }
 
         // A zero-length chunk is the chunked-encoding terminator; skip it so
@@ -163,7 +166,7 @@ pub const Response = struct {
         var buf: [16]u8 = undefined;
         const chunk_header = try std.fmt.bufPrint(&buf, "{x}\r\n", .{data.len});
 
-        self.writeChunkBytes(chunk_header, data) catch |err| return self.conn.checkWriteError(err);
+        self.writeChunkBytes(chunk_header, data) catch |err| return self.conn.getWriteError() orelse err;
     }
 
     fn writeChunkBytes(self: *Response, chunk_header: []const u8, data: []const u8) !void {
