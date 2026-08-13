@@ -107,17 +107,16 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
-    // A transport failure under TLS is recorded twice: tls.zig gets only the
-    // generic `ReadFailed`/`WriteFailed` from the ciphertext reader/writer and
-    // stores that, while the real cause sits on the TCP layer underneath. So
-    // the generic errors are not answers; keep descending when we see one.
-    // A TLS-level failure (bad record mac, bad version, ...) is stored as
-    // itself and stops the search.
+    // tls.zig records `TransportReadFailed`/`TransportWriteFailed` when the
+    // layer below it failed, because all it saw was the ciphertext
+    // reader/writer's generic error; the real cause is on the TCP layer.
+    // So those two mean "keep descending". A TLS-level failure (bad record
+    // mac, bad version, ...) is recorded as itself and stops the search.
 
     fn checkReadError(self: *Connection) !void {
         if (build_options.use_tls) {
             if (self.tls_conn != null) {
-                if (self.tls_reader.err) |e| if (e != error.ReadFailed) return e;
+                if (self.tls_reader.err) |e| if (e != error.TransportReadFailed) return e;
             }
         }
         if (self.tcp_reader.err) |e| return e;
@@ -131,7 +130,7 @@ pub const Connection = struct {
     fn checkWriteError(self: *Connection) !void {
         if (build_options.use_tls) {
             if (self.tls_conn != null) {
-                if (self.tls_writer.err) |e| if (e != error.WriteFailed) return e;
+                if (self.tls_writer.err) |e| if (e != error.TransportWriteFailed) return e;
             }
         }
         if (self.tcp_writer.err) |e| return e;
@@ -565,13 +564,13 @@ test "Connection: error accessors descend past the TLS layer's generic error" {
 
     { // a transport write failure: TLS records WriteFailed, TCP has the cause
         var conn = testTlsConnection();
-        conn.tls_writer.err = error.WriteFailed;
+        conn.tls_writer.err = error.TransportWriteFailed;
         conn.tcp_writer.err = error.ConnectionResetByPeer;
         try std.testing.expectEqual(error.ConnectionResetByPeer, conn.getWriteError().?);
     }
     { // same on the read side
         var conn = testTlsConnection();
-        conn.tls_reader.err = error.ReadFailed;
+        conn.tls_reader.err = error.TransportReadFailed;
         conn.tcp_reader.err = error.Canceled;
         try std.testing.expectEqual(error.Canceled, conn.getReadError().?);
     }
