@@ -99,6 +99,7 @@ pub const Connection = struct {
     /// error a write failure should surface.
     pub fn initWriterForTesting(self: *Connection, w: *std.Io.Writer) void {
         self.* = .{ .io = undefined, .stream = undefined, .reader = undefined, .writer = w };
+        self.tcp_reader.err = null;
         self.tcp_writer.err = null;
     }
 
@@ -106,11 +107,17 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
+    // A transport failure under TLS is recorded twice: tls.zig gets only the
+    // generic `ReadFailed`/`WriteFailed` from the ciphertext reader/writer and
+    // stores that, while the real cause sits on the TCP layer underneath. So
+    // the generic errors are not answers; keep descending when we see one.
+    // A TLS-level failure (bad record mac, bad version, ...) is stored as
+    // itself and stops the search.
+
     fn checkReadError(self: *Connection) !void {
         if (build_options.use_tls) {
             if (self.tls_conn != null) {
-                if (self.tls_reader.err) |e| return e;
-                return;
+                if (self.tls_reader.err) |e| if (e != error.ReadFailed) return e;
             }
         }
         if (self.tcp_reader.err) |e| return e;
@@ -124,22 +131,35 @@ pub const Connection = struct {
     fn checkWriteError(self: *Connection) !void {
         if (build_options.use_tls) {
             if (self.tls_conn != null) {
-                if (self.tls_writer.err) |e| return e;
-                if (self.tcp_writer.err) |e| return e;
-                if (self.tls_reader.err) |e| return e;
-                if (self.tcp_reader.err) |e| return e;
-                return;
+                if (self.tls_writer.err) |e| if (e != error.WriteFailed) return e;
             }
         }
         if (self.tcp_writer.err) |e| return e;
     }
 
     /// The real error behind a generic `error.WriteFailed`, if any was
-    /// recorded. For TLS, a write can fail because the TLS layer needed to
-    /// read internally, so both the TLS reader and writer (and the raw TCP
-    /// pair underneath) are scanned.
+    /// recorded.
     pub fn getWriteError(self: *Connection) ?@typeInfo(@TypeOf(checkWriteError(self))).error_union.error_set {
         if (checkWriteError(self)) |_| return null else |e| return e;
+    }
+
+    /// True when `err` means the peer is gone rather than something being
+    /// wrong. Teardown is the same either way; this only decides whether the
+    /// connection is worth a log line and whether shutdown() is worth a
+    /// syscall.
+    pub fn isPeerGone(err: anyerror) bool {
+        return switch (err) {
+            error.EndOfStream,
+            // Peer closed the transport between TLS records without
+            // close_notify. Rude, but routine from clients that just close
+            // the socket. `TlsTruncated`, where a record was cut in half, is
+            // deliberately not here.
+            error.TlsUnexpectedEof,
+            error.ConnectionResetByPeer,
+            error.BrokenPipe,
+            => true,
+            else => false,
+        };
     }
 };
 
@@ -309,7 +329,13 @@ pub fn Server(comptime Ctx: type) type {
         fn handleConnectionWrapper(self: *Self, stream: std.Io.net.Stream) std.Io.Cancelable!void {
             handleConnection(self, stream) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
-                log.err("Connection error: {}", .{err});
+                // A peer disappearing mid-request is ordinary and would drown
+                // out the failures worth looking at.
+                if (Connection.isPeerGone(err)) {
+                    log.debug("Connection closed by peer: {}", .{err});
+                } else {
+                    log.err("Connection error: {}", .{err});
+                }
             };
         }
 
@@ -502,7 +528,17 @@ pub fn Server(comptime Ctx: type) type {
                         needs_shutdown.* = false;
                         return;
                     },
-                    error.ReadFailed => return connection.getReadError() orelse error.ReadFailed,
+                    error.ReadFailed => {
+                        const e = connection.getReadError() orelse error.ReadFailed;
+                        // Nothing is in flight between requests, so a peer
+                        // that went away here has cost us nothing. The socket
+                        // is already gone, so skip the shutdown syscall too.
+                        if (Connection.isPeerGone(e)) {
+                            needs_shutdown.* = false;
+                            return;
+                        }
+                        return e;
+                    },
                 };
             }
         }
@@ -511,4 +547,58 @@ pub fn Server(comptime Ctx: type) type {
 
 test {
     _ = RequestParser;
+}
+
+/// A Connection with no real transport, in TLS mode, so the error accessors
+/// can be driven directly. Only the `err` fields are read.
+fn testTlsConnection() Connection {
+    var conn: Connection = undefined;
+    conn.initWriterForTesting(undefined);
+    conn.tls_conn = .{ .input = undefined, .output = undefined, .cipher = undefined };
+    conn.tls_reader.err = null;
+    conn.tls_writer.err = null;
+    return conn;
+}
+
+test "Connection: error accessors descend past the TLS layer's generic error" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+
+    { // a transport write failure: TLS records WriteFailed, TCP has the cause
+        var conn = testTlsConnection();
+        conn.tls_writer.err = error.WriteFailed;
+        conn.tcp_writer.err = error.ConnectionResetByPeer;
+        try std.testing.expectEqual(error.ConnectionResetByPeer, conn.getWriteError().?);
+    }
+    { // same on the read side
+        var conn = testTlsConnection();
+        conn.tls_reader.err = error.ReadFailed;
+        conn.tcp_reader.err = error.Canceled;
+        try std.testing.expectEqual(error.Canceled, conn.getReadError().?);
+    }
+}
+
+test "Connection: a TLS-level failure is reported as itself" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+
+    { // not a transport failure, so there is nothing below to descend to
+        var conn = testTlsConnection();
+        conn.tls_reader.err = error.TlsBadRecordMac;
+        conn.tcp_reader.err = error.ConnectionResetByPeer;
+        try std.testing.expectEqual(error.TlsBadRecordMac, conn.getReadError().?);
+    }
+    { // and with nothing recorded anywhere there is no error to report
+        var conn = testTlsConnection();
+        try std.testing.expectEqual(@as(?anyerror, null), conn.getWriteError());
+    }
+}
+
+test "Connection: isPeerGone separates a departed peer from a real failure" {
+    try std.testing.expect(Connection.isPeerGone(error.EndOfStream));
+    try std.testing.expect(Connection.isPeerGone(error.ConnectionResetByPeer));
+    // Closed between records: nothing was in flight, nothing was lost.
+    try std.testing.expect(Connection.isPeerGone(error.TlsUnexpectedEof));
+    // Closed mid-record: a record was cut, which is worth hearing about.
+    try std.testing.expect(!Connection.isPeerGone(error.TlsTruncated));
+    try std.testing.expect(!Connection.isPeerGone(error.TlsBadRecordMac));
+    try std.testing.expect(!Connection.isPeerGone(error.Canceled));
 }
