@@ -33,8 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .tls = .{
-            .url = "git+https://github.com/ianic/tls.zig#5452bafc98d23e304209cb24d81fd2d19434e52d",
-            .hash = "tls-0.1.0-ER2e0hOsBQA6IN_UFrQFn0A_dIdW8HleuHi3oTT059RI",
+            .url = "git+https://github.com/lalinsky/tls.zig#4ff3e5a2e6c9b2624fba1de3792bb29afa8de0d3",
+            .hash = "tls-0.1.0-ER2e0vs0BgCXLcL87UB__FMdgDryWw5ZO0G--qeog8sF",
             .lazy = true,
         },
     },
