@@ -916,3 +916,55 @@ test "Server: 417 Expectation Failed for unknown Expect value" {
 
     try client_future.await(io);
 }
+test "Server: HEAD is answered by the GET route with no body" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/thing", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.content_type = .text;
+            res.body = "0123456789";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            defer stream.shutdown(_io, .both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            var conn_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &conn_buf);
+
+            try writer.interface.writeAll("HEAD /thing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            try writer.interface.flush();
+
+            var rest: [2048]u8 = undefined;
+            var sink: std.Io.Writer = .fixed(&rest);
+            _ = reader.interface.streamRemaining(&sink) catch {};
+            const got = sink.buffered();
+
+            try std.testing.expect(std.mem.indexOf(u8, got, "HTTP/1.1 200") != null);
+            // The length a GET would have reported...
+            try std.testing.expect(std.mem.indexOf(u8, got, "Content-Length: 10") != null);
+            // ...and none of those bytes.
+            try std.testing.expect(std.mem.indexOf(u8, got, "0123456789") == null);
+            try std.testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n"));
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
