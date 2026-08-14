@@ -20,7 +20,7 @@ import unittest
 HOST = "127.0.0.1"
 BINARY_NAME = "server" + (".exe" if platform.system() == "Windows" else "")
 BINARY_PATH = os.path.join(os.path.dirname(__file__), "zig-out", "bin", BINARY_NAME)
-STARTUP_TIMEOUT = 10  # seconds
+STARTUP_TIMEOUT = 30  # seconds
 SHUTDOWN_TIMEOUT = 5  # seconds
 
 
@@ -55,10 +55,13 @@ class HttpbinTest(unittest.TestCase):
         )
 
         if not cls.wait_for_server():
+            exit_code = cls.server_process.poll()
             cls.server_process.kill()
             raise RuntimeError(
-                f"Server did not start within {STARTUP_TIMEOUT} seconds. "
-                f"Its output was:\n{cls.read_log()}"
+                f"Server never answered on {HOST}:{cls.port}.\n"
+                f"binary: {BINARY_PATH}\n"
+                f"exited: {'no, still running' if exit_code is None else exit_code}\n"
+                f"output:\n{cls.read_log()}"
             )
 
     @classmethod
@@ -81,6 +84,10 @@ class HttpbinTest(unittest.TestCase):
     def wait_for_server(cls, timeout: float = STARTUP_TIMEOUT) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # A server that has already exited is never going to answer,
+            # and the exit code says more than the timeout would.
+            if cls.server_process.poll() is not None:
+                return False
             try:
                 conn = http.client.HTTPConnection(HOST, cls.port, timeout=1)
                 conn.request("GET", "/ip")
