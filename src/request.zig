@@ -18,6 +18,9 @@ pub const Request = struct {
     content_type: ?http.ContentType = null,
     params: http.Params = .{},
     query: http.Params = .{},
+    /// The peer this request arrived from. Unix socket peers have no
+    /// address of their own, so they report the unspecified one.
+    remote_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,

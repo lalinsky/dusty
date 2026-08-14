@@ -1032,3 +1032,37 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     try std.testing.expect(elapsed_ns >= 100 * std.time.ns_per_ms);
     try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
 }
+test "Server: request carries the peer address" {
+    const TestContext = struct {
+        const Self = @This();
+
+        seen: ?std.Io.net.IpAddress = null,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.get("/whoami", handleGet);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            try writer.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            try writer.flush();
+        }
+
+        fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            ctx.seen = req.remote_address;
+            res.body = "OK\n";
+        }
+    };
+
+    var ctx: TestContext = .{};
+    try testClientServer(TestContext, &ctx);
+
+    const seen = ctx.seen orelse return error.HandlerNeverRan;
+    // The client connects over IPv4 loopback, so that is what the peer
+    // must be -- not the unspecified default, and not the listen address,
+    // whose port belongs to the server.
+    try std.testing.expect(seen == .ip4);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, seen.ip4.bytes);
+    try std.testing.expect(seen.ip4.port != 0);
+}
