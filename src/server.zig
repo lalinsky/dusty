@@ -362,10 +362,25 @@ pub fn Server(comptime Ctx: type) type {
             // directly over the raw stream.
             if (build_options.use_tls) {
                 if (self.tls_auth) |*auth| {
-                    connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth) catch |err| {
-                        log.err("TLS handshake failed: {}", .{err});
-                        return;
-                    };
+                    // The handshake is the one part of a connection's life
+                    // the request loop's timeout cannot cover, since that
+                    // loop does not exist yet. A peer that opens a socket
+                    // and then stalls mid-handshake would otherwise hold a
+                    // task and the connection's whole buffer reservation
+                    // for as long as it likes -- cheaper for it than a
+                    // slow request, which is bounded.
+                    {
+                        var handshake: zio.AutoCancel = .init;
+                        defer handshake.clear();
+                        if (self.config.timeout.request) |duration| {
+                            handshake.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
+                        }
+
+                        connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth) catch |err| {
+                            log.err("TLS handshake failed: {}", .{err});
+                            return;
+                        };
+                    }
 
                     // Per-request arena nested on the connection arena: resetting it
                     // between keepalive requests reuses the connection's memory
