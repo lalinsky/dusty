@@ -155,7 +155,9 @@ pub const BodyWriter = struct {
     /// Marks the body complete. It is sent with the rest of the response,
     /// once the headers have settled.
     pub fn end(self: *BodyWriter) !void {
-        std.debug.assert(self.res.body_writer_open); // end called twice
+        // Idempotent, so `defer body.end() catch {}` alongside an explicit
+        // `end` on the success path is harmless rather than a second body.
+        if (!self.res.body_writer_open) return;
         self.res.body_writer_open = false;
         try self.interface.flush();
     }
@@ -179,11 +181,6 @@ pub const StreamingBodyWriter = struct {
     /// fails, so a handler that catches one can find out what happened
     /// instead of being told only that it did.
     err: ?Error = null,
-    /// Length the handler declared, if any.
-    content_length: ?usize = null,
-    /// Body bytes handed to the connection, checked against `content_length`.
-    sent: usize = 0,
-
     /// Everything `writeHeader` can fail with, plus the real transport
     /// errors hiding behind `WriteFailed`.
     pub const Error = Connection.WriteError || HeaderError;
@@ -222,7 +219,7 @@ pub const StreamingBodyWriter = struct {
             self.writeChunk(pending, data, splat, total)
         else
             self.writeBody(pending, data, splat));
-        self.sent += total;
+        self.res.body_sent += total;
         return w.consume(total);
     }
 
@@ -272,7 +269,9 @@ pub const StreamingBodyWriter = struct {
     /// writes the terminator. Must be called before the handler returns.
     pub fn end(self: *StreamingBodyWriter) !void {
         const res = self.res;
-        std.debug.assert(res.body_writer_open); // end called twice
+        // Idempotent: a second `end` must not write a second terminator,
+        // which the peer would read as the start of the next message.
+        if (!res.body_writer_open) return;
         res.body_writer_open = false;
 
         try self.record(self.interface.flush());
@@ -280,8 +279,8 @@ pub const StreamingBodyWriter = struct {
         try self.record(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
-        if (self.content_length) |declared| {
-            if (self.sent != declared) return error.ContentLengthMismatch;
+        if (res.content_length) |declared| {
+            if (res.body_sent != declared) return error.ContentLengthMismatch;
         }
         res.written = true;
     }
@@ -300,8 +299,14 @@ pub const Response = struct {
     keepalive: bool = true,
     chunked: bool = false,
     streaming: bool = false,
-    /// A `BodyWriter` was handed out and has not been ended yet.
+    /// A body writer was handed out and has not been ended yet.
     body_writer_open: bool = false,
+    /// Length declared before streaming, if any. On the response rather
+    /// than the writer so that `write` can still tell whether the body
+    /// that went out matched it, even if the writer was abandoned.
+    content_length: ?usize = null,
+    /// Body bytes handed to the connection by a streaming writer.
+    body_sent: usize = 0,
 
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
@@ -339,14 +344,13 @@ pub const Response = struct {
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
         self.startBody();
-        var body: StreamingBodyWriter = .init(self, buf);
         if (self.headers.get("Content-Length")) |v| {
-            body.content_length = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
+            self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
         } else {
             self.chunked = true;
         }
         try self.writeHeader();
-        return body;
+        return .init(self, buf);
     }
 
     fn startBody(self: *Response) void {
@@ -472,13 +476,25 @@ pub const Response = struct {
         if (self.body_writer_open) {
             self.body_writer_open = false;
             if (self.headers_written) {
-                if (self.chunked) try self.conn.writer.writeAll("0\r\n\r\n");
+                // Streaming was under way. Whatever the writer still held
+                // is gone with the handler's buffer, so the body is short.
+                if (self.chunked) {
+                    // Framing survives: terminate and let the peer see a
+                    // truncated but well formed body.
+                    try self.conn.writer.writeAll("0\r\n\r\n");
+                } else if (self.content_length) |declared| {
+                    // Nothing can make the body match the length we
+                    // promised, so the connection must not be reused: the
+                    // peer would read the next response as this body.
+                    if (self.body_sent != declared) self.keepalive = false;
+                }
                 try self.conn.writer.flush();
                 self.written = true;
                 return;
             }
-            // Nothing was sent, so the caller's own body (a 500, say) wins.
-            _ = self.buffer.writer.consumeAll();
+            // Nothing was sent yet. A buffered body lives in the arena and
+            // is still good, so leave it be: an error handler that built a
+            // replacement has already cleared it.
         }
         self.written = true;
 
@@ -921,6 +937,126 @@ test "StreamingBodyWriter: records the real error behind error.WriteFailed" {
     var body_buf: [64]u8 = undefined;
     try std.testing.expectError(error.WriteFailed, response.stream(&body_buf));
     try std.testing.expectEqual(error.ConnectionResetByPeer, connection.getWriteError().?);
+}
+
+test "BodyWriter: end is idempotent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body = response.writer();
+    try body.interface.writeAll("hello");
+    try body.end();
+    // The `defer body.end() catch {}` that pairs with the line above.
+    try body.end();
+    try response.write();
+
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "\r\n\r\nhello"));
+}
+
+test "StreamingBodyWriter: end does not write a second terminator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello");
+    try body.end();
+    try body.end();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.endsWith(u8, written, "5\r\nhello\r\n0\r\n\r\n"));
+    // Exactly one terminator.
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOfPos(u8, written, std.mem.indexOf(u8, written, "0\r\n\r\n").? + 1, "0\r\n\r\n"),
+    );
+}
+
+test "Response: an abandoned buffered body is still sent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body = response.writer();
+    try body.interface.writeAll("hello");
+    // Handler returns without calling end.
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "hello"));
+}
+
+test "Response: an abandoned short body closes the connection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "11");
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello world");
+    // Handler returns without end, so the body never leaves its buffer.
+    try response.write();
+
+    try std.testing.expectEqual(@as(usize, 0), response.body_sent);
+    // The peer would read the next response as this body, so the
+    // connection must not be reused.
+    try std.testing.expect(!response.keepalive);
+}
+
+test "Response: an abandoned chunked body is still terminated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello");
+    try body.interface.flush();
+    // Handler returns without end.
+    try response.write();
+
+    // Truncated, but framed: the peer knows where the body ended.
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "0\r\n\r\n"));
+    try std.testing.expect(response.keepalive);
 }
 
 test "Response: json() with simple object" {
