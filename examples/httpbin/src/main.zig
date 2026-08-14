@@ -17,6 +17,16 @@ const max_bytes = 100 * 1024;
 const max_stream_lines = 100;
 const max_delay_seconds = 10;
 
+/// Answers with a plain-text message in place of the endpoint's usual
+/// body. The message is comptime so the trailing newline -- which keeps it
+/// readable when a client prints the body raw -- can be appended without
+/// allocating.
+fn fail(res: *Response, status: http.Status, comptime message: []const u8) void {
+    res.status = status;
+    res.content_type = .text;
+    res.body = message ++ "\n";
+}
+
 fn pathParamInt(req: *Request, name: []const u8, comptime T: type) ?T {
     const raw = req.params.get(name) orelse return null;
     return std.fmt.parseInt(T, raw, 10) catch null;
@@ -28,9 +38,7 @@ fn pathParamInt(req: *Request, name: []const u8, comptime T: type) ?T {
 fn requireParamInt(req: *Request, res: *Response, name: []const u8, comptime T: type) ?T {
     const raw = req.params.get(name) orelse "";
     return std.fmt.parseInt(T, raw, 10) catch {
-        res.status = .bad_request;
-        res.content_type = .text;
-        res.body = "Invalid count\n";
+        fail(res, .bad_request, "Invalid count");
         return null;
     };
 }
@@ -93,7 +101,7 @@ fn writeDescription(
 
     if (with_method) {
         try w.objectField("method");
-        try w.write(methodName(req.method));
+        try w.write(req.method.name());
     }
 
     if (body) |data| {
@@ -155,24 +163,6 @@ fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.jso
     return parsed.value;
 }
 
-/// Sends a JSON body through the collecting writer: nothing reaches the
-/// connection until the response is complete, so the headers stay open.
-fn sendJson(res: *Response, req: *Request, extra: ?struct { key: []const u8, value: []const u8 }) !void {
-    var body = res.writer();
-    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-    if (extra) |e| {
-        // One extra field, written by wrapping the description.
-        try w.beginObject();
-        try w.objectField(e.key);
-        try w.write(e.value);
-        try w.endObject();
-    } else {
-        try writeDescription(&w, req, res, null, null, false);
-    }
-    try body.end();
-    try res.header("Content-Type", "application/json");
-}
-
 fn handleIndex(_: *Request, res: *Response) !void {
     res.content_type = .text;
     res.body =
@@ -195,22 +185,7 @@ fn handleIndex(_: *Request, res: *Response) !void {
 }
 
 fn handleGet(req: *Request, res: *Response) !void {
-    try sendJson(res, req, null);
-}
-
-fn methodName(m: http.Method) []const u8 {
-    return switch (m) {
-        .get => "GET",
-        .head => "HEAD",
-        .post => "POST",
-        .put => "PUT",
-        .patch => "PATCH",
-        .delete => "DELETE",
-        .options => "OPTIONS",
-        .trace => "TRACE",
-        .connect => "CONNECT",
-        else => "UNKNOWN",
-    };
+    return describe(req, res, null, false);
 }
 
 /// Shared by the methods that carry a body: post, put, patch, delete.
@@ -223,12 +198,18 @@ fn describeWithBody(req: *Request, res: *Response, with_method: bool) !void {
     // object in the response buffer if this failed, and that fragment
     // would then be sent as the body of the 500.
     const data = (try req.body()) orelse "";
+    return describe(req, res, data, with_method);
+}
 
+/// Sends the description through the collecting writer: nothing reaches
+/// the connection until the response is complete, so the headers stay
+/// open.
+fn describe(req: *Request, res: *Response, data: ?[]const u8, with_method: bool) !void {
+    res.content_type = .json;
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
     try writeDescription(&w, req, res, null, data, with_method);
     try body.end();
-    try res.header("Content-Type", "application/json");
 }
 
 /// Answers whatever the request method was. Unlike the others this always
@@ -239,6 +220,7 @@ fn handleAnything(req: *Request, res: *Response) !void {
 }
 
 fn handleHeaders(req: *Request, res: *Response) !void {
+    res.content_type = .json;
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
     try w.beginObject();
@@ -252,41 +234,21 @@ fn handleHeaders(req: *Request, res: *Response) !void {
     try w.endObject();
     try w.endObject();
     try body.end();
-    try res.header("Content-Type", "application/json");
 }
 
 fn handleIp(req: *Request, res: *Response) !void {
-    try sendJson(res, req, .{ .key = "origin", .value = origin(req) });
+    try res.json(.{ .origin = origin(req) }, .{});
 }
 
 fn handleUserAgent(req: *Request, res: *Response) !void {
-    try sendJson(res, req, .{ .key = "user-agent", .value = req.headers.get("User-Agent") orelse "" });
-}
-
-/// `http.Status` is an exhaustive enum, so `@enumFromInt` on a value it
-/// does not name is illegal behaviour: a panic in Debug, worse in
-/// ReleaseFast. The code comes straight from the URL, so it has to be
-/// checked against the set before converting.
-fn statusFromCode(code: u16) ?http.Status {
-    inline for (@typeInfo(http.Status).@"enum".fields) |f| {
-        if (f.value == code) return @field(http.Status, f.name);
-    }
-    return null;
+    try res.json(.{ .user_agent = req.headers.get("User-Agent") orelse "" }, .{});
 }
 
 fn handleStatus(req: *Request, res: *Response) !void {
-    const code = pathParamInt(req, "code", u16) orelse {
-        res.status = .bad_request;
-        res.content_type = .text;
-        res.body = "Invalid status code\n";
-        return;
-    };
-    res.status = statusFromCode(code) orelse {
-        res.status = .bad_request;
-        res.content_type = .text;
-        res.body = "Unsupported status code\n";
-        return;
-    };
+    const code = pathParamInt(req, "code", u16) orelse
+        return fail(res, .bad_request, "Invalid status code");
+    res.status = http.Status.fromCode(code) catch
+        return fail(res, .bad_request, "Unsupported status code");
 }
 
 /// Sized up front, so this takes the writer's identity path: the body is
@@ -337,7 +299,7 @@ fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
 /// response arrive in pieces rather than all at once.
 fn handleStream(req: *Request, res: *Response) !void {
     const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_stream_lines);
-    try res.header("Content-Type", "application/json");
+    res.content_type = .json;
 
     var buf: [4096]u8 = undefined;
     var body = try res.stream(&buf);
@@ -358,30 +320,22 @@ fn handleDelay(req: *Request, res: *Response) !void {
     // httpbin accepts fractions here, and clients use them to keep tests
     // quick.
     const raw = req.params.get("seconds") orelse "0";
-    const requested = std.fmt.parseFloat(f64, raw) catch {
-        res.status = .bad_request;
-        res.content_type = .text;
-        res.body = "Invalid delay\n";
-        return;
-    };
+    const requested = std.fmt.parseFloat(f64, raw) catch
+        return fail(res, .bad_request, "Invalid delay");
     // parseFloat accepts "nan" and "inf". Neither is a duration, and the
     // caps would quietly turn them into 0 and the maximum.
-    if (!std.math.isFinite(requested)) {
-        res.status = .bad_request;
-        res.content_type = .text;
-        res.body = "Invalid delay\n";
-        return;
-    }
+    if (!std.math.isFinite(requested)) return fail(res, .bad_request, "Invalid delay");
     const seconds = @min(@max(requested, 0), @as(f64, max_delay_seconds));
     // Cancellable: a request timeout or a shutdown surfaces here as
     // error.Canceled rather than holding the connection open.
-    try std.Io.sleep(req.io, .fromNanoseconds(@intFromFloat(seconds * std.time.ns_per_s)), .real);
+    try req.io.sleep(.fromNanoseconds(@intFromFloat(seconds * std.time.ns_per_s)), .real);
     // Registered for every method, and httpbin reflects the body here the
     // same way /post does.
     return describeWithBody(req, res, false);
 }
 
 fn handleCookies(req: *Request, res: *Response) !void {
+    res.content_type = .json;
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
     try w.beginObject();
@@ -401,7 +355,6 @@ fn handleCookies(req: *Request, res: *Response) !void {
     try w.endObject();
     try w.endObject();
     try body.end();
-    try res.header("Content-Type", "application/json");
 }
 
 /// RFC 6265 cookie-name: a token, so no separators and no controls. The
@@ -434,18 +387,8 @@ fn handleCookiesSet(req: *Request, res: *Response) !void {
     // still attached, so the client was told no and handed cookies anyway.
     var check = req.query.iterator();
     while (check.next()) |entry| {
-        if (!isCookieName(entry.key_ptr.*)) {
-            res.status = .bad_request;
-            res.content_type = .text;
-            res.body = "Invalid cookie name\n";
-            return;
-        }
-        if (!isCookieValue(entry.value_ptr.*)) {
-            res.status = .bad_request;
-            res.content_type = .text;
-            res.body = "Invalid cookie value\n";
-            return;
-        }
+        if (!isCookieName(entry.key_ptr.*)) return fail(res, .bad_request, "Invalid cookie name");
+        if (!isCookieValue(entry.value_ptr.*)) return fail(res, .bad_request, "Invalid cookie value");
     }
 
     var it = req.query.iterator();
@@ -516,10 +459,9 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var rt = if (threads == 0)
-        try zio.Runtime.init(init.gpa, .{ .executors = .auto })
-    else
-        try zio.Runtime.init(init.gpa, .{ .executors = .exact(@intCast(threads)) });
+    var rt = try zio.Runtime.init(init.gpa, .{
+        .executors = if (threads == 0) .auto else .exact(@intCast(threads)),
+    });
     defer rt.deinit();
 
     var server = http.Server(void).init(init.gpa, rt.io(), .{
