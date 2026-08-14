@@ -118,33 +118,23 @@ pub const WebSocketClient = struct {
     ws: WebSocket,
     conn: *Connection,
 
+    // No flushing here: `WebSocket` flushes each frame while holding its write
+    // mutex, and a flush from out here would touch the same writer unguarded.
+
     pub fn send(self: *WebSocketClient, msg_type: WebSocket.MessageType, data: []const u8) !void {
-        try self.ws.send(msg_type, data);
-        try self.conn.flush();
+        return self.ws.send(msg_type, data);
     }
 
     pub fn receive(self: *WebSocketClient) !WebSocket.Message {
-        const msg = self.ws.receive() catch |err| {
-            if (self.ws.auto_responded) {
-                // Best effort: flush queued control-frame reply before bubbling error.
-                self.conn.flush() catch {};
-            }
-            return err;
-        };
-        if (self.ws.auto_responded) {
-            try self.conn.flush();
-        }
-        return msg;
+        return self.ws.receive();
     }
 
     pub fn ping(self: *WebSocketClient, data: []const u8) !void {
-        try self.ws.ping(data);
-        try self.conn.flush();
+        return self.ws.ping(data);
     }
 
     pub fn close(self: *WebSocketClient, code: WebSocket.CloseCode, reason: []const u8) !void {
-        try self.ws.close(code, reason);
-        try self.conn.flush();
+        return self.ws.close(code, reason);
     }
 
     pub fn deinit(self: *WebSocketClient) void {
@@ -895,7 +885,7 @@ pub const Client = struct {
 
         var seed: u64 = undefined;
         self.io.random(std.mem.asBytes(&seed));
-        var ws = WebSocket.init(conn.writer, conn.reader, conn.allocator, seed);
+        var ws = WebSocket.init(self.io, conn.writer, conn.reader, conn.allocator, seed);
         ws.is_client = true;
         return .{ .ws = ws, .conn = conn };
     }
