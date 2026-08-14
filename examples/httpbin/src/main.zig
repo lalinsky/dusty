@@ -12,19 +12,13 @@ const http = @import("dusty");
 const Request = http.Request;
 const Response = http.Response;
 
-/// What `std.debug` writes through -- `std.debug.print`, panics, stack
-/// traces, and every `std.log` line. Left alone std stands up a second,
-/// blocking `Io` of its own beside the runtime. This is the same zio
-/// `Io` the server itself runs on, so a log line written from a handler
-/// goes through the event loop rather than parking its executor on
-/// stderr.
-///
-/// It needs no runtime of its own: zio finds the executor on the thread,
-/// and an operation with no task behind it runs as a blocking syscall
-/// instead -- which covers both logging before the runtime starts and
-/// logging while a panic unwinds, since the panic handler drops the
-/// current task for exactly that reason.
-pub const std_options_debug_io = zio.debug_io;
+// Points `std.debug` and `std.log` at the same zio `Io` the server runs on, so
+// a log line from a handler goes through the event loop rather than parking its
+// executor on stderr. Disabled until https://github.com/lalinsky/zio/issues/661
+// is fixed: on a backend with no native file writes (kqueue, epoll), a log line
+// whose write reaches the thread pool deadlocks the process.
+//
+// pub const std_options_debug_io = zio.debug_io;
 
 /// httpbin caps these so a stray URL cannot ask for unbounded work.
 const max_bytes = 100 * 1024;
