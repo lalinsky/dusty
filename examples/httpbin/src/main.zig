@@ -22,6 +22,19 @@ fn pathParamInt(req: *Request, name: []const u8, comptime T: type) ?T {
     return std.fmt.parseInt(T, raw, 10) catch null;
 }
 
+/// A path parameter that must be a number. Answers 400 and returns null
+/// when it is not, so a client bug shows up as a client bug rather than as
+/// an empty but successful response.
+fn requireParamInt(req: *Request, res: *Response, name: []const u8, comptime T: type) ?T {
+    const raw = req.params.get(name) orelse "";
+    return std.fmt.parseInt(T, raw, 10) catch {
+        res.status = .bad_request;
+        res.content_type = .text;
+        res.body = "Invalid count\n";
+        return null;
+    };
+}
+
 fn queryInt(req: *Request, name: []const u8, comptime T: type, default: T) T {
     const raw = req.query.get(name) orelse return default;
     return std.fmt.parseInt(T, raw, 10) catch default;
@@ -50,6 +63,8 @@ fn writeDescription(
     res: *Response,
     id: ?usize,
     body: ?[]const u8,
+    /// Only /anything reports it, so it is opt in rather than always on.
+    with_method: bool,
 ) !void {
     try w.beginObject();
 
@@ -75,6 +90,11 @@ fn writeDescription(
     try w.write(try absoluteUrl(req, res));
     try w.objectField("origin");
     try w.write(origin(req));
+
+    if (with_method) {
+        try w.objectField("method");
+        try w.write(methodName(req.method));
+    }
 
     if (body) |data| {
         try w.objectField("data");
@@ -141,7 +161,7 @@ fn sendJson(res: *Response, req: *Request, extra: ?struct { key: []const u8, val
         try w.write(e.value);
         try w.endObject();
     } else {
-        try writeDescription(&w, req, res, null, null);
+        try writeDescription(&w, req, res, null, null, false);
     }
     try body.end();
     try res.header("Content-Type", "application/json");
@@ -172,8 +192,27 @@ fn handleGet(req: *Request, res: *Response) !void {
     try sendJson(res, req, null);
 }
 
+fn methodName(m: http.Method) []const u8 {
+    return switch (m) {
+        .get => "GET",
+        .head => "HEAD",
+        .post => "POST",
+        .put => "PUT",
+        .patch => "PATCH",
+        .delete => "DELETE",
+        .options => "OPTIONS",
+        .trace => "TRACE",
+        .connect => "CONNECT",
+        else => "UNKNOWN",
+    };
+}
+
 /// Shared by the methods that carry a body: post, put, patch, delete.
 fn handleWithBody(req: *Request, res: *Response) !void {
+    return describeWithBody(req, res, false);
+}
+
+fn describeWithBody(req: *Request, res: *Response, with_method: bool) !void {
     // Read the body first. Serialising as we go would leave a half written
     // object in the response buffer if this failed, and that fragment
     // would then be sent as the body of the 500.
@@ -181,15 +220,16 @@ fn handleWithBody(req: *Request, res: *Response) !void {
 
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-    try writeDescription(&w, req, res, null, data);
+    try writeDescription(&w, req, res, null, data, with_method);
     try body.end();
     try res.header("Content-Type", "application/json");
 }
 
-/// Answers whatever the request method was, like httpbin's /anything.
+/// Answers whatever the request method was. Unlike the others this always
+/// reports the full shape, including `method` and the body fields, so a
+/// GET here still carries an empty `data`/`form`/`json`/`files`.
 fn handleAnything(req: *Request, res: *Response) !void {
-    if (req.method == .get or req.method == .head) return handleGet(req, res);
-    return handleWithBody(req, res);
+    return describeWithBody(req, res, true);
 }
 
 fn handleHeaders(req: *Request, res: *Response) !void {
@@ -246,7 +286,7 @@ fn handleStatus(req: *Request, res: *Response) !void {
 /// Sized up front, so this takes the writer's identity path: the body is
 /// streamed with the declared Content-Length and no chunk framing.
 fn handleBytes(req: *Request, res: *Response) !void {
-    const n = @min(pathParamInt(req, "n", usize) orelse 0, max_bytes);
+    const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_bytes);
 
     var len_buf: [24]u8 = undefined;
     try res.header("Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{n}));
@@ -260,7 +300,7 @@ fn handleBytes(req: *Request, res: *Response) !void {
 
 /// Same bytes, but no length up front, so this one is chunked.
 fn handleStreamBytes(req: *Request, res: *Response) !void {
-    const n = @min(pathParamInt(req, "n", usize) orelse 0, max_bytes);
+    const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_bytes);
     try res.header("Content-Type", "application/octet-stream");
 
     var buf: [4096]u8 = undefined;
@@ -290,7 +330,7 @@ fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
 /// One JSON object per line, flushed as it goes, so a client sees the
 /// response arrive in pieces rather than all at once.
 fn handleStream(req: *Request, res: *Response) !void {
-    const n = @min(pathParamInt(req, "n", usize) orelse 1, max_stream_lines);
+    const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_stream_lines);
     try res.header("Content-Type", "application/json");
 
     var buf: [4096]u8 = undefined;
@@ -299,7 +339,7 @@ fn handleStream(req: *Request, res: *Response) !void {
         // A fresh serialiser per line: each line is its own JSON document,
         // and Stringify refuses to start a second one.
         var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-        try writeDescription(&w, req, res, i, null);
+        try writeDescription(&w, req, res, i, null, false);
         try body.interface.writeByte('\n');
         // Each line goes out as its own chunk, so the client sees the
         // response arrive in pieces.
@@ -361,9 +401,26 @@ fn isCookieName(name: []const u8) bool {
     return true;
 }
 
+/// RFC 6265 cookie-octet, plus space and comma because `serializeCookie`
+/// quotes those. Everything else -- notably `;` -- would end the value and
+/// start an attribute, which is the same injection the name check blocks.
+fn isCookieValue(value: []const u8) bool {
+    for (value) |c| {
+        if (c < 0x20 or c >= 0x7f) return false;
+        if (std.mem.indexOfScalar(u8, ";\\\"", c) != null) return false;
+    }
+    return true;
+}
+
 fn handleCookiesSet(req: *Request, res: *Response) !void {
     var it = req.query.iterator();
     while (it.next()) |entry| {
+        if (!isCookieValue(entry.value_ptr.*)) {
+            res.status = .bad_request;
+            res.content_type = .text;
+            res.body = "Invalid cookie value\n";
+            return;
+        }
         if (!isCookieName(entry.key_ptr.*)) {
             res.status = .bad_request;
             res.content_type = .text;
