@@ -48,8 +48,8 @@ pub const config = struct {
 };
 
 pub const Connection = struct {
-    pub const Reader = struct { interface: std.Io.Reader };
-    pub const Writer = struct { interface: std.Io.Writer };
+    pub const Reader = struct { interface: std.Io.Reader, err: ?anyerror = null };
+    pub const Writer = struct { interface: std.Io.Writer, err: ?anyerror = null };
 
     pub fn reader(self: *Connection, buffer: []u8) Reader {
         _ = self;
