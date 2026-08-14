@@ -65,17 +65,21 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     try res.header("X-Demo", "Chunked-Response");
     res.status = .ok;
 
-    // Send chunks of data
-    try res.chunk("First chunk of data\n");
-    try res.chunk("Second chunk of data\n");
-    try res.chunk("Third chunk of data\n");
+    // Streamed: the headers go out now and each flush puts a chunk on
+    // the wire, so the client sees the response as it is produced.
+    var buf: [256]u8 = undefined;
+    var body = try res.stream(&buf);
+    const w = &body.interface;
 
-    // Dynamic content in chunk
-    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{std.Io.Timestamp.now(req.io, .real).toSeconds()});
-    try res.chunk(dynamic);
+    try w.writeAll("First chunk of data\n");
+    try w.writeAll("Second chunk of data\n");
+    try w.writeAll("Third chunk of data\n");
+    try w.flush();
 
-    try res.chunk("Final chunk!\n");
-    // res.write() will be called automatically by the server to add terminator
+    try w.print("Chunk with timestamp: {d}\n", .{std.Io.Timestamp.now(req.io, .real).toSeconds()});
+    try w.writeAll("Final chunk!\n");
+
+    try body.end();
 }
 
 fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {

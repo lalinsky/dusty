@@ -136,6 +136,9 @@ pub const Connection = struct {
         if (self.tcp_writer.err) |e| return e;
     }
 
+    /// The error type `getWriteError` yields.
+    pub const WriteError = @typeInfo(@TypeOf(checkWriteError(undefined))).error_union.error_set;
+
     /// The real error behind a generic `error.WriteFailed`, if any was
     /// recorded.
     pub fn getWriteError(self: *Connection) ?@typeInfo(@TypeOf(checkWriteError(self))).error_union.error_set {

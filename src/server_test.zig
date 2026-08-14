@@ -748,9 +748,12 @@ test "Server: handler error after streaming started aborts the connection" {
     server.router.get("/bad-stream", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             _ = req;
-            // Start a chunked response, then fail - headers/first chunk are
+            // Start streaming, then fail - the headers and first chunk are
             // already on the wire, so the error can't be turned into a 500.
-            try res.chunk("partial");
+            var body_buf: [64]u8 = undefined;
+            var body = try res.stream(&body_buf);
+            try body.interface.writeAll("partial");
+            try body.interface.flush();
             return error.Boom;
         }
     }.handle);

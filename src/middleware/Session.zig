@@ -98,19 +98,26 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
     const should_set = req.session.modified or (self.config.max_age != null and req.session.len > 0);
 
     if (should_set) {
-        if (req.session.len == 0) {
+        const result = if (req.session.len == 0) blk: {
             // Session was cleared — delete the cookie
             var delete_opts = self.config.cookie_opts;
             delete_opts.max_age = .zero;
-            try res.setCookie(self.config.cookie_name, "", delete_opts);
-        } else {
+            break :blk res.setCookie(self.config.cookie_name, "", delete_opts);
+        } else blk: {
             const signed = try self.signSession(req.arena, &req.session, .now(req.io, .real));
             var opts = self.config.cookie_opts;
             if (self.config.max_age) |ma| {
                 opts.max_age = ma;
             }
-            try res.setCookie(self.config.cookie_name, signed, opts);
-        }
+            break :blk res.setCookie(self.config.cookie_name, signed, opts);
+        };
+        result catch |err| switch (err) {
+            // The handler streamed its response, so the headers left before
+            // we got here and the cookie cannot be refreshed. That is the
+            // handler's choice to make, not a failure of the request.
+            error.HeadersAlreadySent => log.debug("session cookie not set: response already started", .{}),
+            else => |e| return e,
+        };
     }
 }
 
