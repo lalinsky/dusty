@@ -395,24 +395,17 @@ pub fn main(init: std.process.Init) !void {
     }, &ctx);
     defer server.deinit();
 
-    // GET and HEAD together: Flask derives HEAD from GET, dusty treats it
-    // as its own method, so every readable route needs both.
-    const readable = .{
-        .{ "/", handleIndex },
-        .{ "/get", handleGet },
-        .{ "/headers", handleHeaders },
-        .{ "/ip", handleIp },
-        .{ "/user-agent", handleUserAgent },
-        .{ "/bytes/:n", handleBytes },
-        .{ "/stream-bytes/:n", handleStreamBytes },
-        .{ "/stream/:n", handleStream },
-        .{ "/cookies", handleCookies },
-        .{ "/cookies/set", handleCookiesSet },
-    };
-    inline for (readable) |route| {
-        server.router.get(route[0], route[1]);
-        server.router.head(route[0], route[1]);
-    }
+    // A GET route answers HEAD too, so these need registering once.
+    server.router.get("/", handleIndex);
+    server.router.get("/get", handleGet);
+    server.router.get("/headers", handleHeaders);
+    server.router.get("/ip", handleIp);
+    server.router.get("/user-agent", handleUserAgent);
+    server.router.get("/bytes/:n", handleBytes);
+    server.router.get("/stream-bytes/:n", handleStreamBytes);
+    server.router.get("/stream/:n", handleStream);
+    server.router.get("/cookies", handleCookies);
+    server.router.get("/cookies/set", handleCookiesSet);
 
     // httpbin answers these for every method.
     const any_method = .{
@@ -422,7 +415,6 @@ pub fn main(init: std.process.Init) !void {
     };
     inline for (any_method) |route| {
         server.router.get(route[0], route[1]);
-        server.router.head(route[0], route[1]);
         server.router.post(route[0], route[1]);
         server.router.put(route[0], route[1]);
         server.router.patch(route[0], route[1]);
