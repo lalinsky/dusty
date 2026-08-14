@@ -116,6 +116,12 @@ pub const BodyWriter = struct {
     /// fails, so a handler that catches one can find out what happened
     /// instead of being told only that it did.
     err: ?Error = null,
+    /// Length the handler declared up front, if any. With one, the body is
+    /// streamed as-is: the length is already known, so chunk framing would
+    /// only add overhead.
+    content_length: ?usize = null,
+    /// Body bytes handed to the transport, checked against `content_length`.
+    sent: usize = 0,
 
     /// Everything `writeHeader` can fail with, plus the real transport
     /// errors hiding behind `WriteFailed`.
@@ -124,8 +130,13 @@ pub const BodyWriter = struct {
     const HeaderError = @typeInfo(@typeInfo(@TypeOf(Response.writeHeader)).@"fn".return_type.?).error_union.error_set;
 
     fn init(res: *Response, buf: []u8) BodyWriter {
+        const declared: ?usize = if (res.headers.get("Content-Length")) |v|
+            std.fmt.parseInt(usize, v, 10) catch |e| std.debug.panic("bad Content-Length {s}: {}", .{ v, e })
+        else
+            null;
         return .{
             .res = res,
+            .content_length = declared,
             .interface = .{
                 .buffer = buf,
                 .vtable = &.{ .drain = BodyWriter.drain },
@@ -150,11 +161,12 @@ pub const BodyWriter = struct {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
         const res = self.res;
 
-        // Getting here at all means the body outgrew the buffer, or the
-        // handler asked to start streaming. Either way the length can no
-        // longer be stated up front.
-        if (!res.chunked) {
-            res.chunked = true;
+        // Getting here means the body outgrew the buffer, or the handler
+        // asked to start streaming. Either way it is going out now, so the
+        // framing has to be decided: chunked, unless the handler already
+        // told us how long the body is.
+        if (!res.headers_written) {
+            if (self.content_length == null) res.chunked = true;
             try self.record(res.writeHeader());
         }
 
@@ -164,8 +176,27 @@ pub const BodyWriter = struct {
         // send nothing at all rather than ending the body early.
         if (total == 0) return 0;
 
-        try self.record(self.writeChunk(pending, data, splat, total));
+        try self.record(if (res.chunked)
+            self.writeChunk(pending, data, splat, total)
+        else
+            self.writeBody(pending, data, splat));
+        self.sent += total;
         return w.consume(total);
+    }
+
+    /// Streams the body as-is, for a declared Content-Length.
+    fn writeBody(
+        self: *BodyWriter,
+        pending: []const u8,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!void {
+        const out = self.res.conn.writer;
+        try out.writeAll(pending);
+        for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| try out.writeAll(pattern);
+        try out.flush();
     }
 
     fn writeChunk(
@@ -197,19 +228,24 @@ pub const BodyWriter = struct {
         std.debug.assert(res.body_writer_open);
         res.body_writer_open = false;
 
-        if (res.chunked) {
+        if (res.headers_written) {
+            // Already streaming; drain whatever is left.
             try self.record(self.interface.flush());
-            try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
+            if (res.chunked) try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
         } else {
             // Never drained, so the whole body is still in the buffer and
-            // its length is known.
+            // its length is known without the handler saying so.
             const body = self.interface.buffered();
             res.body = body;
             defer res.body = "";
             try self.record(res.writeHeader());
             try self.record(res.conn.writer.writeAll(body));
+            self.sent += body.len;
         }
         try self.record(res.conn.writer.flush());
+        // Sending the wrong number of bytes for a declared length leaves the
+        // connection out of sync, and the client waiting.
+        if (self.content_length) |declared| std.debug.assert(self.sent == declared);
         res.written = true;
     }
 };
@@ -756,6 +792,64 @@ test "Response: chunked flag defaults to false" {
 
     const response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectEqual(false, response.chunked);
+}
+
+test "BodyWriter: a declared Content-Length streams without chunk framing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "11");
+
+    // Buffer too small for the body, so it has to stream; with a declared
+    // length that must not turn into chunked.
+    var body_buf: [4]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("hello ");
+    try body.interface.writeAll("world");
+    try body.end();
+
+    try std.testing.expect(!response.chunked);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 11\r\n" ++
+            "\r\n" ++
+            "hello world",
+        conn_writer.buffered(),
+    );
+}
+
+test "BodyWriter: a declared Content-Length is not written twice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "5");
+
+    // Fits, so it never drains and takes the buffered path instead.
+    var body_buf: [64]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("hello");
+    try body.end();
+
+    const written = conn_writer.buffered();
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        std.mem.indexOfPos(u8, written, std.mem.indexOf(u8, written, "Content-Length").? + 1, "Content-Length"),
+    );
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhello"));
 }
 
 test "BodyWriter: records the real error behind error.WriteFailed" {
