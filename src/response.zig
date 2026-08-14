@@ -371,6 +371,23 @@ pub const Response = struct {
         _ = self.buffer.writer.consumeAll();
     }
 
+    /// Throws away a body that was started but never finished, so a
+    /// replacement can be written in its place. `write` prefers the
+    /// buffer over `body`, so without this an error response would be
+    /// sent with whatever the failed handler had produced so far.
+    ///
+    /// Only usable while the headers are still open; once they are on the
+    /// wire the framing is already promised and the body cannot be
+    /// swapped.
+    pub fn resetBody(self: *Response) void {
+        std.debug.assert(!self.headers_written);
+        self.clearWriter();
+        self.body = "";
+        self.body_writer_open = false;
+        // The old body's type does not describe the new one.
+        self.content_type = null;
+    }
+
     pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
         const json_formatter = std.json.fmt(value, options);
         try json_formatter.format(&self.buffer.writer);
@@ -1484,4 +1501,35 @@ test "EventWriter: splatBytesAll" {
     try ew.end();
 
     try std.testing.expectEqualStrings("data: ababab\n\n", conn_writer.buffered());
+}
+
+test "Response: resetBody replaces a half written body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.content_type = .json;
+    var body = response.writer();
+    try body.interface.writeAll("{\"half\":");
+    // The handler fails here, without ever calling `end`.
+
+    response.resetBody();
+    response.status = .internal_server_error;
+    response.content_type = .text;
+    response.body = "500 Internal Server Error\n";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "500") != null);
+    // The fragment must not survive as the body, nor its length as the
+    // Content-Length, nor its content type as the type.
+    try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 26") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "500 Internal Server Error\n"));
 }

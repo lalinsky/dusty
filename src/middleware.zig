@@ -2,6 +2,7 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
+const Connection = @import("server.zig").Connection;
 
 const log = std.log.scoped(.dusty);
 
@@ -118,19 +119,32 @@ pub fn Executor(comptime Ctx: type) type {
         }
 
         fn handleNotFound(self: *Self) !void {
+            // A middleware may have written part of a body before the
+            // router came up empty, and `write` would send that in place
+            // of the 404. Unlike the error path, nothing has checked the
+            // headers yet: a middleware that started streaming has already
+            // committed the framing, so there is nothing to replace.
+            if (!self.res.headers_written) self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
                 try self.ctx.notFound(self.req, self.res);
             } else {
                 self.res.status = .not_found;
+                self.res.content_type = .text;
                 self.res.body = "404 Not Found\n";
             }
         }
 
         fn handleError(self: *Self, err: anyerror) void {
+            // Whatever the handler managed to write is half of something
+            // it did not finish, and `write` would send it in place of the
+            // error response. The caller has already checked that the
+            // headers are still open.
+            self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(self.req, self.res, err);
             } else {
                 self.res.status = .internal_server_error;
+                self.res.content_type = .text;
                 self.res.body = "500 Internal Server Error\n";
             }
         }
@@ -500,4 +514,83 @@ test "Executor: middleware error triggers custom uncaughtError" {
     try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("custom 500", res.body);
+}
+
+test "Executor: a handler that fails mid-body does not send the fragment" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var req: Request = .{ .arena = arena.allocator(), .conn = undefined, .parser = undefined };
+    var res = try Response.init(arena.allocator(), &connection, 32);
+
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .ctx = {},
+        .action = struct {
+            fn handle(_: *Request, r: *Response) !void {
+                r.content_type = .json;
+                var body = r.writer();
+                try body.interface.writeAll("{\"half\":");
+                return error.Boom;
+            }
+        }.handle,
+        .middlewares = &.{},
+    };
+
+    try executor.run();
+    try std.testing.expectEqual(.internal_server_error, res.status);
+
+    try res.write();
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "500 Internal Server Error\n"));
+}
+
+const WritingMiddleware = struct {
+    pub fn execute(_: *const WritingMiddleware, _: *Request, res: *Response, executor: *Executor(void)) !void {
+        res.content_type = .json;
+        var body = res.writer();
+        try body.interface.writeAll("{\"half\":");
+        return executor.next();
+    }
+};
+
+test "Executor: a middleware that wrote a body does not supply the 404" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var req: Request = .{ .arena = arena.allocator(), .conn = undefined, .parser = undefined };
+    var res = try Response.init(arena.allocator(), &connection, 32);
+
+    var mw = WritingMiddleware{};
+    const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .ctx = {},
+        // No route matched, so the executor falls through to the 404.
+        .action = null,
+        .middlewares = &middlewares,
+    };
+
+    try executor.run();
+    try std.testing.expectEqual(.not_found, res.status);
+
+    try res.write();
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "404 Not Found\n"));
 }
