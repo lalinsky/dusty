@@ -28,6 +28,9 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
         if (std.ascii.eqlIgnoreCase(key, "connection") or
             std.ascii.eqlIgnoreCase(key, "keep-alive") or
             std.ascii.eqlIgnoreCase(key, "transfer-encoding") or
+            // The client decompresses transparently, so the upstream
+            // length does not describe what we are about to send.
+            std.ascii.eqlIgnoreCase(key, "content-length") or
             std.ascii.eqlIgnoreCase(key, "upgrade") or
             std.ascii.eqlIgnoreCase(key, "proxy-connection") or
             std.ascii.eqlIgnoreCase(key, "host"))
@@ -70,6 +73,9 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
         if (std.ascii.eqlIgnoreCase(key, "connection") or
             std.ascii.eqlIgnoreCase(key, "keep-alive") or
             std.ascii.eqlIgnoreCase(key, "transfer-encoding") or
+            // The client decompresses transparently, so the upstream
+            // length does not describe what we are about to send.
+            std.ascii.eqlIgnoreCase(key, "content-length") or
             std.ascii.eqlIgnoreCase(key, "upgrade") or
             std.ascii.eqlIgnoreCase(key, "proxy-connection"))
         {
@@ -82,7 +88,7 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     // Stream response body
     const body_reader = upstream_res.reader();
     var buf: [4096]u8 = undefined;
-    var body_writer = res.writer(&buf);
+    var body_writer = try res.stream(&buf);
     const bytes_written = try body_reader.streamRemaining(&body_writer.interface);
     try body_writer.end();
 

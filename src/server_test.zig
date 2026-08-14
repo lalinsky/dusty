@@ -751,7 +751,7 @@ test "Server: handler error after streaming started aborts the connection" {
             // Start streaming, then fail - the headers and first chunk are
             // already on the wire, so the error can't be turned into a 500.
             var body_buf: [64]u8 = undefined;
-            var body = res.writer(&body_buf);
+            var body = try res.stream(&body_buf);
             try body.interface.writeAll("partial");
             try body.interface.flush();
             return error.Boom;

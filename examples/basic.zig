@@ -65,19 +65,15 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     try res.header("X-Demo", "Chunked-Response");
     res.status = .ok;
 
-    // The body is written through a buffer the handler owns. It is sent
-    // with a Content-Length if it all fits, and switches to chunked
-    // transfer encoding as soon as it does not, or as soon as we flush.
+    // Streamed: the headers go out now and each flush puts a chunk on
+    // the wire, so the client sees the response as it is produced.
     var buf: [256]u8 = undefined;
-    var body = res.writer(&buf);
+    var body = try res.stream(&buf);
     const w = &body.interface;
 
     try w.writeAll("First chunk of data\n");
     try w.writeAll("Second chunk of data\n");
     try w.writeAll("Third chunk of data\n");
-
-    // Force it out now rather than waiting for the buffer to fill; this is
-    // what commits the response to chunked encoding.
     try w.flush();
 
     try w.print("Chunk with timestamp: {d}\n", .{std.Io.Timestamp.now(req.io, .real).toSeconds()});
