@@ -144,13 +144,13 @@ fn writeDescription(
 }
 
 fn isFormEncoded(req: *Request) bool {
-    const ct = req.headers.get("Content-Type") orelse return false;
-    return std.mem.startsWith(u8, ct, "application/x-www-form-urlencoded");
+    // Already parsed for us, and parameters like `; charset=` are stripped,
+    // which a prefix match on the raw header would have to handle itself.
+    return req.content_type == .form;
 }
 
 fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.json.Value {
-    const ct = req.headers.get("Content-Type") orelse return null;
-    if (!std.mem.startsWith(u8, ct, "application/json")) return null;
+    if (req.content_type != .json) return null;
     const parsed = std.json.parseFromSlice(std.json.Value, arena, data, .{}) catch return null;
     return parsed.value;
 }
@@ -364,6 +364,14 @@ fn handleDelay(req: *Request, res: *Response) !void {
         res.body = "Invalid delay\n";
         return;
     };
+    // parseFloat accepts "nan" and "inf". Neither is a duration, and the
+    // caps would quietly turn them into 0 and the maximum.
+    if (!std.math.isFinite(requested)) {
+        res.status = .bad_request;
+        res.content_type = .text;
+        res.body = "Invalid delay\n";
+        return;
+    }
     const seconds = @min(@max(requested, 0), @as(f64, max_delay_seconds));
     // Cancellable: a request timeout or a shutdown surfaces here as
     // error.Canceled rather than holding the connection open.
@@ -421,32 +429,44 @@ fn isCookieValue(value: []const u8) bool {
 }
 
 fn handleCookiesSet(req: *Request, res: *Response) !void {
-    var it = req.query.iterator();
-    while (it.next()) |entry| {
-        if (!isCookieValue(entry.value_ptr.*)) {
-            res.status = .bad_request;
-            res.content_type = .text;
-            res.body = "Invalid cookie value\n";
-            return;
-        }
+    // Check the whole batch first. Setting as we go meant a bad entry
+    // answered 400 with the Set-Cookie headers of the entries before it
+    // still attached, so the client was told no and handed cookies anyway.
+    var check = req.query.iterator();
+    while (check.next()) |entry| {
         if (!isCookieName(entry.key_ptr.*)) {
             res.status = .bad_request;
             res.content_type = .text;
             res.body = "Invalid cookie name\n";
             return;
         }
+        if (!isCookieValue(entry.value_ptr.*)) {
+            res.status = .bad_request;
+            res.content_type = .text;
+            res.body = "Invalid cookie value\n";
+            return;
+        }
+    }
+
+    var it = req.query.iterator();
+    while (it.next()) |entry| {
         try res.setCookie(entry.key_ptr.*, entry.value_ptr.*, .{ .path = "/" });
     }
     res.status = .found;
     try res.header("Location", "/cookies");
 }
 
-/// Parses `--<name>=<uint>` and returns the value, or null if `arg` doesn't
-/// match the flag or the value doesn't parse.
-fn uintFlag(arg: []const u8, comptime name: []const u8) ?u64 {
+/// Parses `--<name>=<uint>`. Null means this argument is not that flag;
+/// an error means it is, but the value could not be read -- conflating the
+/// two made `--port=abc` look like an unknown argument and start on the
+/// default port.
+fn uintFlag(arg: []const u8, comptime name: []const u8) !?u64 {
     const prefix = "--" ++ name ++ "=";
     if (!std.mem.startsWith(u8, arg, prefix)) return null;
-    return std.fmt.parseUnsigned(u64, arg[prefix.len..], 10) catch null;
+    return std.fmt.parseUnsigned(u64, arg[prefix.len..], 10) catch {
+        std.log.err("--{s} needs a non-negative integer, got '{s}'", .{ name, arg[prefix.len..] });
+        return error.InvalidArgument;
+    };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -466,25 +486,25 @@ pub fn main(init: std.process.Init) !void {
         while (args.next()) |arg| {
             // Narrowing a flag with @intCast is safety checked, so an out
             // of range value panics rather than explaining itself.
-            if (uintFlag(arg, "port")) |v| {
+            if (try uintFlag(arg, "port")) |v| {
                 if (v > std.math.maxInt(u16)) {
                     std.log.err("--port must be 0..65535, got {d}", .{v});
                     return error.InvalidArgument;
                 }
                 port = @intCast(v);
-            } else if (uintFlag(arg, "threads")) |v| {
+            } else if (try uintFlag(arg, "threads")) |v| {
                 if (v > 1024) {
                     std.log.err("--threads must be 0..1024, got {d}", .{v});
                     return error.InvalidArgument;
                 }
                 threads = @intCast(v);
-            } else if (uintFlag(arg, "request-timeout")) |v| {
+            } else if (try uintFlag(arg, "request-timeout")) |v| {
                 if (v > std.math.maxInt(u32)) {
                     std.log.err("--request-timeout is too large: {d}", .{v});
                     return error.InvalidArgument;
                 }
                 request_timeout = .fromSeconds(@intCast(v));
-            } else if (uintFlag(arg, "keepalive-timeout")) |v| {
+            } else if (try uintFlag(arg, "keepalive-timeout")) |v| {
                 if (v > std.math.maxInt(u32)) {
                     std.log.err("--keepalive-timeout is too large: {d}", .{v});
                     return error.InvalidArgument;
