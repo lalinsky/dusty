@@ -47,6 +47,15 @@ const Origin = struct {
             }}),
         }
     }
+
+    /// Without this it would serialize as the `IpAddress` union rather
+    /// than as the string it prints. Raw, because the quotes are the only
+    /// escaping an address can need.
+    pub fn jsonStringify(self: Origin, jw: anytype) !void {
+        try jw.beginWriteRaw();
+        try jw.writer.print("\"{f}\"", .{self});
+        jw.endWriteRaw();
+    }
 };
 
 /// httpbin reports an absolute URL, and clients parse it for the host, so
@@ -58,96 +67,69 @@ fn absoluteUrl(req: *Request, res: *Response) ![]const u8 {
     });
 }
 
-/// Writes the fields httpbin answers with. `body` is the request body for
-/// the methods that carry one, which adds `data`, `form`, `json` and
-/// `files` the way `get_dict` does. Written straight out rather than built
-/// as a tree, so the streaming endpoints can emit one of these per line.
-fn writeDescription(
-    w: *std.json.Stringify,
-    req: *Request,
-    res: *Response,
-    id: ?usize,
-    body: ?[]const u8,
-    /// Only /anything reports it, so it is opt in rather than always on.
-    with_method: bool,
-) !void {
-    try w.beginObject();
+/// The shape httpbin answers with. The optional fields are left out
+/// entirely when null, so `/get` carries no `data` and only `/anything`
+/// reports a `method`; `json` is the exception, and is written as JSON
+/// null whenever there was a body to parse.
+const Description = struct {
+    headers: http.Headers,
+    args: http.Params,
+    url: []const u8,
+    origin: Origin,
+    method: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    form: ?Form = null,
+    json: ?std.json.Value = null,
+    files: ?struct {} = null,
+    id: ?usize = null,
 
-    try w.objectField("headers");
-    try w.beginObject();
-    var it = req.headers.iterator();
-    while (it.next()) |entry| {
-        try w.objectField(entry.key);
-        try w.write(entry.value);
-    }
-    try w.endObject();
+    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+};
 
-    try w.objectField("args");
-    try w.beginObject();
-    var q = req.query.iterator();
-    while (q.next()) |entry| {
-        try w.objectField(entry.key);
-        try w.write(entry.value);
-    }
-    try w.endObject();
+/// The body read as a form, when it says it is one. Serialized straight
+/// from the raw body, so nothing is built up first.
+const Form = struct {
+    arena: std.mem.Allocator,
+    data: []const u8,
+    encoded: bool,
 
-    try w.objectField("url");
-    try w.write(try absoluteUrl(req, res));
-    try w.objectField("origin");
-    // `print` writes raw, so the quotes are ours; an address only ever
-    // formats as digits and separators, which need no escaping.
-    try w.print("\"{f}\"", .{Origin{ .address = req.remote_address }});
-
-    if (with_method) {
-        try w.objectField("method");
-        try w.write(req.method.name());
-    }
-
-    if (body) |data| {
-        try w.objectField("data");
-        try w.write(data);
-
-        // Only parsed when the body says it is a form, as httpbin does.
-        try w.objectField("form");
-        try w.beginObject();
-        if (req.content_type == .form) {
-            var form = std.mem.splitScalar(u8, data, '&');
-            while (form.next()) |pair| {
+    pub fn jsonStringify(self: Form, jw: anytype) !void {
+        try jw.beginObject();
+        if (self.encoded) {
+            var it = std.mem.splitScalar(u8, self.data, '&');
+            while (it.next()) |pair| {
                 if (pair.len == 0) continue;
                 const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-                // A bad %XX is the client's problem, not a reason to drop
-                // the request: propagating here would leave the connection
-                // closed with no response at all, since nothing has been
-                // flushed yet. Skip the pair and answer with the rest.
-                const key = Request.urlUnescape(res.arena, pair[0..eq]) catch continue;
-                const value = Request.urlUnescape(res.arena, pair[eq + 1 ..]) catch continue;
-                try w.objectField(key);
-                try w.write(value);
+                // A bad %XX is the client's problem, not a reason to fail
+                // the response. Skip the pair and answer with the rest.
+                const key = Request.urlUnescape(self.arena, pair[0..eq]) catch continue;
+                const value = Request.urlUnescape(self.arena, pair[eq + 1 ..]) catch continue;
+                try jw.objectField(key);
+                try jw.write(value);
             }
         }
-        try w.endObject();
-
-        // `json` is the parsed body when it is JSON, and null otherwise --
-        // clients assert on it to check a POST round-tripped.
-        try w.objectField("json");
-        if (parseJson(res.arena, req, data)) |parsed| {
-            try w.write(parsed);
-        } else {
-            try w.write(null);
-        }
-
-        // Multipart is not handled here, but the key has to exist.
-        try w.objectField("files");
-        try w.beginObject();
-        try w.endObject();
+        try jw.endObject();
     }
+};
 
-    if (id) |i| {
-        try w.objectField("id");
-        try w.write(i);
+fn describe(req: *Request, res: *Response, body: ?[]const u8, with_method: bool, id: ?usize) !Description {
+    var desc: Description = .{
+        .headers = req.headers,
+        .args = req.query,
+        .url = try absoluteUrl(req, res),
+        .origin = .{ .address = req.remote_address },
+        .method = if (with_method) req.method.name() else null,
+        .id = id,
+    };
+    if (body) |data| {
+        desc.data = data;
+        desc.form = .{ .arena = res.arena, .data = data, .encoded = req.content_type == .form };
+        // Present but null when the body was not JSON, which is what a
+        // client checks to see whether its POST round-tripped.
+        desc.json = parseJson(res.arena, req, data) orelse .null;
+        desc.files = .{};
     }
-
-    try w.endObject();
+    return desc;
 }
 
 fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.json.Value {
@@ -178,60 +160,35 @@ fn handleIndex(_: *Request, res: *Response) !void {
 }
 
 fn handleGet(req: *Request, res: *Response) !void {
-    return describe(req, res, null, false);
+    try res.json(try describe(req, res, null, false, null), Description.options);
 }
 
 /// Shared by the methods that carry a body: post, put, patch, delete.
 fn handleWithBody(req: *Request, res: *Response) !void {
-    return describeWithBody(req, res, false);
+    return sendDescription(req, res, false);
 }
 
-fn describeWithBody(req: *Request, res: *Response, with_method: bool) !void {
+fn sendDescription(req: *Request, res: *Response, with_method: bool) !void {
     // Read the body first. Serialising as we go would leave a half written
     // object in the response buffer if this failed, and that fragment
     // would then be sent as the body of the 500.
     const data = (try req.body()) orelse "";
-    return describe(req, res, data, with_method);
-}
-
-/// Sends the description through the collecting writer: nothing reaches
-/// the connection until the response is complete, so the headers stay
-/// open.
-fn describe(req: *Request, res: *Response, data: ?[]const u8, with_method: bool) !void {
-    res.content_type = .json;
-    var body = res.writer();
-    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-    try writeDescription(&w, req, res, null, data, with_method);
-    try body.end();
+    try res.json(try describe(req, res, data, with_method, null), Description.options);
 }
 
 /// Answers whatever the request method was. Unlike the others this always
 /// reports the full shape, including `method` and the body fields, so a
 /// GET here still carries an empty `data`/`form`/`json`/`files`.
 fn handleAnything(req: *Request, res: *Response) !void {
-    return describeWithBody(req, res, true);
+    return sendDescription(req, res, true);
 }
 
 fn handleHeaders(req: *Request, res: *Response) !void {
-    res.content_type = .json;
-    var body = res.writer();
-    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-    try w.beginObject();
-    try w.objectField("headers");
-    try w.beginObject();
-    var it = req.headers.iterator();
-    while (it.next()) |entry| {
-        try w.objectField(entry.key);
-        try w.write(entry.value);
-    }
-    try w.endObject();
-    try w.endObject();
-    try body.end();
+    try res.json(.{ .headers = req.headers }, .{});
 }
 
 fn handleIp(req: *Request, res: *Response) !void {
-    const address = try std.fmt.allocPrint(res.arena, "{f}", .{Origin{ .address = req.remote_address }});
-    try res.json(.{ .origin = address }, .{});
+    try res.json(.{ .origin = Origin{ .address = req.remote_address } }, .{});
 }
 
 fn handleUserAgent(req: *Request, res: *Response) !void {
@@ -306,8 +263,8 @@ fn handleStream(req: *Request, res: *Response) !void {
     for (0..n) |i| {
         // A fresh serialiser per line: each line is its own JSON document,
         // and Stringify refuses to start a second one.
-        var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-        try writeDescription(&w, req, res, i, null, false);
+        var w: std.json.Stringify = .{ .writer = &body.interface, .options = Description.options };
+        try w.write(try describe(req, res, null, false, i));
         try body.interface.writeByte('\n');
         // Each line goes out as its own chunk, so the client sees the
         // response arrive in pieces.
@@ -327,7 +284,7 @@ fn handleDelay(req: *Request, res: *Response) !void {
     try req.io.sleep(.fromNanoseconds(@intFromFloat(seconds * std.time.ns_per_s)), .real);
     // Registered for every method, and httpbin reflects the body here the
     // same way /post does.
-    return describeWithBody(req, res, false);
+    return sendDescription(req, res, false);
 }
 
 fn handleCookies(req: *Request, res: *Response) !void {
