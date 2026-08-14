@@ -1,9 +1,249 @@
+//! An httpbin-shaped server, used to exercise dusty against off-the-shelf
+//! HTTP clients and to give the test suite something to talk to that is not
+//! a third party service.
+//!
+//! The endpoints follow the behaviour documented at https://httpbin.org;
+//! the responses are built here rather than copied, so they match in shape
+//! rather than byte for byte.
 const std = @import("std");
 const zio = @import("zio");
 const http = @import("dusty");
 
-fn handleRoot(_: *http.Request, res: *http.Response) !void {
-    res.body = "Hello World!\n";
+const Request = http.Request;
+const Response = http.Response;
+
+/// httpbin caps these so a stray URL cannot ask for unbounded work.
+const max_bytes = 100 * 1024;
+const max_stream_lines = 100;
+const max_delay_seconds = 10;
+
+fn pathParamInt(req: *Request, name: []const u8, comptime T: type) ?T {
+    const raw = req.params.get(name) orelse return null;
+    return std.fmt.parseInt(T, raw, 10) catch null;
+}
+
+fn queryInt(req: *Request, name: []const u8, comptime T: type, default: T) T {
+    const raw = req.query.get(name) orelse return default;
+    return std.fmt.parseInt(T, raw, 10) catch default;
+}
+
+fn origin(req: *Request) []const u8 {
+    return req.headers.get("X-Forwarded-For") orelse "127.0.0.1";
+}
+
+/// Writes the fields most httpbin endpoints answer with: the request,
+/// reflected. Written straight out rather than built as a tree, so the
+/// streaming endpoints can emit one of these per line.
+fn writeDescription(w: *std.json.Stringify, req: *Request, id: ?usize) !void {
+    try w.beginObject();
+
+    try w.objectField("headers");
+    try w.beginObject();
+    var it = req.headers.iterator();
+    while (it.next()) |entry| {
+        try w.objectField(entry.key);
+        try w.write(entry.value);
+    }
+    try w.endObject();
+
+    try w.objectField("args");
+    try w.beginObject();
+    var q = req.query.iterator();
+    while (q.next()) |entry| {
+        try w.objectField(entry.key_ptr.*);
+        try w.write(entry.value_ptr.*);
+    }
+    try w.endObject();
+
+    try w.objectField("url");
+    try w.write(req.url);
+    try w.objectField("origin");
+    try w.write(origin(req));
+    if (id) |i| {
+        try w.objectField("id");
+        try w.write(i);
+    }
+
+    try w.endObject();
+}
+
+/// Sends a JSON body through the collecting writer: nothing reaches the
+/// connection until the response is complete, so the headers stay open.
+fn sendJson(res: *Response, req: *Request, extra: ?struct { key: []const u8, value: []const u8 }) !void {
+    var body = res.writer();
+    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
+    if (extra) |e| {
+        // One extra field, written by wrapping the description.
+        try w.beginObject();
+        try w.objectField(e.key);
+        try w.write(e.value);
+        try w.endObject();
+    } else {
+        try writeDescription(&w, req, null);
+    }
+    try body.end();
+    try res.header("Content-Type", "application/json");
+}
+
+fn handleIndex(_: *Request, res: *Response) !void {
+    res.content_type = .text;
+    res.body =
+        \\dusty httpbin
+        \\
+        \\  /get                 request, reflected as JSON
+        \\  /post                same, for POST, including the body
+        \\  /headers             request headers
+        \\  /ip                  origin address
+        \\  /user-agent          User-Agent header
+        \\  /status/:code        respond with the given status
+        \\  /bytes/:n            n bytes, with a Content-Length
+        \\  /stream/:n           n JSON lines, chunked
+        \\  /stream-bytes/:n     n bytes, chunked
+        \\  /delay/:seconds      respond after a delay
+        \\  /cookies             cookies sent by the client
+        \\  /cookies/set         set cookies from the query string
+        \\
+    ;
+}
+
+fn handleGet(req: *Request, res: *Response) !void {
+    try sendJson(res, req, null);
+}
+
+fn handlePost(req: *Request, res: *Response) !void {
+    var body = res.writer();
+    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
+    try w.beginObject();
+    try w.objectField("data");
+    try w.write((try req.body()) orelse "");
+    try w.objectField("origin");
+    try w.write(origin(req));
+    try w.objectField("url");
+    try w.write(req.url);
+    try w.endObject();
+    try body.end();
+    try res.header("Content-Type", "application/json");
+}
+
+fn handleHeaders(req: *Request, res: *Response) !void {
+    var body = res.writer();
+    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
+    try w.beginObject();
+    try w.objectField("headers");
+    try w.beginObject();
+    var it = req.headers.iterator();
+    while (it.next()) |entry| {
+        try w.objectField(entry.key);
+        try w.write(entry.value);
+    }
+    try w.endObject();
+    try w.endObject();
+    try body.end();
+    try res.header("Content-Type", "application/json");
+}
+
+fn handleIp(req: *Request, res: *Response) !void {
+    try sendJson(res, req, .{ .key = "origin", .value = origin(req) });
+}
+
+fn handleUserAgent(req: *Request, res: *Response) !void {
+    try sendJson(res, req, .{ .key = "user-agent", .value = req.headers.get("User-Agent") orelse "" });
+}
+
+fn handleStatus(req: *Request, res: *Response) !void {
+    const code = pathParamInt(req, "code", u16) orelse 200;
+    res.status = @enumFromInt(code);
+}
+
+/// Sized up front, so this takes the writer's identity path: the body is
+/// streamed with the declared Content-Length and no chunk framing.
+fn handleBytes(req: *Request, res: *Response) !void {
+    const n = @min(pathParamInt(req, "n", usize) orelse 0, max_bytes);
+
+    var len_buf: [24]u8 = undefined;
+    try res.header("Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{n}));
+    try res.header("Content-Type", "application/octet-stream");
+
+    var buf: [4096]u8 = undefined;
+    var body = try res.stream(&buf);
+    try writeBytes(&body.interface, req, n);
+    try body.end();
+}
+
+/// Same bytes, but no length up front, so this one is chunked.
+fn handleStreamBytes(req: *Request, res: *Response) !void {
+    const n = @min(pathParamInt(req, "n", usize) orelse 0, max_bytes);
+    try res.header("Content-Type", "application/octet-stream");
+
+    var buf: [4096]u8 = undefined;
+    var body = try res.stream(&buf);
+    try writeBytes(&body.interface, req, n);
+    try body.end();
+}
+
+fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
+    // Seedable, so a client can ask for the same bytes twice.
+    var prng: std.Random.DefaultPrng = .init(queryInt(req, "seed", u64, 0));
+    const rand = prng.random();
+    var chunk: [1024]u8 = undefined;
+    var left = n;
+    while (left > 0) {
+        const take = @min(left, chunk.len);
+        rand.bytes(chunk[0..take]);
+        try w.writeAll(chunk[0..take]);
+        left -= take;
+    }
+}
+
+/// One JSON object per line, flushed as it goes, so a client sees the
+/// response arrive in pieces rather than all at once.
+fn handleStream(req: *Request, res: *Response) !void {
+    const n = @min(pathParamInt(req, "n", usize) orelse 1, max_stream_lines);
+    try res.header("Content-Type", "application/json");
+
+    var buf: [4096]u8 = undefined;
+    var body = try res.stream(&buf);
+    for (0..n) |i| {
+        // A fresh serialiser per line: each line is its own JSON document,
+        // and Stringify refuses to start a second one.
+        var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
+        try writeDescription(&w, req, i);
+        try body.interface.writeByte('\n');
+        // Each line goes out as its own chunk, so the client sees the
+        // response arrive in pieces.
+        try body.interface.flush();
+    }
+    try body.end();
+}
+
+fn handleDelay(req: *Request, res: *Response) !void {
+    const seconds = @min(pathParamInt(req, "seconds", u64) orelse 0, max_delay_seconds);
+    // Cancellable: a request timeout or a shutdown surfaces here as
+    // error.Canceled rather than holding the connection open.
+    try std.Io.sleep(req.io, .fromSeconds(seconds), .real);
+    try sendJson(res, req, null);
+}
+
+fn handleCookies(req: *Request, res: *Response) !void {
+    var body = res.writer();
+    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
+    try w.beginObject();
+    // TODO: dusty's Cookie only supports lookup by name, so the jar
+    // cannot be enumerated. Reporting the raw header until it can.
+    try w.objectField("cookies");
+    try w.write(req.headers.get("Cookie") orelse "");
+    try w.endObject();
+    try body.end();
+    try res.header("Content-Type", "application/json");
+}
+
+fn handleCookiesSet(req: *Request, res: *Response) !void {
+    var it = req.query.iterator();
+    while (it.next()) |entry| {
+        try res.setCookie(entry.key_ptr.*, entry.value_ptr.*, .{ .path = "/" });
+    }
+    res.status = .found;
+    try res.header("Location", "/cookies");
 }
 
 /// Parses `--<name>=<uint>` and returns the value, or null if `arg` doesn't
@@ -16,9 +256,11 @@ fn uintFlag(arg: []const u8, comptime name: []const u8) ?u64 {
 
 pub fn main(init: std.process.Init) !void {
     // Options (all optional):
+    //   --port=N                listen port (default: 8080)
     //   --threads=N             executor threads (default: auto = all cores)
     //   --request-timeout=SECS  max time to receive a request (default: none)
     //   --keepalive-timeout=SECS max idle time on a keepalive connection (default: none)
+    var port: u16 = 8080;
     var threads: usize = 0; // 0 = auto
     var request_timeout: ?std.Io.Duration = null;
     var keepalive_timeout: ?std.Io.Duration = null;
@@ -27,7 +269,9 @@ pub fn main(init: std.process.Init) !void {
         defer args.deinit();
         _ = args.next(); // argv0
         while (args.next()) |arg| {
-            if (uintFlag(arg, "threads")) |v| {
+            if (uintFlag(arg, "port")) |v| {
+                port = @intCast(v);
+            } else if (uintFlag(arg, "threads")) |v| {
                 threads = @intCast(v);
             } else if (uintFlag(arg, "request-timeout")) |v| {
                 request_timeout = .fromSeconds(@intCast(v));
@@ -53,13 +297,21 @@ pub fn main(init: std.process.Init) !void {
     }, {});
     defer server.deinit();
 
-    server.router.get("/", handleRoot);
+    server.router.get("/", handleIndex);
+    server.router.get("/get", handleGet);
+    server.router.post("/post", handlePost);
+    server.router.get("/headers", handleHeaders);
+    server.router.get("/ip", handleIp);
+    server.router.get("/user-agent", handleUserAgent);
+    server.router.get("/status/:code", handleStatus);
+    server.router.get("/bytes/:n", handleBytes);
+    server.router.get("/stream-bytes/:n", handleStreamBytes);
+    server.router.get("/stream/:n", handleStream);
+    server.router.get("/delay/:seconds", handleDelay);
+    server.router.get("/cookies", handleCookies);
+    server.router.get("/cookies/set", handleCookiesSet);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    std.log.info("Starting server on http://127.0.0.1:8080 (threads={d}, request_timeout={}, keepalive_timeout={})", .{
-        threads,
-        request_timeout != null,
-        keepalive_timeout != null,
-    });
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
+    std.log.info("httpbin on http://127.0.0.1:{d} (threads={d})", .{ port, threads });
     try server.listen(addr);
 }
