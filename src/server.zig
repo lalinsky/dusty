@@ -415,6 +415,12 @@ pub fn Server(comptime Ctx: type) type {
                 request_count += 1;
 
                 if (self.config.timeout.request) |duration| {
+                    // TODO(zio): drop once we require a zio with
+                    // lalinsky/zio#657. `set` is meant to handle a re-arm
+                    // itself, and stopped: it arms on the executor the task
+                    // is on now, so re-arming after a migration asks one
+                    // loop for a timer live in another's heap.
+                    timeout.clear();
                     timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
                 }
 
@@ -522,6 +528,8 @@ pub fn Server(comptime Ctx: type) type {
                 connection.reader.end = 0;
 
                 if (self.config.timeout.keepalive) |duration| {
+                    // TODO(zio): drop with the one above, same reason.
+                    timeout.clear();
                     timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
                 }
 
