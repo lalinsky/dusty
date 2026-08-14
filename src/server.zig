@@ -17,6 +17,13 @@ const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 
 const log = std.log.scoped(.dusty);
 
+/// How long the accept loop waits after failing for want of a file
+/// descriptor or memory, doubling up to the cap. Short enough that a brief
+/// shortage costs a little latency, capped so a sustained one settles into
+/// one attempt a second rather than a spin.
+const min_accept_backoff_ms = 5;
+const max_accept_backoff_ms = 1000;
+
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer), plus the arena backing their buffers, for one accepted
 /// connection. Initialized in place: `tls_conn` stores pointers into
@@ -297,26 +304,51 @@ pub fn Server(comptime Ctx: type) type {
                 group.cancel(self.io);
             }
 
+            // Grows while accepting keeps failing for want of resources, and
+            // is reset by the first connection that gets through.
+            var backoff_ms: u64 = 0;
+
             while (true) {
-                const stream = server.accept(self.io) catch |err| {
-                    if (err == error.Canceled) {
-                        log.info("Graceful shutdown requested", .{});
-                        self.shutting_down.store(true, .release);
-                        while (true) { // TODO: add graceful shutdown timeout
-                            const remaining = self.active_connections.load(.acquire);
-                            if (remaining == 0) break;
-                            log.info("Waiting for {} remaining connections to close", .{remaining});
-                            // Returns immediately if the count already changed, otherwise
-                            // blocks until a close wakes it or the timeout expires.
-                            try self.io.futexWaitTimeout(u32, &self.active_connections.raw, remaining, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } });
-                            // No connection closed within the timeout. Let the deferred
-                            // group.cancel tear down the remaining handlers.
-                            if (self.active_connections.load(.acquire) == remaining) return error.Timeout;
-                        }
+                const stream = server.accept(self.io) catch |err| switch (err) {
+                    error.Canceled => {
+                        self.drainConnections();
                         return err;
-                    }
-                    return err;
+                    },
+                    // One connection went away between its SYN and our
+                    // accept, which says nothing about the listener. Routine
+                    // on a public address, where clients reset and scanners
+                    // probe, so it is not worth a log line or a pause.
+                    error.ConnectionAborted => continue,
+                    // The machine is out of something, for now. Sleeping and
+                    // trying again turns that into latency; returning would
+                    // turn a condition that clears on its own into an outage
+                    // that needs a restart.
+                    error.ProcessFdQuotaExceeded,
+                    error.SystemFdQuotaExceeded,
+                    error.SystemResources,
+                    error.WouldBlock,
+                    => {
+                        backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
+                        log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
+                        self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch |sleep_err| {
+                            // Acted on here, not deferred to the accept
+                            // above with `recancel`. That accept keeps
+                            // failing for its own reason -- the fd table is
+                            // full, which is why we are in the backoff --
+                            // and an operation that completes with a result
+                            // of its own has the cancellation re-armed
+                            // rather than reported, so the caller gets its
+                            // result. Deferring therefore livelocks: the
+                            // cancellation is re-armed by turns here and in
+                            // the runtime, and never delivered.
+                            self.drainConnections();
+                            return sleep_err;
+                        };
+                        continue;
+                    },
+                    else => return err,
                 };
+                backoff_ms = 0;
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
                 group.concurrent(self.io, handleConnectionWrapper, .{ self, stream }) catch |err| {
@@ -324,6 +356,59 @@ pub fn Server(comptime Ctx: type) type {
                     _ = self.active_connections.fetchSub(1, .acq_rel);
                     stream.close(self.io);
                     continue;
+                };
+            }
+        }
+
+        /// Stops accepting and waits for the connections already in flight.
+        /// Reached from every way the accept loop can learn it was canceled,
+        /// so a shutdown drains whether the cancel landed on the accept or
+        /// on a backoff wait.
+        ///
+        /// Runs under cancel protection: this is the shutdown, and a further
+        /// cancel arriving mid-drain would abandon connections rather than
+        /// finish with them. What bounds it is its own policy below, not
+        /// whoever asked it to stop.
+        ///
+        /// Infallible, so that `listen` reports the cancellation that stopped
+        /// it rather than a detail of how the drain went. Connections that
+        /// outlast the wait are logged and left to the caller's deferred
+        /// `group.cancel`, which tears them down either way.
+        fn drainConnections(self: *Self) void {
+            const protection = self.io.swapCancelProtection(.blocked);
+            defer _ = self.io.swapCancelProtection(protection);
+
+            log.info("Graceful shutdown requested", .{});
+            self.shutting_down.store(true, .release);
+
+            // Turned into a deadline once, so the budget covers the drain as
+            // a whole. A per-wait duration would restart it every time a
+            // connection closed, and a steady trickle would then hold the
+            // shutdown open indefinitely.
+            const timeout: std.Io.Timeout = if (self.config.timeout.shutdown) |duration|
+                std.Io.Timeout.toDeadline(.{ .duration = .{ .raw = duration, .clock = .awake } }, self.io)
+            else
+                .none;
+
+            while (true) {
+                const remaining = self.active_connections.load(.acquire);
+                if (remaining == 0) return;
+
+                if (timeout.toTimestamp(self.io)) |deadline| {
+                    if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
+                        log.warn("Shutdown timed out with {d} connection(s) still open", .{remaining});
+                        return;
+                    }
+                }
+
+                log.info("Waiting for {} remaining connections to close", .{remaining});
+                // Wakes when a connection closes, or when the deadline
+                // arrives; the loop above decides which happened. Spurious
+                // wakeups just re-read the count.
+                self.io.futexWaitTimeout(u32, &self.active_connections.raw, remaining, timeout) catch |err| switch (err) {
+                    // Cannot happen: protection is blocked for this whole
+                    // function, so no Io call here is a cancelation point.
+                    error.Canceled => unreachable,
                 };
             }
         }
