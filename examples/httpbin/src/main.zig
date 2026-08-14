@@ -30,9 +30,24 @@ fn fail(res: *Response, status: http.Status, comptime message: []const u8) void 
     res.body = message ++ "\n";
 }
 
-fn origin(req: *Request) []const u8 {
-    return req.headers.get("X-Forwarded-For") orelse "127.0.0.1";
-}
+/// An address without its port, which is the origin httpbin reports.
+/// `IpAddress.format` always writes one, and std has no portless
+/// formatter for IPv4.
+const Origin = struct {
+    address: std.Io.net.IpAddress,
+
+    pub fn format(self: Origin, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self.address) {
+            .ip4 => |a| try w.print("{d}.{d}.{d}.{d}", .{
+                a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3],
+            }),
+            .ip6 => |a| try w.print("{f}", .{std.Io.net.Ip6Address.Unresolved{
+                .bytes = a.bytes,
+                .interface_name = null,
+            }}),
+        }
+    }
+};
 
 /// httpbin reports an absolute URL, and clients parse it for the host, so
 /// rebuild one from the Host header rather than echoing the path.
@@ -79,7 +94,9 @@ fn writeDescription(
     try w.objectField("url");
     try w.write(try absoluteUrl(req, res));
     try w.objectField("origin");
-    try w.write(origin(req));
+    // `print` writes raw, so the quotes are ours; an address only ever
+    // formats as digits and separators, which need no escaping.
+    try w.print("\"{f}\"", .{Origin{ .address = req.remote_address }});
 
     if (with_method) {
         try w.objectField("method");
@@ -213,7 +230,8 @@ fn handleHeaders(req: *Request, res: *Response) !void {
 }
 
 fn handleIp(req: *Request, res: *Response) !void {
-    try res.json(.{ .origin = origin(req) }, .{});
+    const address = try std.fmt.allocPrint(res.arena, "{f}", .{Origin{ .address = req.remote_address }});
+    try res.json(.{ .origin = address }, .{});
 }
 
 fn handleUserAgent(req: *Request, res: *Response) !void {
