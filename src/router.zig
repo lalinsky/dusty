@@ -219,11 +219,6 @@ pub fn Router(comptime Ctx: type) type {
         }
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
-            // Get the tree for this method
-            const method_idx = @intFromEnum(req.method);
-            std.debug.assert(method_idx < 256);
-            const root = self.trees[method_idx] orelse return null;
-
             // Strip query parameters from URL and parse them
             req.query.clearRetainingCapacity();
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
@@ -253,14 +248,31 @@ pub fn Router(comptime Ctx: type) type {
                 offset += segment.len + 1; // +1 for the '/'
             }
 
-            const node = try matchRecursive(root, req, path, segments.items, offsets.items, 0);
-            if (node) |n| {
-                if (n.route) |opaque_route| {
-                    const route: *const Route = @ptrCast(@alignCast(opaque_route));
-                    return route.*;
-                }
+            if (try self.matchIn(req.method, req, path, segments.items, offsets.items)) |route| {
+                return route;
+            }
+            // A HEAD response is the GET response without the body, so a
+            // HEAD with no route of its own is answered by the GET one.
+            // Second, so a route registered with `head` still wins.
+            if (req.method == .head) {
+                return self.matchIn(.get, req, path, segments.items, offsets.items);
             }
             return null;
+        }
+
+        fn matchIn(
+            self: *const Self,
+            method: Method,
+            req: *Request,
+            path: []const u8,
+            segments: []const []const u8,
+            offsets: []const usize,
+        ) !?Route {
+            const root = self.trees[@intFromEnum(method)] orelse return null;
+            const node = try matchRecursive(root, req, path, segments, offsets, 0) orelse return null;
+            const opaque_route = node.route orelse return null;
+            const route: *const Route = @ptrCast(@alignCast(opaque_route));
+            return route.*;
         }
 
         pub fn get(self: *Self, path: []const u8, handler: Handler) void {
@@ -1282,4 +1294,94 @@ test "Group: any method registers all methods" {
         const route = try router.findHandler(&req);
         try std.testing.expect(route != null);
     }
+}
+
+test "Router: a GET route answers HEAD" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users", testHandler);
+
+    var req = Request{
+        .method = .head,
+        .url = "/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+
+    // The fallback is HEAD's alone; nothing else borrows from GET.
+    req.method = .post;
+    try std.testing.expect(try router.findHandler(&req) == null);
+    req.url = "/nothing";
+    req.method = .head;
+    try std.testing.expect(try router.findHandler(&req) == null);
+}
+
+test "Router: an explicit HEAD route wins over the GET one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users", testHandler);
+    router.head("/users", testHandler2);
+
+    var req = Request{
+        .method = .head,
+        .url = "/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    try std.testing.expectEqual(&testHandler2, (try router.findHandler(&req)).?.action);
+
+    req.method = .get;
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+}
+
+test "Router: HEAD falls back per path, not per tree" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    // A HEAD tree exists because of /other, but /users is not in it.
+    router.head("/other", testHandler2);
+    router.get("/users", testHandler);
+
+    var req = Request{
+        .method = .head,
+        .url = "/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+}
+
+test "Router: HEAD falling back to GET still captures path params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:id", testHandler);
+
+    var req = Request{
+        .method = .head,
+        .url = "/users/42",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .conn = undefined,
+    };
+    try std.testing.expect(try router.findHandler(&req) != null);
+    try std.testing.expectEqualStrings("42", req.params.get("id").?);
 }

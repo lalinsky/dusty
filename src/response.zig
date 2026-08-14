@@ -215,6 +215,14 @@ pub const StreamingBodyWriter = struct {
         // send nothing rather than ending the body early.
         if (total == 0) return 0;
 
+        // A HEAD reports the length its GET would have and sends none of
+        // it. The handler still writes, and is still charged for what it
+        // wrote, so a declared Content-Length is checked the same way.
+        if (self.res.head) {
+            self.res.body_sent += total;
+            return w.consume(total);
+        }
+
         try self.record(if (self.res.chunked)
             self.writeChunk(pending, data, splat, total)
         else
@@ -283,7 +291,7 @@ pub const StreamingBodyWriter = struct {
         errdefer res.keepalive = false;
 
         try self.record(self.interface.flush());
-        if (res.chunked) try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
+        if (res.chunked and !res.head) try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
         try self.record(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
@@ -306,6 +314,11 @@ pub const Response = struct {
     keepalive: bool = true,
     chunked: bool = false,
     streaming: bool = false,
+    /// The request was a HEAD, so the headers go out describing the body
+    /// a GET would have sent, and the body itself does not. Set by the
+    /// server; a handler writes its body either way and does not have to
+    /// know.
+    head: bool = false,
     /// A body writer was handed out and has not been ended yet.
     body_writer_open: bool = false,
     /// Length declared before streaming, if any. On the response rather
@@ -512,7 +525,7 @@ pub const Response = struct {
                 if (self.chunked) {
                     // Framing survives: terminate and let the peer see a
                     // truncated but well formed body.
-                    try self.conn.writer.writeAll("0\r\n\r\n");
+                    if (!self.head) try self.conn.writer.writeAll("0\r\n\r\n");
                 } else if (self.content_length) |declared| {
                     // Nothing can make the body match the length we
                     // promised, so the connection must not be reused: the
@@ -531,8 +544,9 @@ pub const Response = struct {
 
         if (self.chunked) {
             // A streaming writer sent the headers; all that is left is the
-            // terminator.
-            try self.conn.writer.writeAll("0\r\n\r\n");
+            // terminator, which is body framing and so is not sent for a
+            // HEAD either.
+            if (!self.head) try self.conn.writer.writeAll("0\r\n\r\n");
             try self.conn.writer.flush();
             return;
         }
@@ -540,10 +554,13 @@ pub const Response = struct {
         // Write headers if not already written
         try self.writeHeader();
 
-        // Write body (either from buffer or body field)
-        const buffered = self.buffer.writer.buffered();
-        const body = if (buffered.len > 0) buffered else self.body;
-        try self.conn.writer.writeAll(body);
+        // Write body (either from buffer or body field). A HEAD response
+        // has already reported its length and must stop here.
+        if (!self.head) {
+            const buffered = self.buffer.writer.buffered();
+            const body = if (buffered.len > 0) buffered else self.body;
+            try self.conn.writer.writeAll(body);
+        }
 
         try self.conn.writer.flush();
     }
@@ -1574,4 +1591,103 @@ test "Response: resetBody drops the headers that described the old body" {
     // Headers that say nothing about the body are left alone.
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Request-Id: abc") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "oops\n"));
+}
+
+test "Response: a HEAD reports the length but sends no body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.head = true;
+    response.content_type = .text;
+    response.body = "hello";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    // The headers are the ones a GET would have got.
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "text/plain") != null);
+    // The body is not.
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+}
+
+test "Response: a HEAD sends no body written through the writer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.head = true;
+    var body = response.writer();
+    try body.interface.writeAll("hello");
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+}
+
+test "Response: a streamed HEAD sends the framing headers and nothing after" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.head = true;
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("first");
+    try body.interface.flush();
+    try body.interface.writeAll("second");
+    try body.end();
+
+    // Chunked is what a GET would have been, so it is still announced --
+    // but no chunk and no terminator follow it.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        conn_writer.buffered(),
+    );
+}
+
+test "Response: a streamed HEAD still checks a declared length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.head = true;
+    try response.header("Content-Length", "5");
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    // The handler wrote what a GET would have, and is held to the length
+    // it promised even though none of it went out.
+    try body.interface.writeAll("hello");
+    try body.end();
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+        conn_writer.buffered(),
+    );
 }
