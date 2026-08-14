@@ -377,7 +377,27 @@ pub fn Server(comptime Ctx: type) type {
                         }
 
                         connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth) catch |err| {
-                            log.err("TLS handshake failed: {}", .{err});
+                            // tls.zig only saw the ciphertext reader or
+                            // writer fail generically, so the cause is a
+                            // layer down -- and when the handshake ran out
+                            // of time, that cause is the cancel.
+                            const cause = switch (err) {
+                                error.TransportReadFailed => connection.getReadError() orelse err,
+                                error.TransportWriteFailed => connection.getWriteError() orelse err,
+                                else => err,
+                            };
+                            // Nothing was negotiated, so there is no TLS
+                            // session to shut down politely either way.
+                            needs_shutdown = false;
+                            if (cause == error.Canceled) {
+                                log.debug("TLS handshake canceled", .{});
+                                return error.Canceled;
+                            }
+                            if (Connection.isPeerGone(cause)) {
+                                log.debug("TLS handshake abandoned by peer: {}", .{cause});
+                            } else {
+                                log.err("TLS handshake failed: {}", .{cause});
+                            }
                             return;
                         };
                     }
