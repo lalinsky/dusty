@@ -98,6 +98,122 @@ pub const EventStream = struct {
     }
 };
 
+/// Writes a response body, picking the framing from how much gets written.
+///
+/// Nothing is sent while the body still fits in the caller's buffer, so
+/// `end` can send it with an exact `Content-Length`. The first drain --
+/// the buffer overflowing, or the handler calling `flush` to start
+/// streaming -- commits to chunked transfer encoding, because from then on
+/// the length is not known in advance.
+///
+/// The buffer only has to outlive the handler if `end` is not called, and
+/// `end` must be called, so a stack buffer is fine.
+pub const BodyWriter = struct {
+    res: *Response,
+    interface: std.Io.Writer,
+    /// The real cause behind the generic `error.WriteFailed` that the
+    /// `std.Io.Writer` interface has to return. Recorded when a write
+    /// fails, so a handler that catches one can find out what happened
+    /// instead of being told only that it did.
+    err: ?Error = null,
+
+    /// Everything `writeHeader` can fail with, plus the real transport
+    /// errors hiding behind `WriteFailed`.
+    pub const Error = Connection.WriteError || HeaderError;
+
+    const HeaderError = @typeInfo(@typeInfo(@TypeOf(Response.writeHeader)).@"fn".return_type.?).error_union.error_set;
+
+    fn init(res: *Response, buf: []u8) BodyWriter {
+        return .{
+            .res = res,
+            .interface = .{
+                .buffer = buf,
+                .vtable = &.{ .drain = BodyWriter.drain },
+            },
+        };
+    }
+
+    /// Runs `result`, recording what actually went wrong. The interface
+    /// still reports the generic `WriteFailed`, as its contract requires;
+    /// `err` is where the answer lives.
+    fn record(self: *BodyWriter, result: HeaderError!void) std.Io.Writer.Error!void {
+        result catch |e| {
+            self.err = if (e == error.WriteFailed)
+                self.res.conn.getWriteError() orelse e
+            else
+                e;
+            return error.WriteFailed;
+        };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        const res = self.res;
+
+        // Getting here at all means the body outgrew the buffer, or the
+        // handler asked to start streaming. Either way the length can no
+        // longer be stated up front.
+        if (!res.chunked) {
+            res.chunked = true;
+            try self.record(res.writeHeader());
+        }
+
+        const pending = w.buffered();
+        const total = pending.len + std.Io.Writer.countSplat(data, splat);
+        // A zero length chunk is the terminator, so an empty flush has to
+        // send nothing at all rather than ending the body early.
+        if (total == 0) return 0;
+
+        try self.record(self.writeChunk(pending, data, splat, total));
+        return w.consume(total);
+    }
+
+    fn writeChunk(
+        self: *BodyWriter,
+        pending: []const u8,
+        data: []const []const u8,
+        splat: usize,
+        total: usize,
+    ) std.Io.Writer.Error!void {
+        // 16 hex digits covers any usize, plus the CRLF.
+        var size_buf: [18]u8 = undefined;
+        const size = std.fmt.bufPrint(&size_buf, "{x}\r\n", .{total}) catch unreachable;
+
+        const out = self.res.conn.writer;
+        try out.writeAll(size);
+        try out.writeAll(pending);
+        for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| try out.writeAll(pattern);
+        try out.writeAll("\r\n");
+        try out.flush();
+    }
+
+    /// Finishes the body. Must be called before the handler returns: until
+    /// it does, a buffered body has not been sent and a chunked one has no
+    /// terminator.
+    pub fn end(self: *BodyWriter) !void {
+        const res = self.res;
+        std.debug.assert(res.body_writer_open);
+        res.body_writer_open = false;
+
+        if (res.chunked) {
+            try self.record(self.interface.flush());
+            try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
+        } else {
+            // Never drained, so the whole body is still in the buffer and
+            // its length is known.
+            const body = self.interface.buffered();
+            res.body = body;
+            defer res.body = "";
+            try self.record(res.writeHeader());
+            try self.record(res.conn.writer.writeAll(body));
+        }
+        try self.record(res.conn.writer.flush());
+        res.written = true;
+    }
+};
+
 pub const Response = struct {
     status: http.Status = .ok,
     body: []const u8 = "",
@@ -111,6 +227,8 @@ pub const Response = struct {
     keepalive: bool = true,
     chunked: bool = false,
     streaming: bool = false,
+    /// A `BodyWriter` was handed out and has not been ended yet.
+    body_writer_open: bool = false,
 
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
@@ -127,8 +245,15 @@ pub const Response = struct {
         try self.headers.put(name, value);
     }
 
-    pub fn writer(self: *Response) *std.Io.Writer {
-        return &self.buffer.writer;
+    /// A writer for the response body. `buf` holds the body until it
+    /// overflows or is flushed; see `BodyWriter`. Call `end` on the result
+    /// before returning from the handler.
+    pub fn writer(self: *Response, buf: []u8) BodyWriter {
+        std.debug.assert(!self.body_writer_open); // one body writer per response
+        std.debug.assert(!self.headers_written); // body cannot start after the headers
+        std.debug.assert(self.body.len == 0 and self.buffer.writer.end == 0); // body already set
+        self.body_writer_open = true;
+        return .init(self, buf);
     }
 
     pub fn clearWriter(self: *Response) void {
@@ -145,36 +270,6 @@ pub const Response = struct {
         const serialized = try serializeCookie(self.arena, name, value, opts);
         try http.validateHeaderValue(serialized);
         try self.headers.add("Set-Cookie", serialized);
-    }
-
-    pub fn chunk(self: *Response, data: []const u8) !void {
-        if (!self.chunked) {
-            self.chunked = true;
-            self.writeHeader() catch |err| switch (err) {
-                error.WriteFailed => return self.conn.getWriteError() orelse err,
-                else => |e| return e,
-            };
-        }
-
-        // A zero-length chunk is the chunked-encoding terminator; skip it so
-        // an accidental empty write doesn't end the response early (and let
-        // subsequent chunks land after the terminator on the wire).
-        if (data.len == 0) return;
-
-        // Format: {size_hex}\r\n{data}\r\n
-        // Buffer size: enough for a 1TB chunk (40 bits = 10 hex digits) + formatting
-        var buf: [16]u8 = undefined;
-        const chunk_header = try std.fmt.bufPrint(&buf, "{x}\r\n", .{data.len});
-
-        self.writeChunkBytes(chunk_header, data) catch |err| return self.conn.getWriteError() orelse err;
-    }
-
-    fn writeChunkBytes(self: *Response, chunk_header: []const u8, data: []const u8) !void {
-        // Write chunk size header, data, and trailing CRLF
-        try self.conn.writer.writeAll(chunk_header);
-        try self.conn.writer.writeAll(data);
-        try self.conn.writer.writeAll("\r\n");
-        try self.conn.writer.flush();
     }
 
     pub fn startEventStream(self: *Response) !EventStream {
@@ -268,6 +363,9 @@ pub const Response = struct {
         if (self.written) {
             return;
         }
+        // The body writer's buffer belongs to the handler and is gone by
+        // now, so there is nothing left that could finish the response.
+        std.debug.assert(!self.body_writer_open); // handler returned without calling end()
         self.written = true;
 
         if (self.chunked) {
@@ -290,7 +388,7 @@ pub const Response = struct {
     }
 };
 
-test "Response: basic writer usage" {
+test "BodyWriter: a body that fits is sent with a Content-Length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -301,16 +399,23 @@ test "Response: basic writer usage" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    const w = response.writer();
 
-    try w.writeAll("Hello, ");
-    try w.writeAll("World!");
+    var body_buf: [64]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("Hello, ");
+    try body.interface.writeAll("World!");
+    try body.end();
 
-    const buffered = response.buffer.writer.buffered();
-    try std.testing.expectEqualStrings("Hello, World!", buffered);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 13\r\n" ++
+            "\r\n" ++
+            "Hello, World!",
+        conn_writer.buffered(),
+    );
+    try std.testing.expect(!response.chunked);
 }
-
-test "Response: writer with formatted output" {
+test "BodyWriter: overflowing the buffer switches to chunked" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -321,15 +426,20 @@ test "Response: writer with formatted output" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    const w = response.writer();
 
-    try w.print("Hello, {s}! You are {d} years old.", .{ "Alice", 30 });
+    // Too small for the body, so the first write has to drain.
+    var body_buf: [8]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.print("Hello, {s}! You are {d}.", .{ "Alice", 30 });
+    try body.end();
 
-    const buffered = response.buffer.writer.buffered();
-    try std.testing.expectEqualStrings("Hello, Alice! You are 30 years old.", buffered);
+    const written = conn_writer.buffered();
+    try std.testing.expect(response.chunked);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "0\r\n\r\n"));
 }
-
-test "Response: buffer takes precedence over body" {
+test "BodyWriter: flush starts streaming before the buffer is full" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -340,20 +450,27 @@ test "Response: buffer takes precedence over body" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    response.body = "body content";
 
-    const w = response.writer();
-    try w.writeAll("writer content");
+    var body_buf: [1024]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("first");
+    // Plenty of room left, but the handler wants it on the wire now.
+    try body.interface.flush();
+    try std.testing.expect(response.chunked);
 
-    // Buffer should have content
-    const buffered = response.buffer.writer.buffered();
-    try std.testing.expectEqualStrings("writer content", buffered);
-    try std.testing.expect(buffered.len > 0);
+    try body.interface.writeAll("second");
+    try body.end();
 
-    // Body is still there but shouldn't be used
-    try std.testing.expectEqualStrings("body content", response.body);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "5\r\nfirst\r\n" ++
+            "6\r\nsecond\r\n" ++
+            "0\r\n\r\n",
+        conn_writer.buffered(),
+    );
 }
-
 test "Response: body used when buffer is empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -397,7 +514,7 @@ test "Response: write() with body" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Hello World") != null);
 }
 
-test "Response: write() with writer buffer" {
+test "BodyWriter: writes between flushes are framed as one chunk" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -408,17 +525,25 @@ test "Response: write() with writer buffer" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    const w = response.writer();
-    try w.print("Count: {d}", .{42});
 
-    try response.write();
+    var body_buf: [1024]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("aaa");
+    try body.interface.writeAll("bbb");
+    try body.interface.print("{d}", .{42});
+    try body.interface.flush();
+    try body.end();
 
-    const written = conn_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "HTTP/1.1 200") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Count: 42") != null);
+    // One chunk for all three writes, not three.
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "8\r\naaabbb42\r\n" ++
+            "0\r\n\r\n",
+        conn_writer.buffered(),
+    );
 }
-
 test "Response: write() only writes once" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -522,7 +647,7 @@ test "Response: write() after writeHeader() doesn't duplicate headers" {
     try std.testing.expectEqual(header_len + "Body content".len, full_len);
 }
 
-test "Response: clearWriter()" {
+test "BodyWriter: an empty flush does not terminate the body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -533,18 +658,26 @@ test "Response: clearWriter()" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    const w = response.writer();
 
-    try w.writeAll("First content");
-    try std.testing.expectEqualStrings("First content", response.buffer.writer.buffered());
+    var body_buf: [1024]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("first");
+    try body.interface.flush();
+    // Nothing buffered: a zero length chunk here would end the body early.
+    try body.interface.flush();
+    try body.interface.writeAll("second");
+    try body.end();
 
-    response.clearWriter();
-    try std.testing.expectEqualStrings("", response.buffer.writer.buffered());
-
-    try w.writeAll("Second content");
-    try std.testing.expectEqualStrings("Second content", response.buffer.writer.buffered());
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "5\r\nfirst\r\n" ++
+            "6\r\nsecond\r\n" ++
+            "0\r\n\r\n",
+        conn_writer.buffered(),
+    );
 }
-
 test "Response: keepalive defaults to true" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -586,69 +719,7 @@ test "Response: Connection close header when keepalive is false" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") != null);
 }
 
-test "Response: chunked with single chunk" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response.init(arena.allocator(), &connection, 32);
-    response.status = .ok;
-
-    try response.chunk("Hello");
-    try response.write();
-
-    const written = conn_writer.buffered();
-
-    // Validate exact chunked encoding format
-    const expected =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Transfer-Encoding: chunked\r\n" ++
-        "\r\n" ++ // End of headers
-        "5\r\n" ++ // Chunk size
-        "Hello\r\n" ++ // Chunk data + trailing CRLF
-        "0\r\n\r\n"; // Final terminator
-
-    try std.testing.expectEqualStrings(expected, written);
-}
-
-test "Response: chunked with multiple chunks" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response.init(arena.allocator(), &connection, 32);
-
-    try response.chunk("First");
-    try response.chunk("Second chunk");
-    try response.write();
-
-    const written = conn_writer.buffered();
-
-    // Validate exact chunked encoding format
-    const expected =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Transfer-Encoding: chunked\r\n" ++
-        "\r\n" ++ // End of headers
-        "5\r\n" ++ // First chunk size
-        "First\r\n" ++ // First chunk data + trailing CRLF
-        "c\r\n" ++ // Second chunk size (12 in hex)
-        "Second chunk\r\n" ++ // Second chunk data + trailing CRLF
-        "0\r\n\r\n"; // Final terminator
-
-    try std.testing.expectEqualStrings(expected, written);
-}
-
-test "Response: chunked with custom headers" {
+test "BodyWriter: headers set before the body are sent with it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -662,24 +733,15 @@ test "Response: chunked with custom headers" {
     response.status = .created;
     try response.header("X-Custom", "value");
 
-    try response.chunk("Data");
-    try response.write();
+    var body_buf: [8]u8 = undefined;
+    var body = response.writer(&body_buf);
+    try body.interface.writeAll("Data that does not fit");
+    try body.end();
 
     const written = conn_writer.buffered();
-
-    // Validate exact chunked encoding format with custom headers
-    const expected =
-        "HTTP/1.1 201 CREATED\r\n" ++
-        "X-Custom: value\r\n" ++
-        "Transfer-Encoding: chunked\r\n" ++
-        "\r\n" ++ // End of headers
-        "4\r\n" ++ // Chunk size (4 bytes)
-        "Data\r\n" ++ // Chunk data + trailing CRLF
-        "0\r\n\r\n"; // Final terminator
-
-    try std.testing.expectEqualStrings(expected, written);
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 201 CREATED\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: value") != null);
 }
-
 test "Response: chunked flag defaults to false" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -693,39 +755,11 @@ test "Response: chunked flag defaults to false" {
     try std.testing.expectEqual(false, response.chunked);
 }
 
-test "Response: chunk() skips empty data so it doesn't terminate the stream" {
+test "BodyWriter: records the real error behind error.WriteFailed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response.init(arena.allocator(), &connection, 32);
-
-    try response.chunk("first");
-    try response.chunk(""); // would be the chunked terminator if written; must be skipped
-    try response.chunk("second");
-    try response.write();
-
-    const written = conn_writer.buffered();
-    const expected =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Transfer-Encoding: chunked\r\n" ++
-        "\r\n" ++
-        "5\r\nfirst\r\n" ++
-        "6\r\nsecond\r\n" ++
-        "0\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, written);
-}
-
-test "Response: chunk() surfaces the real error behind error.WriteFailed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    // Buffer too small to hold the headers, so the very first write fails.
+    // Too small to hold the headers, so the first drain fails.
     var buf: [4]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
@@ -734,11 +768,15 @@ test "Response: chunk() surfaces the real error behind error.WriteFailed" {
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
     var response = try Response.init(arena.allocator(), &connection, 32);
+    var body_buf: [2]u8 = undefined;
+    var body = response.writer(&body_buf);
 
-    try std.testing.expectError(error.ConnectionResetByPeer, response.chunk("first"));
+    // The interface reports the generic error, as it must.
+    try std.testing.expectError(error.WriteFailed, body.interface.writeAll("too long for the buffer"));
+    // The answer is on the writer.
+    try std.testing.expectEqual(error.ConnectionResetByPeer, body.err.?);
 }
-
-test "Response: chunk() falls back to error.WriteFailed when no real error was recorded" {
+test "BodyWriter: falls back to WriteFailed when nothing was recorded" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -749,34 +787,12 @@ test "Response: chunk() falls back to error.WriteFailed when no real error was r
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
+    var body_buf: [2]u8 = undefined;
+    var body = response.writer(&body_buf);
 
-    try std.testing.expectError(error.WriteFailed, response.chunk("first"));
+    try std.testing.expectError(error.WriteFailed, body.interface.writeAll("too long for the buffer"));
+    try std.testing.expectEqual(error.WriteFailed, body.err.?);
 }
-
-test "Response: chunked mode doesn't write Content-Length" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-
-    var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
-
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(&conn_writer);
-
-    var response = try Response.init(arena.allocator(), &connection, 32);
-
-    try response.chunk("test");
-    try response.write();
-
-    const written = conn_writer.buffered();
-
-    // Should NOT have Content-Length header
-    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
-
-    // Should have Transfer-Encoding instead
-    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
-}
-
 test "Response: json() with simple object" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

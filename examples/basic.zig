@@ -65,17 +65,25 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     try res.header("X-Demo", "Chunked-Response");
     res.status = .ok;
 
-    // Send chunks of data
-    try res.chunk("First chunk of data\n");
-    try res.chunk("Second chunk of data\n");
-    try res.chunk("Third chunk of data\n");
+    // The body is written through a buffer the handler owns. It is sent
+    // with a Content-Length if it all fits, and switches to chunked
+    // transfer encoding as soon as it does not, or as soon as we flush.
+    var buf: [256]u8 = undefined;
+    var body = res.writer(&buf);
+    const w = &body.interface;
 
-    // Dynamic content in chunk
-    const dynamic = try std.fmt.allocPrint(res.arena, "Chunk with timestamp: {d}\n", .{std.Io.Timestamp.now(req.io, .real).toSeconds()});
-    try res.chunk(dynamic);
+    try w.writeAll("First chunk of data\n");
+    try w.writeAll("Second chunk of data\n");
+    try w.writeAll("Third chunk of data\n");
 
-    try res.chunk("Final chunk!\n");
-    // res.write() will be called automatically by the server to add terminator
+    // Force it out now rather than waiting for the buffer to fill; this is
+    // what commits the response to chunked encoding.
+    try w.flush();
+
+    try w.print("Chunk with timestamp: {d}\n", .{std.Io.Timestamp.now(req.io, .real).toSeconds()});
+    try w.writeAll("Final chunk!\n");
+
+    try body.end();
 }
 
 fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
