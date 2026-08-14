@@ -123,6 +123,36 @@ class HttpbinTest(unittest.TestCase):
                     return b"".join(chunks)
                 chunks.append(chunk)
 
+    # Index
+
+    def test_index_lists_every_endpoint(self):
+        status, headers, raw = self.request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/plain", headers["Content-Type"])
+        page = raw.decode()
+        # Listed here so a route added without a line in the index, or a
+        # line left behind by one that went away, shows up as a failure.
+        for path in (
+            "/get",
+            "/post",
+            "/put",
+            "/patch",
+            "/delete",
+            "/anything",
+            "/headers",
+            "/ip",
+            "/user-agent",
+            "/status/:code",
+            "/bytes/:n",
+            "/stream/:n",
+            "/stream-bytes/:n",
+            "/delay/:seconds",
+            "/cookies",
+            "/cookies/set",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, page)
+
     # Reflection
 
     def test_get_reflects_the_request(self):
@@ -202,6 +232,15 @@ class HttpbinTest(unittest.TestCase):
             with self.subTest(method=method):
                 data = self.get_json("/anything", method=method, body="a=1")
                 self.assertEqual(data["method"], method)
+
+    def test_status_and_delay_answer_any_method(self):
+        # Registered for every method, like /anything.
+        for method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+            with self.subTest(method=method):
+                status, _, _ = self.request(method, "/status/204")
+                self.assertEqual(status, 204)
+                status, _, _ = self.request(method, "/delay/0")
+                self.assertEqual(status, 200)
 
     def test_body_methods_have_their_own_paths(self):
         for method, path in (

@@ -166,6 +166,10 @@ fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
         \\
         \\  /get                 request, reflected as JSON
         \\  /post                same, for POST, including the body
+        \\  /put                 same, for PUT
+        \\  /patch               same, for PATCH
+        \\  /delete              same, for DELETE
+        \\  /anything            same, for any method, which it also reports
         \\  /headers             request headers
         \\  /ip                  origin address
         \\  /user-agent          User-Agent header
