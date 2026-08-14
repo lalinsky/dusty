@@ -273,6 +273,14 @@ pub const StreamingBodyWriter = struct {
         // which the peer would read as the start of the next message.
         if (!res.body_writer_open) return;
         res.body_writer_open = false;
+        // From here the bytes already sent are the response, whatever
+        // happens next, so `write` must not add a terminator or a body to
+        // them.
+        res.written = true;
+        // If this does not finish cleanly the body is not framed the way
+        // its headers promised, and the connection cannot carry another
+        // response.
+        errdefer res.keepalive = false;
 
         try self.record(self.interface.flush());
         if (res.chunked) try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
@@ -282,7 +290,6 @@ pub const StreamingBodyWriter = struct {
         if (res.content_length) |declared| {
             if (res.body_sent != declared) return error.ContentLengthMismatch;
         }
-        res.written = true;
     }
 };
 
@@ -499,8 +506,8 @@ pub const Response = struct {
         self.written = true;
 
         if (self.chunked) {
-            // For chunked responses, headers are already written by chunk()
-            // We just need to write the final zero-length chunk terminator
+            // A streaming writer sent the headers; all that is left is the
+            // terminator.
             try self.conn.writer.writeAll("0\r\n\r\n");
             try self.conn.writer.flush();
             return;
@@ -1057,6 +1064,57 @@ test "Response: an abandoned chunked body is still terminated" {
     // Truncated, but framed: the peer knows where the body ended.
     try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "0\r\n\r\n"));
     try std.testing.expect(response.keepalive);
+}
+
+test "StreamingBodyWriter: a failed end does not let write add to the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "11");
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    // What an error handler would leave behind after the body started.
+    response.body = "error body";
+    try body.interface.writeAll("short");
+    try std.testing.expectError(error.ContentLengthMismatch, body.end());
+
+    const after_end = conn_writer.end;
+    // The `catch {}` half of `defer body.end() catch {}`: the response is
+    // finished either way, so this must add nothing.
+    try response.write();
+    try std.testing.expectEqual(after_end, conn_writer.end);
+    try std.testing.expect(!response.keepalive);
+}
+
+test "StreamingBodyWriter: a failed end does not leave a second terminator" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello");
+    try body.end();
+
+    const written = conn_writer.buffered();
+    try response.write();
+    // Already finished, so nothing more goes out.
+    try std.testing.expectEqualStrings(written, conn_writer.buffered());
 }
 
 test "Response: json() with simple object" {
