@@ -319,6 +319,10 @@ pub const Response = struct {
     /// server; a handler writes its body either way and does not have to
     /// know.
     head: bool = false,
+    /// Where a HEAD event stream writes. Per response rather than shared,
+    /// because two executors would otherwise be counting into the same
+    /// one.
+    discard: std.Io.Writer.Discarding = .init(&.{}),
     /// A body writer was handed out and has not been ended yet.
     body_writer_open: bool = false,
     /// Length declared before streaming, if any. On the response rather
@@ -428,7 +432,10 @@ pub const Response = struct {
         self.streaming = true;
         try self.writeHeader();
         try self.conn.writer.flush();
-        return .{ .conn = self.conn.writer };
+        // A HEAD gets the headers an event stream would have opened with
+        // and none of the events, so the whole stream writes into a sink
+        // rather than every send having to ask.
+        return .{ .conn = if (self.head) &self.discard.writer else self.conn.writer };
     }
 
     /// Upgrade HTTP connection to WebSocket.
@@ -1690,4 +1697,32 @@ test "Response: a streamed HEAD still checks a declared length" {
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
         conn_writer.buffered(),
     );
+}
+
+test "Response: a HEAD event stream sends the headers and no events" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.head = true;
+
+    const stream = try response.startEventStream();
+    try stream.send("hello", .{});
+    var w = try stream.startSend(.{ .event = "tick" });
+    try w.interface.writeAll("more");
+    try w.end();
+
+    // The headers a GET would have opened the stream with, and nothing
+    // after them.
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "text/event-stream") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "tick") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "data:") == null);
 }
