@@ -118,7 +118,7 @@ const Description = struct {
     origin: Origin,
     method: ?[]const u8 = null,
     data: ?[]const u8 = null,
-    form: ?Form = null,
+    form: ?http.Params = null,
     json: ?std.json.Value = null,
     files: ?struct {} = null,
     id: ?usize = null,
@@ -126,44 +126,25 @@ const Description = struct {
     const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
 };
 
-/// The body read as a form, when it says it is one. Serialized straight
-/// from the raw body, so nothing is built up first.
-const Form = struct {
-    arena: std.mem.Allocator,
-    data: []const u8,
-    encoded: bool,
-
-    pub fn jsonStringify(self: Form, jw: anytype) !void {
-        try jw.beginObject();
-        if (self.encoded) {
-            var it = std.mem.splitScalar(u8, self.data, '&');
-            while (it.next()) |pair| {
-                if (pair.len == 0) continue;
-                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-                // A bad %XX is the client's problem, not a reason to fail
-                // the response. Skip the pair and answer with the rest.
-                const key = Request.urlUnescape(self.arena, pair[0..eq]) catch continue;
-                const value = Request.urlUnescape(self.arena, pair[eq + 1 ..]) catch continue;
-                try jw.objectField(key);
-                try jw.write(value);
-            }
-        }
-        try jw.endObject();
-    }
+/// What varies between the endpoints that answer a description.
+const Describe = struct {
+    body: ?[]const u8 = null,
+    with_method: bool = false,
+    id: ?usize = null,
 };
 
-fn describe(req: *Request, res: *Response, body: ?[]const u8, with_method: bool, id: ?usize) !Description {
+fn describe(req: *Request, res: *Response, opts: Describe) !Description {
     var desc: Description = .{
         .headers = req.headers,
         .args = req.query,
         .url = try absoluteUrl(req, res),
         .origin = .{ .address = req.remote_address },
-        .method = if (with_method) req.method.name() else null,
-        .id = id,
+        .method = if (opts.with_method) req.method.name() else null,
+        .id = opts.id,
     };
-    if (body) |data| {
+    if (opts.body) |data| {
         desc.data = data;
-        desc.form = .{ .arena = res.arena, .data = data, .encoded = req.content_type == .form };
+        desc.form = if (req.content_type == .form) .{ .map = (try req.formData()).* } else .{};
         // Present but null when the body was not JSON, which is what a
         // client checks to see whether its POST round-tripped.
         desc.json = parseJson(res.arena, req, data) orelse .null;
@@ -200,7 +181,7 @@ fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
 }
 
 fn handleGet(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(try describe(req, res, null, false, null), Description.options);
+    try res.json(try describe(req, res, .{}), Description.options);
 }
 
 /// Shared by the methods that carry a body: post, put, patch, delete.
@@ -213,7 +194,12 @@ fn sendDescription(req: *Request, res: *Response, with_method: bool) !void {
     // object in the response buffer if this failed, and that fragment
     // would then be sent as the body of the 500.
     const data = (try req.body()) orelse "";
-    try res.json(try describe(req, res, data, with_method, null), Description.options);
+    const desc = describe(req, res, .{ .body = data, .with_method = with_method }) catch |err| switch (err) {
+        // A body that does not parse is the client's mistake, not ours.
+        error.InvalidEscapeSequence, error.TooManyFormFields => return fail(res, .bad_request, "Invalid form body"),
+        else => |e| return e,
+    };
+    try res.json(desc, Description.options);
 }
 
 /// Answers whatever the request method was. Unlike the others this always
@@ -304,7 +290,7 @@ fn handleStream(_: *Ctx, req: *Request, res: *Response) !void {
         // A fresh serialiser per line: each line is its own JSON document,
         // and Stringify refuses to start a second one.
         var w: std.json.Stringify = .{ .writer = &body.interface, .options = Description.options };
-        try w.write(try describe(req, res, null, false, i));
+        try w.write(try describe(req, res, .{ .id = i }));
         try body.interface.writeByte('\n');
         // Each line goes out as its own chunk, so the client sees the
         // response arrive in pieces.
@@ -328,50 +314,7 @@ fn handleDelay(_: *Ctx, req: *Request, res: *Response) !void {
 }
 
 fn handleCookies(_: *Ctx, req: *Request, res: *Response) !void {
-    res.content_type = .json;
-    var body = res.writer();
-    var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-    try w.beginObject();
-    // TODO(#123): dusty's Cookie only supports lookup by name, so the jar
-    // cannot be enumerated. Splitting the raw header keeps the response
-    // shape a client expects until it can.
-    try w.objectField("cookies");
-    try w.beginObject();
-    var it = std.mem.splitScalar(u8, req.headers.get("Cookie") orelse "", ';');
-    while (it.next()) |pair| {
-        const kv = std.mem.trim(u8, pair, " ");
-        if (kv.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
-        try w.objectField(kv[0..eq]);
-        try w.write(kv[eq + 1 ..]);
-    }
-    try w.endObject();
-    try w.endObject();
-    try body.end();
-}
-
-/// RFC 6265 cookie-name: a token, so no separators and no controls. The
-/// name here comes from the query string, and `setCookie` only checks the
-/// serialised result for CRLF -- a name containing `;` would otherwise
-/// smuggle in its own attributes.
-fn isCookieName(name: []const u8) bool {
-    if (name.len == 0) return false;
-    for (name) |c| {
-        if (c <= 0x20 or c >= 0x7f) return false;
-        if (std.mem.indexOfScalar(u8, "()<>@,;:\\\"/[]?={}", c) != null) return false;
-    }
-    return true;
-}
-
-/// RFC 6265 cookie-octet, plus space and comma because `serializeCookie`
-/// quotes those. Everything else -- notably `;` -- would end the value and
-/// start an attribute, which is the same injection the name check blocks.
-fn isCookieValue(value: []const u8) bool {
-    for (value) |c| {
-        if (c < 0x20 or c >= 0x7f) return false;
-        if (std.mem.indexOfScalar(u8, ";\\\"", c) != null) return false;
-    }
-    return true;
+    try res.json(.{ .cookies = req.cookies() }, .{});
 }
 
 fn handleCookiesSet(_: *Ctx, req: *Request, res: *Response) !void {
@@ -380,8 +323,8 @@ fn handleCookiesSet(_: *Ctx, req: *Request, res: *Response) !void {
     // still attached, so the client was told no and handed cookies anyway.
     var check = req.query.iterator();
     while (check.next()) |entry| {
-        if (!isCookieName(entry.key)) return fail(res, .bad_request, "Invalid cookie name");
-        if (!isCookieValue(entry.value)) return fail(res, .bad_request, "Invalid cookie value");
+        http.validateCookieName(entry.key) catch return fail(res, .bad_request, "Invalid cookie name");
+        http.validateCookieValue(entry.value) catch return fail(res, .bad_request, "Invalid cookie value");
     }
 
     var it = req.query.iterator();
