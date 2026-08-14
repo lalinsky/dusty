@@ -111,11 +111,16 @@ fn handleGet(req: *Request, res: *Response) !void {
 }
 
 fn handlePost(req: *Request, res: *Response) !void {
+    // Read the body first. Serialising as we go would leave a half written
+    // object in the response buffer if this failed, and that fragment
+    // would then be sent as the body of the 500.
+    const data = (try req.body()) orelse "";
+
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
     try w.beginObject();
     try w.objectField("data");
-    try w.write((try req.body()) orelse "");
+    try w.write(data);
     try w.objectField("origin");
     try w.write(origin(req));
     try w.objectField("url");
@@ -150,9 +155,30 @@ fn handleUserAgent(req: *Request, res: *Response) !void {
     try sendJson(res, req, .{ .key = "user-agent", .value = req.headers.get("User-Agent") orelse "" });
 }
 
+/// `http.Status` is an exhaustive enum, so `@enumFromInt` on a value it
+/// does not name is illegal behaviour: a panic in Debug, worse in
+/// ReleaseFast. The code comes straight from the URL, so it has to be
+/// checked against the set before converting.
+fn statusFromCode(code: u16) ?http.Status {
+    inline for (@typeInfo(http.Status).@"enum".fields) |f| {
+        if (f.value == code) return @field(http.Status, f.name);
+    }
+    return null;
+}
+
 fn handleStatus(req: *Request, res: *Response) !void {
-    const code = pathParamInt(req, "code", u16) orelse 200;
-    res.status = @enumFromInt(code);
+    const code = pathParamInt(req, "code", u16) orelse {
+        res.status = .bad_request;
+        res.content_type = .text;
+        res.body = "Invalid status code\n";
+        return;
+    };
+    res.status = statusFromCode(code) orelse {
+        res.status = .bad_request;
+        res.content_type = .text;
+        res.body = "Unsupported status code\n";
+        return;
+    };
 }
 
 /// Sized up front, so this takes the writer's identity path: the body is
@@ -228,18 +254,47 @@ fn handleCookies(req: *Request, res: *Response) !void {
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
     try w.beginObject();
-    // TODO: dusty's Cookie only supports lookup by name, so the jar
-    // cannot be enumerated. Reporting the raw header until it can.
+    // TODO(#123): dusty's Cookie only supports lookup by name, so the jar
+    // cannot be enumerated. Splitting the raw header keeps the response
+    // shape a client expects until it can.
     try w.objectField("cookies");
-    try w.write(req.headers.get("Cookie") orelse "");
+    try w.beginObject();
+    var it = std.mem.splitScalar(u8, req.headers.get("Cookie") orelse "", ';');
+    while (it.next()) |pair| {
+        const kv = std.mem.trim(u8, pair, " ");
+        if (kv.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        try w.objectField(kv[0..eq]);
+        try w.write(kv[eq + 1 ..]);
+    }
+    try w.endObject();
     try w.endObject();
     try body.end();
     try res.header("Content-Type", "application/json");
 }
 
+/// RFC 6265 cookie-name: a token, so no separators and no controls. The
+/// name here comes from the query string, and `setCookie` only checks the
+/// serialised result for CRLF -- a name containing `;` would otherwise
+/// smuggle in its own attributes.
+fn isCookieName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (c <= 0x20 or c >= 0x7f) return false;
+        if (std.mem.indexOfScalar(u8, "()<>@,;:\\\"/[]?={}", c) != null) return false;
+    }
+    return true;
+}
+
 fn handleCookiesSet(req: *Request, res: *Response) !void {
     var it = req.query.iterator();
     while (it.next()) |entry| {
+        if (!isCookieName(entry.key_ptr.*)) {
+            res.status = .bad_request;
+            res.content_type = .text;
+            res.body = "Invalid cookie name\n";
+            return;
+        }
         try res.setCookie(entry.key_ptr.*, entry.value_ptr.*, .{ .path = "/" });
     }
     res.status = .found;
