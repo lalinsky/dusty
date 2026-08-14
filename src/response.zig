@@ -209,7 +209,7 @@ pub const Response = struct {
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
-        return WebSocket.init(self.conn, req.conn, self.arena, seed);
+        return WebSocket.init(req.io, self.conn, req.conn, self.arena, seed);
     }
 
     pub fn writeHeader(self: *Response) !void {
