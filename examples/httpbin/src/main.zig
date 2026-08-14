@@ -108,8 +108,14 @@ fn writeDescription(
             while (form.next()) |pair| {
                 if (pair.len == 0) continue;
                 const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-                try w.objectField(try Request.urlUnescape(res.arena, pair[0..eq]));
-                try w.write(try Request.urlUnescape(res.arena, pair[eq + 1 ..]));
+                // A bad %XX is the client's problem, not a reason to drop
+                // the request: propagating here would leave the connection
+                // closed with no response at all, since nothing has been
+                // flushed yet. Skip the pair and answer with the rest.
+                const key = Request.urlUnescape(res.arena, pair[0..eq]) catch continue;
+                const value = Request.urlUnescape(res.arena, pair[eq + 1 ..]) catch continue;
+                try w.objectField(key);
+                try w.write(value);
             }
         }
         try w.endObject();
@@ -362,7 +368,9 @@ fn handleDelay(req: *Request, res: *Response) !void {
     // Cancellable: a request timeout or a shutdown surfaces here as
     // error.Canceled rather than holding the connection open.
     try std.Io.sleep(req.io, .fromNanoseconds(@intFromFloat(seconds * std.time.ns_per_s)), .real);
-    try sendJson(res, req, null);
+    // Registered for every method, and httpbin reflects the body here the
+    // same way /post does.
+    return describeWithBody(req, res, false);
 }
 
 fn handleCookies(req: *Request, res: *Response) !void {
@@ -456,13 +464,31 @@ pub fn main(init: std.process.Init) !void {
         defer args.deinit();
         _ = args.next(); // argv0
         while (args.next()) |arg| {
+            // Narrowing a flag with @intCast is safety checked, so an out
+            // of range value panics rather than explaining itself.
             if (uintFlag(arg, "port")) |v| {
+                if (v > std.math.maxInt(u16)) {
+                    std.log.err("--port must be 0..65535, got {d}", .{v});
+                    return error.InvalidArgument;
+                }
                 port = @intCast(v);
             } else if (uintFlag(arg, "threads")) |v| {
+                if (v > 1024) {
+                    std.log.err("--threads must be 0..1024, got {d}", .{v});
+                    return error.InvalidArgument;
+                }
                 threads = @intCast(v);
             } else if (uintFlag(arg, "request-timeout")) |v| {
+                if (v > std.math.maxInt(u32)) {
+                    std.log.err("--request-timeout is too large: {d}", .{v});
+                    return error.InvalidArgument;
+                }
                 request_timeout = .fromSeconds(@intCast(v));
             } else if (uintFlag(arg, "keepalive-timeout")) |v| {
+                if (v > std.math.maxInt(u32)) {
+                    std.log.err("--keepalive-timeout is too large: {d}", .{v});
+                    return error.InvalidArgument;
+                }
                 keepalive_timeout = .fromSeconds(@intCast(v));
             } else {
                 std.log.warn("ignoring unknown argument: {s}", .{arg});
