@@ -311,7 +311,7 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 const stream = server.accept(self.io) catch |err| switch (err) {
                     error.Canceled => {
-                        try self.drainConnections();
+                        self.drainConnections();
                         return err;
                     },
                     // One connection went away between its SYN and our
@@ -331,14 +331,17 @@ pub fn Server(comptime Ctx: type) type {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
                         log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
                         self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch |sleep_err| {
-                            // Acted on here, not deferred with `recancel` to
-                            // the accept above: that accept is failing
-                            // without suspending -- that is why we are in
-                            // the backoff -- so it is not a cancelation
-                            // point and would never report it. Deferring
-                            // livelocks, ping-ponging the cancellation
-                            // between here and the re-arm.
-                            try self.drainConnections();
+                            // Acted on here, not deferred to the accept
+                            // above with `recancel`. That accept keeps
+                            // failing for its own reason -- the fd table is
+                            // full, which is why we are in the backoff --
+                            // and an operation that completes with a result
+                            // of its own has the cancellation re-armed
+                            // rather than reported, so the caller gets its
+                            // result. Deferring therefore livelocks: the
+                            // cancellation is re-armed by turns here and in
+                            // the runtime, and never delivered.
+                            self.drainConnections();
                             return sleep_err;
                         };
                         continue;
@@ -366,7 +369,12 @@ pub fn Server(comptime Ctx: type) type {
         /// cancel arriving mid-drain would abandon connections rather than
         /// finish with them. What bounds it is its own policy below, not
         /// whoever asked it to stop.
-        fn drainConnections(self: *Self) error{Timeout}!void {
+        ///
+        /// Infallible, so that `listen` reports the cancellation that stopped
+        /// it rather than a detail of how the drain went. Connections that
+        /// outlast the wait are logged and left to the caller's deferred
+        /// `group.cancel`, which tears them down either way.
+        fn drainConnections(self: *Self) void {
             const protection = self.io.swapCancelProtection(.blocked);
             defer _ = self.io.swapCancelProtection(protection);
 
@@ -383,9 +391,12 @@ pub fn Server(comptime Ctx: type) type {
                     // function, so no Io call here is a cancelation point.
                     error.Canceled => unreachable,
                 };
-                // No connection closed within the timeout. Let the deferred
-                // group.cancel tear down the remaining handlers.
-                if (self.active_connections.load(.acquire) == remaining) return error.Timeout;
+                if (self.active_connections.load(.acquire) == remaining) {
+                    // Nothing closed while we waited. Stop holding the
+                    // shutdown open for connections that are not finishing.
+                    log.warn("Giving up on {d} connection(s) that did not close", .{remaining});
+                    return;
+                }
             }
         }
 

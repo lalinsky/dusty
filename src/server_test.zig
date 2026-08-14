@@ -516,11 +516,13 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
 
     try sync.slow_started.wait(io);
 
-    // Graceful shutdown: the drain must block and hit its 100ms timeout long
-    // before the 2s handler completes. Before the fix the drain spun hot until
-    // the handler finished and returned error.Canceled instead.
+    // Graceful shutdown: the drain must block, and give up on the connection
+    // rather than wait out the 2s handler. The elapsed time is what shows
+    // that -- before the fix the drain spun hot until the handler finished,
+    // which took the full two seconds. `listen` reports the cancellation
+    // either way; the drain no longer reports how it went.
     const start = std.Io.Timestamp.now(io, .awake);
-    try std.testing.expectError(error.Timeout, server_future.cancel(io));
+    try std.testing.expectError(error.Canceled, server_future.cancel(io));
     const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
     try std.testing.expect(elapsed_ns < 1500 * std.time.ns_per_ms);
 }
