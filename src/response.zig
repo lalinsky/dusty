@@ -371,6 +371,30 @@ pub const Response = struct {
         _ = self.buffer.writer.consumeAll();
     }
 
+    /// Throws away a body that was started but never finished, so a
+    /// replacement can be written in its place. `write` prefers the
+    /// buffer over `body`, so without this an error response would be
+    /// sent with whatever the failed handler had produced so far.
+    ///
+    /// Only usable while the headers are still open; once they are on the
+    /// wire the framing is already promised and the body cannot be
+    /// swapped.
+    pub fn resetBody(self: *Response) void {
+        std.debug.assert(!self.headers_written);
+        self.clearWriter();
+        self.body = "";
+        self.body_writer_open = false;
+        // Everything that described the old body has to go with it.
+        // `content_type` is the usual way to set one, but a handler can
+        // write either header directly, and then a stale Content-Length
+        // is worse than a stale type: `writeHeader` leaves a length that
+        // is already set alone, so the peer would be told to read a body
+        // of the wrong size and the connection would fall out of step.
+        self.content_type = null;
+        _ = self.headers.remove("Content-Type");
+        _ = self.headers.remove("Content-Length");
+    }
+
     pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
         const json_formatter = std.json.fmt(value, options);
         try json_formatter.format(&self.buffer.writer);
@@ -1484,4 +1508,70 @@ test "EventWriter: splatBytesAll" {
     try ew.end();
 
     try std.testing.expectEqualStrings("data: ababab\n\n", conn_writer.buffered());
+}
+
+test "Response: resetBody replaces a half written body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.content_type = .json;
+    var body = response.writer();
+    try body.interface.writeAll("{\"half\":");
+    // The handler fails here, without ever calling `end`.
+
+    response.resetBody();
+    response.status = .internal_server_error;
+    response.content_type = .text;
+    response.body = "500 Internal Server Error\n";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "500") != null);
+    // The fragment must not survive as the body, nor its length as the
+    // Content-Length, nor its content type as the type.
+    try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 26") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "500 Internal Server Error\n"));
+}
+
+test "Response: resetBody drops the headers that described the old body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    // Set directly rather than through `content_type`, which is the case
+    // clearing that field alone does not cover.
+    try response.header("Content-Type", "application/json");
+    try response.header("Content-Length", "8");
+    try response.header("X-Request-Id", "abc");
+    var body = response.writer();
+    try body.interface.writeAll("{\"half\":");
+
+    response.resetBody();
+    response.status = .internal_server_error;
+    response.body = "oops\n";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
+    // The stale length is the dangerous one: `writeHeader` leaves a length
+    // that is already set alone, so the peer would read 8 bytes of a 5
+    // byte body and take the rest from the next response.
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 8") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5") != null);
+    // Headers that say nothing about the body are left alone.
+    try std.testing.expect(std.mem.indexOf(u8, written, "X-Request-Id: abc") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "oops\n"));
 }
