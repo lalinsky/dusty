@@ -326,6 +326,40 @@ pub const Headers = struct {
         return self.len;
     }
 
+    /// The next entry matching `name` at or after `from`, or null.
+    fn find(self: *const Headers, name: []const u8, h: u8, from: usize) ?usize {
+        for (self.hashes[from..self.len], from..) |hh, i| {
+            if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) return i;
+        }
+        return null;
+    }
+
+    /// Serializes as a JSON object. HTTP lets a name appear more than
+    /// once and a JSON object cannot hold the same key twice, so those
+    /// become an array rather than a repeated key that a parser would
+    /// silently reduce to whichever copy it saw last.
+    pub fn jsonStringify(self: Headers, jw: anytype) !void {
+        try jw.beginObject();
+        for (self.keys[0..self.len], self.hashes[0..self.len], 0..) |name, h, i| {
+            // Later copies are written with the first, so skip them here.
+            if (self.find(name, h, 0).? != i) continue;
+
+            try jw.objectField(name);
+            const second = self.find(name, h, i + 1) orelse {
+                try jw.write(self.values[i]);
+                continue;
+            };
+            try jw.beginArray();
+            try jw.write(self.values[i]);
+            var next: ?usize = second;
+            while (next) |j| : (next = self.find(name, h, j + 1)) {
+                try jw.write(self.values[j]);
+            }
+            try jw.endArray();
+        }
+        try jw.endObject();
+    }
+
     pub fn iterator(self: *const Headers) Iterator {
         return .{ .keys = self.keys[0..self.len], .values = self.values[0..self.len], .pos = 0 };
     }
@@ -378,6 +412,18 @@ pub const Params = struct {
 
     pub fn iterator(self: *const Params) Iterator {
         return .{ .inner = self.map.iterator() };
+    }
+
+    /// Serializes as a JSON object. Keys are unique here, so unlike
+    /// `Headers` every value is a plain string.
+    pub fn jsonStringify(self: Params, jw: anytype) !void {
+        try jw.beginObject();
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            try jw.objectField(entry.key_ptr.*);
+            try jw.write(entry.value_ptr.*);
+        }
+        try jw.endObject();
     }
 
     /// Yields the same `Entry` shape as `Headers.Iterator`, so a loop over
@@ -749,4 +795,74 @@ test "Headers: remove compacts so later entries stay reachable" {
     try std.testing.expectEqualStrings("B", it.next().?.key);
     try std.testing.expectEqualStrings("C", it.next().?.key);
     try std.testing.expectEqual(@as(?Headers.Iterator.Entry, null), it.next());
+}
+fn expectJson(expected: []const u8, value: anytype) !void {
+    var buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try std.json.Stringify.value(value, .{}, &out);
+    try std.testing.expectEqualStrings(expected, out.buffered());
+}
+
+test "Headers: jsonStringify" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("Host", "example.com");
+    try headers.put("Accept", "*/*");
+    try expectJson(
+        \\{"Host":"example.com","Accept":"*/*"}
+    , headers);
+}
+
+test "Headers: jsonStringify groups a repeated name into an array" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.add("Host", "example.com");
+    try headers.add("X-Tag", "a");
+    try headers.add("X-Tag", "b");
+    try headers.add("X-Tag", "c");
+    // The array is written where the name first appeared, and the name is
+    // never repeated as a second key.
+    try expectJson(
+        \\{"Host":"example.com","X-Tag":["a","b","c"]}
+    , headers);
+}
+
+test "Headers: jsonStringify groups case-insensitively" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.add("X-Tag", "a");
+    try headers.add("x-tag", "b");
+    try expectJson(
+        \\{"X-Tag":["a","b"]}
+    , headers);
+}
+
+test "Headers: jsonStringify escapes names and values" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("X-Quote", "a\"b");
+    try expectJson(
+        \\{"X-Quote":"a\"b"}
+    , headers);
+}
+
+test "Headers: jsonStringify of an empty map" {
+    const headers: Headers = .{};
+    try expectJson("{}", headers);
+}
+
+test "Params: jsonStringify" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "a", "1");
+    try expectJson(
+        \\{"a":"1"}
+    , params);
+
+    const empty: Params = .{};
+    try expectJson("{}", empty);
 }
