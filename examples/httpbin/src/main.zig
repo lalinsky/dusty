@@ -20,14 +20,40 @@ const max_delay_seconds = 10;
 const request_timeout: std.Io.Duration = .fromSeconds(max_delay_seconds + 20);
 const keepalive_timeout: std.Io.Duration = .fromSeconds(60);
 
-/// Answers with a plain-text message in place of the endpoint's usual
-/// body. The message is comptime so the trailing newline -- which keeps it
-/// readable when a client prints the body raw -- can be appended without
-/// allocating.
+/// The context. It carries no state -- httpbin has none -- and exists so
+/// the server can reach `notFound` and `uncaughtError`, which dusty only
+/// looks for on a context type.
+const Ctx = struct {
+    /// Answers a route that does not exist. The default is plain text,
+    /// which would be the one response here that a JSON client cannot
+    /// read.
+    pub fn notFound(_: *Ctx, _: *Request, res: *Response) !void {
+        fail(res, .not_found, "Not Found");
+    }
+
+    /// Answers a handler that failed. Returns void, so there is nothing to
+    /// report a failure of its own to -- `fail` has to be infallible.
+    pub fn uncaughtError(_: *Ctx, _: *Request, res: *Response, err: anyerror) void {
+        // The name goes to the log rather than the response: it names an
+        // internal failure, and the client can do nothing with it.
+        std.log.err("unhandled error: {t}", .{err});
+        fail(res, .internal_server_error, "Internal Server Error");
+    }
+};
+
+/// Answers with an error in the same shape as every other response,
+/// rather than the plain text the library falls back to.
+///
+/// Infallible, because the paths that need it -- `uncaughtError`, and
+/// handlers that have already given up -- have nowhere to report a second
+/// failure. Serializing loses only if the arena is exhausted, and the
+/// plain-text fallback needs no allocation at all.
 fn fail(res: *Response, status: http.Status, comptime message: []const u8) void {
     res.status = status;
-    res.content_type = .text;
-    res.body = message ++ "\n";
+    res.json(.{ .@"error" = message, .status = @intFromEnum(status) }, .{}) catch {
+        res.content_type = .text;
+        res.body = message ++ "\n";
+    };
 }
 
 /// An address without its port, which is the origin httpbin reports.
@@ -138,7 +164,7 @@ fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.jso
     return parsed.value;
 }
 
-fn handleIndex(_: *Request, res: *Response) !void {
+fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
     res.content_type = .text;
     res.body =
         \\dusty httpbin
@@ -159,12 +185,12 @@ fn handleIndex(_: *Request, res: *Response) !void {
     ;
 }
 
-fn handleGet(req: *Request, res: *Response) !void {
+fn handleGet(_: *Ctx, req: *Request, res: *Response) !void {
     try res.json(try describe(req, res, null, false, null), Description.options);
 }
 
 /// Shared by the methods that carry a body: post, put, patch, delete.
-fn handleWithBody(req: *Request, res: *Response) !void {
+fn handleWithBody(_: *Ctx, req: *Request, res: *Response) !void {
     return sendDescription(req, res, false);
 }
 
@@ -179,23 +205,23 @@ fn sendDescription(req: *Request, res: *Response, with_method: bool) !void {
 /// Answers whatever the request method was. Unlike the others this always
 /// reports the full shape, including `method` and the body fields, so a
 /// GET here still carries an empty `data`/`form`/`json`/`files`.
-fn handleAnything(req: *Request, res: *Response) !void {
+fn handleAnything(_: *Ctx, req: *Request, res: *Response) !void {
     return sendDescription(req, res, true);
 }
 
-fn handleHeaders(req: *Request, res: *Response) !void {
+fn handleHeaders(_: *Ctx, req: *Request, res: *Response) !void {
     try res.json(.{ .headers = req.headers }, .{});
 }
 
-fn handleIp(req: *Request, res: *Response) !void {
+fn handleIp(_: *Ctx, req: *Request, res: *Response) !void {
     try res.json(.{ .origin = Origin{ .address = req.remote_address } }, .{});
 }
 
-fn handleUserAgent(req: *Request, res: *Response) !void {
+fn handleUserAgent(_: *Ctx, req: *Request, res: *Response) !void {
     try res.json(.{ .user_agent = req.headers.get("User-Agent") orelse "" }, .{});
 }
 
-fn handleStatus(req: *Request, res: *Response) !void {
+fn handleStatus(_: *Ctx, req: *Request, res: *Response) !void {
     const code = req.params.getInt(u16, "code") orelse
         return fail(res, .bad_request, "Invalid status code");
     res.status = http.Status.fromCode(code) catch
@@ -204,7 +230,7 @@ fn handleStatus(req: *Request, res: *Response) !void {
 
 /// Sized up front, so this takes the writer's identity path: the body is
 /// streamed with the declared Content-Length and no chunk framing.
-fn handleBytes(req: *Request, res: *Response) !void {
+fn handleBytes(_: *Ctx, req: *Request, res: *Response) !void {
     const n = @min(req.params.getInt(usize, "n") orelse
         return fail(res, .bad_request, "Invalid count"), max_bytes);
 
@@ -219,7 +245,7 @@ fn handleBytes(req: *Request, res: *Response) !void {
 }
 
 /// Same bytes, but no length up front, so this one is chunked.
-fn handleStreamBytes(req: *Request, res: *Response) !void {
+fn handleStreamBytes(_: *Ctx, req: *Request, res: *Response) !void {
     const n = @min(req.params.getInt(usize, "n") orelse
         return fail(res, .bad_request, "Invalid count"), max_bytes);
     try res.header("Content-Type", "application/octet-stream");
@@ -253,7 +279,7 @@ fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
 
 /// One JSON object per line, flushed as it goes, so a client sees the
 /// response arrive in pieces rather than all at once.
-fn handleStream(req: *Request, res: *Response) !void {
+fn handleStream(_: *Ctx, req: *Request, res: *Response) !void {
     const n = @min(req.params.getInt(usize, "n") orelse
         return fail(res, .bad_request, "Invalid count"), max_stream_lines);
     res.content_type = .json;
@@ -273,7 +299,7 @@ fn handleStream(req: *Request, res: *Response) !void {
     try body.end();
 }
 
-fn handleDelay(req: *Request, res: *Response) !void {
+fn handleDelay(_: *Ctx, req: *Request, res: *Response) !void {
     // httpbin accepts fractions here, and clients use them to keep tests
     // quick.
     const requested = req.params.getFloat(f64, "seconds") orelse
@@ -287,7 +313,7 @@ fn handleDelay(req: *Request, res: *Response) !void {
     return sendDescription(req, res, false);
 }
 
-fn handleCookies(req: *Request, res: *Response) !void {
+fn handleCookies(_: *Ctx, req: *Request, res: *Response) !void {
     res.content_type = .json;
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
@@ -334,7 +360,7 @@ fn isCookieValue(value: []const u8) bool {
     return true;
 }
 
-fn handleCookiesSet(req: *Request, res: *Response) !void {
+fn handleCookiesSet(_: *Ctx, req: *Request, res: *Response) !void {
     // Check the whole batch first. Setting as we go meant a bad entry
     // answered 400 with the Set-Cookie headers of the entries before it
     // still attached, so the client was told no and handed cookies anyway.
@@ -403,12 +429,13 @@ pub fn main(init: std.process.Init) !void {
     var rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
     defer rt.deinit();
 
-    var server = http.Server(void).init(init.gpa, rt.io(), .{
+    var ctx: Ctx = .{};
+    var server = http.Server(Ctx).init(init.gpa, rt.io(), .{
         .timeout = .{
             .request = request_timeout,
             .keepalive = keepalive_timeout,
         },
-    }, {});
+    }, &ctx);
     defer server.deinit();
 
     // GET and HEAD together: Flask derives HEAD from GET, dusty treats it
