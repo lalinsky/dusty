@@ -31,10 +31,26 @@ fn origin(req: *Request) []const u8 {
     return req.headers.get("X-Forwarded-For") orelse "127.0.0.1";
 }
 
-/// Writes the fields most httpbin endpoints answer with: the request,
-/// reflected. Written straight out rather than built as a tree, so the
-/// streaming endpoints can emit one of these per line.
-fn writeDescription(w: *std.json.Stringify, req: *Request, id: ?usize) !void {
+/// httpbin reports an absolute URL, and clients parse it for the host, so
+/// rebuild one from the Host header rather than echoing the path.
+fn absoluteUrl(req: *Request, res: *Response) ![]const u8 {
+    return std.fmt.allocPrint(res.arena, "http://{s}{s}", .{
+        req.headers.get("Host") orelse "localhost",
+        req.url,
+    });
+}
+
+/// Writes the fields httpbin answers with. `body` is the request body for
+/// the methods that carry one, which adds `data`, `form`, `json` and
+/// `files` the way `get_dict` does. Written straight out rather than built
+/// as a tree, so the streaming endpoints can emit one of these per line.
+fn writeDescription(
+    w: *std.json.Stringify,
+    req: *Request,
+    res: *Response,
+    id: ?usize,
+    body: ?[]const u8,
+) !void {
     try w.beginObject();
 
     try w.objectField("headers");
@@ -56,15 +72,61 @@ fn writeDescription(w: *std.json.Stringify, req: *Request, id: ?usize) !void {
     try w.endObject();
 
     try w.objectField("url");
-    try w.write(req.url);
+    try w.write(try absoluteUrl(req, res));
     try w.objectField("origin");
     try w.write(origin(req));
+
+    if (body) |data| {
+        try w.objectField("data");
+        try w.write(data);
+
+        // Only parsed when the body says it is a form, as httpbin does.
+        try w.objectField("form");
+        try w.beginObject();
+        if (isFormEncoded(req)) {
+            var form = std.mem.splitScalar(u8, data, '&');
+            while (form.next()) |pair| {
+                if (pair.len == 0) continue;
+                const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+                try w.objectField(try Request.urlUnescape(res.arena, pair[0..eq]));
+                try w.write(try Request.urlUnescape(res.arena, pair[eq + 1 ..]));
+            }
+        }
+        try w.endObject();
+
+        // `json` is the parsed body when it is JSON, and null otherwise --
+        // clients assert on it to check a POST round-tripped.
+        try w.objectField("json");
+        if (parseJson(res.arena, req, data)) |parsed| {
+            try w.write(parsed);
+        } else {
+            try w.write(null);
+        }
+
+        // Multipart is not handled here, but the key has to exist.
+        try w.objectField("files");
+        try w.beginObject();
+        try w.endObject();
+    }
+
     if (id) |i| {
         try w.objectField("id");
         try w.write(i);
     }
 
     try w.endObject();
+}
+
+fn isFormEncoded(req: *Request) bool {
+    const ct = req.headers.get("Content-Type") orelse return false;
+    return std.mem.startsWith(u8, ct, "application/x-www-form-urlencoded");
+}
+
+fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.json.Value {
+    const ct = req.headers.get("Content-Type") orelse return null;
+    if (!std.mem.startsWith(u8, ct, "application/json")) return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, data, .{}) catch return null;
+    return parsed.value;
 }
 
 /// Sends a JSON body through the collecting writer: nothing reaches the
@@ -79,7 +141,7 @@ fn sendJson(res: *Response, req: *Request, extra: ?struct { key: []const u8, val
         try w.write(e.value);
         try w.endObject();
     } else {
-        try writeDescription(&w, req, null);
+        try writeDescription(&w, req, res, null, null);
     }
     try body.end();
     try res.header("Content-Type", "application/json");
@@ -110,7 +172,8 @@ fn handleGet(req: *Request, res: *Response) !void {
     try sendJson(res, req, null);
 }
 
-fn handlePost(req: *Request, res: *Response) !void {
+/// Shared by the methods that carry a body: post, put, patch, delete.
+fn handleWithBody(req: *Request, res: *Response) !void {
     // Read the body first. Serialising as we go would leave a half written
     // object in the response buffer if this failed, and that fragment
     // would then be sent as the body of the 500.
@@ -118,16 +181,15 @@ fn handlePost(req: *Request, res: *Response) !void {
 
     var body = res.writer();
     var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-    try w.beginObject();
-    try w.objectField("data");
-    try w.write(data);
-    try w.objectField("origin");
-    try w.write(origin(req));
-    try w.objectField("url");
-    try w.write(req.url);
-    try w.endObject();
+    try writeDescription(&w, req, res, null, data);
     try body.end();
     try res.header("Content-Type", "application/json");
+}
+
+/// Answers whatever the request method was, like httpbin's /anything.
+fn handleAnything(req: *Request, res: *Response) !void {
+    if (req.method == .get or req.method == .head) return handleGet(req, res);
+    return handleWithBody(req, res);
 }
 
 fn handleHeaders(req: *Request, res: *Response) !void {
@@ -208,8 +270,12 @@ fn handleStreamBytes(req: *Request, res: *Response) !void {
 }
 
 fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
-    // Seedable, so a client can ask for the same bytes twice.
-    var prng: std.Random.DefaultPrng = .init(queryInt(req, "seed", u64, 0));
+    // Deterministic only when asked, as httpbin does: a client uses ?seed
+    // to fetch the same bytes twice, and expects fresh bytes without it.
+    var prng: std.Random.DefaultPrng = .init(if (req.query.get("seed")) |_|
+        queryInt(req, "seed", u64, 0)
+    else
+        @as(u64, @bitCast(@as(i64, @truncate(std.Io.Timestamp.now(req.io, .real).nanoseconds)))) ^ n);
     const rand = prng.random();
     var chunk: [1024]u8 = undefined;
     var left = n;
@@ -233,7 +299,7 @@ fn handleStream(req: *Request, res: *Response) !void {
         // A fresh serialiser per line: each line is its own JSON document,
         // and Stringify refuses to start a second one.
         var w: std.json.Stringify = .{ .writer = &body.interface, .options = .{} };
-        try writeDescription(&w, req, i);
+        try writeDescription(&w, req, res, i, null);
         try body.interface.writeByte('\n');
         // Each line goes out as its own chunk, so the client sees the
         // response arrive in pieces.
@@ -243,10 +309,19 @@ fn handleStream(req: *Request, res: *Response) !void {
 }
 
 fn handleDelay(req: *Request, res: *Response) !void {
-    const seconds = @min(pathParamInt(req, "seconds", u64) orelse 0, max_delay_seconds);
+    // httpbin accepts fractions here, and clients use them to keep tests
+    // quick.
+    const raw = req.params.get("seconds") orelse "0";
+    const requested = std.fmt.parseFloat(f64, raw) catch {
+        res.status = .bad_request;
+        res.content_type = .text;
+        res.body = "Invalid delay\n";
+        return;
+    };
+    const seconds = @min(@max(requested, 0), @as(f64, max_delay_seconds));
     // Cancellable: a request timeout or a shutdown surfaces here as
     // error.Canceled rather than holding the connection open.
-    try std.Io.sleep(req.io, .fromSeconds(seconds), .real);
+    try std.Io.sleep(req.io, .fromNanoseconds(@intFromFloat(seconds * std.time.ns_per_s)), .real);
     try sendJson(res, req, null);
 }
 
@@ -352,19 +427,44 @@ pub fn main(init: std.process.Init) !void {
     }, {});
     defer server.deinit();
 
-    server.router.get("/", handleIndex);
-    server.router.get("/get", handleGet);
-    server.router.post("/post", handlePost);
-    server.router.get("/headers", handleHeaders);
-    server.router.get("/ip", handleIp);
-    server.router.get("/user-agent", handleUserAgent);
-    server.router.get("/status/:code", handleStatus);
-    server.router.get("/bytes/:n", handleBytes);
-    server.router.get("/stream-bytes/:n", handleStreamBytes);
-    server.router.get("/stream/:n", handleStream);
-    server.router.get("/delay/:seconds", handleDelay);
-    server.router.get("/cookies", handleCookies);
-    server.router.get("/cookies/set", handleCookiesSet);
+    // GET and HEAD together: Flask derives HEAD from GET, dusty treats it
+    // as its own method, so every readable route needs both.
+    const readable = .{
+        .{ "/", handleIndex },
+        .{ "/get", handleGet },
+        .{ "/headers", handleHeaders },
+        .{ "/ip", handleIp },
+        .{ "/user-agent", handleUserAgent },
+        .{ "/bytes/:n", handleBytes },
+        .{ "/stream-bytes/:n", handleStreamBytes },
+        .{ "/stream/:n", handleStream },
+        .{ "/cookies", handleCookies },
+        .{ "/cookies/set", handleCookiesSet },
+    };
+    inline for (readable) |route| {
+        server.router.get(route[0], route[1]);
+        server.router.head(route[0], route[1]);
+    }
+
+    // httpbin answers these for every method.
+    const any_method = .{
+        .{ "/status/:code", handleStatus },
+        .{ "/delay/:seconds", handleDelay },
+        .{ "/anything", handleAnything },
+    };
+    inline for (any_method) |route| {
+        server.router.get(route[0], route[1]);
+        server.router.head(route[0], route[1]);
+        server.router.post(route[0], route[1]);
+        server.router.put(route[0], route[1]);
+        server.router.patch(route[0], route[1]);
+        server.router.delete(route[0], route[1]);
+    }
+
+    server.router.post("/post", handleWithBody);
+    server.router.put("/put", handleWithBody);
+    server.router.patch("/patch", handleWithBody);
+    server.router.delete("/delete", handleWithBody);
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
     std.log.info("httpbin on http://127.0.0.1:{d} (threads={d})", .{ port, threads });
