@@ -26,6 +26,11 @@ pub const ServerConfig = struct {
         keepalive: ?std.Io.Duration = null,
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
+        /// Maximum time a graceful shutdown waits for the connections still
+        /// in flight. Null waits for all of them, however long they take --
+        /// which for a connection that never closes on its own, such as a
+        /// WebSocket or an event stream, is forever.
+        shutdown: ?std.Io.Duration = .fromSeconds(30),
     };
 
     pub const Request = struct {

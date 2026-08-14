@@ -380,23 +380,36 @@ pub fn Server(comptime Ctx: type) type {
 
             log.info("Graceful shutdown requested", .{});
             self.shutting_down.store(true, .release);
-            while (true) { // TODO: add graceful shutdown timeout
+
+            // Turned into a deadline once, so the budget covers the drain as
+            // a whole. A per-wait duration would restart it every time a
+            // connection closed, and a steady trickle would then hold the
+            // shutdown open indefinitely.
+            const timeout: std.Io.Timeout = if (self.config.timeout.shutdown) |duration|
+                std.Io.Timeout.toDeadline(.{ .duration = .{ .raw = duration, .clock = .awake } }, self.io)
+            else
+                .none;
+
+            while (true) {
                 const remaining = self.active_connections.load(.acquire);
                 if (remaining == 0) return;
+
+                if (timeout.toTimestamp(self.io)) |deadline| {
+                    if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
+                        log.warn("Shutdown timed out with {d} connection(s) still open", .{remaining});
+                        return;
+                    }
+                }
+
                 log.info("Waiting for {} remaining connections to close", .{remaining});
-                // Returns immediately if the count already changed, otherwise
-                // blocks until a close wakes it or the timeout expires.
-                self.io.futexWaitTimeout(u32, &self.active_connections.raw, remaining, .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(100), .clock = .awake } }) catch |err| switch (err) {
+                // Wakes when a connection closes, or when the deadline
+                // arrives; the loop above decides which happened. Spurious
+                // wakeups just re-read the count.
+                self.io.futexWaitTimeout(u32, &self.active_connections.raw, remaining, timeout) catch |err| switch (err) {
                     // Cannot happen: protection is blocked for this whole
                     // function, so no Io call here is a cancelation point.
                     error.Canceled => unreachable,
                 };
-                if (self.active_connections.load(.acquire) == remaining) {
-                    // Nothing closed while we waited. Stop holding the
-                    // shutdown open for connections that are not finishing.
-                    log.warn("Giving up on {d} connection(s) that did not close", .{remaining});
-                    return;
-                }
             }
         }
 
