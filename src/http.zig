@@ -178,6 +178,14 @@ pub const Status = enum(c.llhttp_status_t) {
     network_read_timeout = c.HTTP_STATUS_NETWORK_READ_TIMEOUT,
     network_connect_timeout = c.HTTP_STATUS_NETWORK_CONNECT_TIMEOUT,
 
+    /// Converts a status code to the value naming it. `Status` is
+    /// exhaustive, so `@enumFromInt` on a code it does not name is illegal
+    /// behaviour; a code that came from outside -- a URL, a peer -- has to
+    /// come through here.
+    pub fn fromCode(code: u16) error{InvalidStatusCode}!Status {
+        return std.enums.fromInt(Status, code) orelse error.InvalidStatusCode;
+    }
+
     pub fn name(self: Status) [:0]const u8 {
         return std.mem.span(c.llhttp_status_name(@intFromEnum(self)));
     }
@@ -190,6 +198,23 @@ pub const Status = enum(c.llhttp_status_t) {
 test "Status: construct from llhttp_status_t" {
     const status: Status = @enumFromInt(c.HTTP_STATUS_OK);
     try std.testing.expectEqual(.ok, status);
+}
+
+test "Status: fromCode" {
+    try std.testing.expectEqual(.ok, try Status.fromCode(200));
+    try std.testing.expectEqual(.not_found, try Status.fromCode(404));
+    try std.testing.expectEqual(.im_a_teapot, try Status.fromCode(418));
+    // Unassigned, past the end of the range, and zero are all codes the
+    // enum does not name.
+    try std.testing.expectError(error.InvalidStatusCode, Status.fromCode(250));
+    try std.testing.expectError(error.InvalidStatusCode, Status.fromCode(600));
+    try std.testing.expectError(error.InvalidStatusCode, Status.fromCode(0));
+}
+
+test "Status: fromCode round-trips every named status" {
+    inline for (@typeInfo(Status).@"enum".fields) |f| {
+        try std.testing.expectEqual(@field(Status, f.name), try Status.fromCode(f.value));
+    }
 }
 
 test "Status: name" {
