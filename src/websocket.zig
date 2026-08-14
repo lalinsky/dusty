@@ -105,7 +105,6 @@ pub const WebSocket = struct {
                     continue;
                 },
                 .close => {
-                    self.closed = true;
                     var close_code: ?CloseCode = null;
                     var reason: []const u8 = "";
                     if (frame.payload.len >= 2) {
@@ -114,7 +113,7 @@ pub const WebSocket = struct {
                         reason = frame.payload[2..];
                     }
                     // Echo close frame back
-                    try self.writeCloseFrame(close_code orelse .normal, reason);
+                    try self.writeClose(close_code orelse .normal, reason);
                     self.auto_responded = true;
                     return .{ .type = .close, .data = reason, .close_code = close_code };
                 },
@@ -163,23 +162,20 @@ pub const WebSocket = struct {
 
     /// Send a text or binary message
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
-        if (self.closed) return error.EndOfStream;
         if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
         try self.writeFrame(msg_type, data, true);
     }
 
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
-        if (self.closed) return error.EndOfStream;
         if (data.len > 125) return Error.LargeControlFrame;
         try self.writeFrame(.ping, data, true);
     }
 
-    /// Send close frame and mark connection as closed
+    /// Send close frame and mark connection as closed. Does nothing if a close
+    /// frame has already been sent.
     pub fn close(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
-        if (self.closed) return;
-        self.closed = true;
-        try self.writeCloseFrame(code, reason);
+        return self.writeClose(code, reason);
     }
 
     const Frame = struct {
@@ -258,7 +254,11 @@ pub const WebSocket = struct {
     fn writeFrame(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
+        if (self.closed) return error.EndOfStream;
+        return self.writeFrameLocked(opcode, data, fin);
+    }
 
+    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) !void {
         // A half-written frame leaves the peer unable to find the next frame
         // boundary.
         errdefer self.closed = true;
@@ -299,12 +299,17 @@ pub const WebSocket = struct {
         try self.conn.flush();
     }
 
-    fn writeCloseFrame(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
+    fn writeClose(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.closed) return;
+        self.closed = true;
+
         var buf: [127]u8 = undefined;
         std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
-        try self.writeFrame(.close, buf[0 .. 2 + reason_len], true);
+        try self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true);
     }
 
     /// Compute Sec-WebSocket-Accept value from client key
@@ -363,14 +368,14 @@ test "WebSocket: writeFrame binary with medium length" {
     try std.testing.expectEqual(200, std.mem.readInt(u16, written[2..4], .big));
 }
 
-test "WebSocket: writeCloseFrame" {
+test "WebSocket: writeClose" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
     var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
     defer ws.deinit();
-    try ws.writeCloseFrame(.normal, "goodbye");
+    try ws.writeClose(.normal, "goodbye");
 
     const written = conn_writer.buffered();
     // FIN + close opcode
