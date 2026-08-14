@@ -17,6 +17,9 @@ const max_bytes = 100 * 1024;
 const max_stream_lines = 100;
 const max_delay_seconds = 10;
 
+const request_timeout: std.Io.Duration = .fromSeconds(max_delay_seconds + 20);
+const keepalive_timeout: std.Io.Duration = .fromSeconds(60);
+
 /// Answers with a plain-text message in place of the endpoint's usual
 /// body. The message is comptime so the trailing newline -- which keeps it
 /// readable when a client prints the body raw -- can be appended without
@@ -25,27 +28,6 @@ fn fail(res: *Response, status: http.Status, comptime message: []const u8) void 
     res.status = status;
     res.content_type = .text;
     res.body = message ++ "\n";
-}
-
-fn pathParamInt(req: *Request, name: []const u8, comptime T: type) ?T {
-    const raw = req.params.get(name) orelse return null;
-    return std.fmt.parseInt(T, raw, 10) catch null;
-}
-
-/// A path parameter that must be a number. Answers 400 and returns null
-/// when it is not, so a client bug shows up as a client bug rather than as
-/// an empty but successful response.
-fn requireParamInt(req: *Request, res: *Response, name: []const u8, comptime T: type) ?T {
-    const raw = req.params.get(name) orelse "";
-    return std.fmt.parseInt(T, raw, 10) catch {
-        fail(res, .bad_request, "Invalid count");
-        return null;
-    };
-}
-
-fn queryInt(req: *Request, name: []const u8, comptime T: type, default: T) T {
-    const raw = req.query.get(name) orelse return default;
-    return std.fmt.parseInt(T, raw, 10) catch default;
 }
 
 fn origin(req: *Request) []const u8 {
@@ -89,8 +71,8 @@ fn writeDescription(
     try w.beginObject();
     var q = req.query.iterator();
     while (q.next()) |entry| {
-        try w.objectField(entry.key_ptr.*);
-        try w.write(entry.value_ptr.*);
+        try w.objectField(entry.key);
+        try w.write(entry.value);
     }
     try w.endObject();
 
@@ -111,7 +93,7 @@ fn writeDescription(
         // Only parsed when the body says it is a form, as httpbin does.
         try w.objectField("form");
         try w.beginObject();
-        if (isFormEncoded(req)) {
+        if (req.content_type == .form) {
             var form = std.mem.splitScalar(u8, data, '&');
             while (form.next()) |pair| {
                 if (pair.len == 0) continue;
@@ -149,12 +131,6 @@ fn writeDescription(
     }
 
     try w.endObject();
-}
-
-fn isFormEncoded(req: *Request) bool {
-    // Already parsed for us, and parameters like `; charset=` are stripped,
-    // which a prefix match on the raw header would have to handle itself.
-    return req.content_type == .form;
 }
 
 fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.json.Value {
@@ -245,7 +221,7 @@ fn handleUserAgent(req: *Request, res: *Response) !void {
 }
 
 fn handleStatus(req: *Request, res: *Response) !void {
-    const code = pathParamInt(req, "code", u16) orelse
+    const code = req.params.getInt(u16, "code") orelse
         return fail(res, .bad_request, "Invalid status code");
     res.status = http.Status.fromCode(code) catch
         return fail(res, .bad_request, "Unsupported status code");
@@ -254,7 +230,8 @@ fn handleStatus(req: *Request, res: *Response) !void {
 /// Sized up front, so this takes the writer's identity path: the body is
 /// streamed with the declared Content-Length and no chunk framing.
 fn handleBytes(req: *Request, res: *Response) !void {
-    const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_bytes);
+    const n = @min(req.params.getInt(usize, "n") orelse
+        return fail(res, .bad_request, "Invalid count"), max_bytes);
 
     var len_buf: [24]u8 = undefined;
     try res.header("Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{n}));
@@ -268,7 +245,8 @@ fn handleBytes(req: *Request, res: *Response) !void {
 
 /// Same bytes, but no length up front, so this one is chunked.
 fn handleStreamBytes(req: *Request, res: *Response) !void {
-    const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_bytes);
+    const n = @min(req.params.getInt(usize, "n") orelse
+        return fail(res, .bad_request, "Invalid count"), max_bytes);
     try res.header("Content-Type", "application/octet-stream");
 
     var buf: [4096]u8 = undefined;
@@ -280,10 +258,13 @@ fn handleStreamBytes(req: *Request, res: *Response) !void {
 fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
     // Deterministic only when asked, as httpbin does: a client uses ?seed
     // to fetch the same bytes twice, and expects fresh bytes without it.
-    var prng: std.Random.DefaultPrng = .init(if (req.query.get("seed")) |_|
-        queryInt(req, "seed", u64, 0)
-    else
-        @as(u64, @bitCast(@as(i64, @truncate(std.Io.Timestamp.now(req.io, .real).nanoseconds)))) ^ n);
+    const seed: u64 = req.query.getInt(u64, "seed") orelse seed: {
+        var value: u64 = undefined;
+        req.io.random(std.mem.asBytes(&value));
+        break :seed value;
+    };
+
+    var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
     var chunk: [1024]u8 = undefined;
     var left = n;
@@ -298,7 +279,8 @@ fn writeBytes(w: *std.Io.Writer, req: *Request, n: usize) !void {
 /// One JSON object per line, flushed as it goes, so a client sees the
 /// response arrive in pieces rather than all at once.
 fn handleStream(req: *Request, res: *Response) !void {
-    const n = @min(requireParamInt(req, res, "n", usize) orelse return, max_stream_lines);
+    const n = @min(req.params.getInt(usize, "n") orelse
+        return fail(res, .bad_request, "Invalid count"), max_stream_lines);
     res.content_type = .json;
 
     var buf: [4096]u8 = undefined;
@@ -319,12 +301,8 @@ fn handleStream(req: *Request, res: *Response) !void {
 fn handleDelay(req: *Request, res: *Response) !void {
     // httpbin accepts fractions here, and clients use them to keep tests
     // quick.
-    const raw = req.params.get("seconds") orelse "0";
-    const requested = std.fmt.parseFloat(f64, raw) catch
+    const requested = req.params.getFloat(f64, "seconds") orelse
         return fail(res, .bad_request, "Invalid delay");
-    // parseFloat accepts "nan" and "inf". Neither is a duration, and the
-    // caps would quietly turn them into 0 and the maximum.
-    if (!std.math.isFinite(requested)) return fail(res, .bad_request, "Invalid delay");
     const seconds = @min(@max(requested, 0), @as(f64, max_delay_seconds));
     // Cancellable: a request timeout or a shutdown surfaces here as
     // error.Canceled rather than holding the connection open.
@@ -387,81 +365,67 @@ fn handleCookiesSet(req: *Request, res: *Response) !void {
     // still attached, so the client was told no and handed cookies anyway.
     var check = req.query.iterator();
     while (check.next()) |entry| {
-        if (!isCookieName(entry.key_ptr.*)) return fail(res, .bad_request, "Invalid cookie name");
-        if (!isCookieValue(entry.value_ptr.*)) return fail(res, .bad_request, "Invalid cookie value");
+        if (!isCookieName(entry.key)) return fail(res, .bad_request, "Invalid cookie name");
+        if (!isCookieValue(entry.value)) return fail(res, .bad_request, "Invalid cookie value");
     }
 
     var it = req.query.iterator();
     while (it.next()) |entry| {
-        try res.setCookie(entry.key_ptr.*, entry.value_ptr.*, .{ .path = "/" });
+        try res.setCookie(entry.key, entry.value, .{ .path = "/" });
     }
     res.status = .found;
     try res.header("Location", "/cookies");
 }
 
-/// Parses `--<name>=<uint>`. Null means this argument is not that flag;
-/// an error means it is, but the value could not be read -- conflating the
-/// two made `--port=abc` look like an unknown argument and start on the
-/// default port.
-fn uintFlag(arg: []const u8, comptime name: []const u8) !?u64 {
-    const prefix = "--" ++ name ++ "=";
-    if (!std.mem.startsWith(u8, arg, prefix)) return null;
-    return std.fmt.parseUnsigned(u64, arg[prefix.len..], 10) catch {
-        std.log.err("--{s} needs a non-negative integer, got '{s}'", .{ name, arg[prefix.len..] });
+const default_port = 8080;
+
+const Options = struct {
+    /// -l ADDR
+    listen: std.Io.net.IpAddress = .{ .ip4 = .loopback(default_port) },
+};
+
+/// The value following a flag, or an error naming the flag that is
+/// missing one.
+fn flagValue(args: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {
+    return args.next() orelse {
+        std.log.err("{s} needs a value", .{flag});
         return error.InvalidArgument;
     };
 }
 
-pub fn main(init: std.process.Init) !void {
-    // Options (all optional):
-    //   --port=N                listen port (default: 8080)
-    //   --threads=N             executor threads (default: auto = all cores)
-    //   --request-timeout=SECS  max time to receive a request (default: none)
-    //   --keepalive-timeout=SECS max idle time on a keepalive connection (default: none)
-    var port: u16 = 8080;
-    var threads: usize = 0; // 0 = auto
-    var request_timeout: ?std.Io.Duration = null;
-    var keepalive_timeout: ?std.Io.Duration = null;
-    {
-        var args = try init.minimal.args.iterateAllocator(init.gpa);
-        defer args.deinit();
-        _ = args.next(); // argv0
-        while (args.next()) |arg| {
-            // Narrowing a flag with @intCast is safety checked, so an out
-            // of range value panics rather than explaining itself.
-            if (try uintFlag(arg, "port")) |v| {
-                if (v > std.math.maxInt(u16)) {
-                    std.log.err("--port must be 0..65535, got {d}", .{v});
-                    return error.InvalidArgument;
-                }
-                port = @intCast(v);
-            } else if (try uintFlag(arg, "threads")) |v| {
-                if (v > 1024) {
-                    std.log.err("--threads must be 0..1024, got {d}", .{v});
-                    return error.InvalidArgument;
-                }
-                threads = @intCast(v);
-            } else if (try uintFlag(arg, "request-timeout")) |v| {
-                if (v > std.math.maxInt(u32)) {
-                    std.log.err("--request-timeout is too large: {d}", .{v});
-                    return error.InvalidArgument;
-                }
-                request_timeout = .fromSeconds(@intCast(v));
-            } else if (try uintFlag(arg, "keepalive-timeout")) |v| {
-                if (v > std.math.maxInt(u32)) {
-                    std.log.err("--keepalive-timeout is too large: {d}", .{v});
-                    return error.InvalidArgument;
-                }
-                keepalive_timeout = .fromSeconds(@intCast(v));
-            } else {
-                std.log.warn("ignoring unknown argument: {s}", .{arg});
-            }
+/// Values are parsed here rather than carried out as text, because the
+/// iterator owns the strings and frees them when this returns.
+fn parseArgs(init: std.process.Init) !Options {
+    var opts: Options = .{};
+
+    var args = try init.minimal.args.iterateAllocator(init.gpa);
+    defer args.deinit();
+    _ = args.next(); // argv0
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-l")) {
+            // IPv6 has to be bracketed -- `[::1]:8080` -- since the
+            // address itself is full of colons.
+            const text = try flagValue(&args, arg);
+            opts.listen = std.Io.net.IpAddress.parseLiteral(text) catch |err| {
+                std.log.err("{s} {s}: {t}", .{ arg, text, err });
+                return error.InvalidArgument;
+            };
+            // An address given without a port parses as port 0, which
+            // would listen on whatever the kernel handed out.
+            if (opts.listen.getPort() == 0) opts.listen.setPort(default_port);
+        } else {
+            std.log.warn("ignoring unknown argument: {s}", .{arg});
         }
     }
+    return opts;
+}
 
-    var rt = try zio.Runtime.init(init.gpa, .{
-        .executors = if (threads == 0) .auto else .exact(@intCast(threads)),
-    });
+pub fn main(init: std.process.Init) !void {
+    // Options:
+    //   -l ADDR   address to listen on (default: 127.0.0.1:8080)
+    const opts = try parseArgs(init);
+
+    var rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
     defer rt.deinit();
 
     var server = http.Server(void).init(init.gpa, rt.io(), .{
@@ -511,7 +475,6 @@ pub fn main(init: std.process.Init) !void {
     server.router.patch("/patch", handleWithBody);
     server.router.delete("/delete", handleWithBody);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
-    std.log.info("httpbin on http://127.0.0.1:{d} (threads={d})", .{ port, threads });
-    try server.listen(addr);
+    std.log.info("httpbin on http://{f}", .{opts.listen});
+    try server.listen(.{ .ip = opts.listen });
 }
