@@ -207,7 +207,10 @@ fn makeTestResponse() Response {
         .headers = .{},
         .content_type = null,
         .arena = undefined,
-        .buffer = undefined,
+        // Real storage rather than undefined: the 404 and 500 paths clear
+        // the buffer, and `init` allocates nothing until something is
+        // written, so a test that writes no body still leaks nothing.
+        .buffer = .init(std.testing.allocator),
         .conn = undefined,
         .written = false,
         .headers_written = false,

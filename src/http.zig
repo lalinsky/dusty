@@ -279,6 +279,24 @@ pub const Headers = struct {
         return null;
     }
 
+    /// Drops every entry matching name (case-insensitive), keeping the
+    /// order of the rest. Returns how many went.
+    pub fn remove(self: *Headers, name: []const u8) usize {
+        const h = hashFn(name);
+        var kept: usize = 0;
+        for (0..self.len) |i| {
+            if (self.hashes[i] == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) continue;
+            if (kept != i) {
+                self.keys[kept] = self.keys[i];
+                self.values[kept] = self.values[i];
+                self.hashes[kept] = self.hashes[i];
+            }
+            kept += 1;
+        }
+        defer self.len = kept;
+        return self.len - kept;
+    }
+
     pub fn count(self: *const Headers) usize {
         return self.len;
     }
@@ -572,4 +590,43 @@ test "ContentEncoding: fromString" {
     try std.testing.expectEqual(ContentEncoding.deflate, ContentEncoding.fromString("deflate"));
     try std.testing.expectEqual(ContentEncoding.unknown, ContentEncoding.fromString("br"));
     try std.testing.expectEqual(ContentEncoding.unknown, ContentEncoding.fromString("zstd"));
+}
+
+test "Headers: remove" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("Content-Type", "application/json");
+    try headers.put("Host", "example.com");
+    try headers.add("X-Tag", "a");
+    try headers.add("X-Tag", "b");
+
+    // Case-insensitive, and every copy goes.
+    try std.testing.expectEqual(@as(usize, 1), headers.remove("content-type"));
+    try std.testing.expectEqual(@as(?[]const u8, null), headers.get("Content-Type"));
+    try std.testing.expectEqual(@as(usize, 2), headers.remove("X-Tag"));
+    try std.testing.expectEqual(@as(usize, 0), headers.remove("X-Tag"));
+    try std.testing.expectEqual(@as(usize, 0), headers.remove("Never-Set"));
+
+    // What is left keeps its order and its values.
+    try std.testing.expectEqual(@as(usize, 1), headers.count());
+    try std.testing.expectEqualStrings("example.com", headers.get("Host").?);
+}
+
+test "Headers: remove compacts so later entries stay reachable" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("A", "1");
+    try headers.put("B", "2");
+    try headers.put("C", "3");
+    _ = headers.remove("A");
+
+    try std.testing.expectEqualStrings("2", headers.get("B").?);
+    try std.testing.expectEqualStrings("3", headers.get("C").?);
+
+    var it = headers.iterator();
+    try std.testing.expectEqualStrings("B", it.next().?.key);
+    try std.testing.expectEqualStrings("C", it.next().?.key);
+    try std.testing.expectEqual(@as(?Headers.Iterator.Entry, null), it.next());
 }
