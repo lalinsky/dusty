@@ -198,10 +198,10 @@ pub fn Router(comptime Ctx: type) type {
                 if (req.params.count() >= req.config.max_param_count) {
                     return error.TooManyParams;
                 }
-                try req.params.put(req.arena, c.param_name.?, current_segment);
+                try req.params.map.put(req.arena, c.param_name.?, current_segment);
                 const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
                 if (result != null) return result;
-                _ = req.params.remove(c.param_name.?); // backtrack
+                _ = req.params.map.remove(c.param_name.?); // backtrack
             }
 
             // 3. Try wildcard child (lowest precedence)
@@ -211,7 +211,7 @@ pub fn Router(comptime Ctx: type) type {
                 }
                 // Capture remaining path (without query parameters)
                 const remaining = path[segment_offsets[index]..];
-                try req.params.put(req.arena, c.param_name.?, remaining);
+                try req.params.map.put(req.arena, c.param_name.?, remaining);
                 return c;
             }
 
@@ -220,7 +220,7 @@ pub fn Router(comptime Ctx: type) type {
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
             // Strip query parameters from URL and parse them
-            req.query.clearRetainingCapacity();
+            req.query.map.clearRetainingCapacity();
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
                 const query_string = req.url[query_start + 1 ..];
                 try parseQueryString(req, query_string);
@@ -379,7 +379,7 @@ pub fn Router(comptime Ctx: type) type {
             const max_params = @min(ampersand_count + 1, req.config.max_query_count);
 
             // Pre-allocate capacity for the query hashmap
-            try req.query.ensureTotalCapacity(req.arena, @intCast(max_params));
+            try req.query.map.ensureTotalCapacity(req.arena, @intCast(max_params));
 
             var it = std.mem.splitScalar(u8, query_string, '&');
             while (it.next()) |pair| {
@@ -393,10 +393,10 @@ pub fn Router(comptime Ctx: type) type {
                 if (std.mem.indexOfScalar(u8, pair, '=')) |sep| {
                     const key = try Request.urlUnescape(req.arena, pair[0..sep]);
                     const value = try Request.urlUnescape(req.arena, pair[sep + 1 ..]);
-                    req.query.putAssumeCapacity(key, value);
+                    req.query.map.putAssumeCapacity(key, value);
                 } else {
                     const key = try Request.urlUnescape(req.arena, pair);
-                    req.query.putAssumeCapacity(key, "");
+                    req.query.map.putAssumeCapacity(key, "");
                 }
             }
         }

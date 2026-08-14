@@ -349,6 +349,101 @@ pub const Headers = struct {
     };
 };
 
+/// Path parameters and query string values. A string map, with typed
+/// lookups for the values that are meant to be numbers.
+pub const Params = struct {
+    map: std.StringHashMapUnmanaged([]const u8) = .{},
+
+    pub fn get(self: Params, name: []const u8) ?[]const u8 {
+        return self.map.get(name);
+    }
+
+    pub fn count(self: Params) usize {
+        return self.map.count();
+    }
+
+    /// Null when the value is missing, or is not a `T`.
+    pub fn getInt(self: Params, comptime T: type, name: []const u8) ?T {
+        const raw = self.get(name) orelse return null;
+        return std.fmt.parseInt(T, raw, 10) catch null;
+    }
+
+    /// Null when the value is missing, is not a `T`, or is not finite:
+    /// `parseFloat` reads "nan" and "inf", which are not quantities.
+    pub fn getFloat(self: Params, comptime T: type, name: []const u8) ?T {
+        const raw = self.get(name) orelse return null;
+        const value = std.fmt.parseFloat(T, raw) catch return null;
+        return if (std.math.isFinite(value)) value else null;
+    }
+
+    pub fn iterator(self: *const Params) Iterator {
+        return .{ .inner = self.map.iterator() };
+    }
+
+    /// Yields the same `Entry` shape as `Headers.Iterator`, so a loop over
+    /// either reads the same.
+    pub const Iterator = struct {
+        inner: std.StringHashMapUnmanaged([]const u8).Iterator,
+
+        pub const Entry = struct {
+            key: []const u8,
+            value: []const u8,
+        };
+
+        pub fn next(self: *Iterator) ?Entry {
+            const entry = self.inner.next() orelse return null;
+            return .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+        }
+    };
+};
+
+test "Params: getInt" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "n", "42");
+    try params.map.put(std.testing.allocator, "neg", "-1");
+    try params.map.put(std.testing.allocator, "big", "300");
+    try params.map.put(std.testing.allocator, "junk", "12abc");
+    try params.map.put(std.testing.allocator, "empty", "");
+
+    try std.testing.expectEqual(@as(?u16, 42), params.getInt(u16, "n"));
+    try std.testing.expectEqual(@as(?i32, -1), params.getInt(i32, "neg"));
+    // Negative into an unsigned, and a value too wide for the type, are
+    // both "not a T" rather than a wrapped number.
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "neg"));
+    try std.testing.expectEqual(@as(?u8, null), params.getInt(u8, "big"));
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "junk"));
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "empty"));
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "absent"));
+}
+
+test "Params: getFloat" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "half", "0.5");
+    try params.map.put(std.testing.allocator, "nan", "nan");
+    try params.map.put(std.testing.allocator, "inf", "inf");
+    try params.map.put(std.testing.allocator, "junk", "abc");
+
+    try std.testing.expectEqual(@as(?f64, 0.5), params.getFloat(f64, "half"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "nan"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "inf"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "junk"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "absent"));
+}
+
+test "Params: iterator yields the same shape as Headers" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "a", "1");
+
+    var it = params.iterator();
+    const entry = it.next().?;
+    try std.testing.expectEqualStrings("a", entry.key);
+    try std.testing.expectEqualStrings("1", entry.value);
+    try std.testing.expectEqual(@as(?Params.Iterator.Entry, null), it.next());
+}
+
 test "Headers: put/get case insensitive" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);

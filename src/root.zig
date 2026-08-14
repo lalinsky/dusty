@@ -13,6 +13,7 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const Method = @import("http.zig").Method;
 pub const Status = @import("http.zig").Status;
 pub const Headers = @import("http.zig").Headers;
+pub const Params = @import("http.zig").Params;
 pub const ContentType = @import("http.zig").ContentType;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
