@@ -240,6 +240,7 @@ pub const Response = struct {
     }
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
+        std.debug.assert(!self.headers_written); // headers are already on the wire
         try http.validateHeaderName(name);
         try http.validateHeaderValue(value);
         try self.headers.put(name, value);
@@ -267,6 +268,7 @@ pub const Response = struct {
     }
 
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
+        std.debug.assert(!self.headers_written); // headers are already on the wire
         const serialized = try serializeCookie(self.arena, name, value, opts);
         try http.validateHeaderValue(serialized);
         try self.headers.add("Set-Cookie", serialized);
@@ -319,15 +321,16 @@ pub const Response = struct {
         if (self.headers_written) {
             return;
         }
+
+        // Set the Content-Type header. Before the flag, so it goes through
+        // the same door as every other header rather than around it.
+        if (self.content_type) |content_type| {
+            try self.header("Content-Type", content_type.toContentType());
+        }
         self.headers_written = true;
 
         // Write status line
         try self.conn.writer.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
-
-        // Set the Content-Type header
-        if (self.content_type) |content_type| {
-            try self.header("Content-Type", content_type.toContentType());
-        }
 
         // Write headers
         var iter = self.headers.iterator();
