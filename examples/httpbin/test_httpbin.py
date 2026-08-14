@@ -56,12 +56,16 @@ class HttpbinTest(unittest.TestCase):
 
         if not cls.wait_for_server():
             exit_code = cls.server_process.poll()
+            # Where it is stuck is the whole question when a server is alive
+            # but silent, and that cannot be guessed at from another machine.
+            stacks = cls.sample_stacks() if exit_code is None else ""
             cls.server_process.kill()
             raise RuntimeError(
                 f"Server never answered on {HOST}:{cls.port}.\n"
                 f"binary: {BINARY_PATH}\n"
                 f"exited: {'no, still running' if exit_code is None else exit_code}\n"
-                f"output:\n{cls.read_log()}"
+                f"output:\n{cls.read_log()}\n"
+                f"stacks:\n{stacks}"
             )
 
     @classmethod
@@ -74,6 +78,23 @@ class HttpbinTest(unittest.TestCase):
                 cls.server_process.kill()
         if cls.server_log is not None:
             cls.server_log.close()
+
+    @classmethod
+    def sample_stacks(cls) -> str:
+        """Best effort: what every thread of the hung server is doing."""
+        pid = str(cls.server_process.pid)
+        system = platform.system()
+        if system == "Darwin":
+            argv = ["sample", pid, "2", "-mayDie"]
+        elif system == "Linux":
+            argv = ["eu-stack", "-p", pid]
+        else:
+            return f"(no sampler for {system})"
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            return done.stdout or done.stderr or "(sampler produced nothing)"
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"({' '.join(argv)} failed: {e})"
 
     @classmethod
     def read_log(cls) -> str:
