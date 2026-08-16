@@ -1,6 +1,6 @@
 .{
-    .name = .dusty_zio_example,
-    .fingerprint = 0x36721edac7724861,
+    .name = .dusty_httpbin_example,
+    .fingerprint = 0x606b7e3dc7789aaf,
     .version = "0.0.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -8,8 +8,8 @@
             .path = "../..",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.15.0#d1ef67f0e9cfb6515da6770e726a7230812e7d25",
-            .hash = "zio-0.15.0-xHbVVOZuIQDCnTb07LLt5fVQN54KJjWgIgxrDu15TJ4M",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.17.0#a2b134a7abe35d9b29e8578fad30adc7a026fb4e",
+            .hash = "zio-0.17.0-xHbVVKr9JQBFsFjx4hcL4z3BkqyBkonICNTz5DdJxhE2",
         },
     },
     .paths = .{

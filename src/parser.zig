@@ -29,6 +29,10 @@ fn mapError(err: c.llhttp_errno_t) ParseError {
         c.HPE_INVALID_HEADER_TOKEN => ParseError.InvalidHeaderToken,
         c.HPE_INVALID_VERSION => ParseError.InvalidVersion,
         c.HPE_INVALID_STATUS => ParseError.InvalidStatus,
+        // llhttp reports a failing callback by its name, not by what the
+        // callback returned. `onStatusComplete` only fails on a code
+        // `Status` cannot name, so this is that.
+        c.HPE_CB_STATUS_COMPLETE => ParseError.InvalidStatus,
         c.HPE_INVALID_CHUNK_SIZE => ParseError.InvalidChunkSize,
         c.HPE_UNEXPECTED_CONTENT_LENGTH => ParseError.UnexpectedContentLength,
         c.HPE_CLOSED_CONNECTION => ParseError.ClosedConnection,
@@ -374,8 +378,14 @@ pub const ResponseParser = struct {
 
     fn onStatusComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
+        // llhttp accepts any three digit code, but `Status` only names the
+        // ones llhttp knows, and `@enumFromInt` on the rest is illegal
+        // behaviour. Reject here rather than store a value that cannot be
+        // switched on and whose `name()` aborts inside llhttp.
+        const code = std.math.cast(u16, c.llhttp_get_status_code(&self.parser)) orelse return -1;
+        const status = Status.fromCode(code) catch return -1;
         self.state.has_status = true;
-        self.response.status = @enumFromInt(c.llhttp_get_status_code(&self.parser));
+        self.response.status = status;
         return 0;
     }
 
@@ -752,4 +762,25 @@ test "ResponseParser: 404 status" {
     try std.testing.expectEqual(.not_found, response.status);
     try std.testing.expectEqual(1, response.version_major);
     try std.testing.expectEqual(1, response.version_minor);
+}
+
+test "ResponseParser: rejects a status code Status cannot name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var response: ParsedResponse = .{
+        .arena = arena.allocator(),
+    };
+
+    var parser: ResponseParser = undefined;
+    try parser.init(&response, 64);
+    defer parser.deinit();
+
+    // llhttp is happy with any three digits, so without the check in
+    // onStatusComplete this reached @enumFromInt and took the process down.
+    try std.testing.expectError(
+        error.InvalidStatus,
+        parser.feed("HTTP/1.1 250 Weird\r\nContent-Length: 0\r\n\r\n"),
+    );
+    try std.testing.expectEqual(false, parser.state.has_status);
 }

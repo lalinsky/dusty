@@ -28,6 +28,52 @@ pub const Cookie = struct {
         }
         return null;
     }
+
+    pub fn iterator(self: Cookie) Iterator {
+        return .{ .rest = self.header };
+    }
+
+    /// Yields the same `Entry` shape as `Headers.Iterator`, so a loop over
+    /// either reads the same.
+    pub const Iterator = struct {
+        rest: []const u8,
+
+        pub const Entry = struct {
+            name: []const u8,
+            value: []const u8,
+        };
+
+        pub fn next(self: *Iterator) ?Entry {
+            while (self.rest.len > 0) {
+                const pair = if (std.mem.indexOfScalar(u8, self.rest, ';')) |end| blk: {
+                    defer self.rest = self.rest[end + 1 ..];
+                    break :blk self.rest[0..end];
+                } else blk: {
+                    defer self.rest = "";
+                    break :blk self.rest;
+                };
+
+                const trimmed = std.mem.trim(u8, pair, " ");
+                // A pair with no `=` is not a cookie; skipping it is what
+                // `get` does by never matching it.
+                const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+                if (eq == 0) continue; // no name
+                return .{ .name = trimmed[0..eq], .value = trimmed[eq + 1 ..] };
+            }
+            return null;
+        }
+    };
+
+    /// Serializes as a JSON object of name to value.
+    pub fn jsonStringify(self: Cookie, jw: anytype) !void {
+        try jw.beginObject();
+        var it = self.iterator();
+        while (it.next()) |entry| {
+            try jw.objectField(entry.name);
+            try jw.write(entry.value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Options for setting a cookie in a response.
@@ -47,8 +93,31 @@ pub const CookieOpts = struct {
     };
 };
 
+/// RFC 6265 cookie-name, which is a token: no separators and no controls.
+/// `serializeCookie` writes the name verbatim, so a name carrying a `;`
+/// would smuggle in attributes of its own.
+pub fn validateCookieName(name: []const u8) error{InvalidCookieName}!void {
+    if (name.len == 0) return error.InvalidCookieName;
+    for (name) |c| {
+        if (c <= 0x20 or c >= 0x7f) return error.InvalidCookieName;
+        if (std.mem.indexOfScalar(u8, "()<>@,;:\\\"/[]?={}", c) != null) return error.InvalidCookieName;
+    }
+}
+
+/// RFC 6265 cookie-octet, plus the space and comma that `serializeCookie`
+/// quotes. A `;` would end the value and start an attribute, and a quote
+/// would break the quoting it does.
+pub fn validateCookieValue(value: []const u8) error{InvalidCookieValue}!void {
+    for (value) |c| {
+        if (c < 0x20 or c >= 0x7f) return error.InvalidCookieValue;
+        if (std.mem.indexOfScalar(u8, ";\\\"", c) != null) return error.InvalidCookieValue;
+    }
+}
+
 /// Serialize a cookie name/value pair with options into a Set-Cookie header value.
 pub fn serializeCookie(arena: std.mem.Allocator, name: []const u8, value: []const u8, opts: CookieOpts) ![]u8 {
+    try validateCookieName(name);
+    try validateCookieValue(value);
     // Estimate length: name=value + attributes (110 is typical for cookie attributes per Go's implementation)
     const estimated_len = name.len + value.len + opts.path.len + opts.domain.len + 110;
     var buf = std.ArrayListUnmanaged(u8).empty;
@@ -204,4 +273,48 @@ test "serializeCookie: zero max_age deletes cookie" {
 
     const result = try serializeCookie(arena.allocator(), "sess", "abc", .{ .max_age = .zero });
     try std.testing.expectEqualStrings("sess=abc; Max-Age=0", result);
+}
+
+fn expectCookieJson(expected: []const u8, header: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try std.json.Stringify.value(Cookie{ .header = header }, .{}, &out);
+    try std.testing.expectEqualStrings(expected, out.buffered());
+}
+
+test "Cookie: iterator" {
+    var it = (Cookie{ .header = "a=1; b=2;c=3" }).iterator();
+    try std.testing.expectEqualStrings("a", it.next().?.name);
+    try std.testing.expectEqualStrings("2", it.next().?.value);
+    try std.testing.expectEqualStrings("c", it.next().?.name);
+    try std.testing.expectEqual(@as(?Cookie.Iterator.Entry, null), it.next());
+}
+
+test "Cookie: iterator agrees with get" {
+    const jar: Cookie = .{ .header = "session=abc; theme=dark" };
+    var it = jar.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expectEqualStrings(jar.get(entry.name).?, entry.value);
+    }
+}
+
+test "Cookie: iterator skips what get would never match" {
+    // No `=` at all, and an empty name: `get` cannot return either, so
+    // neither can the iterator.
+    var it = (Cookie{ .header = "novalue; =orphan; ok=1" }).iterator();
+    const entry = it.next().?;
+    try std.testing.expectEqualStrings("ok", entry.name);
+    try std.testing.expectEqualStrings("1", entry.value);
+    try std.testing.expectEqual(@as(?Cookie.Iterator.Entry, null), it.next());
+}
+
+test "Cookie: jsonStringify" {
+    try expectCookieJson(
+        \\{"a":"1","b":"2"}
+    , "a=1; b=2");
+    try expectCookieJson("{}", "");
+    // An empty value is a cookie; the name alone is not.
+    try expectCookieJson(
+        \\{"a":""}
+    , "a=");
 }

@@ -178,6 +178,14 @@ pub const Status = enum(c.llhttp_status_t) {
     network_read_timeout = c.HTTP_STATUS_NETWORK_READ_TIMEOUT,
     network_connect_timeout = c.HTTP_STATUS_NETWORK_CONNECT_TIMEOUT,
 
+    /// Converts a status code to the value naming it. `Status` is
+    /// exhaustive, so `@enumFromInt` on a code it does not name is illegal
+    /// behaviour; a code that came from outside -- a URL, a peer -- has to
+    /// come through here.
+    pub fn fromCode(code: u16) error{InvalidStatusCode}!Status {
+        return std.enums.fromInt(Status, code) orelse error.InvalidStatusCode;
+    }
+
     pub fn name(self: Status) [:0]const u8 {
         return std.mem.span(c.llhttp_status_name(@intFromEnum(self)));
     }
@@ -190,6 +198,23 @@ pub const Status = enum(c.llhttp_status_t) {
 test "Status: construct from llhttp_status_t" {
     const status: Status = @enumFromInt(c.HTTP_STATUS_OK);
     try std.testing.expectEqual(.ok, status);
+}
+
+test "Status: fromCode" {
+    try std.testing.expectEqual(.ok, try Status.fromCode(200));
+    try std.testing.expectEqual(.not_found, try Status.fromCode(404));
+    try std.testing.expectEqual(.im_a_teapot, try Status.fromCode(418));
+    // Unassigned, past the end of the range, and zero are all codes the
+    // enum does not name.
+    try std.testing.expectError(error.InvalidStatusCode, Status.fromCode(250));
+    try std.testing.expectError(error.InvalidStatusCode, Status.fromCode(600));
+    try std.testing.expectError(error.InvalidStatusCode, Status.fromCode(0));
+}
+
+test "Status: fromCode round-trips every named status" {
+    inline for (@typeInfo(Status).@"enum".fields) |f| {
+        try std.testing.expectEqual(@field(Status, f.name), try Status.fromCode(f.value));
+    }
 }
 
 test "Status: name" {
@@ -301,6 +326,40 @@ pub const Headers = struct {
         return self.len;
     }
 
+    /// The next entry matching `name` at or after `from`, or null.
+    fn find(self: *const Headers, name: []const u8, h: u8, from: usize) ?usize {
+        for (self.hashes[from..self.len], from..) |hh, i| {
+            if (hh == h and std.ascii.eqlIgnoreCase(self.keys[i], name)) return i;
+        }
+        return null;
+    }
+
+    /// Serializes as a JSON object. HTTP lets a name appear more than
+    /// once and a JSON object cannot hold the same key twice, so those
+    /// become an array rather than a repeated key that a parser would
+    /// silently reduce to whichever copy it saw last.
+    pub fn jsonStringify(self: Headers, jw: anytype) !void {
+        try jw.beginObject();
+        for (self.keys[0..self.len], self.hashes[0..self.len], 0..) |name, h, i| {
+            // Later copies are written with the first, so skip them here.
+            if (self.find(name, h, 0).? != i) continue;
+
+            try jw.objectField(name);
+            const second = self.find(name, h, i + 1) orelse {
+                try jw.write(self.values[i]);
+                continue;
+            };
+            try jw.beginArray();
+            try jw.write(self.values[i]);
+            var next: ?usize = second;
+            while (next) |j| : (next = self.find(name, h, j + 1)) {
+                try jw.write(self.values[j]);
+            }
+            try jw.endArray();
+        }
+        try jw.endObject();
+    }
+
     pub fn iterator(self: *const Headers) Iterator {
         return .{ .keys = self.keys[0..self.len], .values = self.values[0..self.len], .pos = 0 };
     }
@@ -323,6 +382,113 @@ pub const Headers = struct {
         }
     };
 };
+
+/// Path parameters and query string values. A string map, with typed
+/// lookups for the values that are meant to be numbers.
+pub const Params = struct {
+    map: std.StringHashMapUnmanaged([]const u8) = .{},
+
+    pub fn get(self: Params, name: []const u8) ?[]const u8 {
+        return self.map.get(name);
+    }
+
+    pub fn count(self: Params) usize {
+        return self.map.count();
+    }
+
+    /// Null when the value is missing, or is not a `T`.
+    pub fn getInt(self: Params, comptime T: type, name: []const u8) ?T {
+        const raw = self.get(name) orelse return null;
+        return std.fmt.parseInt(T, raw, 10) catch null;
+    }
+
+    /// Null when the value is missing, is not a `T`, or is not finite:
+    /// `parseFloat` reads "nan" and "inf", which are not quantities.
+    pub fn getFloat(self: Params, comptime T: type, name: []const u8) ?T {
+        const raw = self.get(name) orelse return null;
+        const value = std.fmt.parseFloat(T, raw) catch return null;
+        return if (std.math.isFinite(value)) value else null;
+    }
+
+    pub fn iterator(self: *const Params) Iterator {
+        return .{ .inner = self.map.iterator() };
+    }
+
+    /// Serializes as a JSON object. Keys are unique here, so unlike
+    /// `Headers` every value is a plain string.
+    pub fn jsonStringify(self: Params, jw: anytype) !void {
+        try jw.beginObject();
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            try jw.objectField(entry.key_ptr.*);
+            try jw.write(entry.value_ptr.*);
+        }
+        try jw.endObject();
+    }
+
+    /// Yields the same `Entry` shape as `Headers.Iterator`, so a loop over
+    /// either reads the same.
+    pub const Iterator = struct {
+        inner: std.StringHashMapUnmanaged([]const u8).Iterator,
+
+        pub const Entry = struct {
+            key: []const u8,
+            value: []const u8,
+        };
+
+        pub fn next(self: *Iterator) ?Entry {
+            const entry = self.inner.next() orelse return null;
+            return .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+        }
+    };
+};
+
+test "Params: getInt" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "n", "42");
+    try params.map.put(std.testing.allocator, "neg", "-1");
+    try params.map.put(std.testing.allocator, "big", "300");
+    try params.map.put(std.testing.allocator, "junk", "12abc");
+    try params.map.put(std.testing.allocator, "empty", "");
+
+    try std.testing.expectEqual(@as(?u16, 42), params.getInt(u16, "n"));
+    try std.testing.expectEqual(@as(?i32, -1), params.getInt(i32, "neg"));
+    // Negative into an unsigned, and a value too wide for the type, are
+    // both "not a T" rather than a wrapped number.
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "neg"));
+    try std.testing.expectEqual(@as(?u8, null), params.getInt(u8, "big"));
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "junk"));
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "empty"));
+    try std.testing.expectEqual(@as(?u16, null), params.getInt(u16, "absent"));
+}
+
+test "Params: getFloat" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "half", "0.5");
+    try params.map.put(std.testing.allocator, "nan", "nan");
+    try params.map.put(std.testing.allocator, "inf", "inf");
+    try params.map.put(std.testing.allocator, "junk", "abc");
+
+    try std.testing.expectEqual(@as(?f64, 0.5), params.getFloat(f64, "half"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "nan"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "inf"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "junk"));
+    try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "absent"));
+}
+
+test "Params: iterator yields the same shape as Headers" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "a", "1");
+
+    var it = params.iterator();
+    const entry = it.next().?;
+    try std.testing.expectEqualStrings("a", entry.key);
+    try std.testing.expectEqualStrings("1", entry.value);
+    try std.testing.expectEqual(@as(?Params.Iterator.Entry, null), it.next());
+}
 
 test "Headers: put/get case insensitive" {
     var headers = try Headers.init(std.testing.allocator, 8);
@@ -629,4 +795,74 @@ test "Headers: remove compacts so later entries stay reachable" {
     try std.testing.expectEqualStrings("B", it.next().?.key);
     try std.testing.expectEqualStrings("C", it.next().?.key);
     try std.testing.expectEqual(@as(?Headers.Iterator.Entry, null), it.next());
+}
+fn expectJson(expected: []const u8, value: anytype) !void {
+    var buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try std.json.Stringify.value(value, .{}, &out);
+    try std.testing.expectEqualStrings(expected, out.buffered());
+}
+
+test "Headers: jsonStringify" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("Host", "example.com");
+    try headers.put("Accept", "*/*");
+    try expectJson(
+        \\{"Host":"example.com","Accept":"*/*"}
+    , headers);
+}
+
+test "Headers: jsonStringify groups a repeated name into an array" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.add("Host", "example.com");
+    try headers.add("X-Tag", "a");
+    try headers.add("X-Tag", "b");
+    try headers.add("X-Tag", "c");
+    // The array is written where the name first appeared, and the name is
+    // never repeated as a second key.
+    try expectJson(
+        \\{"Host":"example.com","X-Tag":["a","b","c"]}
+    , headers);
+}
+
+test "Headers: jsonStringify groups case-insensitively" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.add("X-Tag", "a");
+    try headers.add("x-tag", "b");
+    try expectJson(
+        \\{"X-Tag":["a","b"]}
+    , headers);
+}
+
+test "Headers: jsonStringify escapes names and values" {
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.put("X-Quote", "a\"b");
+    try expectJson(
+        \\{"X-Quote":"a\"b"}
+    , headers);
+}
+
+test "Headers: jsonStringify of an empty map" {
+    const headers: Headers = .{};
+    try expectJson("{}", headers);
+}
+
+test "Params: jsonStringify" {
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "a", "1");
+    try expectJson(
+        \\{"a":"1"}
+    , params);
+
+    const empty: Params = .{};
+    try expectJson("{}", empty);
 }

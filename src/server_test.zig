@@ -1032,3 +1032,91 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     try std.testing.expect(elapsed_ns >= 100 * std.time.ns_per_ms);
     try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
 }
+test "Server: request carries the peer address" {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        seen: [2]?std.Io.net.IpAddress = @splat(null),
+        count: usize = 0,
+    };
+    var ctx: Ctx = .{};
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{}, &ctx);
+    defer server.deinit();
+
+    server.router.get("/whoami", struct {
+        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+            if (c.count < c.seen.len) c.seen[c.count] = req.remote_address;
+            c.count += 1;
+            res.body = "OK\n";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            defer stream.shutdown(_io, .both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            var conn_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &conn_buf);
+
+            // Two requests on the one connection: the address belongs to
+            // the connection, so the reset between them must not drop it.
+            // Sent one at a time, since a pipelined second request is not
+            // picked up. The second asks the server to close, so reading
+            // to EOF proves its handler finished rather than guessing at
+            // the framing.
+            try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            try writer.interface.flush();
+            try readOneResponse(&reader.interface);
+
+            try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            try writer.interface.flush();
+            var rest: [2048]u8 = undefined;
+            var sink: std.Io.Writer = .fixed(&rest);
+            _ = reader.interface.streamRemaining(&sink) catch {};
+            try std.testing.expect(std.mem.indexOf(u8, sink.buffered(), "HTTP/1.1 200") != null);
+        }
+
+        fn readOneResponse(r: *std.Io.Reader) !void {
+            var content_length: usize = 0;
+            while (true) {
+                const line = std.mem.trimEnd(u8, try r.takeDelimiterExclusive('\n'), "\r");
+                if (line.len == 0) break;
+                const prefix = "Content-Length: ";
+                if (std.ascii.startsWithIgnoreCase(line, prefix)) {
+                    content_length = try std.fmt.parseInt(usize, line[prefix.len..], 10);
+                }
+            }
+            _ = try r.take(content_length);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+
+    try std.testing.expectEqual(@as(usize, 2), ctx.count);
+    for (ctx.seen) |maybe| {
+        const seen = maybe orelse return error.HandlerNeverRan;
+        // The client connects over IPv4 loopback, so that is what the peer
+        // must be -- not the unspecified default, and not the listen
+        // address, whose port belongs to the server.
+        try std.testing.expect(seen == .ip4);
+        try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, seen.ip4.bytes);
+        try std.testing.expect(seen.ip4.port != 0);
+    }
+    // The same connection, so the same peer both times.
+    try std.testing.expect(ctx.seen[0].?.ip4.eql(ctx.seen[1].?.ip4));
+}

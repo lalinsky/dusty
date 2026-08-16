@@ -1402,7 +1402,7 @@ test "Response: header() rejects invalid name" {
     try std.testing.expectError(error.InvalidHeaderName, response.header("X Bad", "value"));
 }
 
-test "Response: setCookie rejects CRLF via header()" {
+test "Response: setCookie rejects a value that would inject a header" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1413,7 +1413,10 @@ test "Response: setCookie rejects CRLF via header()" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    try std.testing.expectError(error.InvalidHeaderValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
+    // Caught as a bad cookie value now, which is the earlier and narrower
+    // of the two checks -- CRLF is not a cookie-octet in the first place.
+    try std.testing.expectError(error.InvalidCookieValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
+    try std.testing.expectError(error.InvalidCookieName, response.setCookie("a;Path=/", "v", .{}));
 }
 
 test "EventStream: rejects newline in event and id fields" {

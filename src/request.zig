@@ -16,8 +16,12 @@ pub const Request = struct {
     version_minor: u8 = 0,
     headers: http.Headers = .{},
     content_type: ?http.ContentType = null,
-    params: std.StringHashMapUnmanaged([]const u8) = .{},
-    query: std.StringHashMapUnmanaged([]const u8) = .{},
+    params: http.Params = .{},
+    query: http.Params = .{},
+    /// The peer this request arrived from. A Unix socket peer has no
+    /// address of its own and is reported as IPv4 loopback, which is what
+    /// both zio and `std.Io.Threaded` substitute on accept.
+    remote_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,
@@ -46,6 +50,9 @@ pub const Request = struct {
         const conn = self.conn;
         const cfg = self.config;
         const res = self.response;
+        // Belongs to the connection, not the request, so it outlives the
+        // reset the way the reader and the parser do.
+        const addr = self.remote_address;
         self.* = .{
             .arena = arena,
             .io = io,
@@ -53,6 +60,7 @@ pub const Request = struct {
             .conn = conn,
             .config = cfg,
             .response = res,
+            .remote_address = addr,
         };
     }
 

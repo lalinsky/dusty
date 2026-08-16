@@ -512,6 +512,7 @@ pub fn Server(comptime Ctx: type) type {
                 .conn = connection.reader,
                 .parser = undefined,
                 .config = self.config.request,
+                .remote_address = connection.stream.socket.address,
             };
 
             var parser: RequestParser = undefined;

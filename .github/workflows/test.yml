@@ -30,13 +30,14 @@ jobs:
       run: zig build test --summary all
       timeout-minutes: 5
 
-    - name: Test demo server
-      run: python3 test_demo_server.py
+    - name: Build httpbin example
+      run: zig build
+      working-directory: examples/httpbin
       timeout-minutes: 5
 
-    - name: Build zio example
-      run: zig build
-      working-directory: examples/zio
+    - name: Test httpbin example
+      run: python3 test_httpbin.py
+      working-directory: examples/httpbin
       timeout-minutes: 5
 
     - name: Build examples
