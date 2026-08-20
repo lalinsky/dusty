@@ -2,7 +2,7 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
-const Connection = @import("server.zig").Connection;
+const Connection = @import("server/connection.zig").Connection;
 
 const log = std.log.scoped(.dusty);
 

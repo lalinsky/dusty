@@ -4,7 +4,7 @@ const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
-const Connection = @import("server.zig").Connection;
+const Connection = @import("server/connection.zig").Connection;
 
 var no_buf: [0]u8 = .{};
 
