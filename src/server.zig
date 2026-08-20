@@ -349,4 +349,7 @@ pub fn Server(comptime Ctx: type) type {
 test {
     _ = @import("server/connection.zig");
     _ = @import("server/h1.zig");
+    if (build_options.use_http2) {
+        _ = @import("server/h2.zig");
+    }
 }
