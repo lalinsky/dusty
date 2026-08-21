@@ -154,12 +154,14 @@ pub const BodyWriter = struct {
 
     /// Marks the body complete. It is sent with the rest of the response,
     /// once the headers have settled.
-    pub fn end(self: *BodyWriter) !void {
+    pub fn end(self: *BodyWriter) Error!void {
         // Idempotent, so `defer body.end() catch {}` alongside an explicit
         // `end` on the success path is harmless rather than a second body.
         if (!self.res.body_writer_open) return;
         self.res.body_writer_open = false;
-        try self.interface.flush();
+        self.interface.flush() catch |err| switch (err) {
+            error.WriteFailed => return self.err orelse error.OutOfMemory,
+        };
     }
 };
 
@@ -204,6 +206,14 @@ pub const StreamingBodyWriter = struct {
             else
                 e;
             return error.WriteFailed;
+        };
+    }
+
+    /// `record`, but returning the cause it stored rather than the sentinel.
+    /// Only `drain` has to return `error.WriteFailed`.
+    fn commit(self: *StreamingBodyWriter, result: HeaderError!void) Error!void {
+        self.record(result) catch |err| switch (err) {
+            error.WriteFailed => return self.err orelse err,
         };
     }
 
@@ -275,7 +285,7 @@ pub const StreamingBodyWriter = struct {
 
     /// Finishes the body: flushes what is left and, for a chunked body,
     /// writes the terminator. Must be called before the handler returns.
-    pub fn end(self: *StreamingBodyWriter) !void {
+    pub fn end(self: *StreamingBodyWriter) (Error || error{ContentLengthMismatch})!void {
         const res = self.res;
         // Idempotent: a second `end` must not write a second terminator,
         // which the peer would read as the start of the next message.
@@ -290,9 +300,9 @@ pub const StreamingBodyWriter = struct {
         // response.
         errdefer res.keepalive = false;
 
-        try self.record(self.interface.flush());
-        if (res.chunked and !res.head) try self.record(res.conn.writer.writeAll("0\r\n\r\n"));
-        try self.record(res.conn.writer.flush());
+        try self.commit(self.interface.flush());
+        if (res.chunked and !res.head) try self.commit(res.conn.writer.writeAll("0\r\n\r\n"));
+        try self.commit(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
         if (res.content_length) |declared| {
@@ -992,6 +1002,47 @@ test "StreamingBodyWriter: records the real error behind error.WriteFailed" {
     var body_buf: [64]u8 = undefined;
     try std.testing.expectError(error.WriteFailed, response.stream(&body_buf));
     try std.testing.expectEqual(error.ConnectionResetByPeer, connection.getWriteError().?);
+}
+
+test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // What a successful stream puts on the wire before `end` appends the
+    // terminator. The failing pass below gets exactly that much room, so the
+    // terminator is the first write with nowhere to go.
+    const upto_end = blk: {
+        var buf: [1024]u8 = undefined;
+        var conn_writer: std.Io.Writer = .fixed(&buf);
+
+        var connection: Connection = undefined;
+        connection.initWriterForTesting(&conn_writer);
+
+        var response = try Response.init(arena.allocator(), &connection, 32);
+        var body_buf: [64]u8 = undefined;
+        var body = try response.stream(&body_buf);
+        try body.interface.writeAll("hello");
+        try body.interface.flush();
+        break :blk conn_writer.end;
+    };
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(buf[0..upto_end]);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello");
+    try body.interface.flush();
+
+    try std.testing.expectError(error.ConnectionResetByPeer, body.end());
+    try std.testing.expectEqual(error.ConnectionResetByPeer, body.err.?);
+    // A body that could not be framed as promised cannot share the connection.
+    try std.testing.expectEqual(false, response.keepalive);
 }
 
 test "BodyWriter: end is idempotent" {
