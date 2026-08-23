@@ -78,6 +78,44 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+### HTTPS and Client Certificates
+
+By default the client verifies servers against the system trust store. `ClientConfig.tls`
+overrides that, and adds a client certificate for servers that require mutual TLS:
+
+```zig
+var client = http.Client.init(init.gpa, init.io, .{
+    .tls = .{
+        // .system (default), .{ .file = ... }, .{ .dir = ... }, or .none
+        .ca = .{ .file = .{ .path = "ca.pem" } },
+        // Presented when the server asks the client to authenticate itself.
+        .client_certificate = .{ .cert_path = "client.pem", .key_path = "client.key" },
+    },
+});
+```
+
+The key must be an unencrypted PKCS#8 (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) PEM file.
+
+These settings apply to every connection a client makes; connections are pooled and reused
+across requests, so they cannot be varied per request. Use a separate `Client` per identity.
+
+The server side is symmetric — `client_auth` makes it ask connecting clients for a certificate:
+
+```zig
+var server = http.Server(void).init(gpa, io, .{
+    .tls = .{
+        .cert_path = "server.pem",
+        .key_path = "server.key",
+        .client_auth = .{
+            .ca = .{ .file = .{ .path = "client-ca.pem" } },
+            // .require (default) rejects a client that sends no certificate;
+            // .request asks for one but accepts an empty reply.
+            .mode = .require,
+        },
+    },
+}, {});
+```
+
 ### Unix Socket Client Example
 
 For communicating with services like Docker Engine:

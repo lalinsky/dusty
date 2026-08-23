@@ -11,6 +11,18 @@ All notable changes to this project will be documented in this file.
 - Added default `User-Agent` header to HTTP client.
 - Fix connection pool corruption when a `Client` is shared by tasks running in parallel. `ConnectionPool` list and counter updates are now guarded by a mutex.
 - `ConnectionPool.init` now takes an `std.Io`, and `ConnectionPool.acquire` no longer does.
+- HTTP client TLS settings are now grouped under `ClientConfig.tls`. **Breaking:** this replaces
+  `ClientConfig.use_system_ca_bundle`; the equivalent of the old default is `.tls = .{ .ca = .system }`.
+- Added mutual TLS (mTLS) to the HTTP client: set `ClientConfig.tls.client_certificate` to present a
+  certificate and key when the server requests client authentication.
+- The HTTP client can now verify servers against a custom CA (`tls.ca = .{ .file = ... }` or
+  `.{ .dir = ... }`), trust nothing (`.none`), or skip verification entirely (`tls.insecure_skip_verify`).
+- Added mutual TLS to the server: `ServerConfig.tls.client_auth` requests (or requires) a client
+  certificate and verifies it against the configured CAs.
+- `TlsCa`/`TlsPath` describe where certificate authorities are loaded from (`.system`, `.file`,
+  `.dir`, `.none`) and are shared by `ClientConfig.tls.ca` and `ServerConfig.tls.client_auth.ca`.
+- Fix memory leak when a client connection fails to initialize (e.g. a rejected TLS handshake): the
+  connection arena was not released.
 
 ## [0.2.0] - 2026-04-26
 
