@@ -65,9 +65,10 @@ pub const EventWriter = struct {
     }
 };
 
-/// A Server-Sent Events body. The response is framed by the connection
-/// closing rather than by a length or by chunks, so the writer underneath
-/// passes bytes straight through and has no terminator to write.
+/// A Server-Sent Events body. The length is not known up front, so the
+/// body is chunked: one chunk per event, and a terminator at the end. The
+/// peer can then tell a stream that finished from one that was cut, and
+/// the connection outlives the stream.
 pub const EventStream = struct {
     body: StreamingBodyWriter,
 
