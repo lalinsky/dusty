@@ -17,6 +17,9 @@ pub const EventWriter = struct {
     /// outgrow the stream's buffer reaches the connection while it is
     /// being written, so a caller filling one from a template finds out
     /// here what went wrong rather than only that something did.
+    ///
+    /// Everything here writes through the stream underneath, so this is
+    /// that writer's answer carried up rather than a second one.
     err: ?Error = null,
 
     /// What the stream underneath can fail with.
@@ -24,34 +27,26 @@ pub const EventWriter = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *EventWriter = @fieldParentPtr("interface", w);
-        var total: usize = 0;
-        for (data[0 .. data.len - 1]) |segment| {
-            try self.record(writeLines(self, segment));
-            total += segment.len;
-        }
-        if (splat > 0) {
-            try self.record(writeLines(self, data[data.len - 1]));
-            total += data[data.len - 1].len;
-        }
+        const total = writeSegments(self, data, splat) catch |err| switch (err) {
+            error.WriteFailed => {
+                self.err = self.body.err;
+                return error.WriteFailed;
+            },
+        };
         return w.consume(total);
     }
 
-    /// Runs `result`, storing what actually went wrong. The interface still
-    /// reports the generic `WriteFailed`, as its contract requires; `err`
-    /// is where the answer lives.
-    fn record(self: *EventWriter, result: std.Io.Writer.Error!void) std.Io.Writer.Error!void {
-        self.commit(result) catch return error.WriteFailed;
-    }
-
-    /// `record`, but returning the cause it stored rather than the sentinel.
-    /// Only `drain` has to return `error.WriteFailed`.
-    fn commit(self: *EventWriter, result: std.Io.Writer.Error!void) Error!void {
-        // Everything here writes through the stream underneath, so that is
-        // where the cause is resolved; this keeps both copies in step.
-        self.body.commit(result) catch |cause| {
-            self.err = cause;
-            return cause;
-        };
+    fn writeSegments(self: *EventWriter, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |segment| {
+            try writeLines(self, segment);
+            total += segment.len;
+        }
+        if (splat > 0) {
+            try writeLines(self, data[data.len - 1]);
+            total += data[data.len - 1].len;
+        }
+        return total;
     }
 
     fn writeLines(self: *EventWriter, bytes: []const u8) std.Io.Writer.Error!void {
@@ -77,7 +72,12 @@ pub const EventWriter = struct {
     /// Closes the event and puts it on the wire. Must be called before the
     /// stream is used again.
     pub fn end(self: *EventWriter) Error!void {
-        return self.commit(self.finish());
+        self.finish() catch |err| switch (err) {
+            error.WriteFailed => {
+                self.err = self.body.err;
+                return self.err orelse error.Unexpected;
+            },
+        };
     }
 
     fn finish(self: *EventWriter) std.Io.Writer.Error!void {
