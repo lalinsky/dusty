@@ -88,10 +88,10 @@ pub fn Executor(comptime Ctx: type) type {
                         // with framing that doesn't account for an error body.
                         // We can't safely rewrite it as a 500; abort the
                         // connection instead of corrupting the response.
-                        log.err("unhandled error after response headers were sent: {}", .{err});
+                        log.err("unhandled error after response headers were sent: {} {s} {s}", .{ err, @tagName(self.req.method), self.req.url });
                         return err;
                     }
-                    log.err("unhandled error in request handler: {}", .{err});
+                    log.err("unhandled error in request handler: {} {s} {s}", .{ err, @tagName(self.req.method), self.req.url });
                     self.handleError(err);
                 },
             };
@@ -355,6 +355,8 @@ fn errorHandler(_: *Request, _: *Response) !void {
 
 test "Executor: default 500 handler on action error" {
     var req: Request = undefined;
+    req.method = .get;
+    req.url = "/test";
     var res = makeTestResponse();
 
     var executor = Executor(void){
@@ -373,6 +375,8 @@ test "Executor: default 500 handler on action error" {
 
 test "Executor: error after headers written propagates instead of rewriting the response" {
     var req: Request = undefined;
+    req.method = .get;
+    req.url = "/test";
     var res = makeTestResponse();
     // Simulate a response that already started (e.g. a streamed/chunked body
     // or a WebSocket upgrade) before the handler failed.
@@ -458,6 +462,8 @@ test "Executor: custom notFound handler" {
 test "Executor: custom uncaughtError handler" {
     var ctx = CustomCtx{};
     var req: Request = undefined;
+    req.method = .get;
+    req.url = "/test";
     var res = makeTestResponse();
 
     var executor = Executor(CustomCtx){
@@ -498,6 +504,8 @@ test "Executor: custom dispatch method" {
 test "Executor: middleware error triggers custom uncaughtError" {
     var ctx = CustomCtx{};
     var req: Request = undefined;
+    req.method = .get;
+    req.url = "/test";
     var res = makeTestResponse();
 
     var mw = ErrorMiddleware{};
@@ -528,7 +536,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .conn = undefined, .parser = undefined };
+    var req: Request = .{ .method = .get, .url = "/test", .arena = arena.allocator(), .conn = undefined, .parser = undefined };
     var res = try Response.init(arena.allocator(), &connection, 32);
 
     var executor = Executor(void){

@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
   `.dir`, `.none`) and are shared by `ClientConfig.tls.ca` and `ServerConfig.tls.client_auth.ca`.
 - Fix memory leak when a client connection fails to initialize (e.g. a rejected TLS handshake): the
   connection arena was not released.
+- Unhandled request handler errors are now logged with the request method and path, not just the error value.
 
 ## [0.2.0] - 2026-04-26
 
