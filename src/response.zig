@@ -12,6 +12,12 @@ pub const EventWriter = struct {
     body: *StreamingBodyWriter,
     line_in_progress: bool,
     interface: std.Io.Writer,
+    /// The real cause behind the generic `error.WriteFailed` that the
+    /// `std.Io.Writer` interface has to return. An event long enough to
+    /// outgrow the stream's buffer reaches the connection while it is
+    /// being written, so a caller filling one from a template finds out
+    /// here what went wrong rather than only that something did.
+    err: ?Error = null,
 
     /// What the stream underneath can fail with.
     pub const Error = StreamingBodyWriter.Error;
@@ -20,14 +26,32 @@ pub const EventWriter = struct {
         const self: *EventWriter = @fieldParentPtr("interface", w);
         var total: usize = 0;
         for (data[0 .. data.len - 1]) |segment| {
-            try writeLines(self, segment);
+            try self.record(writeLines(self, segment));
             total += segment.len;
         }
         if (splat > 0) {
-            try writeLines(self, data[data.len - 1]);
+            try self.record(writeLines(self, data[data.len - 1]));
             total += data[data.len - 1].len;
         }
         return w.consume(total);
+    }
+
+    /// Runs `result`, storing what actually went wrong. The interface still
+    /// reports the generic `WriteFailed`, as its contract requires; `err`
+    /// is where the answer lives.
+    fn record(self: *EventWriter, result: std.Io.Writer.Error!void) std.Io.Writer.Error!void {
+        self.commit(result) catch return error.WriteFailed;
+    }
+
+    /// `record`, but returning the cause it stored rather than the sentinel.
+    /// Only `drain` has to return `error.WriteFailed`.
+    fn commit(self: *EventWriter, result: std.Io.Writer.Error!void) Error!void {
+        // Everything here writes through the stream underneath, so that is
+        // where the cause is resolved; this keeps both copies in step.
+        self.body.commit(result) catch |cause| {
+            self.err = cause;
+            return cause;
+        };
     }
 
     fn writeLines(self: *EventWriter, bytes: []const u8) std.Io.Writer.Error!void {
@@ -53,7 +77,7 @@ pub const EventWriter = struct {
     /// Closes the event and puts it on the wire. Must be called before the
     /// stream is used again.
     pub fn end(self: *EventWriter) Error!void {
-        return self.body.commit(self.finish());
+        return self.commit(self.finish());
     }
 
     fn finish(self: *EventWriter) std.Io.Writer.Error!void {
@@ -1666,6 +1690,43 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
     var w = try stream.startSend(.{});
     try w.interface.writeAll("hello");
     try std.testing.expectError(error.ConnectionResetByPeer, w.end());
+}
+
+test "EventWriter: an event too long for the buffer reports the real error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const header_len = blk: {
+        var probe: [1024]u8 = undefined;
+        var probe_writer: std.Io.Writer = .fixed(&probe);
+        var probe_conn: Connection = undefined;
+        probe_conn.initWriterForTesting(&probe_writer);
+        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        _ = try probe_res.startEventStream();
+        break :blk probe_writer.end;
+    };
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(buf[0..header_len]);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var stream = try response.startEventStream();
+    var w = try stream.startSend(.{});
+
+    // Longer than the stream holds, so it reaches the connection while it
+    // is still being written rather than at `end`. That is what a caller
+    // filling an event from a template does, and the interface can only
+    // tell them the sentinel.
+    const long = try arena.allocator().alloc(u8, Response.event_stream_buffer + 1);
+    @memset(long, 'x');
+
+    try std.testing.expectError(error.WriteFailed, w.interface.writeAll(long));
+    try std.testing.expectEqual(error.ConnectionResetByPeer, w.err.?);
+    // The stream underneath resolved it, and both copies agree.
+    try std.testing.expectEqual(error.ConnectionResetByPeer, stream.body.err.?);
 }
 
 test "Response: setCookie basic" {
