@@ -480,7 +480,11 @@ pub fn Server(comptime Ctx: type) type {
 
             var needs_shutdown = true;
             defer if (needs_shutdown) stream.shutdown(self.io, .both) catch |err| {
-                log.warn("Failed to shutdown client connection: {}", .{err});
+                if (err == error.SocketUnconnected) {
+                    log.debug("Failed to shutdown client connection: {}", .{err});
+                } else {
+                    log.warn("Failed to shutdown client connection: {}", .{err});
+                }
             };
 
             var connection: Connection = undefined;
