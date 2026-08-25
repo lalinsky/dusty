@@ -578,3 +578,271 @@ test "Client: unix socket fetch" {
 
     try client_future.await(io);
 }
+
+const build_options = @import("build_options");
+
+// Self-signed test certificate from examples/certs. It is CA:TRUE with SANs
+// for localhost and 127.0.0.1, so the same file serves as the server
+// certificate and as the CA that validates it.
+const test_cert_path = "examples/certs/cert.pem";
+const test_key_path = "examples/certs/key.pem";
+
+test "Client: HTTPS with a custom CA file" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/secure", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "over tls";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/secure", .{s.address.ip.getPort()});
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("over tls", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: presents a client certificate for mutual TLS" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    // The test certificate is CA:TRUE and self-signed, so the same file serves
+    // as the server certificate, the client certificate, and the CA that
+    // validates both.
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+        },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "authed";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{
+                    .ca = .{ .file = .{ .path = test_cert_path } },
+                    .client_certificate = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+                },
+            });
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("authed", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Server: client_auth .require rejects a client with no certificate" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
+        },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "unreachable";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            // In TLS 1.3 the client finishes its flight before the server can
+            // reject the missing certificate, so the refusal surfaces on the
+            // first read rather than as a handshake error.
+            try std.testing.expectError(error.ReadFailed, client.fetch(url, .{}));
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Server: client_auth .request accepts a client with no certificate" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
+        },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "anonymous";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("anonymous", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: rejects a server certificate the configured CA does not cover" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const port = s.address.ip.getPort();
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{port});
+
+            // The system trust store does not contain the self-signed test cert.
+            var strict = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer strict.deinit();
+            try std.testing.expectError(error.TlsInitializationFailed, strict.fetch(url, .{}));
+
+            // insecure_skip_verify takes it anyway.
+            var lax = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .none, .insecure_skip_verify = true },
+            });
+            defer lax.deinit();
+            var response = try lax.fetch(url, .{});
+            defer response.deinit();
+            try std.testing.expectEqual(.ok, response.status());
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Client: ca .none without insecure_skip_verify is rejected" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{
+        .tls = .{ .ca = .none },
+    });
+    defer client.deinit();
+
+    // Fails while loading the TLS material, before any connection is attempted.
+    try std.testing.expectError(error.NoCertificateAuthority, client.fetch("https://localhost:1/", .{}));
+}

@@ -1,5 +1,52 @@
 const std = @import("std");
 
+/// Where a TLS peer's certificate authorities are loaded from. Shared by the
+/// client (verifying server certificates) and the server (verifying client
+/// certificates under mutual TLS).
+pub const TlsCa = union(enum) {
+    /// The platform trust store.
+    system,
+    /// A single PEM file holding one or more certificates.
+    file: TlsPath,
+    /// A directory of PEM files, each holding one or more certificates.
+    dir: TlsPath,
+    /// Trust nothing. Rejected unless the side using it says otherwise.
+    none,
+
+    /// Reads the certificates into a fresh bundle owned by the caller.
+    pub fn load(self: TlsCa, allocator: std.mem.Allocator, io: std.Io) !std.crypto.Certificate.Bundle {
+        const now = std.Io.Clock.real.now(io);
+
+        var bundle: std.crypto.Certificate.Bundle = .empty;
+        errdefer bundle.deinit(allocator);
+        switch (self) {
+            .system => try bundle.rescan(allocator, io, now),
+            .file => |src| try bundle.addCertsFromFilePath(
+                allocator,
+                io,
+                now,
+                src.dir orelse std.Io.Dir.cwd(),
+                src.path,
+            ),
+            .dir => |src| try bundle.addCertsFromDirPath(
+                allocator,
+                io,
+                src.dir orelse std.Io.Dir.cwd(),
+                src.path,
+            ),
+            .none => {},
+        }
+        return bundle;
+    }
+};
+
+pub const TlsPath = struct {
+    path: []const u8,
+    /// Directory `path` is resolved against. Defaults to the current working
+    /// directory.
+    dir: ?std.Io.Dir = null,
+};
+
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
@@ -17,6 +64,20 @@ pub const ServerConfig = struct {
         /// Directory the cert/key paths are resolved against. Defaults to the
         /// current working directory.
         dir: ?std.Io.Dir = null,
+        /// Ask connecting clients to authenticate with a certificate (mutual
+        /// TLS). Null means client certificates are never requested.
+        client_auth: ?ClientAuth = null,
+
+        pub const ClientAuth = struct {
+            /// Certificate authorities used to verify client certificates.
+            /// `.none` is rejected by listen().
+            ca: TlsCa,
+            /// `.require` rejects a client that sends no certificate;
+            /// `.request` asks for one but accepts an empty reply.
+            mode: Mode = .require,
+
+            pub const Mode = enum { request, require };
+        };
     };
 
     pub const Timeout = struct {

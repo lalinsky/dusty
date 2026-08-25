@@ -5,6 +5,8 @@ const build_options = @import("build_options");
 
 const unix_path_max = 108;
 
+const config_mod = @import("config.zig");
+
 const http = @import("http.zig");
 const Method = http.Method;
 const Status = http.Status;
@@ -78,8 +80,12 @@ pub const ClientConfig = struct {
     max_idle_connections: u8 = 8,
     /// Buffer size (bytes) for reading response headers.
     buffer_size: usize = 4096,
-    /// Use system CA bundle for HTTPS connections.
-    use_system_ca_bundle: bool = true,
+    /// TLS settings for https:// (and wss://) connections. Requires the
+    /// `use_tls` build option; with TLS compiled out any HTTPS request fails
+    /// with error.TlsNotConfigured. Applies to every connection the client
+    /// makes: connections are pooled and reused across requests, so the trust
+    /// settings and client identity cannot be varied per request.
+    tls: TlsConfig = .{},
     /// Maximum number of headers allowed in a response.
     max_response_header_count: usize = 64,
     /// User-Agent header sent with requests. Set to null to omit it.
@@ -89,6 +95,37 @@ pub const ClientConfig = struct {
     /// when the library is built with the `use_http2` build option; ignored for
     /// cleartext (http://) connections. Defaults off.
     http2: bool = false,
+};
+
+/// TLS settings for the HTTP client.
+pub const TlsConfig = struct {
+    /// Certificate authorities used to verify the server's certificate chain.
+    ca: Ca = .system,
+    /// Certificate and key to present when the server asks the client to
+    /// authenticate itself (mutual TLS). When null, a server that requires a
+    /// client certificate rejects the handshake.
+    client_certificate: ?ClientCertificate = null,
+    /// Accept any server certificate and skip host name checking. This makes
+    /// the connection trivially interceptable; for testing only.
+    insecure_skip_verify: bool = false,
+
+    /// Where the client gets the certificate authorities it trusts. `.none` is
+    /// only valid together with `insecure_skip_verify`.
+    pub const Ca = config_mod.TlsCa;
+
+    pub const ClientCertificate = struct {
+        /// PEM certificate chain, leaf first, resolved against `dir`.
+        cert_path: []const u8,
+        /// PEM private key for the leaf certificate, resolved against `dir`.
+        /// Must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
+        /// KEY"); passphrase-protected keys are not supported.
+        key_path: []const u8,
+        /// Directory the paths are resolved against. Defaults to the current
+        /// working directory.
+        dir: ?std.Io.Dir = null,
+    };
+
+    pub const Path = config_mod.TlsPath;
 };
 
 /// Options for a single fetch request.
@@ -144,8 +181,14 @@ pub const WebSocketClient = struct {
     }
 };
 
-const CaBundleRef = struct {
-    bundle: *std.crypto.Certificate.Bundle,
+/// Borrowed view of the client-wide TLS material, handed to each HTTPS
+/// connection. The pointers reference storage owned by the `Client`, which
+/// outlives every connection it hands them to.
+const TlsRef = struct {
+    ca_bundle: *std.crypto.Certificate.Bundle,
+    /// Client certificate for mutual TLS, null when none is configured.
+    client_cert: ?*tls.config.CertKeyPair,
+    insecure_skip_verify: bool,
 };
 
 /// Parse a URL string into a std.Uri.
@@ -363,7 +406,7 @@ pub const Connection = struct {
         buffer_size: usize,
         max_response_headers: usize,
         protocol: Protocol,
-        ca_bundle: ?CaBundleRef,
+        tls_config: ?TlsRef,
         unix_socket_path: ?[]const u8,
         advertise_http2: bool,
     ) !void {
@@ -371,6 +414,7 @@ pub const Connection = struct {
         self.io = io;
         self.stream = stream;
         self.arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer self.arena.deinit();
         self.pool = pool;
         self.closing = false;
         self.buffer_size = buffer_size;
@@ -406,7 +450,7 @@ pub const Connection = struct {
 
         if (protocol == .https) {
             if (!build_options.use_tls) return error.TlsNotConfigured;
-            const ca = ca_bundle orelse return error.MissingCaBundle;
+            const tls_cfg = tls_config orelse return error.MissingTlsConfig;
 
             // TCP-layer (ciphertext) buffers. tls.zig requires the input buffer to
             // fit a full TLS record; the output buffer caps the produced record size.
@@ -438,7 +482,9 @@ pub const Connection = struct {
                 &self.tcp_writer.interface,
                 .{
                     .host = remote_host,
-                    .root_ca = ca.bundle.*,
+                    .root_ca = tls_cfg.ca_bundle.*,
+                    .insecure_skip_verify = tls_cfg.insecure_skip_verify,
+                    .auth = tls_cfg.client_cert,
                     .now = std.Io.Clock.real.now(self.io),
                     .rng = self.tls_rng.interface(),
                     .alpn_protocols = alpn_protocols,
@@ -690,9 +736,17 @@ pub const Client = struct {
     io: std.Io,
     config: ClientConfig,
     pool: ConnectionPool,
-    ca_bundle: std.crypto.Certificate.Bundle,
-    ca_bundle_lock: std.Io.RwLock,
-    ca_bundle_loaded: std.atomic.Value(bool),
+    tls_state: TlsState,
+    tls_lock: std.Io.RwLock,
+    tls_loaded: std.atomic.Value(bool),
+
+    /// TLS material shared by every HTTPS connection. Reading the trust store
+    /// and deriving the client key are expensive, so both are loaded once on
+    /// the first HTTPS request and reused afterwards.
+    const TlsState = struct {
+        ca_bundle: std.crypto.Certificate.Bundle = .empty,
+        client_cert: ?tls.config.CertKeyPair = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
         return .{
@@ -700,30 +754,57 @@ pub const Client = struct {
             .io = io,
             .config = config,
             .pool = ConnectionPool.init(allocator, io, config.max_idle_connections),
-            .ca_bundle = .empty,
-            .ca_bundle_lock = .init,
-            .ca_bundle_loaded = std.atomic.Value(bool).init(false),
+            .tls_state = .{},
+            .tls_lock = .init,
+            .tls_loaded = std.atomic.Value(bool).init(false),
         };
     }
 
-    fn ensureCaBundle(self: *Client) !CaBundleRef {
-        if (!self.ca_bundle_loaded.load(.acquire)) {
-            try self.ca_bundle_lock.lock(self.io);
-            defer self.ca_bundle_lock.unlock(self.io);
-            if (!self.ca_bundle_loaded.load(.unordered)) {
-                const now = std.Io.Clock.real.now(self.io);
-                try self.ca_bundle.rescan(self.allocator, self.io, now);
-                self.ca_bundle_loaded.store(true, .release);
+    fn ensureTlsState(self: *Client) !TlsRef {
+        if (!self.tls_loaded.load(.acquire)) {
+            try self.tls_lock.lock(self.io);
+            defer self.tls_lock.unlock(self.io);
+            if (!self.tls_loaded.load(.unordered)) {
+                try self.loadTlsState();
+                self.tls_loaded.store(true, .release);
             }
         }
         return .{
-            .bundle = &self.ca_bundle,
+            .ca_bundle = &self.tls_state.ca_bundle,
+            .client_cert = if (self.tls_state.client_cert) |*pair| pair else null,
+            .insecure_skip_verify = self.config.tls.insecure_skip_verify,
         };
+    }
+
+    /// Builds the CA bundle and client certificate into locals and only commits
+    /// them once both succeed, so a failure leaves `tls_state` empty and a later
+    /// retry starts from a clean bundle instead of appending to a half-built one.
+    fn loadTlsState(self: *Client) !void {
+        const cfg = self.config.tls;
+        if (cfg.ca == .none and !cfg.insecure_skip_verify) return error.NoCertificateAuthority;
+
+        var ca_bundle = try cfg.ca.load(self.allocator, self.io);
+        errdefer ca_bundle.deinit(self.allocator);
+
+        var client_cert: ?tls.config.CertKeyPair = null;
+        errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
+        if (cfg.client_certificate) |cc| {
+            client_cert = try tls.config.CertKeyPair.fromFilePath(
+                self.allocator,
+                self.io,
+                cc.dir orelse std.Io.Dir.cwd(),
+                cc.cert_path,
+                cc.key_path,
+            );
+        }
+
+        self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };
     }
 
     pub fn deinit(self: *Client) void {
         self.pool.deinit();
-        self.ca_bundle.deinit(self.allocator);
+        self.tls_state.ca_bundle.deinit(self.allocator);
+        if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
     }
 
     /// Perform an HTTP request.
@@ -750,7 +831,7 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         protocol: Protocol,
-        ca_bundle: ?CaBundleRef,
+        tls_config: ?TlsRef,
         unix_socket_path: ?[]const u8,
         // Whether to offer HTTP/2 via TLS ALPN. Callers that can't speak h2
         // (e.g. the WebSocket upgrade path) must pass false.
@@ -779,7 +860,7 @@ pub const Client = struct {
                 self.config.buffer_size,
                 self.config.max_response_header_count,
                 protocol,
-                ca_bundle,
+                tls_config,
                 unix_socket_path,
                 advertise_http2,
             );
@@ -800,13 +881,10 @@ pub const Client = struct {
         var host_buffer: [255]u8 = undefined;
         const host = try uriHost(uri, &host_buffer);
 
-        // Initialize CA bundle for HTTPS
-        const ca_bundle: ?CaBundleRef = if (info.protocol == .https) blk: {
+        // Load the shared TLS material for HTTPS
+        const tls_config: ?TlsRef = if (info.protocol == .https) blk: {
             if (!build_options.use_tls) return error.TlsNotConfigured;
-            if (!self.config.use_system_ca_bundle) {
-                return error.TlsNotConfigured;
-            }
-            break :blk try self.ensureCaBundle();
+            break :blk try self.ensureTlsState();
         } else null;
 
         // Reject any CRLF/NUL smuggled in via the URL host.
@@ -814,7 +892,7 @@ pub const Client = struct {
 
         // Acquire or create a connection. WebSocket upgrades are HTTP/1.1 only,
         // so never advertise h2 here.
-        const conn = try self.acquireConnection(host, info.port, info.protocol, ca_bundle, options.unix_socket_path, false);
+        const conn = try self.acquireConnection(host, info.port, info.protocol, tls_config, options.unix_socket_path, false);
         errdefer {
             conn.deinit();
             self.allocator.destroy(conn);
@@ -894,19 +972,16 @@ pub const Client = struct {
         var host_buffer: [255]u8 = undefined;
         const host = try uriHost(state.uri, &host_buffer);
 
-        // Initialize CA bundle for HTTPS
-        const ca_bundle: ?CaBundleRef = if (state.protocol == .https) blk: {
+        // Load the shared TLS material for HTTPS
+        const tls_config: ?TlsRef = if (state.protocol == .https) blk: {
             if (!build_options.use_tls) return error.TlsNotConfigured;
-            if (!self.config.use_system_ca_bundle) {
-                return error.TlsNotConfigured;
-            }
-            break :blk try self.ensureCaBundle();
+            break :blk try self.ensureTlsState();
         } else null;
 
         // Acquire or create a connection. The redirect path releases it early
         // and continues with fallible work, so the errdefer must be disarmed
         // after that release to avoid releasing the connection twice.
-        const conn = try self.acquireConnection(host, state.port, state.protocol, ca_bundle, state.options.unix_socket_path, build_options.use_http2 and self.config.http2 and state.protocol == .https);
+        const conn = try self.acquireConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, build_options.use_http2 and self.config.http2 and state.protocol == .https);
         var conn_released = false;
         errdefer if (!conn_released) self.pool.release(conn);
 

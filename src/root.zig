@@ -3,6 +3,8 @@ const std = @import("std");
 pub const Server = @import("server.zig").Server;
 pub const Address = @import("server.zig").Address;
 pub const ServerConfig = @import("config.zig").ServerConfig;
+pub const TlsCa = @import("config.zig").TlsCa;
+pub const TlsPath = @import("config.zig").TlsPath;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const Request = @import("request.zig").Request;
@@ -28,6 +30,7 @@ pub const Executor = @import("middleware.zig").Executor;
 // Client
 pub const Client = @import("client.zig").Client;
 pub const ClientConfig = @import("client.zig").ClientConfig;
+pub const TlsConfig = @import("client.zig").TlsConfig;
 pub const ClientResponse = @import("client.zig").ClientResponse;
 pub const FetchOptions = @import("client.zig").FetchOptions;
 pub const WebSocketClient = @import("client.zig").WebSocketClient;

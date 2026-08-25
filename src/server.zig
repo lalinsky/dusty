@@ -24,6 +24,13 @@ const log = std.log.scoped(.dusty);
 const min_accept_backoff_ms = 5;
 const max_accept_backoff_ms = 1000;
 
+/// Borrowed view of the client-certificate settings, handed to each accepted
+/// connection. The bundle is owned by the Server and outlives every connection.
+const ClientAuthRef = struct {
+    bundle: *std.crypto.Certificate.Bundle,
+    mode: ServerConfig.Tls.ClientAuth.Mode,
+};
+
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer), plus the arena backing their buffers, for one accepted
 /// connection. Initialized in place: `tls_conn` stores pointers into
@@ -68,6 +75,7 @@ pub const Connection = struct {
         stream: std.Io.net.Stream,
         request_buffer_size: usize,
         auth: *tls.config.CertKeyPair,
+        client_auth: ?ClientAuthRef,
     ) !void {
         self.* = .{ .io = io, .stream = stream };
         self.arena = .init(allocator);
@@ -92,6 +100,15 @@ pub const Connection = struct {
         self.tls_rng = .{ .io = io };
         self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
             .auth = auth,
+            // Built here rather than passed in as a tls.config.ClientAuth, so
+            // tls_stub.zig does not have to mirror the type.
+            .client_auth = if (client_auth) |ca| .{
+                .root_ca = ca.bundle.*,
+                .auth_type = switch (ca.mode) {
+                    .request => .request,
+                    .require => .require,
+                },
+            } else null,
             .now = std.Io.Clock.real.now(io),
             .rng = self.tls_rng.interface(),
         });
@@ -205,6 +222,9 @@ pub fn Server(comptime Ctx: type) type {
         _middleware_registry: std.SinglyLinkedList,
         /// Server certificate/key, loaded once in listen() when config.tls is set.
         tls_auth: ?tls.config.CertKeyPair = null,
+        /// CAs for verifying client certificates, loaded alongside tls_auth
+        /// when config.tls.client_auth is set.
+        tls_client_ca: ?std.crypto.Certificate.Bundle = null,
 
         pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
             return .{
@@ -261,6 +281,15 @@ pub fn Server(comptime Ctx: type) type {
             // Load the server certificate/key once, shared across all connections.
             if (build_options.use_tls) {
                 if (self.config.tls) |tls_cfg| {
+                    // Checked before anything is loaded, so the early return
+                    // has nothing to clean up.
+                    if (tls_cfg.client_auth) |client_auth| {
+                        if (client_auth.ca == .none) {
+                            log.err("config.tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
+                            return error.NoCertificateAuthority;
+                        }
+                    }
+
                     const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
                     self.tls_auth = tls.config.CertKeyPair.fromFilePath(
                         self.allocator,
@@ -272,6 +301,17 @@ pub fn Server(comptime Ctx: type) type {
                         log.err("Failed to load TLS certificate/key: {}", .{err});
                         return err;
                     };
+                    errdefer {
+                        self.tls_auth.?.deinit(self.allocator);
+                        self.tls_auth = null;
+                    }
+
+                    if (tls_cfg.client_auth) |client_auth| {
+                        self.tls_client_ca = client_auth.ca.load(self.allocator, self.io) catch |err| {
+                            log.err("Failed to load client certificate authorities: {}", .{err});
+                            return err;
+                        };
+                    }
                 }
             } else if (self.config.tls != null) {
                 log.err("config.tls is set but the library was built with use_tls=false", .{});
@@ -281,6 +321,10 @@ pub fn Server(comptime Ctx: type) type {
                 if (self.tls_auth) |*auth| {
                     auth.deinit(self.allocator);
                     self.tls_auth = null;
+                }
+                if (self.tls_client_ca) |*bundle| {
+                    bundle.deinit(self.allocator);
+                    self.tls_client_ca = null;
                 }
             };
 
@@ -461,7 +505,12 @@ pub fn Server(comptime Ctx: type) type {
                             handshake.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
                         }
 
-                        connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth) catch |err| {
+                        const client_auth: ?ClientAuthRef = if (self.tls_client_ca) |*bundle| .{
+                            .bundle = bundle,
+                            .mode = self.config.tls.?.client_auth.?.mode,
+                        } else null;
+
+                        connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth, client_auth) catch |err| {
                             // tls.zig only saw the ciphertext reader or
                             // writer fail generically, so the cause is a
                             // layer down -- and when the handshake ran out

@@ -1120,3 +1120,20 @@ test "Server: request carries the peer address" {
     // The same connection, so the same peer both times.
     try std.testing.expect(ctx.seen[0].?.ip4.eql(ctx.seen[1].?.ip4));
 }
+
+test "Server: client_auth with ca .none is rejected by listen" {
+    if (!@import("build_options").use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{
+            .cert_path = "examples/certs/cert.pem",
+            .key_path = "examples/certs/key.pem",
+            .client_auth = .{ .ca = .none },
+        },
+    }, {});
+    defer server.deinit();
+
+    const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+    try std.testing.expectError(error.NoCertificateAuthority, server.listen(addr));
+}
