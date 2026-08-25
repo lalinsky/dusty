@@ -115,7 +115,7 @@ pub const EventStream = struct {
     /// on the result before touching the stream again.
     pub fn startSend(self: *EventStream, opts: Options) Error!EventWriter {
         try opts.validate();
-        try self.body.commit(sendFields(&self.body.interface, opts));
+        try self.body.res.resolve(sendFields(&self.body.interface, opts));
         return .{
             .body = &self.body,
             .line_in_progress = false,
@@ -128,7 +128,7 @@ pub const EventStream = struct {
     /// Sends one complete event.
     pub fn send(self: *EventStream, data: []const u8, opts: Options) Error!void {
         try opts.validate();
-        return self.body.commit(sendEvent(&self.body.interface, data, opts));
+        return self.body.res.resolve(sendEvent(&self.body.interface, data, opts));
     }
 
     /// The fields that precede the data. Reports the sentinel, as anything
@@ -249,22 +249,13 @@ pub const StreamingBodyWriter = struct {
         };
     }
 
-    /// Runs `result`, storing what actually went wrong. The interface still
-    /// reports the generic `WriteFailed`, as its contract requires; `err`
-    /// is where the answer lives.
+    /// Runs `result`, storing what actually went wrong. `drain` is the one
+    /// path that cannot hand the cause back -- the `std.Io.Writer` vtable
+    /// fixes its error set -- so this is the one place `err` is written.
     fn record(self: *StreamingBodyWriter, result: std.Io.Writer.Error!void) std.Io.Writer.Error!void {
-        self.commit(result) catch return error.WriteFailed;
-    }
-
-    /// `record`, but returning the cause it stored rather than the sentinel.
-    /// Only `drain` has to return `error.WriteFailed`.
-    fn commit(self: *StreamingBodyWriter, result: std.Io.Writer.Error!void) Error!void {
-        result catch |err| switch (err) {
-            error.WriteFailed => {
-                const cause = self.res.conn.getWriteError() orelse error.Unexpected;
-                self.err = cause;
-                return cause;
-            },
+        self.res.resolve(result) catch |cause| {
+            self.err = cause;
+            return error.WriteFailed;
         };
     }
 
@@ -351,9 +342,9 @@ pub const StreamingBodyWriter = struct {
         // response.
         errdefer res.keepalive = false;
 
-        try self.commit(self.interface.flush());
-        if (res.chunked and !res.head) try self.commit(res.conn.writer.writeAll("0\r\n\r\n"));
-        try self.commit(res.conn.writer.flush());
+        try res.resolve(self.interface.flush());
+        if (res.chunked and !res.head) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
+        try res.resolve(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
         if (res.content_length) |declared| {
@@ -555,8 +546,11 @@ pub const Response = struct {
     }
 
     /// Turns the sentinel a `std.Io.Writer` reports into the cause the
-    /// connection recorded. Every public entry point funnels its writes
-    /// through here exactly once, so the sentinel never reaches a caller.
+    /// connection recorded. The one place that answer is worked out: every
+    /// public entry point on the response and on the body writers over it
+    /// funnels its writes through here, so the sentinel never reaches a
+    /// caller. Only a `drain`, whose error set the vtable fixes, cannot --
+    /// which is what the writers' `err` fields are for.
     fn resolve(self: *Response, result: std.Io.Writer.Error!void) SendError!void {
         result catch |err| switch (err) {
             error.WriteFailed => return self.conn.getWriteError() orelse error.Unexpected,
@@ -1143,7 +1137,6 @@ test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
     try body.interface.flush();
 
     try std.testing.expectError(error.ConnectionResetByPeer, body.end());
-    try std.testing.expectEqual(error.ConnectionResetByPeer, body.err.?);
     // A body that could not be framed as promised cannot share the connection.
     try std.testing.expectEqual(false, response.keepalive);
 }
