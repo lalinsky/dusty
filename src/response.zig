@@ -73,10 +73,9 @@ pub const EventWriter = struct {
     /// stream is used again.
     pub fn end(self: *EventWriter) Error!void {
         self.finish() catch |err| switch (err) {
-            error.WriteFailed => {
-                self.err = self.body.err;
-                return self.err orelse error.Unexpected;
-            },
+            // Nothing to store: `err` is for the cause `drain` cannot
+            // return, and this one goes back to the caller.
+            error.WriteFailed => return self.body.err orelse error.Unexpected,
         };
     }
 
