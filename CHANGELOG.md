@@ -23,6 +23,8 @@ All notable changes to this project will be documented in this file.
   `.dir`, `.none`) and are shared by `ClientConfig.tls.ca` and `ServerConfig.tls.client_auth.ca`.
 - Fix memory leak when a client connection fails to initialize (e.g. a rejected TLS handshake): the
   connection arena was not released.
+- The server no longer logs a `warn` when the deferred connection shutdown fails with
+  `error.SocketUnconnected`; that just means the peer was already gone, so it's logged at `debug`.
 
 ## [0.2.0] - 2026-04-26
 

@@ -480,7 +480,17 @@ pub fn Server(comptime Ctx: type) type {
 
             var needs_shutdown = true;
             defer if (needs_shutdown) stream.shutdown(self.io, .both) catch |err| {
-                log.warn("Failed to shutdown client connection: {}", .{err});
+                // SocketUnconnected here just means the peer was already gone
+                // by the time this deferred cleanup ran; shutdown() was only
+                // ever best-effort politeness, and stream.close() above still
+                // released the fd. Not worth a warning, unlike isPeerGone's
+                // other cases, which don't apply here since this errors from
+                // shutdown() itself, not from reading/writing the connection.
+                if (err == error.SocketUnconnected) {
+                    log.debug("Failed to shutdown client connection: {}", .{err});
+                } else {
+                    log.warn("Failed to shutdown client connection: {}", .{err});
+                }
             };
 
             var connection: Connection = undefined;
