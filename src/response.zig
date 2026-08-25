@@ -486,20 +486,16 @@ pub const Response = struct {
     pub fn startEventStream(self: *Response) !EventStream {
         try self.header("Content-Type", "text/event-stream");
         try self.header("Cache-Control", "no-cache");
-        // Before the headers go out, so a stream that cannot be opened is
-        // not announced first.
-        const buf = try self.arena.alloc(u8, event_stream_buffer);
-        self.keepalive = false;
-        // Neither a length nor chunks: an event stream ends when the
-        // connection does. `writeHeader` leaves out the Content-Length,
-        // and the body writer has nothing to frame or terminate.
-        self.streaming = true;
-        self.startBody();
-        try self.writeHeader();
+        // Chunked, like any other body of unknown length. An event stream
+        // could be delimited by closing the connection instead, but then a
+        // peer cannot tell a stream that ended from one that was cut, and
+        // the connection is spent either way.
+        //
         // A HEAD gets the headers an event stream would have opened with
-        // and none of the events. The body writer already drops what it is
+        // and none of the events; the body writer already drops what it is
         // given for a HEAD, so no send has to ask.
-        return .{ .body = .init(self, buf) };
+        const buf = try self.arena.alloc(u8, event_stream_buffer);
+        return .{ .body = try self.stream(buf) };
     }
 
     /// Upgrade HTTP connection to WebSocket.
@@ -560,7 +556,17 @@ pub const Response = struct {
 
     pub fn writeHeader(self: *Response) WriteError!void {
         if (!try self.prepareHeader()) return;
-        return self.resolve(self.sendHeader(self.conn.writer));
+        return self.resolve(self.sendHeaderAlone(self.conn.writer));
+    }
+
+    /// The headers with nothing behind them. `write` sends them with a body
+    /// and flushes once for both; everything else -- a streaming body, an
+    /// event stream, a WebSocket -- has nothing queued, and the headers
+    /// must not wait in the buffer for a body that may be seconds away, or
+    /// that is the peer's turn to send.
+    fn sendHeaderAlone(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.sendHeader(w);
+        return w.flush();
     }
 
     /// The header block on the wire. Reports the sentinel, as anything
@@ -595,13 +601,6 @@ pub const Response = struct {
 
         // End of headers (applies to both chunked and non-chunked)
         try w.writeAll("\r\n");
-
-        // A streaming response has nothing queued behind its headers, so
-        // they have to reach the peer now: the first event may be seconds
-        // away, and for a WebSocket the next byte is the peer's to send. A
-        // framed body is already waiting, and goes out with them in one
-        // write rather than paying for a second.
-        if (self.streaming) try w.flush();
     }
 
     pub fn write(self: *Response) WriteError!void {
@@ -1474,6 +1473,7 @@ const TestEventStream = struct {
     response: Response,
     stream: EventStream,
     header_end: usize,
+    decoded: [1024]u8,
 
     fn init(self: *TestEventStream, buf: []u8) !void {
         self.arena = .init(std.testing.allocator);
@@ -1488,8 +1488,28 @@ const TestEventStream = struct {
         self.arena.deinit();
     }
 
-    fn events(self: *TestEventStream) []const u8 {
+    /// What went out behind the headers, still chunk-framed.
+    fn raw(self: *TestEventStream) []const u8 {
         return self.conn_writer.buffered()[self.header_end..];
+    }
+
+    /// The events with the chunk framing peeled off, so a test about how an
+    /// event is formatted does not have to spell out chunk sizes. That the
+    /// framing is there at all is asserted on its own, below.
+    fn events(self: *TestEventStream) ![]const u8 {
+        var rest = self.raw();
+        var n: usize = 0;
+        while (rest.len > 0) {
+            const size_end = std.mem.indexOf(u8, rest, "\r\n") orelse return error.TruncatedChunk;
+            const size = try std.fmt.parseInt(usize, rest[0..size_end], 16);
+            if (size == 0) break;
+            const body = rest[size_end + 2 ..];
+            if (body.len < size + 2) return error.TruncatedChunk;
+            @memcpy(self.decoded[n..][0..size], body[0..size]);
+            n += size;
+            rest = body[size + 2 ..];
+        }
+        return self.decoded[0..n];
     }
 };
 
@@ -1501,7 +1521,7 @@ test "EventStream: send with data only" {
 
     try t.stream.send("hello world", .{});
 
-    const written = t.events();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: hello world\n\n", written);
 }
 
@@ -1513,7 +1533,7 @@ test "EventStream: send with event name" {
 
     try t.stream.send("payload", .{ .event = "update" });
 
-    const written = t.events();
+    const written = try t.events();
     try std.testing.expectEqualStrings("event: update\ndata: payload\n\n", written);
 }
 
@@ -1525,7 +1545,7 @@ test "EventStream: send with all options" {
 
     try t.stream.send("payload", .{ .event = "update", .id = "42", .retry = 5000 });
 
-    const written = t.events();
+    const written = try t.events();
     try std.testing.expectEqualStrings("event: update\nid: 42\nretry: 5000\ndata: payload\n\n", written);
 }
 
@@ -1538,7 +1558,7 @@ test "EventStream: multiple sends" {
     try t.stream.send("first", .{});
     try t.stream.send("second", .{ .event = "msg" });
 
-    const written = t.events();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: first\n\nevent: msg\ndata: second\n\n", written);
 }
 
@@ -1562,11 +1582,30 @@ test "Response: startEventStream" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: text/event-stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Cache-Control: no-cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "data: connected\n\n") != null);
-    try std.testing.expectEqual(false, response.keepalive);
-    // An event stream ends when the connection does: neither a length nor
-    // chunks may frame it, or the peer stops reading at the wrong place.
+    // The stream has no length to declare, so it is chunked -- which is
+    // what lets the peer tell a stream that ended from one that was cut,
+    // and lets the connection outlive it.
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
+    try std.testing.expectEqual(true, response.keepalive);
+}
+
+test "EventStream: each event is one chunk" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    try t.stream.send("hi", .{});
+    try t.stream.send("there", .{ .event = "msg" });
+
+    // One chunk per event, so a peer sees each one whole and as soon as it
+    // is sent rather than when the buffer happens to fill.
+    try std.testing.expectEqualStrings(
+        "a\r\ndata: hi\n\n\r\n" ++
+            "18\r\nevent: msg\ndata: there\n\n\r\n",
+        t.raw(),
+    );
 }
 
 test "EventStream: send reports the real error, not error.WriteFailed" {
@@ -1741,7 +1780,7 @@ test "EventStream: multi-line data splits into multiple data lines" {
 
     try t.stream.send("line1\nline2", .{});
 
-    const written = t.events();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
 }
 
@@ -1753,7 +1792,7 @@ test "EventStream: CRLF line endings stripped in data" {
 
     try t.stream.send("line1\r\nline2", .{});
 
-    const written = t.events();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
 }
 
@@ -1767,7 +1806,7 @@ test "EventWriter: basic write" {
     try ew.interface.writeAll("hello");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: hello\n\n", t.events());
+    try std.testing.expectEqualStrings("data: hello\n\n", try t.events());
 }
 
 test "EventWriter: multi-line" {
@@ -1780,7 +1819,7 @@ test "EventWriter: multi-line" {
     try ew.interface.writeAll("line1\nline2");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", t.events());
+    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", try t.events());
 }
 
 test "EventWriter: print" {
@@ -1793,7 +1832,7 @@ test "EventWriter: print" {
     try ew.interface.print("count: {d}", .{42});
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: count: 42\n\n", t.events());
+    try std.testing.expectEqualStrings("data: count: 42\n\n", try t.events());
 }
 
 test "EventWriter: with options" {
@@ -1806,7 +1845,7 @@ test "EventWriter: with options" {
     try ew.interface.writeAll("payload");
     try ew.end();
 
-    try std.testing.expectEqualStrings("event: update\nid: 42\ndata: payload\n\n", t.events());
+    try std.testing.expectEqualStrings("event: update\nid: 42\ndata: payload\n\n", try t.events());
 }
 
 test "EventWriter: multiple writes merged into one event" {
@@ -1820,7 +1859,7 @@ test "EventWriter: multiple writes merged into one event" {
     try ew.interface.writeAll("bar");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: foobar\n\n", t.events());
+    try std.testing.expectEqualStrings("data: foobar\n\n", try t.events());
 }
 
 test "EventWriter: writeByte" {
@@ -1835,7 +1874,7 @@ test "EventWriter: writeByte" {
     try ew.interface.writeByte('C');
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: ABC\n\n", t.events());
+    try std.testing.expectEqualStrings("data: ABC\n\n", try t.events());
 }
 
 test "EventWriter: splatBytesAll" {
@@ -1848,7 +1887,7 @@ test "EventWriter: splatBytesAll" {
     try ew.interface.splatBytesAll("ab", 3);
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: ababab\n\n", t.events());
+    try std.testing.expectEqualStrings("data: ababab\n\n", try t.events());
 }
 
 test "Response: resetBody replaces a half written body" {
