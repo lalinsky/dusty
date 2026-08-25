@@ -136,11 +136,20 @@ pub const Connection = struct {
     // reader/writer's generic error; the real cause is on the TCP layer.
     // So those two mean "keep descending". A TLS-level failure (bad record
     // mac, bad version, ...) is recorded as itself and stops the search.
+    //
+    // They are switched on rather than compared so that they drop out of
+    // the inferred error set as well as out of the answer: like the
+    // `WriteFailed` they stand in for, they name no cause a caller could
+    // act on, and nothing that descends past them can return one.
 
     fn checkReadError(self: *Connection) !void {
         if (build_options.use_tls) {
             if (self.tls_conn != null) {
-                if (self.tls_reader.err) |e| if (e != error.TransportReadFailed) return e;
+                if (self.tls_reader.err) |e| switch (e) {
+                    // Keep descending: the cause is on the TCP layer below.
+                    error.TransportReadFailed => {},
+                    else => |cause| return cause,
+                };
             }
         }
         if (self.tcp_reader.err) |e| return e;
@@ -154,7 +163,11 @@ pub const Connection = struct {
     fn checkWriteError(self: *Connection) !void {
         if (build_options.use_tls) {
             if (self.tls_conn != null) {
-                if (self.tls_writer.err) |e| if (e != error.TransportWriteFailed) return e;
+                if (self.tls_writer.err) |e| switch (e) {
+                    // Keep descending: the cause is on the TCP layer below.
+                    error.TransportWriteFailed => {},
+                    else => |cause| return cause,
+                };
             }
         }
         if (self.tcp_writer.err) |e| return e;
@@ -774,6 +787,21 @@ test "Connection: a TLS-level failure is reported as itself" {
     { // and with nothing recorded anywhere there is no error to report
         var conn = testTlsConnection();
         try std.testing.expectEqual(@as(?anyerror, null), conn.getWriteError());
+    }
+}
+
+test "Connection: the placeholders it descends past stay out of its error sets" {
+    // `TransportReadFailed`/`TransportWriteFailed` mean only "the layer
+    // below failed", which is what the accessors exist to look past. They
+    // must not survive into what a caller can be handed, any more than the
+    // `ReadFailed`/`WriteFailed` they stand in for.
+    var conn = testTlsConnection();
+    const ReadError = @typeInfo(@TypeOf(conn.getReadError())).optional.child;
+    inline for (@typeInfo(ReadError).error_set.?) |e| {
+        try std.testing.expect(!std.mem.eql(u8, e.name, "TransportReadFailed"));
+    }
+    inline for (@typeInfo(Connection.WriteError).error_set.?) |e| {
+        try std.testing.expect(!std.mem.eql(u8, e.name, "TransportWriteFailed"));
     }
 }
 

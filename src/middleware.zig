@@ -82,6 +82,12 @@ pub fn Executor(comptime Ctx: type) type {
                 // writes it, instead of tearing down the connection with no
                 // reply.
                 else => {
+                    // Unless the peer is what went away. `Response` resolves
+                    // its writes now, so a disconnect arrives here as
+                    // `ConnectionResetByPeer` rather than `WriteFailed` --
+                    // just as fatal, and just as much not the handler's
+                    // fault, so it is neither a 500 nor worth an error log.
+                    if (Connection.isPeerGone(err)) return err;
                     if (self.res.headers_written) {
                         // The response already started (e.g. streaming/chunked
                         // body or a WebSocket upgrade), so headers were sent
