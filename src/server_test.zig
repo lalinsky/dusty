@@ -745,6 +745,89 @@ test "Server: handler error yields 500 and keeps the connection alive" {
     try std.testing.expectEqualStrings("ok", resp2.body);
 }
 
+test "Server: an event stream is chunked and leaves the connection reusable" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/events", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            var events = try res.startEventStream();
+            try events.send("first", .{ .event = "tick", .id = "1" });
+            try events.send("second", .{});
+        }
+    }.handle);
+
+    server.router.get("/ok", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "ok";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    try w.writeAll("GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    // Read up to the chunked terminator, which is where the stream ends and
+    // the connection becomes free for the next request.
+    var got: [1024]u8 = undefined;
+    var len: usize = 0;
+    while (std.mem.indexOf(u8, got[0..len], "0\r\n\r\n") == null) {
+        r.fillMore() catch break;
+        const buffered = r.buffered();
+        if (buffered.len == 0) break;
+        const to_copy = @min(buffered.len, got.len - len);
+        @memcpy(got[len..][0..to_copy], buffered[0..to_copy]);
+        r.toss(to_copy);
+        len += to_copy;
+    }
+    const reply = got[0..len];
+
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Content-Type: text/event-stream") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Transfer-Encoding: chunked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "Content-Length") == null);
+    // Each event sits between a chunk header and its trailing CRLF, so it
+    // reached the peer on its own rather than when a buffer filled.
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\r\nevent: tick\nid: 1\ndata: first\n\n\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\r\ndata: second\n\n\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, reply, "0\r\n\r\n"));
+
+    // Chunks end the stream without ending the connection, so the next
+    // request on it is still answered.
+    try w.writeAll("GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    var status2: [64]u8 = undefined;
+    var body2: [64]u8 = undefined;
+    const resp2 = try readResponse(r, &status2, &body2);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.status, "200") != null);
+    try std.testing.expectEqualStrings("ok", resp2.body);
+}
+
 test "Server: handler error after streaming started aborts the connection" {
     const io = std.testing.io;
 

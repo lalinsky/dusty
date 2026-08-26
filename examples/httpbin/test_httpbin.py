@@ -31,6 +31,29 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def parse_sse(raw: bytes):
+    """Events as (event, id, data) triples, per the text/event-stream grammar.
+
+    Written from the spec rather than from how dusty emits them, so a
+    change in framing shows up as a parse failure here.
+    """
+    events, fields, data = [], {}, []
+    for line in raw.decode().split("\n"):
+        if line == "":
+            if fields or data:
+                events.append((fields.get("event"), fields.get("id"), "\n".join(data)))
+                fields, data = {}, []
+            continue
+        name, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if name == "data":
+            data.append(value)
+        else:
+            fields[name] = value
+    return events
+
+
 class HttpbinTest(unittest.TestCase):
     server_process = None
     server_log = None
@@ -340,6 +363,45 @@ class HttpbinTest(unittest.TestCase):
         self.assertEqual(headers.get("Transfer-Encoding"), "chunked")
         lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
         self.assertEqual([line["id"] for line in lines], [0, 1, 2, 3, 4])
+
+    def test_sse_is_chunked(self):
+        status, headers, _ = self.request("GET", "/sse/3")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "text/event-stream")
+        # No length is known up front, so the stream is framed by chunks
+        # rather than by closing the connection.
+        self.assertEqual(headers.get("Transfer-Encoding"), "chunked")
+        self.assertNotIn("Content-Length", headers)
+
+    def test_sse_emits_one_event_each(self):
+        status, _, raw = self.request("GET", "/sse/3")
+        self.assertEqual(status, 200)
+        events = parse_sse(raw)
+        self.assertEqual([name for name, _, _ in events], ["tick"] * 3)
+        self.assertEqual([id_ for _, id_, _ in events], ["0", "1", "2"])
+        self.assertEqual([json.loads(data)["id"] for _, _, data in events], [0, 1, 2])
+
+    def test_sse_leaves_the_connection_reusable(self):
+        """Chunked framing ends the stream without ending the connection."""
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=5)
+        try:
+            conn.request("GET", "/sse/2")
+            first = conn.getresponse()
+            self.assertEqual(first.status, 200)
+            self.assertEqual(len(parse_sse(first.read())), 2)
+
+            # Would raise if the server had hung up after the stream.
+            conn.request("GET", "/get")
+            second = conn.getresponse()
+            self.assertEqual(second.status, 200)
+            json.loads(second.read())
+        finally:
+            conn.close()
+
+    def test_sse_count_is_validated(self):
+        status, _, raw = self.request("GET", "/sse/abc")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(raw)["error"], "Invalid count")
 
     def test_delay_waits(self):
         start = time.monotonic()

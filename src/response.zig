@@ -9,12 +9,34 @@ const Connection = @import("server.zig").Connection;
 var no_buf: [0]u8 = .{};
 
 pub const EventWriter = struct {
-    conn: *std.Io.Writer,
+    body: *StreamingBodyWriter,
     line_in_progress: bool,
     interface: std.Io.Writer,
+    /// The real cause behind the generic `error.WriteFailed` that the
+    /// `std.Io.Writer` interface has to return. An event long enough to
+    /// outgrow the stream's buffer reaches the connection while it is
+    /// being written, so a caller filling one from a template finds out
+    /// here what went wrong rather than only that something did.
+    ///
+    /// Everything here writes through the stream underneath, so this is
+    /// that writer's answer carried up rather than a second one.
+    err: ?Error = null,
+
+    /// What the stream underneath can fail with.
+    pub const Error = StreamingBodyWriter.Error;
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *EventWriter = @fieldParentPtr("interface", w);
+        const total = writeSegments(self, data, splat) catch |err| switch (err) {
+            error.WriteFailed => {
+                self.err = self.body.err;
+                return error.WriteFailed;
+            },
+        };
+        return w.consume(total);
+    }
+
+    fn writeSegments(self: *EventWriter, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         var total: usize = 0;
         for (data[0 .. data.len - 1]) |segment| {
             try writeLines(self, segment);
@@ -24,77 +46,110 @@ pub const EventWriter = struct {
             try writeLines(self, data[data.len - 1]);
             total += data[data.len - 1].len;
         }
-        return w.consume(total);
+        return total;
     }
 
-    fn writeLines(self: *EventWriter, bytes: []const u8) !void {
+    fn writeLines(self: *EventWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        const out = &self.body.interface;
         var rest = bytes;
         while (std.mem.findScalar(u8, rest, '\n')) |idx| {
-            if (!self.line_in_progress) try self.conn.writeAll("data: ");
+            if (!self.line_in_progress) try out.writeAll("data: ");
             const line_end = if (idx > 0 and rest[idx - 1] == '\r') idx - 1 else idx;
-            try self.conn.writeAll(rest[0..line_end]);
-            try self.conn.writeAll("\n");
+            try out.writeAll(rest[0..line_end]);
+            try out.writeAll("\n");
             self.line_in_progress = false;
             rest = rest[idx + 1 ..];
         }
         if (rest.len > 0) {
             if (!self.line_in_progress) {
-                try self.conn.writeAll("data: ");
+                try out.writeAll("data: ");
                 self.line_in_progress = true;
             }
-            try self.conn.writeAll(rest);
+            try out.writeAll(rest);
         }
     }
 
-    pub fn end(self: *EventWriter) !void {
+    /// Closes the event and puts it on the wire. Must be called before the
+    /// stream is used again.
+    pub fn end(self: *EventWriter) Error!void {
+        self.finish() catch |err| switch (err) {
+            // Nothing to store: `err` is for the cause `drain` cannot
+            // return, and this one goes back to the caller.
+            error.WriteFailed => return self.body.err orelse error.Unexpected,
+        };
+    }
+
+    fn finish(self: *EventWriter) std.Io.Writer.Error!void {
         try self.interface.flush();
-        if (self.line_in_progress) try self.conn.writeAll("\n");
-        try self.conn.writeAll("\n");
-        try self.conn.flush();
+        const out = &self.body.interface;
+        if (self.line_in_progress) try out.writeAll("\n");
+        try out.writeAll("\n");
+        return out.flush();
     }
 };
 
+/// A Server-Sent Events body. The length is not known up front, so the
+/// body is chunked: one chunk per event, and a terminator at the end. The
+/// peer can then tell a stream that finished from one that was cut, and
+/// the connection outlives the stream.
 pub const EventStream = struct {
-    conn: *std.Io.Writer,
+    body: StreamingBodyWriter,
+
+    /// What sending an event can fail with.
+    pub const Error = StreamingBodyWriter.Error || error{InvalidEventField};
 
     pub const Options = struct {
         event: ?[]const u8 = null,
         id: ?[]const u8 = null,
         retry: ?u32 = null,
+
+        /// A CR or LF in either field would close the line early and let
+        /// whoever supplied it write the rest of the event itself.
+        fn validate(self: Options) error{InvalidEventField}!void {
+            if (self.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
+            if (self.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
+        }
     };
 
-    pub fn startSend(self: EventStream, opts: Options) !EventWriter {
-        if (opts.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
-        if (opts.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
-
-        if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
-        if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
-        if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
-
+    /// Opens an event whose data is written as it is produced. Call `end`
+    /// on the result before touching the stream again.
+    pub fn startSend(self: *EventStream, opts: Options) Error!EventWriter {
+        try opts.validate();
+        try self.body.res.resolve(sendFields(&self.body.interface, opts));
         return .{
-            .conn = self.conn,
+            .body = &self.body,
             .line_in_progress = false,
-            .interface = .{
-                .buffer = &no_buf,
-                .vtable = &.{ .drain = &EventWriter.drain },
-            },
+            // Unbuffered: the stream underneath is the buffer, and holding
+            // bytes here would only copy them twice.
+            .interface = .{ .buffer = &no_buf, .vtable = &.{ .drain = &EventWriter.drain } },
         };
     }
 
-    pub fn send(self: EventStream, data: []const u8, opts: Options) !void {
-        if (opts.event) |e| if (std.mem.indexOfAny(u8, e, "\r\n") != null) return error.InvalidEventField;
-        if (opts.id) |id| if (std.mem.indexOfAny(u8, id, "\r\n") != null) return error.InvalidEventField;
+    /// Sends one complete event.
+    pub fn send(self: *EventStream, data: []const u8, opts: Options) Error!void {
+        try opts.validate();
+        return self.body.res.resolve(sendEvent(&self.body.interface, data, opts));
+    }
 
-        if (opts.event) |e| try self.conn.print("event: {s}\n", .{e});
-        if (opts.id) |id| try self.conn.print("id: {s}\n", .{id});
-        if (opts.retry) |r| try self.conn.print("retry: {d}\n", .{r});
+    /// The fields that precede the data. Reports the sentinel, as anything
+    /// writing to a `std.Io.Writer` does; the public entry points resolve it.
+    fn sendFields(w: *std.Io.Writer, opts: Options) std.Io.Writer.Error!void {
+        if (opts.event) |e| try w.print("event: {s}\n", .{e});
+        if (opts.id) |id| try w.print("id: {s}\n", .{id});
+        if (opts.retry) |r| try w.print("retry: {d}\n", .{r});
+    }
+
+    fn sendEvent(w: *std.Io.Writer, data: []const u8, opts: Options) std.Io.Writer.Error!void {
+        try sendFields(w, opts);
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             const stripped = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-            try self.conn.print("data: {s}\n", .{stripped});
+            try w.print("data: {s}\n", .{stripped});
         }
-        try self.conn.writeAll("\n");
-        try self.conn.flush();
+        try w.writeAll("\n");
+        // One event, one write: an event held back is an event the peer
+        // has not had, and the next one may be a long way off.
+        return w.flush();
     }
 };
 
@@ -183,11 +238,9 @@ pub const StreamingBodyWriter = struct {
     /// fails, so a handler that catches one can find out what happened
     /// instead of being told only that it did.
     err: ?Error = null,
-    /// Everything `writeHeader` can fail with, plus the real transport
-    /// errors hiding behind `WriteFailed`.
-    pub const Error = Connection.WriteError || HeaderError;
-
-    const HeaderError = @typeInfo(@typeInfo(@TypeOf(Response.writeHeader)).@"fn".return_type.?).error_union.error_set;
+    /// Everything a write to the connection can fail with, resolved to its
+    /// cause rather than the `std.Io.Writer` sentinel.
+    pub const Error = Response.SendError;
 
     fn init(res: *Response, buf: []u8) StreamingBodyWriter {
         return .{
@@ -196,24 +249,13 @@ pub const StreamingBodyWriter = struct {
         };
     }
 
-    /// Runs `result`, recording what actually went wrong. The interface
-    /// still reports the generic `WriteFailed`, as its contract requires;
-    /// `err` is where the answer lives.
-    fn record(self: *StreamingBodyWriter, result: HeaderError!void) std.Io.Writer.Error!void {
-        result catch |e| {
-            self.err = if (e == error.WriteFailed)
-                self.res.conn.getWriteError() orelse e
-            else
-                e;
+    /// Runs `result`, storing what actually went wrong. `drain` is the one
+    /// path that cannot hand the cause back -- the `std.Io.Writer` vtable
+    /// fixes its error set -- so this is the one place `err` is written.
+    fn record(self: *StreamingBodyWriter, result: std.Io.Writer.Error!void) std.Io.Writer.Error!void {
+        self.res.resolve(result) catch |cause| {
+            self.err = cause;
             return error.WriteFailed;
-        };
-    }
-
-    /// `record`, but returning the cause it stored rather than the sentinel.
-    /// Only `drain` has to return `error.WriteFailed`.
-    fn commit(self: *StreamingBodyWriter, result: HeaderError!void) Error!void {
-        self.record(result) catch |err| switch (err) {
-            error.WriteFailed => return self.err orelse err,
         };
     }
 
@@ -300,9 +342,9 @@ pub const StreamingBodyWriter = struct {
         // response.
         errdefer res.keepalive = false;
 
-        try self.commit(self.interface.flush());
-        if (res.chunked and !res.head) try self.commit(res.conn.writer.writeAll("0\r\n\r\n"));
-        try self.commit(res.conn.writer.flush());
+        try res.resolve(self.interface.flush());
+        if (res.chunked and !res.head) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
+        try res.resolve(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
         if (res.content_length) |declared| {
@@ -329,10 +371,6 @@ pub const Response = struct {
     /// server; a handler writes its body either way and does not have to
     /// know.
     head: bool = false,
-    /// Where a HEAD event stream writes. Per response rather than shared,
-    /// because two executors would otherwise be counting into the same
-    /// one.
-    discard: std.Io.Writer.Discarding = .init(&.{}),
     /// A body writer was handed out and has not been ended yet.
     body_writer_open: bool = false,
     /// Length declared before streaming, if any. On the response rather
@@ -341,6 +379,26 @@ pub const Response = struct {
     content_length: ?usize = null,
     /// Body bytes handed to the connection by a streaming writer.
     body_sent: usize = 0,
+
+    /// What shaping a header can fail with. Nothing here touches the
+    /// connection: a header set after the headers went out, a name or value
+    /// that would not survive the wire, one header too many.
+    pub const HeaderError = error{
+        HeadersAlreadySent,
+        InvalidHeaderName,
+        InvalidHeaderValue,
+        TooManyHeaders,
+    };
+
+    /// What sending bytes to the peer can fail with, resolved to the cause
+    /// the connection recorded. `error.WriteFailed` is the `std.Io.Writer`
+    /// vtable's sentinel and says nothing a caller can act on, so it does
+    /// not appear here; a writer that failed without recording a cause --
+    /// a fixed buffer running out, say -- comes back as `Unexpected`.
+    pub const SendError = Connection.WriteError || error{Unexpected};
+
+    /// What `writeHeader` and `write` can fail with.
+    pub const WriteError = HeaderError || SendError;
 
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
@@ -351,7 +409,7 @@ pub const Response = struct {
         };
     }
 
-    pub fn header(self: *Response, name: []const u8, value: []const u8) !void {
+    pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
         // Not a programmer error: middleware that runs after the handler
         // cannot know whether the handler chose to stream.
         if (self.headers_written) return error.HeadersAlreadySent;
@@ -435,17 +493,24 @@ pub const Response = struct {
         try self.headers.add("Set-Cookie", serialized);
     }
 
+    /// How much of an event the stream holds before pushing it at the
+    /// connection. One write per event is the point, so this only has to
+    /// be large enough that an ordinary event does not split across two.
+    const event_stream_buffer = 4096;
+
     pub fn startEventStream(self: *Response) !EventStream {
         try self.header("Content-Type", "text/event-stream");
         try self.header("Cache-Control", "no-cache");
-        self.keepalive = false;
-        self.streaming = true;
-        try self.writeHeader();
-        try self.conn.writer.flush();
+        // Chunked, like any other body of unknown length. An event stream
+        // could be delimited by closing the connection instead, but then a
+        // peer cannot tell a stream that ended from one that was cut, and
+        // the connection is spent either way.
+        //
         // A HEAD gets the headers an event stream would have opened with
-        // and none of the events, so the whole stream writes into a sink
-        // rather than every send having to ask.
-        return .{ .conn = if (self.head) &self.discard.writer else self.conn.writer };
+        // and none of the events; the body writer already drops what it is
+        // given for a HEAD, so no send has to ask.
+        const buf = try self.arena.alloc(u8, event_stream_buffer);
+        return .{ .body = try self.stream(buf) };
     }
 
     /// Upgrade HTTP connection to WebSocket.
@@ -474,17 +539,29 @@ pub const Response = struct {
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
         try self.writeHeader();
-        try self.conn.writer.flush();
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
         return WebSocket.init(req.io, self.conn.writer, req.conn, self.arena, seed);
     }
 
-    pub fn writeHeader(self: *Response) !void {
-        if (self.headers_written) {
-            return;
-        }
+    /// Turns the sentinel a `std.Io.Writer` reports into the cause the
+    /// connection recorded. The one place that answer is worked out: every
+    /// public entry point on the response and on the body writers over it
+    /// funnels its writes through here, so the sentinel never reaches a
+    /// caller. Only a `drain`, whose error set the vtable fixes, cannot --
+    /// which is what the writers' `err` fields are for.
+    fn resolve(self: *Response, result: std.Io.Writer.Error!void) SendError!void {
+        result catch |err| switch (err) {
+            error.WriteFailed => return self.conn.getWriteError() orelse error.Unexpected,
+        };
+    }
+
+    /// Settles the headers: applies `content_type` and marks them sent.
+    /// Returns whether they still have to go on the wire -- false once
+    /// something else has already put them there.
+    fn prepareHeader(self: *Response) HeaderError!bool {
+        if (self.headers_written) return false;
 
         // Set the Content-Type header. Before the flag, so it goes through
         // the same door as every other header rather than around it.
@@ -492,41 +569,59 @@ pub const Response = struct {
             try self.header("Content-Type", content_type.toContentType());
         }
         self.headers_written = true;
+        return true;
+    }
 
+    pub fn writeHeader(self: *Response) WriteError!void {
+        if (!try self.prepareHeader()) return;
+        return self.resolve(self.sendHeaderAlone(self.conn.writer));
+    }
+
+    /// The headers with nothing behind them. `write` sends them with a body
+    /// and flushes once for both; everything else -- a streaming body, an
+    /// event stream, a WebSocket -- has nothing queued, and the headers
+    /// must not wait in the buffer for a body that may be seconds away, or
+    /// that is the peer's turn to send.
+    fn sendHeaderAlone(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.sendHeader(w);
+        return w.flush();
+    }
+
+    /// The header block on the wire. Reports the sentinel, as anything
+    /// writing to a `std.Io.Writer` does; the public entry point resolves it.
+    fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
-        try self.conn.writer.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
+        try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
 
         // Write headers
         var iter = self.headers.iterator();
         while (iter.next()) |entry| {
-            try self.conn.writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+            try w.print("{s}: {s}\r\n", .{ entry.key, entry.value });
         }
 
         // Write Connection header based on keepalive
         if (!self.keepalive) {
-            try self.conn.writer.writeAll("Connection: close\r\n");
+            try w.writeAll("Connection: close\r\n");
         }
 
         // Write Transfer-Encoding or Content-Length
         if (self.chunked) {
-            try self.conn.writer.writeAll("Transfer-Encoding: chunked\r\n");
+            try w.writeAll("Transfer-Encoding: chunked\r\n");
         } else if (!self.streaming) {
             // Write Content-Length if not manually set (skip for streaming responses like SSE)
             const has_content_length = self.headers.get("Content-Length") != null;
             if (!has_content_length) {
                 const buffer_end = self.buffer.writer.end;
                 const body_len = if (buffer_end > 0) buffer_end else self.body.len;
-                try self.conn.writer.print("Content-Length: {d}\r\n", .{body_len});
+                try w.print("Content-Length: {d}\r\n", .{body_len});
             }
         }
 
         // End of headers (applies to both chunked and non-chunked)
-        try self.conn.writer.writeAll("\r\n");
-
-        // Don't flush here - let the caller flush after writing (the first part of) the body
+        try w.writeAll("\r\n");
     }
 
-    pub fn write(self: *Response) !void {
+    pub fn write(self: *Response) WriteError!void {
         if (self.written) {
             return;
         }
@@ -536,50 +631,53 @@ pub const Response = struct {
         // started body is still framed correctly.
         if (self.body_writer_open) {
             self.body_writer_open = false;
-            if (self.headers_written) {
-                // Streaming was under way. Whatever the writer still held
-                // is gone with the handler's buffer, so the body is short.
-                if (self.chunked) {
-                    // Framing survives: terminate and let the peer see a
-                    // truncated but well formed body.
-                    if (!self.head) try self.conn.writer.writeAll("0\r\n\r\n");
-                } else if (self.content_length) |declared| {
-                    // Nothing can make the body match the length we
-                    // promised, so the connection must not be reused: the
-                    // peer would read the next response as this body.
+            // Streaming under way with a declared length: whatever the
+            // writer still held is gone with the handler's buffer, so the
+            // body is short. Nothing can make it match the length we
+            // promised, and the connection must not be reused -- the peer
+            // would read the next response as this body. A chunked body
+            // needs no such care: `sendBody` terminates it, and a
+            // truncated but well framed body is one the peer can finish.
+            if (self.headers_written and !self.chunked) {
+                if (self.content_length) |declared| {
                     if (self.body_sent != declared) self.keepalive = false;
                 }
-                try self.conn.writer.flush();
-                self.written = true;
-                return;
             }
-            // Nothing was sent yet. A buffered body lives in the arena and
-            // is still good, so leave it be: an error handler that built a
-            // replacement has already cleared it.
+            // If nothing was sent yet, a buffered body lives in the arena
+            // and is still good, so leave it be: an error handler that
+            // built a replacement has already cleared it.
         }
         self.written = true;
 
+        // Already false for a chunked response: the streaming writer
+        // settled the headers when it sent them.
+        const send_header = try self.prepareHeader();
+        return self.resolve(self.sendBody(self.conn.writer, send_header));
+    }
+
+    /// Whatever this response still owes the peer, on the wire. Reports the
+    /// sentinel, as anything writing to a `std.Io.Writer` does; `write`
+    /// resolves it.
+    fn sendBody(self: *Response, w: *std.Io.Writer, send_header: bool) std.Io.Writer.Error!void {
         if (self.chunked) {
             // A streaming writer sent the headers; all that is left is the
             // terminator, which is body framing and so is not sent for a
             // HEAD either.
-            if (!self.head) try self.conn.writer.writeAll("0\r\n\r\n");
-            try self.conn.writer.flush();
-            return;
+            if (!self.head) try w.writeAll("0\r\n\r\n");
+            return w.flush();
         }
 
-        // Write headers if not already written
-        try self.writeHeader();
+        if (send_header) try self.sendHeader(w);
 
         // Write body (either from buffer or body field). A HEAD response
         // has already reported its length and must stop here.
         if (!self.head) {
             const buffered = self.buffer.writer.buffered();
             const body = if (buffered.len > 0) buffered else self.body;
-            try self.conn.writer.writeAll(body);
+            try w.writeAll(body);
         }
 
-        try self.conn.writer.flush();
+        return w.flush();
     }
 };
 
@@ -986,7 +1084,7 @@ test "StreamingBodyWriter: rejects a Content-Length it cannot parse" {
     try std.testing.expectError(error.InvalidContentLength, response.stream(&body_buf));
 }
 
-test "StreamingBodyWriter: records the real error behind error.WriteFailed" {
+test "StreamingBodyWriter: stream reports the real error, not error.WriteFailed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1000,8 +1098,7 @@ test "StreamingBodyWriter: records the real error behind error.WriteFailed" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     var body_buf: [64]u8 = undefined;
-    try std.testing.expectError(error.WriteFailed, response.stream(&body_buf));
-    try std.testing.expectEqual(error.ConnectionResetByPeer, connection.getWriteError().?);
+    try std.testing.expectError(error.ConnectionResetByPeer, response.stream(&body_buf));
 }
 
 test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
@@ -1040,9 +1137,84 @@ test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
     try body.interface.flush();
 
     try std.testing.expectError(error.ConnectionResetByPeer, body.end());
-    try std.testing.expectEqual(error.ConnectionResetByPeer, body.err.?);
     // A body that could not be framed as promised cannot share the connection.
     try std.testing.expectEqual(false, response.keepalive);
+}
+
+test "Response: write reports the real error, not error.WriteFailed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Too small to hold the status line, so the first write has nowhere to go.
+    var buf: [4]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.body = "hello";
+
+    try std.testing.expectError(error.ConnectionResetByPeer, response.write());
+}
+
+test "Response: writeHeader reports the real error, not error.WriteFailed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [4]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try std.testing.expectError(error.ConnectionResetByPeer, response.writeHeader());
+}
+
+test "Response: a write that recorded no cause reports Unexpected" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The buffer fills with nothing behind it to blame, so there is no
+    // cause to resolve to.
+    var buf: [4]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.body = "hello";
+
+    try std.testing.expectError(error.Unexpected, response.write());
+}
+
+test "Response: no std.Io.Writer sentinel escapes the public write API" {
+    // `error.WriteFailed` says only that a write failed, which the caller
+    // already knew when it called us. Everything below reaches the
+    // connection, and none of it may report the sentinel.
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    inline for (.{
+        Response.WriteError,
+        ErrorSetOf(Response.writeHeader),
+        ErrorSetOf(Response.write),
+        ErrorSetOf(Response.stream),
+        ErrorSetOf(Response.startEventStream),
+        ErrorSetOf(Response.upgradeWebSocket),
+        EventStream.Error,
+        EventWriter.Error,
+    }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        }
+    }
 }
 
 test "BodyWriter: end is idempotent" {
@@ -1307,48 +1479,103 @@ test "Response: json() with nested object" {
     try std.testing.expectEqualStrings("{\"user\":{\"name\":\"Bob\",\"id\":42},\"active\":true}", buffered);
 }
 
+/// An event stream over a fixed buffer. Built in place: the response points
+/// at the connection and the stream at the response, so none of it can be
+/// moved once it exists. `events` is what a test is actually after -- what
+/// went out behind the headers.
+const TestEventStream = struct {
+    arena: std.heap.ArenaAllocator,
+    conn_writer: std.Io.Writer,
+    connection: Connection,
+    response: Response,
+    stream: EventStream,
+    header_end: usize,
+    decoded: [1024]u8,
+
+    fn init(self: *TestEventStream, buf: []u8) !void {
+        self.arena = .init(std.testing.allocator);
+        self.conn_writer = .fixed(buf);
+        self.connection.initWriterForTesting(&self.conn_writer);
+        self.response = try Response.init(self.arena.allocator(), &self.connection, 32);
+        self.stream = try self.response.startEventStream();
+        self.header_end = self.conn_writer.end;
+    }
+
+    fn deinit(self: *TestEventStream) void {
+        self.arena.deinit();
+    }
+
+    /// What went out behind the headers, still chunk-framed.
+    fn raw(self: *TestEventStream) []const u8 {
+        return self.conn_writer.buffered()[self.header_end..];
+    }
+
+    /// The events with the chunk framing peeled off, so a test about how an
+    /// event is formatted does not have to spell out chunk sizes. That the
+    /// framing is there at all is asserted on its own, below.
+    fn events(self: *TestEventStream) ![]const u8 {
+        var rest = self.raw();
+        var n: usize = 0;
+        while (rest.len > 0) {
+            const size_end = std.mem.indexOf(u8, rest, "\r\n") orelse return error.TruncatedChunk;
+            const size = try std.fmt.parseInt(usize, rest[0..size_end], 16);
+            if (size == 0) break;
+            const body = rest[size_end + 2 ..];
+            if (body.len < size + 2) return error.TruncatedChunk;
+            @memcpy(self.decoded[n..][0..size], body[0..size]);
+            n += size;
+            rest = body[size + 2 ..];
+        }
+        return self.decoded[0..n];
+    }
+};
+
 test "EventStream: send with data only" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try stream.send("hello world", .{});
+    try t.stream.send("hello world", .{});
 
-    const written = conn_writer.buffered();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: hello world\n\n", written);
 }
 
 test "EventStream: send with event name" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try stream.send("payload", .{ .event = "update" });
+    try t.stream.send("payload", .{ .event = "update" });
 
-    const written = conn_writer.buffered();
+    const written = try t.events();
     try std.testing.expectEqualStrings("event: update\ndata: payload\n\n", written);
 }
 
 test "EventStream: send with all options" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try stream.send("payload", .{ .event = "update", .id = "42", .retry = 5000 });
+    try t.stream.send("payload", .{ .event = "update", .id = "42", .retry = 5000 });
 
-    const written = conn_writer.buffered();
+    const written = try t.events();
     try std.testing.expectEqualStrings("event: update\nid: 42\nretry: 5000\ndata: payload\n\n", written);
 }
 
 test "EventStream: multiple sends" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try stream.send("first", .{});
-    try stream.send("second", .{ .event = "msg" });
+    try t.stream.send("first", .{});
+    try t.stream.send("second", .{ .event = "msg" });
 
-    const written = conn_writer.buffered();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: first\n\nevent: msg\ndata: second\n\n", written);
 }
 
@@ -1363,7 +1590,7 @@ test "Response: startEventStream" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    const stream = try response.startEventStream();
+    var stream = try response.startEventStream();
 
     try stream.send("connected", .{});
 
@@ -1372,7 +1599,126 @@ test "Response: startEventStream" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: text/event-stream") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Cache-Control: no-cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "data: connected\n\n") != null);
-    try std.testing.expectEqual(false, response.keepalive);
+    // The stream has no length to declare, so it is chunked -- which is
+    // what lets the peer tell a stream that ended from one that was cut,
+    // and lets the connection outlive it.
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
+    try std.testing.expectEqual(true, response.keepalive);
+}
+
+test "EventStream: each event is one chunk" {
+    var buf: [1024]u8 = undefined;
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
+
+    try t.stream.send("hi", .{});
+    try t.stream.send("there", .{ .event = "msg" });
+
+    // One chunk per event, so a peer sees each one whole and as soon as it
+    // is sent rather than when the buffer happens to fill.
+    try std.testing.expectEqualStrings(
+        "a\r\ndata: hi\n\n\r\n" ++
+            "18\r\nevent: msg\ndata: there\n\n\r\n",
+        t.raw(),
+    );
+}
+
+test "EventStream: send reports the real error, not error.WriteFailed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // What opening the stream puts on the wire. The failing pass below gets
+    // exactly that much room, so the first event has nowhere to go.
+    const header_len = blk: {
+        var probe: [1024]u8 = undefined;
+        var probe_writer: std.Io.Writer = .fixed(&probe);
+        var probe_conn: Connection = undefined;
+        probe_conn.initWriterForTesting(&probe_writer);
+        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        _ = try probe_res.startEventStream();
+        break :blk probe_writer.end;
+    };
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(buf[0..header_len]);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var stream = try response.startEventStream();
+
+    try std.testing.expectError(error.ConnectionResetByPeer, stream.send("hello", .{}));
+    try std.testing.expectEqual(error.ConnectionResetByPeer, stream.body.err.?);
+}
+
+test "EventWriter: end reports the real error, not error.WriteFailed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const header_len = blk: {
+        var probe: [1024]u8 = undefined;
+        var probe_writer: std.Io.Writer = .fixed(&probe);
+        var probe_conn: Connection = undefined;
+        probe_conn.initWriterForTesting(&probe_writer);
+        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        _ = try probe_res.startEventStream();
+        break :blk probe_writer.end;
+    };
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(buf[0..header_len]);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var stream = try response.startEventStream();
+
+    // The event is held in the stream's buffer, so nothing reaches the
+    // connection until `end` closes it.
+    var w = try stream.startSend(.{});
+    try w.interface.writeAll("hello");
+    try std.testing.expectError(error.ConnectionResetByPeer, w.end());
+}
+
+test "EventWriter: an event too long for the buffer reports the real error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const header_len = blk: {
+        var probe: [1024]u8 = undefined;
+        var probe_writer: std.Io.Writer = .fixed(&probe);
+        var probe_conn: Connection = undefined;
+        probe_conn.initWriterForTesting(&probe_writer);
+        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        _ = try probe_res.startEventStream();
+        break :blk probe_writer.end;
+    };
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(buf[0..header_len]);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var stream = try response.startEventStream();
+    var w = try stream.startSend(.{});
+
+    // Longer than the stream holds, so it reaches the connection while it
+    // is still being written rather than at `end`. That is what a caller
+    // filling an event from a template does, and the interface can only
+    // tell them the sentinel.
+    const long = try arena.allocator().alloc(u8, Response.event_stream_buffer + 1);
+    @memset(long, 'x');
+
+    try std.testing.expectError(error.WriteFailed, w.interface.writeAll(long));
+    try std.testing.expectEqual(error.ConnectionResetByPeer, w.err.?);
+    // The stream underneath resolved it, and both copies agree.
+    try std.testing.expectEqual(error.ConnectionResetByPeer, stream.body.err.?);
 }
 
 test "Response: setCookie basic" {
@@ -1472,120 +1818,130 @@ test "Response: setCookie rejects a value that would inject a header" {
 
 test "EventStream: rejects newline in event and id fields" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try std.testing.expectError(error.InvalidEventField, stream.send("ok", .{ .event = "bad\nevent" }));
-    try std.testing.expectError(error.InvalidEventField, stream.send("ok", .{ .id = "bad\rid" }));
+    try std.testing.expectError(error.InvalidEventField, t.stream.send("ok", .{ .event = "bad\nevent" }));
+    try std.testing.expectError(error.InvalidEventField, t.stream.send("ok", .{ .id = "bad\rid" }));
 }
 
 test "EventStream: multi-line data splits into multiple data lines" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try stream.send("line1\nline2", .{});
+    try t.stream.send("line1\nline2", .{});
 
-    const written = conn_writer.buffered();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
 }
 
 test "EventStream: CRLF line endings stripped in data" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    try stream.send("line1\r\nline2", .{});
+    try t.stream.send("line1\r\nline2", .{});
 
-    const written = conn_writer.buffered();
+    const written = try t.events();
     try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", written);
 }
 
 test "EventWriter: basic write" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{});
+    var ew = try t.stream.startSend(.{});
     try ew.interface.writeAll("hello");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: hello\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("data: hello\n\n", try t.events());
 }
 
 test "EventWriter: multi-line" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{});
+    var ew = try t.stream.startSend(.{});
     try ew.interface.writeAll("line1\nline2");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("data: line1\ndata: line2\n\n", try t.events());
 }
 
 test "EventWriter: print" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{});
+    var ew = try t.stream.startSend(.{});
     try ew.interface.print("count: {d}", .{42});
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: count: 42\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("data: count: 42\n\n", try t.events());
 }
 
 test "EventWriter: with options" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{ .event = "update", .id = "42" });
+    var ew = try t.stream.startSend(.{ .event = "update", .id = "42" });
     try ew.interface.writeAll("payload");
     try ew.end();
 
-    try std.testing.expectEqualStrings("event: update\nid: 42\ndata: payload\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("event: update\nid: 42\ndata: payload\n\n", try t.events());
 }
 
 test "EventWriter: multiple writes merged into one event" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{});
+    var ew = try t.stream.startSend(.{});
     try ew.interface.writeAll("foo");
     try ew.interface.writeAll("bar");
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: foobar\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("data: foobar\n\n", try t.events());
 }
 
 test "EventWriter: writeByte" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{});
+    var ew = try t.stream.startSend(.{});
     try ew.interface.writeByte('A');
     try ew.interface.writeByte('B');
     try ew.interface.writeByte('C');
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: ABC\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("data: ABC\n\n", try t.events());
 }
 
 test "EventWriter: splatBytesAll" {
     var buf: [1024]u8 = undefined;
-    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var t: TestEventStream = undefined;
+    try t.init(&buf);
+    defer t.deinit();
 
-    const stream = EventStream{ .conn = &conn_writer };
-    var ew = try stream.startSend(.{});
+    var ew = try t.stream.startSend(.{});
     try ew.interface.splatBytesAll("ab", 3);
     try ew.end();
 
-    try std.testing.expectEqualStrings("data: ababab\n\n", conn_writer.buffered());
+    try std.testing.expectEqualStrings("data: ababab\n\n", try t.events());
 }
 
 test "Response: resetBody replaces a half written body" {
@@ -1765,7 +2121,7 @@ test "Response: a HEAD event stream sends the headers and no events" {
     var response = try Response.init(arena.allocator(), &connection, 32);
     response.head = true;
 
-    const stream = try response.startEventStream();
+    var stream = try response.startEventStream();
     try stream.send("hello", .{});
     var w = try stream.startSend(.{ .event = "tick" });
     try w.interface.writeAll("more");
