@@ -1,4 +1,5 @@
 const std = @import("std");
+const Transport = @import("transport.zig").Transport;
 
 /// An established WebSocket connection (RFC 6455). Obtained from
 /// `Response.upgradeWebSocket` on the server side and `Client.connectWebSocket`
@@ -7,8 +8,10 @@ const std = @import("std");
 /// One task may call `receive`; any number of tasks may send concurrently.
 pub const WebSocket = struct {
     io: std.Io,
-    conn: *std.Io.Writer,
-    reader: *std.Io.Reader,
+    /// The connection underneath, and the only thing that knows why a frame
+    /// failed to go out or come in. Shared with both ends of the library,
+    /// which hold unrelated `Connection` types.
+    transport: Transport,
     msg_arena: std.heap.ArenaAllocator,
     is_client: bool = false,
     prng: std.Random.DefaultPrng,
@@ -66,11 +69,10 @@ pub const WebSocket = struct {
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-    pub fn init(io: std.Io, conn: *std.Io.Writer, reader: *std.Io.Reader, gpa: std.mem.Allocator, seed: u64) WebSocket {
+    pub fn init(io: std.Io, transport: Transport, gpa: std.mem.Allocator, seed: u64) WebSocket {
         return .{
             .io = io,
-            .conn = conn,
-            .reader = reader,
+            .transport = transport,
             .msg_arena = std.heap.ArenaAllocator.init(gpa),
             .prng = std.Random.DefaultPrng.init(seed),
         };
@@ -86,6 +88,15 @@ pub const WebSocket = struct {
     /// Pong frames are ignored.
     /// The returned message data is valid until the next call to receive().
     pub fn receive(self: *WebSocket) !Message {
+        return self.receiveFrame() catch |err| switch (err) {
+            // The reads inside can only report the sentinel; the transport
+            // knows what actually happened.
+            error.ReadFailed => self.transport.getReadError() orelse error.Unexpected,
+            else => |e| e,
+        };
+    }
+
+    fn receiveFrame(self: *WebSocket) !Message {
         _ = self.msg_arena.reset(.retain_capacity);
         self.fragmented_data = .empty;
         self.auto_responded = false;
@@ -187,7 +198,7 @@ pub const WebSocket = struct {
     fn readFrame(self: *WebSocket) !Frame {
         // Read first 2 bytes (header)
         var header: [2]u8 = undefined;
-        try self.reader.readSliceAll(&header);
+        try self.transport.reader.readSliceAll(&header);
 
         const fin = (header[0] & 0x80) != 0;
         // RSV1, RSV2, RSV3 must be 0 (we don't support extensions)
@@ -216,18 +227,18 @@ pub const WebSocket = struct {
         // Extended payload length
         if (payload_len == 126) {
             var len_buf: [2]u8 = undefined;
-            try self.reader.readSliceAll(&len_buf);
+            try self.transport.reader.readSliceAll(&len_buf);
             payload_len = std.mem.readInt(u16, &len_buf, .big);
         } else if (payload_len == 127) {
             var len_buf: [8]u8 = undefined;
-            try self.reader.readSliceAll(&len_buf);
+            try self.transport.reader.readSliceAll(&len_buf);
             payload_len = std.mem.readInt(u64, &len_buf, .big);
         }
 
         // Read masking key if present (client -> server messages are masked)
         var mask_key: [4]u8 = undefined;
         if (masked) {
-            try self.reader.readSliceAll(&mask_key);
+            try self.transport.reader.readSliceAll(&mask_key);
         }
 
         // Read payload
@@ -235,7 +246,7 @@ pub const WebSocket = struct {
             return Error.MessageTooLarge;
         }
         const payload = try self.msg_arena.allocator().alloc(u8, @intCast(payload_len));
-        try self.reader.readSliceAll(payload);
+        try self.transport.reader.readSliceAll(payload);
 
         // Unmask if needed
         if (masked) {
@@ -251,52 +262,60 @@ pub const WebSocket = struct {
         };
     }
 
+    /// Turns the sentinel a `std.Io.Writer` reports into the cause the
+    /// transport recorded. Every frame leaves through here.
+    fn resolveWrite(self: *WebSocket, result: std.Io.Writer.Error!void) !void {
+        result catch |err| switch (err) {
+            error.WriteFailed => return self.transport.getWriteError() orelse error.Unexpected,
+        };
+    }
+
     fn writeFrame(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.writeFrameLocked(opcode, data, fin);
+        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin));
     }
 
-    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) !void {
+    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) std.Io.Writer.Error!void {
         // A half-written frame leaves the peer unable to find the next frame
         // boundary.
         errdefer self.closed = true;
 
         // First byte: FIN + opcode
         const byte0: u8 = (@as(u8, if (fin) 0x80 else 0x00)) | @intFromEnum(opcode);
-        try self.conn.writeByte(byte0);
+        try self.transport.writer.writeByte(byte0);
 
         // Second byte: mask bit + payload length
         const mask_bit: u8 = if (self.is_client) 0x80 else 0x00;
         if (data.len < 126) {
-            try self.conn.writeByte(mask_bit | @as(u8, @intCast(data.len)));
+            try self.transport.writer.writeByte(mask_bit | @as(u8, @intCast(data.len)));
         } else if (data.len <= 65535) {
-            try self.conn.writeByte(mask_bit | 126);
+            try self.transport.writer.writeByte(mask_bit | 126);
             var len_buf: [2]u8 = undefined;
             std.mem.writeInt(u16, &len_buf, @intCast(data.len), .big);
-            try self.conn.writeAll(&len_buf);
+            try self.transport.writer.writeAll(&len_buf);
         } else {
-            try self.conn.writeByte(mask_bit | 127);
+            try self.transport.writer.writeByte(mask_bit | 127);
             var len_buf: [8]u8 = undefined;
             std.mem.writeInt(u64, &len_buf, @intCast(data.len), .big);
-            try self.conn.writeAll(&len_buf);
+            try self.transport.writer.writeAll(&len_buf);
         }
 
         if (self.is_client) {
             // Client frames must be masked (RFC 6455)
             var mask_key: [4]u8 = undefined;
             self.prng.random().bytes(&mask_key);
-            try self.conn.writeAll(&mask_key);
+            try self.transport.writer.writeAll(&mask_key);
 
             // XOR payload with mask key
             for (data, 0..) |byte, i| {
-                try self.conn.writeByte(byte ^ mask_key[i % 4]);
+                try self.transport.writer.writeByte(byte ^ mask_key[i % 4]);
             }
         } else {
-            try self.conn.writeAll(data);
+            try self.transport.writer.writeAll(data);
         }
-        try self.conn.flush();
+        try self.transport.writer.flush();
     }
 
     fn writeClose(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
@@ -309,7 +328,7 @@ pub const WebSocket = struct {
         std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
-        try self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true);
+        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true));
     }
 
     /// Compute Sec-WebSocket-Accept value from client key
@@ -335,7 +354,7 @@ test "WebSocket: writeFrame text" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     try ws.writeFrame(.text, "Hello", true);
 
@@ -353,7 +372,7 @@ test "WebSocket: writeFrame binary with medium length" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
 
     const payload = "x" ** 200;
@@ -373,7 +392,7 @@ test "WebSocket: writeClose" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     try ws.writeClose(.normal, "goodbye");
 
@@ -402,7 +421,7 @@ test "WebSocket: readFrame unmasked (client mode)" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
     const frame = try ws.readFrame();
@@ -418,7 +437,7 @@ test "WebSocket: readFrame rejects unmasked client frame (server mode)" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     // is_client = false (default) — must reject unmasked input per RFC 6455 §5.1.
     try std.testing.expectError(WebSocket.Error.UnmaskedClientFrame, ws.readFrame());
@@ -434,7 +453,7 @@ test "WebSocket: readFrame rejects masked server frame (client mode)" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
     try std.testing.expectError(WebSocket.Error.MaskedServerFrame, ws.readFrame());
@@ -456,7 +475,7 @@ test "WebSocket: readFrame masked" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     const frame = try ws.readFrame();
 
@@ -481,7 +500,7 @@ test "WebSocket: receive handles ping automatically" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     const msg = try ws.receive();
 
@@ -510,7 +529,7 @@ test "WebSocket: readFrame rejects RSV bits" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     try std.testing.expectError(WebSocket.Error.ReservedFlags, ws.readFrame());
 }
@@ -530,7 +549,7 @@ test "WebSocket: readFrame rejects large control frame" {
     var buf: [1024]u8 = undefined;
     var conn_writer: std.Io.Writer = .fixed(&buf);
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
     try std.testing.expectError(WebSocket.Error.LargeControlFrame, ws.readFrame());
@@ -541,7 +560,7 @@ test "WebSocket: writeFrame masked (client mode)" {
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(std.testing.io, &conn_writer, &reader, std.testing.allocator, 0);
+    var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
     try ws.writeFrame(.text, "Hello", true);
@@ -610,7 +629,7 @@ test "WebSocket: concurrent sends do not interleave within a frame" {
     defer probe.out.deinit(gpa);
     var reader: std.Io.Reader = .fixed("");
 
-    var ws = WebSocket.init(io, &probe.interface, &reader, gpa, 0);
+    var ws = WebSocket.init(io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
     defer ws.deinit();
 
     const a = "a" ** 300;
@@ -639,5 +658,47 @@ test "WebSocket: concurrent sends do not interleave within a frame" {
     const ba = frame_b ++ frame_a;
     if (!std.mem.eql(u8, written, &ab) and !std.mem.eql(u8, written, &ba)) {
         return error.FrameInterleaved;
+    }
+}
+
+test "WebSocket: send reports the real error, not error.WriteFailed" {
+    // Too small to hold the frame, so the payload has nowhere to go.
+    var buf: [4]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var reader: std.Io.Reader = .fixed("");
+
+    // No socket, but something beneath the writer that recorded a cause --
+    // which is all the transport is consulted for.
+    var tcp_writer: std.Io.net.Stream.Writer = undefined;
+    tcp_writer.err = error.ConnectionResetByPeer;
+
+    var ws = WebSocket.init(std.testing.io, .{
+        .writer = &conn_writer,
+        .reader = &reader,
+        .tcp_writer = &tcp_writer,
+    }, std.testing.allocator, 0);
+    defer ws.deinit();
+
+    try std.testing.expectError(error.ConnectionResetByPeer, ws.send(.text, "x" ** 64));
+}
+
+test "WebSocket: no std.Io sentinel escapes its public API" {
+    // `ReadFailed`/`WriteFailed` say only that a read or write failed, which
+    // the caller knew when it called. Neither may leave these.
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    inline for (.{
+        ErrorSetOf(WebSocket.send),
+        ErrorSetOf(WebSocket.ping),
+        ErrorSetOf(WebSocket.close),
+        ErrorSetOf(WebSocket.receive),
+    }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+        }
     }
 }

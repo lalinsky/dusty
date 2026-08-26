@@ -994,7 +994,7 @@ pub const Client = struct {
 
         var seed: u64 = undefined;
         self.io.random(std.mem.asBytes(&seed));
-        var ws = WebSocket.init(self.io, conn.writer, conn.reader, conn.allocator, seed);
+        var ws = WebSocket.init(self.io, conn.transport(), conn.allocator, seed);
         ws.is_client = true;
         return .{ .ws = ws, .conn = conn };
     }
