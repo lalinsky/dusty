@@ -18,6 +18,7 @@ const WebSocket = @import("websocket.zig").WebSocket;
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
 const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
+const Transport = @import("transport.zig").Transport;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
 const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
@@ -516,6 +517,36 @@ pub const Connection = struct {
         }
     }
 
+    /// A borrowed view of the reader/writer stack, and the one thing that
+    /// knows how to say what a failed read or write actually was. Shared with
+    /// the server rather than reimplemented, which is how the TLS layer's
+    /// errors stopped being invisible here.
+    pub fn transport(self: *Connection) Transport {
+        const has_tls = build_options.use_tls and self.tls_conn != null;
+        return .{
+            .reader = self.reader,
+            .writer = self.writer,
+            .tcp_reader = &self.tcp_reader,
+            .tcp_writer = &self.tcp_writer,
+            .tls_reader = if (has_tls) &self.tls_reader else null,
+            .tls_writer = if (has_tls) &self.tls_writer else null,
+        };
+    }
+
+    pub const ReadError = Transport.ReadError;
+    pub const WriteError = Transport.WriteError;
+
+    /// The real error behind a generic `error.ReadFailed`, if any was recorded.
+    pub fn getReadError(self: *Connection) ?ReadError {
+        return self.transport().getReadError();
+    }
+
+    /// The real error behind a generic `error.WriteFailed`, if any was
+    /// recorded.
+    pub fn getWriteError(self: *Connection) ?WriteError {
+        return self.transport().getWriteError();
+    }
+
     pub fn deinit(self: *Connection) void {
         self.stream.close(self.io);
         if (self.protocol == .https) {
@@ -943,7 +974,7 @@ pub const Client = struct {
 
         // Parse response headers
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
-            error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+            error.ReadFailed => return conn.getReadError() orelse error.ReadFailed,
             else => |e| return e,
         };
 
@@ -1024,7 +1055,7 @@ pub const Client = struct {
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
             conn.closing = true;
             switch (err) {
-                error.ReadFailed => return conn.tcp_reader.err orelse error.ReadFailed,
+                error.ReadFailed => return conn.getReadError() orelse error.ReadFailed,
                 else => |e| return e,
             }
         };
@@ -1056,7 +1087,7 @@ pub const Client = struct {
                     _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
                         error.ReadFailed => {
                             conn.closing = true;
-                            return conn.tcp_reader.err orelse error.ReadFailed;
+                            return conn.getReadError() orelse error.ReadFailed;
                         },
                     };
                     if (!conn.parser.isBodyComplete()) conn.closing = true;

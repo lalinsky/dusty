@@ -13,6 +13,7 @@ const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
+const Transport = @import("transport.zig").Transport;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 
 const log = std.log.scoped(.dusty);
@@ -131,78 +132,35 @@ pub const Connection = struct {
         self.arena.deinit();
     }
 
-    // tls.zig records `TransportReadFailed`/`TransportWriteFailed` when the
-    // layer below it failed, because all it saw was the ciphertext
-    // reader/writer's generic error; the real cause is on the TCP layer.
-    // So those two mean "keep descending". A TLS-level failure (bad record
-    // mac, bad version, ...) is recorded as itself and stops the search.
-    //
-    // They are switched on rather than compared so that they drop out of
-    // the inferred error set as well as out of the answer: like the
-    // `WriteFailed` they stand in for, they name no cause a caller could
-    // act on, and nothing that descends past them can return one.
-
-    fn checkReadError(self: *Connection) !void {
-        if (build_options.use_tls) {
-            if (self.tls_conn != null) {
-                if (self.tls_reader.err) |e| switch (e) {
-                    // Keep descending: the cause is on the TCP layer below.
-                    error.TransportReadFailed => {},
-                    else => |cause| return cause,
-                };
-            }
-        }
-        if (self.tcp_reader.err) |e| return e;
+    /// A borrowed view of the layers above, for the parts of the library
+    /// that are shared with the client and so can hold neither `Connection`.
+    pub fn transport(self: *Connection) Transport {
+        const has_tls = build_options.use_tls and self.tls_conn != null;
+        return .{
+            .reader = self.reader,
+            .writer = self.writer,
+            .tcp_reader = &self.tcp_reader,
+            .tcp_writer = &self.tcp_writer,
+            .tls_reader = if (has_tls) &self.tls_reader else null,
+            .tls_writer = if (has_tls) &self.tls_writer else null,
+        };
     }
 
-    /// The error type `getReadError` yields.
-    pub const ReadError = @typeInfo(@TypeOf(checkReadError(undefined))).error_union.error_set;
+    pub const ReadError = Transport.ReadError;
+    pub const WriteError = Transport.WriteError;
 
     /// The real error behind a generic `error.ReadFailed`, if any was recorded.
     pub fn getReadError(self: *Connection) ?ReadError {
-        if (checkReadError(self)) |_| return null else |e| return e;
+        return self.transport().getReadError();
     }
-
-    fn checkWriteError(self: *Connection) !void {
-        if (build_options.use_tls) {
-            if (self.tls_conn != null) {
-                if (self.tls_writer.err) |e| switch (e) {
-                    // Keep descending: the cause is on the TCP layer below.
-                    error.TransportWriteFailed => {},
-                    else => |cause| return cause,
-                };
-            }
-        }
-        if (self.tcp_writer.err) |e| return e;
-    }
-
-    /// The error type `getWriteError` yields.
-    pub const WriteError = @typeInfo(@TypeOf(checkWriteError(undefined))).error_union.error_set;
 
     /// The real error behind a generic `error.WriteFailed`, if any was
     /// recorded.
     pub fn getWriteError(self: *Connection) ?WriteError {
-        if (checkWriteError(self)) |_| return null else |e| return e;
+        return self.transport().getWriteError();
     }
 
-    /// True when `err` means the peer is gone rather than something being
-    /// wrong. Teardown is the same either way; this only decides whether the
-    /// connection is worth a log line and whether shutdown() is worth a
-    /// syscall.
-    pub fn isPeerGone(err: anyerror) bool {
-        return switch (err) {
-            error.EndOfStream,
-            // Peer closed the transport between TLS records without
-            // close_notify. Rude, but routine from clients that just close
-            // the socket. `TlsTruncated`, where a record was cut in half, is
-            // deliberately not here.
-            error.TlsUnexpectedEof,
-            error.ConnectionResetByPeer,
-            error.BrokenPipe,
-            => true,
-            else => false,
-        };
-    }
+    pub const isPeerGone = Transport.isPeerGone;
 };
 
 pub const Address = union(enum) {
