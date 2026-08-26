@@ -876,13 +876,22 @@ pub const Client = struct {
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
-            client_cert = try tls.config.CertKeyPair.fromFilePath(
+            client_cert = tls.config.CertKeyPair.fromFilePath(
                 self.allocator,
                 self.io,
                 cc.dir orelse std.Io.Dir.cwd(),
                 cc.cert_path,
                 cc.key_path,
-            );
+                // Reads the certificate and key off disk through readers
+                // that belong to tls.zig, which keeps their causes to
+                // itself -- all that comes back is `error.ReadFailed`.
+                // Named here rather than passed on: in the error set of a
+                // request a bare read failure cannot be told from the socket
+                // failing, and this one is about a file the caller named.
+            ) catch |err| switch (err) {
+                error.ReadFailed => return error.TlsConfigUnreadable,
+                else => |e| return e,
+            };
         }
 
         self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };
@@ -1616,23 +1625,20 @@ test "ClientResponse: a streaming read can be resolved without going through bod
     try std.testing.expectEqual(error.BadGzipHeader, response.getReadError().?);
 }
 
-test "Client: no std.Io.Reader sentinel escapes the response API" {
-    // `ReadFailed` says only that a read failed, which the caller knew when
-    // it called. The response side has more layers than the server's --
-    // socket, TLS, body framing, decompression -- and any of them could drop
-    // its answer on the way up.
+test "Client: no std.Io sentinel escapes its public API" {
+    // `ReadFailed`/`WriteFailed` say only that a read or write failed, which
+    // the caller knew when it called. The client stacks more layers than the
+    // server does -- socket, TLS, request and response framing,
+    // decompression -- and any of them could drop its answer on the way up.
     const ErrorSetOf = struct {
         fn f(comptime func: anytype) type {
             return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
         }
     }.f;
-    //
-    // `Client.fetch` and `Client.connectWebSocket` are deliberately absent:
-    // they also write the request and open the connection, and neither path
-    // resolves yet. That is the client's half of what #144 did for the
-    // server's responses, and it is not this change.
     inline for (.{
         ErrorSetOf(ClientResponse.body),
+        ErrorSetOf(Client.fetch),
+        ErrorSetOf(Client.connectWebSocket),
         ErrorSetOf(WebSocketClient.send),
         ErrorSetOf(WebSocketClient.receive),
     }) |Set| {
