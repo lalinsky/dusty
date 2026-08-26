@@ -697,6 +697,39 @@ pub const ClientResponse = struct {
 
     /// Read the entire response body into memory.
     /// Result is cached for subsequent calls.
+    /// Walks down from the topmost layer that ran to whichever one recorded
+    /// what went wrong. Which layers those are depends on what `reader`
+    /// handed out: a corrupt gzip stream fails in the decompressor, above a
+    /// body reader that saw nothing wrong.
+    ///
+    /// Errors rather than returning one, so its set can be inferred; the same
+    /// shape `Connection.checkReadError` has.
+    fn checkRead(self: *ClientResponse) !void {
+        if (self._decompressor_init) {
+            if (self._decompressor.err) |e| switch (e) {
+                // The decompressor stores whatever it was handed, and what
+                // the body reader hands it on failure is the sentinel. So
+                // this means "the layer below failed, keep descending" --
+                // the same thing tls.zig's `TransportReadFailed` means, and
+                // it leaves the inferred error set the same way.
+                error.ReadFailed => {},
+                else => |cause| return cause,
+            };
+        }
+        if (self._body_reader.err) |e| return e;
+    }
+
+    /// The error type `getReadError` yields.
+    pub const ReadError = @typeInfo(@TypeOf(checkRead(undefined))).error_union.error_set;
+
+    /// The real error behind an `error.ReadFailed` from `reader`, if any
+    /// layer recorded one. `body` resolves for you; a caller streaming the
+    /// body itself has to ask, since the interface it reads through cannot
+    /// say more than that a read failed.
+    pub fn getReadError(self: *ClientResponse) ?ReadError {
+        if (checkRead(self)) |_| return null else |e| return e;
+    }
+
     pub fn body(self: *ClientResponse) !?[]const u8 {
         if (self._body_read) {
             return self._body;
@@ -705,25 +738,7 @@ pub const ClientResponse = struct {
         const r = self.reader();
         const result = r.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
-            // The interface can only say that a read failed. Which layer
-            // holds the answer depends on which reader `reader` handed out:
-            // a corrupt gzip stream fails in the decompressor, above a body
-            // reader that saw nothing wrong.
-            error.ReadFailed => {
-                if (self._decompressor_init) {
-                    if (self._decompressor.err) |e| switch (e) {
-                        // The decompressor stores whatever it was handed, and
-                        // what the body reader hands it on failure is the
-                        // sentinel. So this means "the layer below failed,
-                        // keep descending" -- the same thing tls.zig's
-                        // `TransportReadFailed` means, and it leaves the
-                        // inferred error set the same way.
-                        error.ReadFailed => {},
-                        else => |cause| return cause,
-                    };
-                }
-                return self._body_reader.err orelse error.Unexpected;
-            },
+            error.ReadFailed => return self.getReadError() orelse error.Unexpected,
             else => |e| return e,
         };
 
@@ -1513,6 +1528,36 @@ test "ClientResponse.body: a corrupt gzip body reports the decompression failure
     // The bytes arrived intact; it is the layer above the body reader that
     // could not make sense of them, so that is where the answer is.
     try std.testing.expectError(error.BadGzipHeader, response.body());
+}
+
+test "ClientResponse: a streaming read can be resolved without going through body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++
+        ("not a gzip stream at all" ++ "12345678");
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // Streaming the body rather than calling `body`, which is the case with
+    // no other way to find out what happened.
+    const r = response.reader();
+    var sink: std.Io.Writer = .fixed(&[_]u8{});
+    try std.testing.expectError(error.ReadFailed, r.stream(&sink, .limited(64)));
+    try std.testing.expectEqual(error.BadGzipHeader, response.getReadError().?);
 }
 
 test "Client: no std.Io.Reader sentinel escapes the response API" {
