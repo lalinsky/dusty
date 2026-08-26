@@ -155,8 +155,11 @@ pub const Connection = struct {
         if (self.tcp_reader.err) |e| return e;
     }
 
+    /// The error type `getReadError` yields.
+    pub const ReadError = @typeInfo(@TypeOf(checkReadError(undefined))).error_union.error_set;
+
     /// The real error behind a generic `error.ReadFailed`, if any was recorded.
-    pub fn getReadError(self: *Connection) ?@typeInfo(@TypeOf(checkReadError(self))).error_union.error_set {
+    pub fn getReadError(self: *Connection) ?ReadError {
         if (checkReadError(self)) |_| return null else |e| return e;
     }
 
@@ -178,7 +181,7 @@ pub const Connection = struct {
 
     /// The real error behind a generic `error.WriteFailed`, if any was
     /// recorded.
-    pub fn getWriteError(self: *Connection) ?@typeInfo(@TypeOf(checkWriteError(self))).error_union.error_set {
+    pub fn getWriteError(self: *Connection) ?WriteError {
         if (checkWriteError(self)) |_| return null else |e| return e;
     }
 
@@ -795,9 +798,7 @@ test "Connection: the placeholders it descends past stay out of its error sets" 
     // below failed", which is what the accessors exist to look past. They
     // must not survive into what a caller can be handed, any more than the
     // `ReadFailed`/`WriteFailed` they stand in for.
-    var conn = testTlsConnection();
-    const ReadError = @typeInfo(@TypeOf(conn.getReadError())).optional.child;
-    inline for (@typeInfo(ReadError).error_set.?) |e| {
+    inline for (@typeInfo(Connection.ReadError).error_set.?) |e| {
         try std.testing.expect(!std.mem.eql(u8, e.name, "TransportReadFailed"));
     }
     inline for (@typeInfo(Connection.WriteError).error_set.?) |e| {
