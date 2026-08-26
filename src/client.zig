@@ -705,9 +705,25 @@ pub const ClientResponse = struct {
         const r = self.reader();
         const result = r.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
-            // The interface can only say that a read failed; the reader
-            // holds what it was.
-            error.ReadFailed => return self._body_reader.err orelse error.Unexpected,
+            // The interface can only say that a read failed. Which layer
+            // holds the answer depends on which reader `reader` handed out:
+            // a corrupt gzip stream fails in the decompressor, above a body
+            // reader that saw nothing wrong.
+            error.ReadFailed => {
+                if (self._decompressor_init) {
+                    if (self._decompressor.err) |e| switch (e) {
+                        // The decompressor stores whatever it was handed, and
+                        // what the body reader hands it on failure is the
+                        // sentinel. So this means "the layer below failed,
+                        // keep descending" -- the same thing tls.zig's
+                        // `TransportReadFailed` means, and it leaves the
+                        // inferred error set the same way.
+                        error.ReadFailed => {},
+                        else => |cause| return cause,
+                    };
+                }
+                return self._body_reader.err orelse error.Unexpected;
+            },
             else => |e| return e,
         };
 
@@ -977,7 +993,7 @@ pub const Client = struct {
 
         // Parse response headers
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| switch (err) {
-            error.ReadFailed => return conn.getReadError() orelse error.ReadFailed,
+            error.ReadFailed => return conn.getReadError() orelse error.Unexpected,
             else => |e| return e,
         };
 
@@ -1058,7 +1074,7 @@ pub const Client = struct {
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
             conn.closing = true;
             switch (err) {
-                error.ReadFailed => return conn.getReadError() orelse error.ReadFailed,
+                error.ReadFailed => return conn.getReadError() orelse error.Unexpected,
                 else => |e| return e,
             }
         };
@@ -1471,6 +1487,59 @@ test "ClientResponse.body: basic response" {
 
     const body = try response.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse.body: a corrupt gzip body reports the decompression failure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++ ("not a gzip stream at all" ++ "12345678");
+    var reader = std.Io.Reader.fixed(raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // The bytes arrived intact; it is the layer above the body reader that
+    // could not make sense of them, so that is where the answer is.
+    try std.testing.expectError(error.BadGzipHeader, response.body());
+}
+
+test "Client: no std.Io.Reader sentinel escapes the response API" {
+    // `ReadFailed` says only that a read failed, which the caller knew when
+    // it called. The response side has more layers than the server's --
+    // socket, TLS, body framing, decompression -- and any of them could drop
+    // its answer on the way up.
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    //
+    // `Client.fetch` and `Client.connectWebSocket` are deliberately absent:
+    // they also write the request and open the connection, and neither path
+    // resolves yet. That is the client's half of what #144 did for the
+    // server's responses, and it is not this change.
+    inline for (.{
+        ErrorSetOf(ClientResponse.body),
+        ErrorSetOf(WebSocketClient.send),
+        ErrorSetOf(WebSocketClient.receive),
+    }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        }
+    }
 }
 
 test "ClientResponse.body: large body over 128 bytes" {

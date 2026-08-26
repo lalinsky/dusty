@@ -577,7 +577,7 @@ pub fn Server(comptime Ctx: type) type {
                         needs_shutdown.* = false;
                         return;
                     },
-                    error.ReadFailed => return connection.getReadError() orelse error.ReadFailed,
+                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     else => |e| return e,
                 };
 
@@ -621,8 +621,8 @@ pub fn Server(comptime Ctx: type) type {
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
                 executor.run() catch |err| switch (err) {
-                    error.ReadFailed => return connection.getReadError() orelse error.ReadFailed,
-                    error.WriteFailed => return connection.getWriteError() orelse error.WriteFailed,
+                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
+                    error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
                     else => |e| return e,
                 };
 
@@ -690,7 +690,7 @@ pub fn Server(comptime Ctx: type) type {
                         return;
                     },
                     error.ReadFailed => {
-                        const e = connection.getReadError() orelse error.ReadFailed;
+                        const e = connection.getReadError() orelse error.Unexpected;
                         // Nothing is in flight between requests, so a peer
                         // that went away here has cost us nothing. The socket
                         // is already gone, so skip the shutdown syscall too.
