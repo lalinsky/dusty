@@ -556,7 +556,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .conn = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
     var res = try Response.init(arena.allocator(), &connection, 32);
 
     var executor = Executor(void){
@@ -602,7 +602,7 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .conn = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
     var res = try Response.init(arena.allocator(), &connection, 32);
 
     var mw = WritingMiddleware{};

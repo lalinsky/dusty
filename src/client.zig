@@ -643,7 +643,7 @@ pub const ClientResponse = struct {
     // Direct pointers for reading (testable without full connection)
     arena: std.mem.Allocator,
     parser: *ResponseParser,
-    conn: *std.Io.Reader,
+    transport: Transport,
     parsed: *ParsedResponse,
     max_response_size: usize,
     decompress: bool = true,
@@ -705,7 +705,10 @@ pub const ClientResponse = struct {
         const r = self.reader();
         const result = r.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
-            else => return err,
+            // The interface can only say that a read failed; the reader
+            // holds what it was.
+            error.ReadFailed => return self._body_reader.err orelse error.Unexpected,
+            else => |e| return e,
         };
 
         self._body_read = true;
@@ -723,14 +726,14 @@ pub const ClientResponse = struct {
         // If body has already been read, return a reader for the cached body
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
-            self._body_reader = ResponseBodyReader.init(self.parser, self.conn, &self._body_reader_buffer);
+            self._body_reader = ResponseBodyReader.init(self.parser, self.transport, &self._body_reader_buffer);
             self._body_reader.interface = std.Io.Reader.fixed(cached_body);
             return &self._body_reader.interface;
         }
 
         // Initialize body reader if not already done
         if (!self._body_reader_init) {
-            self._body_reader = ResponseBodyReader.init(self.parser, self.conn, &self._body_reader_buffer);
+            self._body_reader = ResponseBodyReader.init(self.parser, self.transport, &self._body_reader_buffer);
             self._body_reader_init = true;
         }
 
@@ -1083,11 +1086,11 @@ pub const Client = struct {
                 if (!conn.parser.isBodyComplete()) {
                     const max_drain = 2048;
                     var drain_buf: [1024]u8 = undefined;
-                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.reader, &drain_buf);
+                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &drain_buf);
                     _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
                         error.ReadFailed => {
                             conn.closing = true;
-                            return conn.getReadError() orelse error.ReadFailed;
+                            return body_reader.err orelse error.Unexpected;
                         },
                     };
                     if (!conn.parser.isBodyComplete()) conn.closing = true;
@@ -1162,7 +1165,7 @@ pub const Client = struct {
         return ClientResponse{
             .arena = conn.arena.allocator(),
             .parser = &conn.parser,
-            .conn = conn.reader,
+            .transport = conn.transport(),
             .parsed = &conn.parsed_response,
             .max_response_size = self.config.max_response_size,
             .decompress = state.options.decompress,
@@ -1461,7 +1464,7 @@ test "ClientResponse.body: basic response" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
     };
@@ -1487,7 +1490,7 @@ test "ClientResponse.body: large body over 128 bytes" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
     };
@@ -1513,7 +1516,7 @@ test "ClientResponse.body: no body" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
     };
@@ -1541,7 +1544,7 @@ test "ClientResponse.body: connection-close (EOF-delimited) body" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
     };
@@ -1567,7 +1570,7 @@ test "ClientResponse.reader: streaming read" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
     };
@@ -1602,7 +1605,7 @@ test "ClientResponse.reader: after body() returns cached data" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
     };
@@ -1635,7 +1638,7 @@ test "ClientResponse.body: gzip decompression" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
         .decompress = true,
@@ -1663,7 +1666,7 @@ test "ClientResponse.body: gzip decompression disabled" {
     var response = ClientResponse{
         .arena = arena.allocator(),
         .parser = &parser,
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parsed = &parsed,
         .max_response_size = 1024,
         .decompress = false,

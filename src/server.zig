@@ -536,7 +536,7 @@ pub fn Server(comptime Ctx: type) type {
             var request: Request = .{
                 .arena = arena.allocator(),
                 .io = self.io,
-                .conn = connection.reader,
+                .transport = connection.transport(),
                 .parser = undefined,
                 .config = self.config.request,
                 .remote_address = connection.stream.socket.address,
@@ -635,11 +635,13 @@ pub fn Server(comptime Ctx: type) type {
                     };
                     if (drainable) {
                         var scratch: [4096]u8 = undefined;
-                        var body_reader = RequestBodyReader.init(&parser, connection.reader, &scratch);
+                        var body_reader = RequestBodyReader.init(&parser, connection.transport(), &scratch);
                         if (body_reader.interface.discardShort(max + 1)) |consumed| {
                             if (consumed > max) response.keepalive = false;
                         } else |_| {
-                            if (connection.getReadError()) |e| if (e == error.Canceled) return error.Canceled;
+                            // A cancel is the request timing out, not a body
+                            // worth giving up on quietly.
+                            if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
                             response.keepalive = false;
                         }
                     } else {
