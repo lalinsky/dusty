@@ -474,9 +474,15 @@ pub const ResponseParser = struct {
 /// - `state.body_dest_pos: usize`
 /// - `isBodyComplete() bool`
 /// - `prepareBodyRead(dest: []u8) void`
-/// - `feed(data: []const u8) !void`
-/// - `finish() !void`
+/// - `feed(data: []const u8) (ParseError || error{Paused})!void`
+/// - `finish() ParseError!void`
 /// - `getConsumedBytes(ptr: [*c]const u8) usize`
+///
+/// `feed` and `finish` must fail within `ParseError`, because what they
+/// return ends up in `err` and from there in the error set of every public
+/// body read. A parser free to invent its own errors would put its internals
+/// in that set -- `Paused` included, which is signalling between the parser
+/// and this loop and means nothing to a caller.
 pub fn BodyReader(comptime Parser: type) type {
     return struct {
         parser: *Parser,
@@ -494,6 +500,13 @@ pub fn BodyReader(comptime Parser: type) type {
         err: ?Error = null,
 
         const Self = @This();
+
+        comptime {
+            // Stated above, checked here: a parser outside `ParseError` would
+            // otherwise fail somewhere inside `stream` with no hint as to why.
+            assertFailsWithin(@TypeOf(Parser.feed), ParseError || error{Paused});
+            assertFailsWithin(@TypeOf(Parser.finish), ParseError);
+        }
 
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
@@ -619,6 +632,17 @@ pub fn BodyReader(comptime Parser: type) type {
 }
 
 /// BodyReader specialized for HTTP requests.
+/// Fails to compile unless every error `Fn` can return is in `Allowed`.
+fn assertFailsWithin(comptime Fn: type, comptime Allowed: type) void {
+    const returned = @typeInfo(@typeInfo(Fn).@"fn".return_type.?).error_union.error_set;
+    for (@typeInfo(returned).error_set.?) |e| {
+        // A member of `Allowed` coerces; anything else is a compile error
+        // naming the offending parser and error.
+        const member: Allowed = @field(Allowed, e.name);
+        _ = &member;
+    }
+}
+
 fn sendContinue(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
     return w.flush();
