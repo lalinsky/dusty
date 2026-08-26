@@ -817,10 +817,12 @@ test "Client: rejects a server certificate the configured CA does not cover" {
             var url_buf: [64]u8 = undefined;
             const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{port});
 
-            // The system trust store does not contain the self-signed test cert.
+            // The system trust store does not contain the self-signed test
+            // cert, and says so: which certificate check failed is the whole
+            // point of the answer here.
             var strict = dusty.Client.init(std.testing.allocator, _io, .{});
             defer strict.deinit();
-            try std.testing.expectError(error.TlsInitializationFailed, strict.fetch(url, .{}));
+            try std.testing.expectError(error.CertificateIssuerNotFound, strict.fetch(url, .{}));
 
             // insecure_skip_verify takes it anyway.
             var lax = dusty.Client.init(std.testing.allocator, _io, .{

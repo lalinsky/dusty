@@ -490,7 +490,27 @@ pub const Connection = struct {
                     .rng = self.tls_rng.interface(),
                     .alpn_protocols = alpn_protocols,
                 },
-            ) catch return error.TlsInitializationFailed;
+            ) catch |err| {
+                // tls.zig only ever saw the ciphertext reader or writer fail
+                // generically, so for those the cause is a layer down.
+                // Nothing is negotiated yet, so that layer is all there is.
+                const ciphertext: Transport = .{
+                    .reader = &self.tcp_reader.interface,
+                    .writer = &self.tcp_writer.interface,
+                    .tcp_reader = &self.tcp_reader,
+                    .tcp_writer = &self.tcp_writer,
+                };
+                return switch (err) {
+                    error.TransportReadFailed => ciphertext.getReadError() orelse error.Unexpected,
+                    // A failed ciphertext write arrives either way round
+                    // depending on where in the handshake it happened; both
+                    // mean the same thing and neither names a cause.
+                    error.TransportWriteFailed,
+                    error.WriteFailed,
+                    => ciphertext.getWriteError() orelse error.Unexpected,
+                    else => |e| e,
+                };
+            };
 
             // Record the negotiated wire version from the ALPN selection.
             self.http_version = HttpVersion.fromAlpn(self.tls_conn.?.alpn_protocol);
@@ -574,10 +594,12 @@ pub const Connection = struct {
         self.reader.end = buffered.len;
     }
 
-    pub fn flush(self: *Connection) !void {
+    pub fn flush(self: *Connection) WriteError!void {
         // For HTTPS this drains the cleartext writer, which encrypts and flushes
         // the underlying TCP writer in one step; for HTTP it flushes the socket directly.
-        try self.writer.flush();
+        self.writer.flush() catch |err| switch (err) {
+            error.WriteFailed => return self.getWriteError() orelse error.Unexpected,
+        };
     }
 
     pub fn host(self: *const Connection) []const u8 {
@@ -854,13 +876,22 @@ pub const Client = struct {
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
-            client_cert = try tls.config.CertKeyPair.fromFilePath(
+            client_cert = tls.config.CertKeyPair.fromFilePath(
                 self.allocator,
                 self.io,
                 cc.dir orelse std.Io.Dir.cwd(),
                 cc.cert_path,
                 cc.key_path,
-            );
+                // Reads the certificate and key off disk through readers
+                // that belong to tls.zig, which keeps their causes to
+                // itself -- all that comes back is `error.ReadFailed`.
+                // Named here rather than passed on: in the error set of a
+                // request a bare read failure cannot be told from the socket
+                // failing, and this one is about a file the caller named.
+            ) catch |err| switch (err) {
+                error.ReadFailed => return error.TlsConfigUnreadable,
+                else => |e| return e,
+            };
         }
 
         self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };
@@ -969,41 +1000,23 @@ pub const Client = struct {
         var key_buf: [24]u8 = undefined;
         _ = std.base64.standard.Encoder.encode(&key_buf, &key_bytes);
 
-        // Write upgrade request
-        const path = uriPath(uri);
-        if (uri.query) |query| {
-            try conn.writer.print("GET {s}?{s} HTTP/1.1\r\n", .{ path, query.percent_encoded });
-        } else {
-            try conn.writer.print("GET {s} HTTP/1.1\r\n", .{path});
-        }
-
-        if ((info.protocol == .http and info.port == 80) or (info.protocol == .https and info.port == 443)) {
-            try conn.writer.print("Host: {s}\r\n", .{host});
-        } else {
-            try conn.writer.print("Host: {s}:{d}\r\n", .{ host, info.port });
-        }
-
-        try conn.writer.writeAll("Upgrade: websocket\r\n");
-        try conn.writer.writeAll("Connection: Upgrade\r\n");
-        try conn.writer.print("Sec-WebSocket-Key: {s}\r\n", .{&key_buf});
-        try conn.writer.writeAll("Sec-WebSocket-Version: 13\r\n");
-
-        // User-provided headers
-        if (options.headers) |h| {
-            var it = h.iterator();
-            while (it.next()) |entry| {
-                if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Upgrade")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Connection")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Key")) continue;
-                if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Version")) continue;
-                try http.validateHeaderName(entry.key);
-                try http.validateHeaderValue(entry.value);
-                try conn.writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+        // Write upgrade request. Through a bare writer, so it can only report
+        // the sentinel; resolved here, once, the way the response path is.
+        writeUpgradeRequest(conn.writer, .{
+            .uri = uri,
+            .host = host,
+            .port = info.port,
+            .protocol = info.protocol,
+            .key = &key_buf,
+            .headers = options.headers,
+        }) catch |err| {
+            conn.closing = true;
+            switch (err) {
+                error.WriteFailed => return conn.getWriteError() orelse error.Unexpected,
+                else => |e| return e,
             }
-        }
+        };
 
-        try conn.writer.writeAll("\r\n");
         try conn.flush();
 
         // Parse response headers
@@ -1076,7 +1089,10 @@ pub const Client = struct {
             .user_agent = self.config.user_agent,
         }) catch |err| {
             conn.closing = true;
-            return err;
+            switch (err) {
+                error.WriteFailed => return conn.getWriteError() orelse error.Unexpected,
+                else => |e| return e,
+            }
         };
 
         conn.flush() catch |err| {
@@ -1231,6 +1247,55 @@ const WriteRequestOptions = struct {
     referer: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
 };
+
+const WriteUpgradeRequestOptions = struct {
+    uri: Uri,
+    host: []const u8,
+    port: u16,
+    protocol: Protocol,
+    key: []const u8,
+    headers: ?*const Headers,
+};
+
+/// The WebSocket upgrade request, on the wire. Takes the writer rather than
+/// the connection so it can only report the sentinel, which is the caller's
+/// to resolve -- the same split `writeRequest` has.
+fn writeUpgradeRequest(writer: *std.Io.Writer, opts: WriteUpgradeRequestOptions) !void {
+    const path = uriPath(opts.uri);
+    if (opts.uri.query) |query| {
+        try writer.print("GET {s}?{s} HTTP/1.1\r\n", .{ path, query.percent_encoded });
+    } else {
+        try writer.print("GET {s} HTTP/1.1\r\n", .{path});
+    }
+
+    if ((opts.protocol == .http and opts.port == 80) or (opts.protocol == .https and opts.port == 443)) {
+        try writer.print("Host: {s}\r\n", .{opts.host});
+    } else {
+        try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
+    }
+
+    try writer.writeAll("Upgrade: websocket\r\n");
+    try writer.writeAll("Connection: Upgrade\r\n");
+    try writer.print("Sec-WebSocket-Key: {s}\r\n", .{opts.key});
+    try writer.writeAll("Sec-WebSocket-Version: 13\r\n");
+
+    // User-provided headers, minus the ones the upgrade owns.
+    if (opts.headers) |h| {
+        var it = h.iterator();
+        while (it.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key, "Host")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Upgrade")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Connection")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Key")) continue;
+            if (std.ascii.eqlIgnoreCase(entry.key, "Sec-WebSocket-Version")) continue;
+            try http.validateHeaderName(entry.key);
+            try http.validateHeaderValue(entry.value);
+            try writer.print("{s}: {s}\r\n", .{ entry.key, entry.value });
+        }
+    }
+
+    return writer.writeAll("\r\n");
+}
 
 fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     // Reject any CRLF/NUL smuggled in via the URL host (a URL like
@@ -1560,23 +1625,20 @@ test "ClientResponse: a streaming read can be resolved without going through bod
     try std.testing.expectEqual(error.BadGzipHeader, response.getReadError().?);
 }
 
-test "Client: no std.Io.Reader sentinel escapes the response API" {
-    // `ReadFailed` says only that a read failed, which the caller knew when
-    // it called. The response side has more layers than the server's --
-    // socket, TLS, body framing, decompression -- and any of them could drop
-    // its answer on the way up.
+test "Client: no std.Io sentinel escapes its public API" {
+    // `ReadFailed`/`WriteFailed` say only that a read or write failed, which
+    // the caller knew when it called. The client stacks more layers than the
+    // server does -- socket, TLS, request and response framing,
+    // decompression -- and any of them could drop its answer on the way up.
     const ErrorSetOf = struct {
         fn f(comptime func: anytype) type {
             return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
         }
     }.f;
-    //
-    // `Client.fetch` and `Client.connectWebSocket` are deliberately absent:
-    // they also write the request and open the connection, and neither path
-    // resolves yet. That is the client's half of what #144 did for the
-    // server's responses, and it is not this change.
     inline for (.{
         ErrorSetOf(ClientResponse.body),
+        ErrorSetOf(Client.fetch),
+        ErrorSetOf(Client.connectWebSocket),
         ErrorSetOf(WebSocketClient.send),
         ErrorSetOf(WebSocketClient.receive),
     }) |Set| {
