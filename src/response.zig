@@ -542,7 +542,7 @@ pub const Response = struct {
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
-        return WebSocket.init(req.io, self.conn.writer, req.conn, self.arena, seed);
+        return WebSocket.init(req.io, self.conn.transport(), self.arena, seed);
     }
 
     /// Turns the sentinel a `std.Io.Writer` reports into the cause the

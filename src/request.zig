@@ -3,6 +3,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
+const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
 const Response = @import("response.zig").Response;
@@ -28,7 +29,7 @@ pub const Request = struct {
 
     // Body reading support
     parser: *RequestParser,
-    conn: *std.Io.Reader,
+    transport: Transport,
     body_reader_buffer: [1024]u8 = undefined,
     config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
@@ -47,7 +48,7 @@ pub const Request = struct {
         const arena = self.arena;
         const io = self.io;
         const parser = self.parser;
-        const conn = self.conn;
+        const transport = self.transport;
         const cfg = self.config;
         const res = self.response;
         // Belongs to the connection, not the request, so it outlives the
@@ -57,7 +58,7 @@ pub const Request = struct {
             .arena = arena,
             .io = io,
             .parser = parser,
-            .conn = conn,
+            .transport = transport,
             .config = cfg,
             .response = res,
             .remote_address = addr,
@@ -68,13 +69,13 @@ pub const Request = struct {
         // If body has already been read, return a reader for the cached body
         if (self._body_read) {
             const cached_body = self._body orelse &.{};
-            var r = RequestBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
+            var r = RequestBodyReader.init(self.parser, self.transport, &self.body_reader_buffer);
             r.interface = std.Io.Reader.fixed(cached_body);
             return r;
         }
 
         // Return the streaming body reader
-        var r = RequestBodyReader.init(self.parser, self.conn, &self.body_reader_buffer);
+        var r = RequestBodyReader.init(self.parser, self.transport, &self.body_reader_buffer);
         r.request = self;
         return r;
     }
@@ -88,7 +89,10 @@ pub const Request = struct {
         var r = self.reader();
         const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
-            else => return err,
+            // The interface can only say that a read failed; the reader
+            // holds what it was.
+            error.ReadFailed => return r.err orelse error.Unexpected,
+            else => |e| return e,
         };
 
         self._body_read = true;
@@ -527,6 +531,26 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
     };
 }
 
+test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
+    // `ReadFailed` says only that a read failed, which the caller knew when
+    // it called. None of these may report it.
+    const ErrorSetOf = struct {
+        fn f(comptime func: anytype) type {
+            return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
+        }
+    }.f;
+    inline for (.{
+        ErrorSetOf(Request.body),
+        ErrorSetOf(Request.jsonValue),
+        ErrorSetOf(Request.formData),
+        ErrorSetOf(Request.multiFormData),
+    }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+        }
+    }
+}
+
 test "Request.body: basic POST" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -536,7 +560,7 @@ test "Request.body: basic POST" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -551,6 +575,57 @@ test "Request.body: basic POST" {
     try std.testing.expectEqualStrings("hello", body.?);
 }
 
+test "Request.body: a body cut short reports the parse failure, not a failed read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The headers promise five bytes and the peer sends two, then stops.
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\nhe";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // Nothing is wrong with the connection, so it has no cause to offer.
+    // The parser does: it is the layer that knows the body was short, and
+    // the reader carries its answer up.
+    try std.testing.expectError(error.ParseFailed, req.body());
+}
+
+test "Request.body: framing the parser rejects is reported as itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A chunk size that is not a number.
+    const raw_request = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n";
+    var reader = std.Io.Reader.fixed(raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectError(error.InvalidChunkSize, req.body());
+}
+
 test "Request.body: large body over 128 bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -561,7 +636,7 @@ test "Request.body: large body over 128 bytes" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -586,7 +661,7 @@ test "Request.cookies: parse cookies from header" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -612,7 +687,7 @@ test "Request.formData: basic key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -637,7 +712,7 @@ test "Request.formData: URL-encoded key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -661,7 +736,7 @@ test "Request.formData: entry with no value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -685,7 +760,7 @@ test "Request.multiFormData: basic key and value" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -710,7 +785,7 @@ test "Request.multiFormData: entry with filename" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -748,7 +823,7 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 
@@ -785,7 +860,7 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
 
     var req: Request = .{
         .arena = arena.allocator(),
-        .conn = &reader,
+        .transport = .{ .reader = &reader, .writer = undefined },
         .parser = undefined,
     };
 

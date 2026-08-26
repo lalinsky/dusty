@@ -436,7 +436,7 @@ test "Router: register and find GET route" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -458,7 +458,7 @@ test "Router: register and find POST route" {
         .url = "/posts",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -480,7 +480,7 @@ test "Router: method mismatch returns null" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -501,7 +501,7 @@ test "Router: path mismatch returns null" {
         .url = "/posts",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -522,7 +522,7 @@ test "Router: parameterized routes" {
         .url = "/users/123",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -547,7 +547,7 @@ test "Router: multiple routes" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const handler1 = try router.findHandler(&req1);
     try std.testing.expect(handler1 != null);
@@ -559,7 +559,7 @@ test "Router: multiple routes" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const handler2 = try router.findHandler(&req2);
     try std.testing.expect(handler2 != null);
@@ -571,7 +571,7 @@ test "Router: multiple routes" {
         .url = "/posts",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const handler3 = try router.findHandler(&req3);
     try std.testing.expect(handler3 != null);
@@ -593,7 +593,7 @@ test "Router: all HTTP methods" {
             .url = "/resource",
             .arena = arena.allocator(),
             .parser = undefined,
-            .conn = undefined,
+            .transport = undefined,
         };
         const handler = try router.findHandler(&req);
         try std.testing.expect(handler != null);
@@ -614,7 +614,7 @@ test "Router: extract single parameter" {
         .url = "/users/123",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -639,7 +639,7 @@ test "Router: extract multiple parameters" {
         .url = "/users/456/posts/789",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -668,7 +668,7 @@ test "Router: mixed static and parameter segments" {
         .url = "/api/v1/users/abc123/profile",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -696,7 +696,7 @@ test "Router: static route has precedence over param route" {
         .url = "/users/new",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -721,7 +721,7 @@ test "Router: wildcard route basic matching" {
         .url = "/files/document.txt",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -743,7 +743,7 @@ test "Router: wildcard captures remaining path" {
         .url = "/files/path/to/file.txt",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -769,7 +769,7 @@ test "Router: static route has precedence over wildcard" {
         .url = "/files/config.json",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -795,7 +795,7 @@ test "Router: param route has precedence over wildcard" {
         .url = "/api/123",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -823,7 +823,7 @@ test "Router: wildcard with multiple segments" {
         .url = "/assets/images/icons/logo.png",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -848,7 +848,7 @@ test "Router: wildcard with prefix path" {
         .url = "/api/v1/files/docs/readme.md",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -873,7 +873,7 @@ test "Router: static route with query parameters" {
         .url = "/users/profile?debug=true&page=1",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -899,7 +899,7 @@ test "Router: param route with query parameters" {
         .url = "/users/123?format=json",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -929,7 +929,7 @@ test "Router: multiple params with query parameters" {
         .url = "/users/456/posts/789?include=comments&sort=date",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -963,7 +963,7 @@ test "Router: wildcard route with query parameters" {
         .url = "/files/docs/readme.md?download=true",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -992,7 +992,7 @@ test "Router: empty query string" {
         .url = "/users/123?",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1020,7 +1020,7 @@ test "Router: no query parameters" {
         .url = "/users/123",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1048,7 +1048,7 @@ test "Router: URL encoded query parameters" {
         .url = "/search?q=hello+world&tag=foo%20bar&special=%21%40%23%24",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1074,7 +1074,7 @@ test "Router: query parameter without value" {
         .url = "/items?featured&sort=name",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1099,7 +1099,7 @@ test "Router: query with empty key-value pairs" {
         .url = "/test?a=1&&b=2&",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     const handler = try router.findHandler(&req);
@@ -1141,7 +1141,7 @@ test "Group: prefix concatenation" {
         .url = "/api/v1/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const route1 = try router.findHandler(&req1);
     try std.testing.expect(route1 != null);
@@ -1152,7 +1152,7 @@ test "Group: prefix concatenation" {
         .url = "/api/v1/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const route2 = try router.findHandler(&req2);
     try std.testing.expect(route2 != null);
@@ -1182,7 +1182,7 @@ test "Group: routes without group middleware get global middlewares" {
         .url = "/direct",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1213,7 +1213,7 @@ test "Group: group middlewares appended after global" {
         .url = "/api/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1245,7 +1245,7 @@ test "Group: no global middlewares, only group middlewares" {
         .url = "/api/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1266,7 +1266,7 @@ test "Group: direct routes have no middlewares when none set" {
         .url = "/health",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     const route = try router.findHandler(&req);
     try std.testing.expect(route != null);
@@ -1289,7 +1289,7 @@ test "Group: any method registers all methods" {
             .url = "/api/resource",
             .arena = arena.allocator(),
             .parser = undefined,
-            .conn = undefined,
+            .transport = undefined,
         };
         const route = try router.findHandler(&req);
         try std.testing.expect(route != null);
@@ -1310,7 +1310,7 @@ test "Router: a GET route answers HEAD" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
 
@@ -1337,7 +1337,7 @@ test "Router: an explicit HEAD route wins over the GET one" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     try std.testing.expectEqual(&testHandler2, (try router.findHandler(&req)).?.action);
 
@@ -1361,7 +1361,7 @@ test "Router: HEAD falls back per path, not per tree" {
         .url = "/users",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
 }
@@ -1380,7 +1380,7 @@ test "Router: HEAD falling back to GET still captures path params" {
         .url = "/users/42",
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
     try std.testing.expect(try router.findHandler(&req) != null);
     try std.testing.expectEqualStrings("42", req.params.get("id").?);

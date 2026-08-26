@@ -1,4 +1,5 @@
 const std = @import("std");
+const Transport = @import("transport.zig").Transport;
 
 const c = @import("llhttp");
 
@@ -473,22 +474,55 @@ pub const ResponseParser = struct {
 /// - `state.body_dest_pos: usize`
 /// - `isBodyComplete() bool`
 /// - `prepareBodyRead(dest: []u8) void`
-/// - `feed(data: []const u8) !void`
-/// - `finish() !void`
+/// - `feed(data: []const u8) (ParseError || error{Paused})!void`
+/// - `finish() ParseError!void`
 /// - `getConsumedBytes(ptr: [*c]const u8) usize`
+///
+/// `feed` and `finish` must fail within `ParseError`, because what they
+/// return ends up in `err` and from there in the error set of every public
+/// body read. A parser free to invent its own errors would put its internals
+/// in that set -- `Paused` included, which is signalling between the parser
+/// and this loop and means nothing to a caller.
 pub fn BodyReader(comptime Parser: type) type {
     return struct {
         parser: *Parser,
-        conn: *std.Io.Reader,
+        transport: Transport,
         interface: std.Io.Reader,
         request: ?*Request = null,
+        /// The real cause behind the generic `error.ReadFailed` that the
+        /// `std.Io.Reader` interface has to return. `stream` is the one path
+        /// that cannot hand a cause back, its error set being fixed by the
+        /// vtable, so it is the one place this is written.
+        ///
+        /// Not every cause is the transport's. A body that stops mid-chunk,
+        /// or framing the parser rejects, fails the read just as surely and
+        /// the connection has nothing to say about it.
+        err: ?Error = null,
 
         const Self = @This();
 
-        pub fn init(parser: *Parser, conn: *std.Io.Reader, buffer: []u8) Self {
+        comptime {
+            // Stated above, checked here: a parser outside `ParseError` would
+            // otherwise fail somewhere inside `stream` with no hint as to why.
+            assertFailsWithin(@TypeOf(Parser.feed), ParseError || error{Paused});
+            assertFailsWithin(@TypeOf(Parser.finish), ParseError);
+        }
+
+        /// What reading a body can fail with, once the sentinel is resolved.
+        pub const Error = Transport.ReadError || Transport.WriteError ||
+            ParseError || error{ IncompleteBody, Unexpected };
+
+        /// Stores what actually went wrong and reports the sentinel the
+        /// vtable requires. Mirrors `fail` on the buffered body writer.
+        fn fail(self: *Self, cause: Error) std.Io.Reader.StreamError {
+            self.err = cause;
+            return error.ReadFailed;
+        }
+
+        pub fn init(parser: *Parser, transport: Transport, buffer: []u8) Self {
             return .{
                 .parser = parser,
-                .conn = conn,
+                .transport = transport,
                 .interface = .{
                     .vtable = &.{ .stream = stream },
                     .buffer = buffer,
@@ -501,15 +535,17 @@ pub fn BodyReader(comptime Parser: type) type {
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
             const parser = self.parser;
-            const conn = self.conn;
+            const conn = self.transport.reader;
 
             // Send 100 Continue on first body read if client expects it
             if (self.request) |req| {
                 if (req.expects_continue) {
                     req.expects_continue = false;
                     if (req.response) |res| {
-                        try res.conn.writer.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
-                        try res.conn.writer.flush();
+                        // A write, on a read: the caller asked for the body
+                        // and this is what unblocks the peer from sending it.
+                        sendContinue(res.conn.writer) catch
+                            return self.fail(self.transport.getWriteError() orelse error.Unexpected);
                     }
                 }
             }
@@ -545,20 +581,20 @@ pub fn BodyReader(comptime Parser: type) type {
                     conn.fillMore() catch |err| switch (err) {
                         error.EndOfStream => {
                             // Connection closed - call finish() to complete the message
-                            parser.finish() catch {
-                                // finish() failed - message was not complete
-                                return error.ReadFailed;
-                            };
+                            parser.finish() catch |e| return self.fail(e);
 
                             // Check if body is now complete after finish()
                             if (parser.isBodyComplete()) {
                                 return error.EndOfStream;
                             }
 
-                            // Message not complete despite EOF
-                            return error.ReadFailed;
+                            // The peer stopped mid-body. Nothing is wrong with
+                            // the connection, so it has no cause to offer.
+                            return self.fail(error.IncompleteBody);
                         },
-                        else => return error.ReadFailed,
+                        error.ReadFailed => return self.fail(
+                            self.transport.getReadError() orelse error.Unexpected,
+                        ),
                     };
                 }
 
@@ -583,7 +619,9 @@ pub fn BodyReader(comptime Parser: type) type {
                             const consumed = parser.getConsumedBytes(buffered.ptr);
                             conn.toss(consumed);
                         },
-                        else => return error.ReadFailed,
+                        // Framing the parser rejected: the bytes arrived, they
+                        // just were not a body.
+                        else => |e| return self.fail(e),
                     }
                 }
 
@@ -594,6 +632,22 @@ pub fn BodyReader(comptime Parser: type) type {
 }
 
 /// BodyReader specialized for HTTP requests.
+/// Fails to compile unless every error `Fn` can return is in `Allowed`.
+fn assertFailsWithin(comptime Fn: type, comptime Allowed: type) void {
+    const returned = @typeInfo(@typeInfo(Fn).@"fn".return_type.?).error_union.error_set;
+    for (@typeInfo(returned).error_set.?) |e| {
+        // A member of `Allowed` coerces; anything else is a compile error
+        // naming the offending parser and error.
+        const member: Allowed = @field(Allowed, e.name);
+        _ = &member;
+    }
+}
+
+fn sendContinue(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("HTTP/1.1 100 Continue\r\n\r\n");
+    return w.flush();
+}
+
 pub const RequestBodyReader = BodyReader(RequestParser);
 
 /// BodyReader specialized for HTTP responses.
@@ -666,7 +720,7 @@ test "RequestParser: basic" {
     var req: Request = .{
         .arena = arena.allocator(),
         .parser = undefined,
-        .conn = undefined,
+        .transport = undefined,
     };
 
     var parser: RequestParser = undefined;

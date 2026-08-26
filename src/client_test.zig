@@ -728,8 +728,10 @@ test "Server: client_auth .require rejects a client with no certificate" {
 
             // In TLS 1.3 the client finishes its flight before the server can
             // reject the missing certificate, so the refusal surfaces on the
-            // first read rather than as a handshake error.
-            try std.testing.expectError(error.ReadFailed, client.fetch(url, .{}));
+            // first read rather than as a handshake error -- and as the alert
+            // the server actually sent, which is a layer below what the read
+            // itself could report.
+            try std.testing.expectError(error.TlsAlertCertificateRequired, client.fetch(url, .{}));
         }
     }.run, .{ &server, io });
 
