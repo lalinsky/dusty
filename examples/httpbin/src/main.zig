@@ -171,6 +171,7 @@ fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
         \\  /bytes/:n            n bytes, with a Content-Length
         \\  /stream/:n           n JSON lines, chunked
         \\  /stream-bytes/:n     n bytes, chunked
+        \\  /sse/:n              n Server-Sent Events, chunked
         \\  /delay/:seconds      respond after a delay
         \\  /cookies             cookies sent by the client
         \\  /cookies/set         set cookies from the query string
@@ -311,6 +312,22 @@ fn handleDelay(_: *Ctx, req: *Request, res: *Response) !void {
     return sendDescription(req, res, false);
 }
 
+fn handleSse(_: *Ctx, req: *Request, res: *Response) !void {
+    const n = @min(req.params.getInt(usize, "n") orelse
+        return fail(res, .bad_request, "Invalid count"), max_stream_lines);
+
+    var events = try res.startEventStream();
+    for (0..n) |i| {
+        var id_buf: [24]u8 = undefined;
+        var data_buf: [64]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}", .{i});
+        const data = try std.fmt.bufPrint(&data_buf, "{{\"id\": {d}}}", .{i});
+        // Each send is one chunk, so the client sees each event as it is
+        // produced rather than when a buffer happens to fill.
+        try events.send(data, .{ .event = "tick", .id = id });
+    }
+}
+
 fn handleCookies(_: *Ctx, req: *Request, res: *Response) !void {
     try res.json(.{ .cookies = req.cookies() }, .{});
 }
@@ -402,6 +419,7 @@ pub fn main(init: std.process.Init) !void {
     server.router.get("/bytes/:n", handleBytes);
     server.router.get("/stream-bytes/:n", handleStreamBytes);
     server.router.get("/stream/:n", handleStream);
+    server.router.get("/sse/:n", handleSse);
     server.router.get("/cookies", handleCookies);
     server.router.get("/cookies/set", handleCookiesSet);
 
