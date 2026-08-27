@@ -850,3 +850,41 @@ test "Client: ca .none without insecure_skip_verify is rejected" {
     // Fails while loading the TLS material, before any connection is attempted.
     try std.testing.expectError(error.NoCertificateAuthority, client.fetch("https://localhost:1/", .{}));
 }
+
+test "Client: a response head too large for the buffer is rejected, not a panic" {
+    const io = std.testing.io;
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    // A peer whose head never ends inside the client's buffer.
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            rd.interface.fillMore() catch {};
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nX-Big: ") catch {};
+            w.interface.splatByteAll('A', 9000) catch {};
+            w.interface.writeAll("\r\nContent-Length: 0\r\n\r\n") catch {};
+            w.interface.flush() catch {};
+            s.shutdown(_io, .both) catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.HeadersTooLarge, client.fetch(url, .{}));
+
+    peer_future.cancel(io);
+}

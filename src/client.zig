@@ -6,6 +6,7 @@ const build_options = @import("build_options");
 const unix_path_max = 108;
 
 const config_mod = @import("config.zig");
+const body_read_reserve = config_mod.body_read_reserve;
 
 const http = @import("http.zig");
 const Method = http.Method;
@@ -79,7 +80,11 @@ pub const ClientConfig = struct {
     max_response_size: usize = 10_485_760, // 10MB
     /// Maximum idle connections to keep in pool (0 = no pooling).
     max_idle_connections: u8 = 8,
-    /// Buffer size (bytes) for reading response headers.
+    /// Buffer size (bytes) for reading the response head: the status line
+    /// and all headers. This is also the limit on it -- parsed header names
+    /// and values are slices into this buffer rather than copies, so the head
+    /// is held whole. A server that sends more gets error.HeadersTooLarge and
+    /// its connection torn down.
     buffer_size: usize = 4096,
     /// TLS settings for https:// (and wss://) connections. Requires the
     /// `use_tls` build option; with TLS compiled out any HTTPS request fails
@@ -461,7 +466,7 @@ pub const Connection = struct {
             errdefer allocator.free(self.tls_tcp_write_buffer);
 
             // HTTP-layer (cleartext) buffers, used by the tls.Connection reader/writer.
-            self.read_buffer = try allocator.alloc(u8, self.buffer_size + 1024);
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + body_read_reserve);
             errdefer allocator.free(self.read_buffer);
             self.write_buffer = try allocator.alloc(u8, 1024);
             errdefer allocator.free(self.write_buffer);
@@ -524,7 +529,7 @@ pub const Connection = struct {
             self.tls_tcp_read_buffer = &.{};
             self.tls_tcp_write_buffer = &.{};
 
-            self.read_buffer = try allocator.alloc(u8, self.buffer_size + 1024);
+            self.read_buffer = try allocator.alloc(u8, self.buffer_size + body_read_reserve);
             errdefer allocator.free(self.read_buffer);
             self.write_buffer = try allocator.alloc(u8, 1024);
             errdefer allocator.free(self.write_buffer);
@@ -1418,6 +1423,10 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
             parsed_len += unparsed.len;
             continue;
         }
+        // Same ceiling as the server's `parseHeaders`, and for the same
+        // reason: the head is held whole, so a buffer with no room left is a
+        // head that will never complete.
+        if (reader.buffer.len - reader.end < body_read_reserve) return error.HeadersTooLarge;
         reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => {
                 if (parsed_len == 0) return error.EndOfStream;

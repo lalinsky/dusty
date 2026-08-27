@@ -1220,3 +1220,105 @@ test "Server: client_auth with ca .none is rejected by listen" {
     const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
     try std.testing.expectError(error.NoCertificateAuthority, server.listen(addr));
 }
+
+test "Server: a request head too large for the buffer gets 431, not a panic" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            // Comfortably past the default buffer_size + body_read_reserve,
+            // in one header so max_header_count is not what rejects it.
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Big: ");
+            try writer.interface.splatByteAll('A', 9000);
+            try writer.interface.writeAll("\r\n\r\n");
+            // The server answers and hangs up mid-head; it never reads the
+            // rest, so this flush may fail on a reset socket. That is the
+            // point, not a failure of the test.
+            writer.interface.flush() catch {};
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectEqualStrings(
+                "HTTP/1.1 431 Request Header Fields Too Large\r",
+                status_line,
+            );
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Server: a head that just fits is still served" {
+    const io = std.testing.io;
+
+    // 2 KB of header against the 4 KB default: comfortably under, so the
+    // guard must not fire early.
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = req.headers.get("X-Big") orelse "missing";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Big: ");
+            try writer.interface.splatByteAll('A', 2048);
+            try writer.interface.writeAll("\r\n\r\n");
+            try writer.interface.flush();
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r", status_line);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}

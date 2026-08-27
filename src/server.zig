@@ -11,6 +11,7 @@ const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
+const body_read_reserve = @import("config.zig").body_read_reserve;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
@@ -86,7 +87,7 @@ pub const Connection = struct {
         // budget, then recycle it (reset keeps the memory). The TLS buffers
         // and the per-request arena are then carved from that one
         // allocation; only unusually large requests grow it.
-        const conn_reserve = tls.input_buffer_len + tls.output_buffer_len + 2 * (request_buffer_size + 1024);
+        const conn_reserve = tls.input_buffer_len + tls.output_buffer_len + 2 * (request_buffer_size + body_read_reserve);
         _ = try self.arena.allocator().alloc(u8, conn_reserve);
         _ = self.arena.reset(.retain_capacity);
 
@@ -162,6 +163,18 @@ pub const Connection = struct {
 
     pub const isPeerGone = Transport.isPeerGone;
 };
+
+/// The one reply that cannot go through `Response`: what overran is the head
+/// that would have said how to frame it. Fixed bytes instead, and
+/// `Connection: close`, because the rest of that head is still queued on the
+/// socket and there is no framing to skip it by.
+fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    return w.flush();
+}
 
 pub const Address = union(enum) {
     ip: std.Io.net.IpAddress,
@@ -554,7 +567,7 @@ pub fn Server(comptime Ctx: type) type {
             defer timeout.clear();
 
             // Allocate initial buffer from arena
-            connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
+            connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + body_read_reserve) catch |err| {
                 log.err("Failed to allocate read buffer: {}", .{err});
                 return err;
             };
@@ -578,6 +591,12 @@ pub fn Server(comptime Ctx: type) type {
                         return;
                     },
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
+                    error.HeadersTooLarge => {
+                        log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
+                        sendHeadersTooLarge(connection.writer) catch
+                            return connection.getWriteError() orelse error.Unexpected;
+                        return;
+                    },
                     else => |e| return e,
                 };
 
@@ -670,7 +689,7 @@ pub fn Server(comptime Ctx: type) type {
                 _ = arena.reset(.retain_capacity);
 
                 // Allocate fresh buffer for keepalive wait (previous buffer was freed by arena reset)
-                connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + 1024) catch |err| {
+                connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + body_read_reserve) catch |err| {
                     log.err("Failed to allocate read buffer: {}", .{err});
                     return err;
                 };

@@ -6,6 +6,7 @@ const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
+const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
@@ -481,11 +482,18 @@ const MultipartForm = struct {
     // End of chunk.
 };
 
-const ParseHeadersError = std.Io.Reader.Error || ParseError || error{ IncompleteRequest, OutOfMemory };
+const ParseHeadersError = std.Io.Reader.Error || ParseError ||
+    error{ IncompleteRequest, HeadersTooLarge, OutOfMemory };
 
 /// Parse HTTP headers from a reader and prepare for body reading.
+///
+/// The head is bounded by `reader.buffer`, less `body_read_reserve`: it is
+/// never tossed while it is being parsed, because the header slices point
+/// into it, so whatever it does not use is all the body reader will have.
+///
 /// Returns error.EndOfStream if connection closed cleanly with no data.
 /// Returns error.IncompleteRequest if connection closed mid-request.
+/// Returns error.HeadersTooLarge if the head does not fit.
 pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeadersError!void {
     // Re-pre-allocate headers each call to handle keep-alive (arena was reset).
     parser.request.headers = try http.Headers.init(parser.request.arena, parser.request.config.max_header_count);
@@ -505,6 +513,11 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
             parsed_len += unparsed.len;
             continue;
         }
+        // Every buffered byte has been consumed as head and it is still
+        // open, so filling again is the only way forward -- and there is no
+        // room left to fill into. `fillMore` would ask its rebase to free a
+        // byte that nothing can free, and assert.
+        if (reader.buffer.len - reader.end < body_read_reserve) return error.HeadersTooLarge;
         reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => {
                 if (parsed_len == 0) return error.EndOfStream;
