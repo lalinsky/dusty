@@ -28,8 +28,10 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
         if (std.ascii.eqlIgnoreCase(key, "connection") or
             std.ascii.eqlIgnoreCase(key, "keep-alive") or
             std.ascii.eqlIgnoreCase(key, "transfer-encoding") or
-            // The client decompresses transparently, so the upstream
-            // length does not describe what we are about to send.
+            // The server decoded the body on the way in, so neither what
+            // the client coded it as nor the length it measured describes
+            // what we are about to send upstream.
+            std.ascii.eqlIgnoreCase(key, "content-encoding") or
             std.ascii.eqlIgnoreCase(key, "content-length") or
             std.ascii.eqlIgnoreCase(key, "upgrade") or
             std.ascii.eqlIgnoreCase(key, "proxy-connection") or
@@ -74,8 +76,9 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
         if (std.ascii.eqlIgnoreCase(key, "connection") or
             std.ascii.eqlIgnoreCase(key, "keep-alive") or
             std.ascii.eqlIgnoreCase(key, "transfer-encoding") or
-            // The client decompresses transparently, so the upstream
-            // length does not describe what we are about to send.
+            // `Content-Encoding` is forwarded: the upstream fetch asked for
+            // no decoding, so the body still is what it says. The length is
+            // not, because the body goes out chunked.
             std.ascii.eqlIgnoreCase(key, "content-length") or
             std.ascii.eqlIgnoreCase(key, "upgrade") or
             std.ascii.eqlIgnoreCase(key, "proxy-connection"))

@@ -687,6 +687,7 @@ pub const ClientResponse = struct {
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*ResponseBodyReader.Decode = null,
+    _body_reader_taken: bool = false,
 
     // Connection reference for cleanup (optional for testing)
     owner: ?*Connection = null,
@@ -759,6 +760,9 @@ pub const ClientResponse = struct {
     /// what `peek` and the `take` family read out of, so size it for the
     /// longest thing they need to see at once; an empty slice is fine for a
     /// caller that only ever streams.
+    ///
+    /// One per response. `body` takes it if you have not, so a caller that
+    /// streams cannot then ask for the body whole.
     pub fn reader(self: *ClientResponse, buffer: []u8) !ResponseBodyReader {
         var r = ResponseBodyReader.init(self.parser, self.transport, buffer);
 
@@ -768,6 +772,12 @@ pub const ClientResponse = struct {
             r.interface = .fixed(self._body orelse &.{});
             return r;
         }
+
+        // The buffer belongs to the caller, so a second reader starts empty
+        // and whatever the first one had buffered is unreachable -- bytes off
+        // the body, with nothing to say they went missing.
+        std.debug.assert(!self._body_reader_taken); // one body reader per response
+        self._body_reader_taken = true;
 
         if (self._decode) |decode| {
             r.decode = decode;
@@ -1660,6 +1670,16 @@ test "Client: no std.Io sentinel escapes its public API" {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
             try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        }
+    }
+
+    // Not a sentinel, but not a cause either: reading a body, a stream that
+    // stopped early is `IncompleteBody`, and `EndOfStream` here would be
+    // read as the peer having hung up. `fetch` is excluded because a
+    // connection-close-delimited response can end that way for real.
+    inline for (.{ ClientResponse.ReadError, ResponseBodyReader.Error }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
         }
     }
 }

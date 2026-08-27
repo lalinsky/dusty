@@ -27,11 +27,13 @@
 //! another reason it is not ours to pick.
 //!
 //! `BodyReader` (`parser.zig`) and `BodyWriter`, `StreamingBodyWriter` and
-//! `EventWriter` (`response.zig`) are all this. `WebSocket` and
-//! `EventStream` hand out no interface at all and resolve inside `send` /
-//! `receive`, which is the same promise kept a different way. `Transport`
-//! and `Connection` expose a bare interface with accessors beside it, which
-//! is allowed only because nothing sits above them to lose the answer.
+//! `EventWriter` (`response.zig`) are all this -- `EventStream.startSend`
+//! hands out the last of them, and `EventStream.send` resolves inside
+//! itself for a caller who does not want one. `WebSocket` hands out no
+//! interface at all and resolves inside `send` / `receive`, which is the
+//! same promise kept a different way. `Transport` and `Connection` expose a
+//! bare interface with accessors beside it, which is allowed only because
+//! nothing sits above them to lose the answer.
 //!
 //! "Resolved" is the load-bearing word. An `err` holding a sentinel is no
 //! better than the sentinel, and layers do record sentinels: tls.zig stores

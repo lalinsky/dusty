@@ -46,6 +46,7 @@ pub const Request = struct {
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*RequestBodyReader.Decode = null,
+    _body_reader_taken: bool = false,
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
@@ -101,6 +102,9 @@ pub const Request = struct {
     /// what `peek` and the `take` family read out of, so size it for the
     /// longest thing they need to see at once; an empty slice is fine for a
     /// caller that only ever streams.
+    ///
+    /// One per body. `body` takes it if you have not, so a handler that
+    /// streams cannot then ask for the body whole.
     pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
         var r = RequestBodyReader.init(self.parser, self.transport, buffer);
 
@@ -110,6 +114,12 @@ pub const Request = struct {
             r.interface = .fixed(self._body orelse &.{});
             return r;
         }
+
+        // The buffer belongs to the caller, so a second reader starts empty
+        // and whatever the first one had buffered is unreachable -- bytes off
+        // the body, with nothing to say they went missing.
+        std.debug.assert(!self._body_reader_taken); // one body reader per request
+        self._body_reader_taken = true;
 
         r.request = self;
         if (self._decode) |decode| {
@@ -662,6 +672,10 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
     }) |Set| {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+            // Not a sentinel, but not a cause either: the body layer calls a
+            // stream that stopped early `IncompleteBody`, and `EndOfStream`
+            // here would be read as the peer having hung up.
+            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
         }
     }
 }
@@ -772,6 +786,37 @@ test "Request.body: decoding off yields what the wire carried" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings(gzip_hello, body.?);
+}
+
+test "Request.body: a compressed body cut short is a bad body, not a departed peer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A valid gzip stream, truncated. The peer is still there and the HTTP
+    // message is whole; it is the compressed stream inside that stops early.
+    const cut_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xcb\x48\xcd\xc9\xc9";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 15\r\n\r\n" ++ cut_gzip;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // The decoder calls this `EndOfStream`, which is how a peer that hung up
+    // is spelled -- `Transport.isPeerGone` would believe it and tear the
+    // connection down rather than answering. The framing half already calls
+    // the same condition `IncompleteBody`, and so must this one.
+    try std.testing.expectError(error.IncompleteBody, req.body());
+    try std.testing.expect(!Transport.isPeerGone(error.IncompleteBody));
 }
 
 test "Request.body: a coding we cannot undo is refused rather than guessed at" {

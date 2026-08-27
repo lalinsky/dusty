@@ -63,7 +63,8 @@ pub const ServerConfig = struct {
     /// `listen.kernel_backlog` deep. Null lifts the cap.
     ///
     /// Costs about `request.buffer_size + 8K` per connection, 33K more under
-    /// TLS.
+    /// TLS, and 70K more for a connection that receives a body with a
+    /// `Content-Encoding` while `request.decompress` is on.
     max_connections: ?u32 = 10_000,
     /// TLS configuration. When set, the server performs a TLS handshake on every
     /// accepted connection and speaks HTTPS. Requires the `use_tls` build option
@@ -121,13 +122,16 @@ pub const ServerConfig = struct {
         /// handler sees, so for a compressed request it bounds what was
         /// decoded rather than what arrived.
         max_body_size: usize = 1_048_576, // 1MB default
-        /// Undo `Content-Encoding` on request bodies. Turn off to read what
-        /// the wire carried; `Request.content_encoding` says what that is.
-        /// A coding we cannot undo fails the read with
-        /// `error.UnsupportedContentEncoding` either way.
+        /// Undo `Content-Encoding` on request bodies. A coding we cannot
+        /// undo fails the read with `error.UnsupportedContentEncoding`
+        /// rather than handing the handler bytes it would misread.
         ///
-        /// Costs a 64K sliding window from the connection's arena, on the
-        /// connections that actually receive a coded body and only once each.
+        /// Turn off to read what the wire carried, whatever it is;
+        /// `Request.content_encoding` says what that was.
+        ///
+        /// Costs about 70K from the connection's arena -- a 64K sliding
+        /// window and the decoder -- on the connections that actually
+        /// receive a coded body, and only once each.
         decompress: bool = true,
         /// Buffer size (bytes) for reading the request head: the request
         /// line and all headers. This is also the limit on it -- the parsed
