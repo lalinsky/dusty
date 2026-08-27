@@ -58,6 +58,13 @@ pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
     listen: std.Io.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
+    /// How many connections may be open at once. At the cap the server stops
+    /// accepting; what arrives meanwhile waits in the kernel's accept queue,
+    /// `listen.kernel_backlog` deep. Null lifts the cap.
+    ///
+    /// Costs about `request.buffer_size + 8K` per connection, 33K more under
+    /// TLS.
+    max_connections: ?u32 = 10_000,
     /// TLS configuration. When set, the server performs a TLS handshake on every
     /// accepted connection and speaks HTTPS. Requires the `use_tls` build option
     /// (enabled by default); with TLS compiled out, setting this fails listen().
@@ -88,10 +95,18 @@ pub const ServerConfig = struct {
     };
 
     pub const Timeout = struct {
-        /// Maximum time to receive a complete request
-        request: ?std.Io.Duration = null,
-        /// Maximum time to keep idle connections open
-        keepalive: ?std.Io.Duration = null,
+        /// Maximum time to complete a request, including handler work and the
+        /// response. TLS handshakes use the same timeout as a separate phase.
+        /// Defaults to 30 seconds; set to null for long-lived handlers, or
+        /// replace it from a handler with `Request.setTimeout`.
+        ///
+        /// Costs a second task per connection on any backend but zio, so on
+        /// `std.Io.Threaded` setting either timeout means two threads per
+        /// connection.
+        request: ?std.Io.Duration = .fromSeconds(30),
+        /// Maximum time to keep idle connections open. Defaults to 60 seconds;
+        /// set to null to keep them open indefinitely.
+        keepalive: ?std.Io.Duration = .fromSeconds(60),
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
         /// Maximum time a graceful shutdown waits for the connections still
@@ -122,3 +137,9 @@ pub const ServerConfig = struct {
         max_multiform_count: usize = 32,
     };
 };
+
+test "ServerConfig: connection timeouts are finite by default" {
+    const cfg: ServerConfig = .{};
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(30), cfg.timeout.request.?);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(60), cfg.timeout.keepalive.?);
+}

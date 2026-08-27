@@ -188,6 +188,137 @@ pub const Address = union(enum) {
     }
 };
 
+/// Whether the injected `zio` can arm a timer against the running task. The
+/// stub says so by declaring `is_stub`; the real package does not.
+const have_auto_cancel = !@hasDecl(zio, "is_stub");
+
+/// A deadline one task publishes and another waits on.
+///
+/// The watcher sleeps on `generation`, which every re-arm and the finish bump
+/// before waking it. That order is what makes the wait lossless: a re-arm
+/// racing the watcher leaves the word different from what the wait expects,
+/// so it returns rather than sleeping on stale terms.
+const Watch = struct {
+    generation: std.atomic.Value(u32) = .init(0),
+    /// Nanoseconds on the `.awake` clock, or `unarmed`.
+    deadline: std.atomic.Value(i64) = .init(unarmed),
+    finished: std.atomic.Value(bool) = .init(false),
+
+    const unarmed = std.math.maxInt(i64);
+
+    fn wake(self: *Watch, io: std.Io) void {
+        _ = self.generation.fetchAdd(1, .acq_rel);
+        io.futexWake(u32, &self.generation.raw, 1);
+    }
+
+    fn set(self: *Watch, io: std.Io, timeout: std.Io.Timeout) void {
+        const deadline = timeout.toTimestamp(io) orelse return self.disarm(io);
+        const awake_ns = if (deadline.clock == .awake)
+            deadline.raw.nanoseconds
+        else blk: {
+            // `Clock.Timestamp.toClock` in Zig 0.16 passes its wrapper where
+            // `Io.Timestamp.durationTo` expects the raw timestamp. Spell out
+            // the same conversion until that helper is fixed upstream.
+            const now_old = deadline.clock.now(io);
+            const now_awake = std.Io.Clock.awake.now(io);
+            const remaining = now_old.durationTo(deadline.raw);
+            break :blk now_awake.addDuration(remaining).nanoseconds;
+        };
+        const ns = std.math.cast(i64, awake_ns) orelse unarmed;
+        self.deadline.store(ns, .release);
+        self.wake(io);
+    }
+
+    fn arm(self: *Watch, io: std.Io, duration: std.Io.Duration) void {
+        self.set(io, .{ .duration = .{ .raw = duration, .clock = .awake } });
+    }
+
+    fn disarm(self: *Watch, io: std.Io) void {
+        self.deadline.store(unarmed, .release);
+        self.wake(io);
+    }
+
+    fn finish(self: *Watch, io: std.Io) void {
+        self.finished.store(true, .release);
+        self.wake(io);
+    }
+
+    /// Blocks until the connection finishes, or `error.Timeout` if it
+    /// overruns the deadline it last published.
+    fn wait(self: *Watch, io: std.Io) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
+        while (true) {
+            const generation = self.generation.load(.acquire);
+            if (self.finished.load(.acquire)) return;
+            const deadline = self.deadline.load(.acquire);
+
+            const timeout: std.Io.Timeout = if (deadline == unarmed) .none else .{
+                .deadline = .{ .raw = .{ .nanoseconds = deadline }, .clock = .awake },
+            };
+            try io.futexWaitTimeout(u32, &self.generation.raw, generation, timeout);
+
+            // The wait does not report why it returned, and `generation` is
+            // only its wakeup token: `arm` publishes the deadline first, so an
+            // unchanged generation does not mean an unchanged deadline. Decide
+            // on what is published now, not on what was captured above.
+            if (self.finished.load(.acquire)) return;
+            const current = self.deadline.load(.acquire);
+            if (current == unarmed) continue;
+            if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= current) return error.Timeout;
+        }
+    }
+};
+
+/// Bounds how long a connection may spend on any one blocking step.
+///
+/// zio arms a timer against the running task. `std.Io` has no deadline for a
+/// stream read, only cancelation, so elsewhere the deadline goes to a second
+/// task that cancels this one when it passes.
+const Timer = if (have_auto_cancel) struct {
+    inner: zio.AutoCancel = .init,
+
+    fn init(_: ?*Watch) @This() {
+        return .{};
+    }
+
+    fn set(self: *@This(), io: std.Io, timeout: std.Io.Timeout) void {
+        // TODO(zio): drop the clear once we require a zio with
+        // lalinsky/zio#657. `set` is meant to handle a re-arm itself, and
+        // stopped: it arms on the executor the task is on now, so re-arming
+        // after a migration asks one loop for a timer live in another's heap.
+        self.inner.clear();
+        const duration = timeout.toDurationFromNow(io) orelse return;
+        const raw_ms = @divFloor(duration.raw.nanoseconds, std.time.ns_per_ms);
+        const milliseconds = std.math.cast(u64, @max(raw_ms, 0)) orelse std.math.maxInt(u64);
+        self.inner.set(.fromMilliseconds(milliseconds));
+    }
+
+    fn clear(self: *@This(), _: std.Io) void {
+        self.inner.clear();
+    }
+} else struct {
+    /// Null when no deadline was configured.
+    watch: ?*Watch = null,
+
+    fn init(w: ?*Watch) @This() {
+        return .{ .watch = w };
+    }
+
+    fn set(self: *@This(), io: std.Io, timeout: std.Io.Timeout) void {
+        const w = self.watch orelse return;
+        w.set(io, timeout);
+    }
+
+    fn clear(self: *@This(), io: std.Io) void {
+        const w = self.watch orelse return;
+        w.disarm(io);
+    }
+};
+
+fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
+    const timer: *Timer = @ptrCast(@alignCast(context));
+    timer.set(io, timeout);
+}
+
 pub fn Server(comptime Ctx: type) type {
     const MiddlewareItem = struct {
         middleware: Middleware(Ctx),
@@ -315,6 +446,13 @@ pub fn Server(comptime Ctx: type) type {
                 }
             };
 
+            if (self.config.max_connections) |max| {
+                if (max == 0) {
+                    log.err("config.max_connections is 0, so no connection could ever be served", .{});
+                    return error.NoConnectionsAllowed;
+                }
+            }
+
             var server = switch (addr) {
                 .ip => |ip| try ip.listen(self.io, self.config.listen),
                 .unix => |unix| try unix.listen(self.io, .{}),
@@ -340,6 +478,11 @@ pub fn Server(comptime Ctx: type) type {
             var backoff_ms: u64 = 0;
 
             while (true) {
+                self.waitForConnectionSlot() catch |err| {
+                    self.drainConnections();
+                    return err;
+                };
+
                 const stream = server.accept(self.io) catch |err| switch (err) {
                     error.Canceled => {
                         self.drainConnections();
@@ -384,7 +527,7 @@ pub fn Server(comptime Ctx: type) type {
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
                 group.concurrent(self.io, handleConnectionWrapper, .{ self, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
-                    _ = self.active_connections.fetchSub(1, .acq_rel);
+                    self.releaseConnectionSlot();
                     stream.close(self.io);
                     continue;
                 };
@@ -444,9 +587,63 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
+        /// Blocks while every connection slot is taken. Not accepting is the
+        /// backpressure: what arrives meanwhile waits in the kernel's accept
+        /// queue, `listen.kernel_backlog` deep.
+        fn waitForConnectionSlot(self: *Self) std.Io.Cancelable!void {
+            const max = self.config.max_connections orelse return;
+            while (true) {
+                const active = self.active_connections.load(.acquire);
+                if (active < max) return;
+                log.debug("At the {d} connection cap; waiting for a slot", .{max});
+                try self.io.futexWait(u32, &self.active_connections.raw, active);
+            }
+        }
+
+        /// Wakes whoever is waiting for one: the accept loop, or the drain.
+        fn releaseConnectionSlot(self: *Self) void {
+            _ = self.active_connections.fetchSub(1, .acq_rel);
+            self.io.futexWake(u32, &self.active_connections.raw, 1);
+        }
+
         fn handleConnectionWrapper(self: *Self, stream: std.Io.net.Stream) std.Io.Cancelable!void {
-            handleConnection(self, stream) catch |err| {
-                if (err == error.Canceled) return error.Canceled;
+            if (comptime have_auto_cancel) return runConnection(self, stream, null);
+
+            if (self.config.timeout.request == null and self.config.timeout.keepalive == null) {
+                return runConnection(self, stream, null);
+            }
+
+            var watch: Watch = .{};
+            var future = self.io.concurrent(runConnection, .{ self, stream, &watch }) catch |err| {
+                log.warn("No task to watch the connection deadline: {}; refusing", .{err});
+                self.releaseConnectionSlot();
+                stream.close(self.io);
+                return;
+            };
+            defer future.cancel(self.io);
+
+            watch.wait(self.io) catch |err| switch (err) {
+                error.Timeout => {
+                    log.debug("Connection exceeded its deadline", .{});
+                    return;
+                },
+                error.Canceled => return error.Canceled,
+            };
+
+            // Collected here rather than by the defer, which would put a
+            // cancelation request to a task partway through its teardown.
+            future.await(self.io);
+        }
+
+        /// Runs on this task under zio, on a task of its own otherwise.
+        fn runConnection(self: *Self, stream: std.Io.net.Stream, watch: ?*Watch) void {
+            defer if (watch) |w| w.finish(self.io);
+
+            handleConnection(self, stream, watch) catch |err| {
+                if (err == error.Canceled) {
+                    log.debug("Connection canceled", .{});
+                    return;
+                }
                 // A peer disappearing mid-request is ordinary and would drown
                 // out the failures worth looking at.
                 if (Connection.isPeerGone(err)) {
@@ -457,11 +654,8 @@ pub fn Server(comptime Ctx: type) type {
             };
         }
 
-        pub fn handleConnection(self: *Self, stream: std.Io.net.Stream) !void {
-            defer {
-                _ = self.active_connections.fetchSub(1, .acq_rel);
-                self.io.futexWake(u32, &self.active_connections.raw, 1);
-            }
+        pub fn handleConnection(self: *Self, stream: std.Io.net.Stream, watch: ?*Watch) !void {
+            defer self.releaseConnectionSlot();
 
             defer stream.close(self.io);
 
@@ -477,6 +671,9 @@ pub fn Server(comptime Ctx: type) type {
             var connection: Connection = undefined;
             defer connection.deinit();
 
+            var timer: Timer = .init(watch);
+            defer timer.clear(self.io);
+
             // When TLS is configured, upgrade the accepted stream and run the
             // request loop over the cleartext reader/writer. Otherwise run it
             // directly over the raw stream.
@@ -490,10 +687,9 @@ pub fn Server(comptime Ctx: type) type {
                     // for as long as it likes -- cheaper for it than a
                     // slow request, which is bounded.
                     {
-                        var handshake: zio.AutoCancel = .init;
-                        defer handshake.clear();
+                        defer timer.clear(self.io);
                         if (self.config.timeout.request) |duration| {
-                            handshake.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
+                            timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
                         }
 
                         const client_auth: ?ClientAuthRef = if (self.tls_client_ca) |*bundle| .{
@@ -531,12 +727,12 @@ pub fn Server(comptime Ctx: type) type {
                     // between keepalive requests reuses the connection's memory
                     // without touching the TLS buffers carved above.
                     var request_arena = std.heap.ArenaAllocator.init(connection.arena.allocator());
-                    return self.handleRequests(&connection, &request_arena, &needs_shutdown);
+                    return self.handleRequests(&connection, &request_arena, &needs_shutdown, &timer);
                 }
             }
 
             connection.initPlain(self.allocator, self.io, stream);
-            return self.handleRequests(&connection, &connection.arena, &needs_shutdown);
+            return self.handleRequests(&connection, &connection.arena, &needs_shutdown, &timer);
         }
 
         /// Runs the HTTP request/keepalive loop over a connection.
@@ -545,6 +741,7 @@ pub fn Server(comptime Ctx: type) type {
             connection: *Connection,
             arena: *std.heap.ArenaAllocator,
             needs_shutdown: *bool,
+            timer: *Timer,
         ) !void {
             var request: Request = .{
                 .arena = arena.allocator(),
@@ -553,6 +750,8 @@ pub fn Server(comptime Ctx: type) type {
                 .parser = undefined,
                 .config = self.config.request,
                 .remote_address = connection.stream.socket.address,
+                ._timeout_context = timer,
+                ._set_timeout = setRequestTimeout,
             };
 
             var parser: RequestParser = undefined;
@@ -563,9 +762,6 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
-            var timeout: zio.AutoCancel = .init;
-            defer timeout.clear();
-
             // Allocate initial buffer from arena
             connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + body_read_reserve) catch |err| {
                 log.err("Failed to allocate read buffer: {}", .{err});
@@ -575,14 +771,12 @@ pub fn Server(comptime Ctx: type) type {
             while (true) {
                 request_count += 1;
 
+                // Cleared when unset, so a keepalive deadline does not carry
+                // into a request meant to be unbounded.
                 if (self.config.timeout.request) |duration| {
-                    // TODO(zio): drop once we require a zio with
-                    // lalinsky/zio#657. `set` is meant to handle a re-arm
-                    // itself, and stopped: it arms on the executor the task
-                    // is on now, so re-arming after a migration asks one
-                    // loop for a timer live in another's heap.
-                    timeout.clear();
-                    timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
+                    timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
+                } else {
+                    timer.clear(self.io);
                 }
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
@@ -697,9 +891,9 @@ pub fn Server(comptime Ctx: type) type {
                 connection.reader.end = 0;
 
                 if (self.config.timeout.keepalive) |duration| {
-                    // TODO(zio): drop with the one above, same reason.
-                    timeout.clear();
-                    timeout.set(.fromMilliseconds(@intCast(duration.toMilliseconds())));
+                    timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
+                } else {
+                    timer.clear(self.io);
                 }
 
                 // Fill some data here, under the keepalive timeout
@@ -794,4 +988,47 @@ test "Connection: isPeerGone separates a departed peer from a real failure" {
     try std.testing.expect(!Connection.isPeerGone(error.TlsTruncated));
     try std.testing.expect(!Connection.isPeerGone(error.TlsBadRecordMac));
     try std.testing.expect(!Connection.isPeerGone(error.Canceled));
+}
+
+test "Watch: accepts an absolute deadline on another clock" {
+    const io = std.testing.io;
+    var watch: Watch = .{};
+    const deadline = std.Io.Clock.Timestamp.now(io, .real).addDuration(.{
+        .raw = .fromMilliseconds(50),
+        .clock = .real,
+    });
+    watch.set(io, .{ .deadline = deadline });
+    try std.testing.expectError(error.Timeout, watch.wait(io));
+}
+
+test "Watch: a deadline republished before its generation does not expire the connection" {
+    const io = std.testing.io;
+    var watch: Watch = .{};
+
+    // Leave enough room for the watcher and this test task both to be
+    // scheduled on a loaded runner before the first deadline arrives.
+    watch.arm(io, .fromMilliseconds(500));
+
+    var watcher = try io.concurrent(struct {
+        fn go(w: *Watch, i: std.Io) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
+            return w.wait(i);
+        }
+    }.go, .{ &watch, io });
+    defer watcher.cancel(io) catch {};
+
+    // The watcher is now asleep holding the first deadline. Publish a later
+    // one the way `arm` does, but stop short of the generation bump -- the
+    // window between its store and its wake.
+    try io.sleep(.fromMilliseconds(25), .awake);
+    const later = std.math.cast(i64, std.Io.Timeout.toDeadline(
+        .{ .duration = .{ .raw = .fromMilliseconds(5_000), .clock = .awake } },
+        io,
+    ).deadline.raw.nanoseconds).?;
+    watch.deadline.store(later, .release);
+
+    // Well past the first deadline, and nowhere near the second.
+    try io.sleep(.fromMilliseconds(600), .awake);
+    watch.finish(io);
+
+    try watcher.await(io);
 }

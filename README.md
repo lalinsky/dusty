@@ -127,6 +127,39 @@ var response = try client.fetch("http://localhost/v1.41/info", .{
 defer response.deinit();
 ```
 
+## Timeouts
+
+Servers use finite timeouts by default so stalled or idle clients eventually
+release their connection slots:
+
+- `timeout.request` defaults to 30 seconds. It covers an entire request,
+  including handler work and writing the response; a TLS handshake gets its own
+  deadline of the same length.
+- `timeout.keepalive` defaults to 60 seconds between requests on a persistent
+  connection.
+- `timeout.shutdown` defaults to 30 seconds for a graceful shutdown drain.
+
+Set a configured timeout to `null` to disable it. A handler can also replace
+its current request deadline with `Request.setTimeout`. It accepts
+`std.Io.Timeout`, so the handler can use a relative duration, provide an exact
+deadline, or disable the deadline with `.none`:
+
+```zig
+req.setTimeout(.{
+    .duration = .{ .raw = .fromSeconds(60), .clock = .awake },
+});
+req.setTimeout(.{ .deadline = deadline });
+req.setTimeout(.none);
+```
+
+Long-lived handlers can use this as an inactivity timeout by re-arming it
+before each WebSocket message or event, without disabling the resilient server
+default for ordinary requests.
+
+On zio, deadlines cancel the connection task directly. Other I/O backends use
+a watchdog task; with `std.Io.Threaded`, that means a second OS thread for each
+connection while either request or keepalive timeouts are enabled.
+
 ## Selecting the I/O Backend
 
 The examples above use `init.io`, the threaded I/O implementation from the stdlib. This is suitable for development or small servers.
