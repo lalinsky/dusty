@@ -156,9 +156,10 @@ Long-lived handlers can use this as an inactivity timeout by re-arming it
 before each WebSocket message or event, without disabling the resilient server
 default for ordinary requests.
 
-On zio, deadlines cancel the connection task directly. Other I/O backends use
-a watchdog task; with `std.Io.Threaded`, that means a second OS thread for each
-connection while either request or keepalive timeouts are enabled.
+On zio, deadlines cancel the connection task directly, which needs a zio new
+enough to have `AutoCancel.setClock`. Other I/O backends use a watchdog task;
+with `std.Io.Threaded`, that means a second OS thread for each connection while
+either request or keepalive timeouts are enabled.
 
 ## Selecting the I/O Backend
 
@@ -172,7 +173,7 @@ it's missing any networking functionality, so use zio for now.
 Add it as a dependency:
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/zio#v0.10.0"
+zig fetch --save "git+https://github.com/lalinsky/zio"
 ```
 
 In `build.zig`, add the zio module:
