@@ -225,6 +225,14 @@ pub const RequestParser = struct {
             self.request.content_type = ContentType.fromContentType(content_type);
         }
 
+        if (self.request.headers.get("Content-Encoding")) |content_encoding| {
+            self.request.content_encoding = ContentEncoding.fromString(content_encoding);
+        }
+
+        if (self.request.headers.get("Content-Length")) |content_length| {
+            self.request.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
+        }
+
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
     }
@@ -260,6 +268,7 @@ pub const ParsedResponse = struct {
     headers: Headers = .{},
     content_type: ?ContentType = null,
     content_encoding: ContentEncoding = .identity,
+    content_length: ?usize = null,
     arena: std.mem.Allocator,
 };
 
@@ -443,6 +452,10 @@ pub const ResponseParser = struct {
             self.response.content_encoding = ContentEncoding.fromString(content_encoding);
         }
 
+        if (self.response.headers.get("Content-Length")) |content_length| {
+            self.response.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
+        }
+
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
     }
@@ -483,20 +496,35 @@ pub const ResponseParser = struct {
 /// body read. A parser free to invent its own errors would put its internals
 /// in that set -- `Paused` included, which is signalling between the parser
 /// and this loop and means nothing to a caller.
+///
+/// Read through `interface` and find out what a failed read was from `err`,
+/// the same way the response body writers work. Passed around by value: it
+/// holds an interface and pointers, and nothing points back at it.
+///
+/// Both transforms between wire bytes and the body a caller asked for are
+/// this type's job. It undoes the transfer framing itself; for a content
+/// coding it stacks, because `std.compress.flate.Decompress` reads from a
+/// `std.Io.Reader` and so needs one underneath it handing over raw framed
+/// bytes. That one is another `BodyReader` -- same type, lower role -- and
+/// `startDecoding` puts it and the decoder in one allocation.
 pub fn BodyReader(comptime Parser: type) type {
     return struct {
         parser: *Parser,
         transport: Transport,
-        interface: std.Io.Reader,
         request: ?*Request = null,
+        /// Set when the headers called for a content coding. Null both when
+        /// nothing is coded and on the lower reader that feeds the decoder.
+        decode: ?*Decode = null,
+        interface: std.Io.Reader,
         /// The real cause behind the generic `error.ReadFailed` that the
         /// `std.Io.Reader` interface has to return. `stream` is the one path
         /// that cannot hand a cause back, its error set being fixed by the
         /// vtable, so it is the one place this is written.
         ///
         /// Not every cause is the transport's. A body that stops mid-chunk,
-        /// or framing the parser rejects, fails the read just as surely and
-        /// the connection has nothing to say about it.
+        /// framing the parser rejects, or a corrupt deflate stream fails the
+        /// read just as surely and the connection has nothing to say about
+        /// it.
         err: ?Error = null,
 
         const Self = @This();
@@ -508,9 +536,30 @@ pub fn BodyReader(comptime Parser: type) type {
             assertFailsWithin(@TypeOf(Parser.finish), ParseError);
         }
 
+        /// What the decoder recorded, said in terms a caller can act on.
+        /// Switched on rather than compared so what it rewrites drops out of
+        /// the inferred error set as well as out of the answer, the same way
+        /// tls.zig's `TransportReadFailed` does in `Transport`.
+        fn decodeCause(e: std.compress.flate.Decompress.Error) !void {
+            switch (e) {
+                // Records whatever the reader below it handed over, and on
+                // failure that is the sentinel: keep descending.
+                error.ReadFailed => {},
+                // The compressed stream stopped early -- the same condition
+                // the framing half reports as `IncompleteBody`, and the same
+                // name is what it needs. `EndOfStream` is how a peer that
+                // hung up is spelled, which `Transport.isPeerGone` believes:
+                // it would tear the connection down instead of answering,
+                // for a peer that is still there and sent a whole message.
+                error.EndOfStream => return error.IncompleteBody,
+                else => |cause| return cause,
+            }
+        }
+
         /// What reading a body can fail with, once the sentinel is resolved.
         pub const Error = Transport.ReadError || Transport.WriteError ||
-            ParseError || error{ IncompleteBody, Unexpected };
+            ParseError || @typeInfo(@TypeOf(decodeCause(undefined))).error_union.error_set ||
+            error{ IncompleteBody, Unexpected };
 
         /// Stores what actually went wrong and reports the sentinel the
         /// vtable requires. Mirrors `fail` on the buffered body writer.
@@ -532,8 +581,92 @@ pub fn BodyReader(comptime Parser: type) type {
             };
         }
 
+        /// The decoder and the reader handing it raw framed bytes, in one
+        /// allocation so the pointers between them stay put while the body
+        /// reader above is copied around by value.
+        pub const Decode = struct {
+            source: Self,
+            source_buffer: [source_buffer_len]u8,
+            decoder: std.compress.flate.Decompress,
+            window: [std.compress.flate.max_window_len]u8,
+
+            /// What the decoder pulls raw framed bytes in. It reads its
+            /// input a few bytes at a time, so this is about how often that
+            /// goes back through the parser, not about correctness.
+            const source_buffer_len = 1024;
+        };
+
+        pub const StartDecodingError = std.mem.Allocator.Error ||
+            error{UnsupportedContentEncoding};
+
+        /// Undo `encoding` as the body is read, so `interface` yields the
+        /// representation the message was about rather than the one it was
+        /// shipped in. `.identity` is a no-op, and an encoding we cannot
+        /// undo is refused rather than guessed at.
+        ///
+        /// Call once, on a reader that has not been read from: what it is
+        /// now is copied down to become the reader underneath, and its
+        /// buffer position is copied with it.
+        ///
+        /// Allocated rather than inline because it is 64K of sliding window
+        /// and a few more of Huffman tables, and a body reader is embedded
+        /// in `Request` and in `ClientResponse` -- neither can carry that
+        /// per message when most messages are not coded at all. It lives as
+        /// long as the reader does; both callers hand over a per-message
+        /// arena.
+        pub fn startDecoding(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            encoding: ContentEncoding,
+        ) StartDecodingError!void {
+            const container: std.compress.flate.Container = switch (encoding) {
+                .identity => return,
+                .gzip => .gzip,
+                // HTTP's "deflate" is zlib-wrapped, whatever the name says.
+                .deflate => .zlib,
+                .unknown => return error.UnsupportedContentEncoding,
+            };
+            // Stated above, checked here. A reader that has been read from
+            // would carry positions into the caller's buffer down into a
+            // copy whose buffer is `source_buffer`, and they would mean
+            // something else there.
+            std.debug.assert(self.decode == null);
+            std.debug.assert(self.interface.seek == self.interface.end);
+
+            const decode = try allocator.create(Decode);
+            decode.source = self.*;
+            decode.source.interface.buffer = &decode.source_buffer;
+            decode.decoder = .init(&decode.source.interface, container, &decode.window);
+            self.decode = decode;
+        }
+
+        /// Pulls decoded bytes from the decoder, and on failure descends to
+        /// whichever layer knows why: the decoder itself, then the reader
+        /// under it, which has already resolved through the transport.
+        fn streamDecoded(
+            self: *Self,
+            decode: *Decode,
+            w: *std.Io.Writer,
+            limit: std.Io.Limit,
+        ) std.Io.Reader.StreamError!usize {
+            return decode.decoder.reader.stream(w, limit) catch |err| switch (err) {
+                error.ReadFailed => {
+                    if (decode.decoder.err) |e| {
+                        if (decodeCause(e)) |_| {} else |cause| return self.fail(cause);
+                    }
+                    return self.fail(decode.source.err orelse error.Unexpected);
+                },
+                else => |e| return e,
+            };
+        }
+
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
+            if (self.decode) |decode| return self.streamDecoded(decode, w, limit);
+            return self.streamFramed(w, limit);
+        }
+
+        fn streamFramed(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const parser = self.parser;
             const conn = self.transport.reader;
 

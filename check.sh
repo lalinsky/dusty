@@ -81,6 +81,12 @@ zig build "${BUILD_ARGS[@]}"
 echo "=== Building examples ==="
 zig build examples "${BUILD_ARGS[@]}"
 
+# Its own build.zig and its own zio, so the top-level build does not reach
+# it and an API change can compile everywhere else and still break it.
+# Takes no -Dzio_backend.
+echo "=== Building httpbin example ==="
+(cd examples/httpbin && zig build)
+
 echo "=== Running unit tests ==="
 if [ -n "$TEST_FILTER" ]; then
     echo "Running unit tests with filter: $TEST_FILTER"

@@ -316,7 +316,8 @@ fn handleSse(_: *Ctx, req: *Request, res: *Response) !void {
     const n = @min(req.params.getInt(usize, "n") orelse
         return fail(res, .bad_request, "Invalid count"), max_stream_lines);
 
-    var events = try res.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var events = try res.startEventStream(&event_buf);
     for (0..n) |i| {
         var id_buf: [24]u8 = undefined;
         var data_buf: [64]u8 = undefined;

@@ -13,6 +13,7 @@ const Method = http.Method;
 const Status = http.Status;
 const Headers = http.Headers;
 const ContentType = http.ContentType;
+const ContentEncoding = http.ContentEncoding;
 
 const WebSocket = @import("websocket.zig").WebSocket;
 
@@ -381,7 +382,12 @@ pub const Connection = struct {
     read_buffer: []u8,
     write_buffer: []u8,
 
-    // Pointers to the actual reader/writer interfaces used for HTTP I/O
+    // Pointers to the actual reader/writer interfaces used for HTTP I/O.
+    //
+    // Public, and bare interfaces, so they can only report
+    // `ReadFailed`/`WriteFailed`. That is allowed here because there is no
+    // layer above them to lose the answer: `getReadError`/`getWriteError`
+    // beside them resolve what actually failed.
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
@@ -679,15 +685,10 @@ pub const ClientResponse = struct {
     _body: ?[]const u8 = null,
     _body_read: bool = false,
 
-    // Body reader state (stored here for stable address needed by decompressor)
-    _body_reader: ResponseBodyReader = undefined,
-    _body_reader_buffer: [1024]u8 = undefined,
-    _body_reader_init: bool = false,
-
-    // Decompression state
-    _decompressor: std.compress.flate.Decompress = undefined,
-    _decompressor_buffer: [std.compress.flate.max_window_len]u8 = undefined,
-    _decompressor_init: bool = false,
+    // Set up on the first body read that calls for decoding, and kept so a
+    // second `reader()` does not build a second decoder over the same body.
+    _decode: ?*ResponseBodyReader.Decode = null,
+    _body_reader_taken: bool = false,
 
     // Connection reference for cleanup (optional for testing)
     owner: ?*Connection = null,
@@ -722,50 +723,51 @@ pub const ClientResponse = struct {
         return self.parsed.content_type;
     }
 
+    /// The coding the body arrived in. Undone by the body reader unless
+    /// `decompress` is off, in which case reading the body yields what the
+    /// wire carried.
+    ///
+    /// Once it is being undone the `Content-Encoding` header is removed,
+    /// because it would describe the body a caller is about to read as
+    /// something it is not. This still says what arrived.
+    pub fn contentEncoding(self: *const ClientResponse) ContentEncoding {
+        return self.parsed.content_encoding;
+    }
+
+    /// How long the body was on the wire, when the headers said. Removed
+    /// from the headers alongside the coding for the same reason, and kept
+    /// here for the same one.
+    pub fn contentLength(self: *const ClientResponse) ?usize {
+        return self.parsed.content_length;
+    }
+
+    /// Both of these describe the body as it arrived, and it is not going
+    /// to arrive that way any more: what the caller reads is decoded, and a
+    /// longer or shorter number of bytes. Leaving them is how a proxy comes
+    /// to forward plain bytes labelled `gzip`. `contentEncoding` and
+    /// `contentLength` keep the answer for a caller that wants it.
+    fn dropEncodedBodyHeaders(self: *ClientResponse) void {
+        _ = self.parsed.headers.remove("Content-Encoding");
+        _ = self.parsed.headers.remove("Content-Length");
+    }
+
+    /// What a failed body read can turn out to be, sentinels resolved. The
+    /// reader `reader` hands out carries one of these in `.err`.
+    pub const ReadError = ResponseBodyReader.Error;
+
     /// Read the entire response body into memory.
     /// Result is cached for subsequent calls.
-    /// Walks down from the topmost layer that ran to whichever one recorded
-    /// what went wrong. Which layers those are depends on what `reader`
-    /// handed out: a corrupt gzip stream fails in the decompressor, above a
-    /// body reader that saw nothing wrong.
-    ///
-    /// Errors rather than returning one, so its set can be inferred; the same
-    /// shape `Connection.checkReadError` has.
-    fn checkRead(self: *ClientResponse) !void {
-        if (self._decompressor_init) {
-            if (self._decompressor.err) |e| switch (e) {
-                // The decompressor stores whatever it was handed, and what
-                // the body reader hands it on failure is the sentinel. So
-                // this means "the layer below failed, keep descending" --
-                // the same thing tls.zig's `TransportReadFailed` means, and
-                // it leaves the inferred error set the same way.
-                error.ReadFailed => {},
-                else => |cause| return cause,
-            };
-        }
-        if (self._body_reader.err) |e| return e;
-    }
-
-    /// The error type `getReadError` yields.
-    pub const ReadError = @typeInfo(@TypeOf(checkRead(undefined))).error_union.error_set;
-
-    /// The real error behind an `error.ReadFailed` from `reader`, if any
-    /// layer recorded one. `body` resolves for you; a caller streaming the
-    /// body itself has to ask, since the interface it reads through cannot
-    /// say more than that a read failed.
-    pub fn getReadError(self: *ClientResponse) ?ReadError {
-        if (checkRead(self)) |_| return null else |e| return e;
-    }
-
     pub fn body(self: *ClientResponse) !?[]const u8 {
         if (self._body_read) {
             return self._body;
         }
 
-        const r = self.reader();
-        const result = r.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
+        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        var no_buf: [0]u8 = .{};
+        var r = try self.reader(&no_buf);
+        const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
-            error.ReadFailed => return self.getReadError() orelse error.Unexpected,
+            error.ReadFailed => return r.err orelse error.Unexpected,
             else => |e| return e,
         };
 
@@ -778,38 +780,46 @@ pub const ClientResponse = struct {
         return result;
     }
 
-    /// Get a streaming body reader. Returns decompressed data if server sent
-    /// compressed response and decompress option was enabled.
-    pub fn reader(self: *ClientResponse) *std.Io.Reader {
-        // If body has already been read, return a reader for the cached body
+    /// The response body: transfer framing undone, and the content coding
+    /// too unless `decompress` is off. Read through `.interface`, and
+    /// `.err` says what an `error.ReadFailed` from it actually was.
+    ///
+    /// `buffer` is where bytes wait between the connection and the caller,
+    /// the way `Response.stream` takes one for the other direction. It is
+    /// what `peek` and the `take` family read out of, so size it for the
+    /// longest thing they need to see at once; an empty slice is fine for a
+    /// caller that only ever streams.
+    ///
+    /// One per response. `body` takes it if you have not, so a caller that
+    /// streams cannot then ask for the body whole.
+    pub fn reader(self: *ClientResponse, buffer: []u8) !ResponseBodyReader {
+        var r = ResponseBodyReader.init(self.parser, self.transport, buffer);
+
+        // Once the body is in memory there is nothing left on the wire, and
+        // what is cached has already been decoded.
         if (self._body_read) {
-            const cached_body = self._body orelse &.{};
-            self._body_reader = ResponseBodyReader.init(self.parser, self.transport, &self._body_reader_buffer);
-            self._body_reader.interface = std.Io.Reader.fixed(cached_body);
-            return &self._body_reader.interface;
+            r.interface = .fixed(self._body orelse &.{});
+            return r;
         }
 
-        // Initialize body reader if not already done
-        if (!self._body_reader_init) {
-            self._body_reader = ResponseBodyReader.init(self.parser, self.transport, &self._body_reader_buffer);
-            self._body_reader_init = true;
+        // The buffer belongs to the caller, so a second reader starts empty
+        // and whatever the first one had buffered is unreachable -- bytes off
+        // the body, with nothing to say they went missing.
+        std.debug.assert(!self._body_reader_taken); // one body reader per response
+
+        if (self._decode) |decode| {
+            r.decode = decode;
+        } else if (self.decompress) {
+            try r.startDecoding(self.arena, self.parsed.content_encoding);
+            if (r.decode != null) self.dropEncodedBodyHeaders();
+            self._decode = r.decode;
         }
 
-        // If decompression enabled and response is compressed, wrap with decompressor
-        if (self.decompress and self.parsed.content_encoding != .identity and !self._decompressor_init) {
-            self._decompressor = std.compress.flate.Decompress.init(
-                &self._body_reader.interface,
-                if (self.parsed.content_encoding == .gzip) .gzip else .zlib,
-                &self._decompressor_buffer,
-            );
-            self._decompressor_init = true;
-        }
-
-        if (self._decompressor_init) {
-            return &self._decompressor.reader;
-        }
-
-        return &self._body_reader.interface;
+        // Claimed only once there is a reader to claim it for. A coding we
+        // cannot undo fails above, and nothing was read; a caller that
+        // handles that error has to be able to ask again.
+        self._body_reader_taken = true;
+        return r;
     }
 };
 
@@ -1138,6 +1148,8 @@ pub const Client = struct {
                 if (!conn.parser.isBodyComplete()) {
                     const max_drain = 2048;
                     var drain_buf: [1024]u8 = undefined;
+                    // No decoding: this is throwing the body away to keep the
+                    // connection, so what it would decode to does not matter.
                     var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &drain_buf);
                     _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
                         error.ReadFailed => {
@@ -1646,10 +1658,53 @@ test "ClientResponse: a streaming read can be resolved without going through bod
 
     // Streaming the body rather than calling `body`, which is the case with
     // no other way to find out what happened.
-    const r = response.reader();
+    var read_buf: [64]u8 = undefined;
+    var r = try response.reader(&read_buf);
     var sink: std.Io.Writer = .fixed(&[_]u8{});
-    try std.testing.expectError(error.ReadFailed, r.stream(&sink, .limited(64)));
-    try std.testing.expectEqual(error.BadGzipHeader, response.getReadError().?);
+    try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
+
+    // Asked of the reader that was handed out, which is the point: a caller
+    // holding it needs nothing else to find out what a failed read was.
+    try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
+}
+
+test "ClientResponse.body: a body read that failed before it started can be asked for again" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // Nothing was read, so nothing was taken -- the server picked the
+    // encoding, and asking twice must not trip the one-reader assert.
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+}
+
+test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
+    // `fetch` returns a `ClientResponse` by value and `reader` returns the
+    // body reader by value, so both are copied per response whether or not
+    // anything was coded. The read buffer comes from the caller, and the
+    // decoder and its 64K window are allocated when the headers call for
+    // them -- so neither of these grows with either.
+    try std.testing.expect(@sizeOf(ClientResponse) < std.compress.flate.max_window_len);
+    try std.testing.expect(@sizeOf(ResponseBodyReader) < std.compress.flate.max_window_len);
+    // Which is what they would otherwise be carrying.
+    try std.testing.expect(@sizeOf(ResponseBodyReader.Decode) > std.compress.flate.max_window_len);
 }
 
 test "Client: no std.Io sentinel escapes its public API" {
@@ -1668,10 +1723,24 @@ test "Client: no std.Io sentinel escapes its public API" {
         ErrorSetOf(Client.connectWebSocket),
         ErrorSetOf(WebSocketClient.send),
         ErrorSetOf(WebSocketClient.receive),
+        // The wrapper a streaming caller resolves through, not just the
+        // functions that resolve for them.
+        ClientResponse.ReadError,
+        ResponseBodyReader.Error,
     }) |Set| {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
             try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        }
+    }
+
+    // Not a sentinel, but not a cause either: reading a body, a stream that
+    // stopped early is `IncompleteBody`, and `EndOfStream` here would be
+    // read as the peer having hung up. `fetch` is excluded because a
+    // connection-close-delimited response can end that way for real.
+    inline for (.{ ClientResponse.ReadError, ResponseBodyReader.Error }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
         }
     }
 }
@@ -1778,17 +1847,18 @@ test "ClientResponse.reader: streaming read" {
         .max_response_size = 1024,
     };
 
-    const body_reader = response.reader();
+    var read_buf: [64]u8 = undefined;
+    var body_reader = try response.reader(&read_buf);
 
     // Read in chunks
     var buf: [5]u8 = undefined;
-    var n = try body_reader.readSliceShort(&buf);
+    var n = try body_reader.interface.readSliceShort(&buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
 
-    n = try body_reader.readSliceShort(&buf);
+    n = try body_reader.interface.readSliceShort(&buf);
     try std.testing.expectEqualStrings(" worl", buf[0..n]);
 
-    n = try body_reader.readSliceShort(&buf);
+    n = try body_reader.interface.readSliceShort(&buf);
     try std.testing.expectEqualStrings("d", buf[0..n]);
 }
 
@@ -1818,8 +1888,9 @@ test "ClientResponse.reader: after body() returns cached data" {
     try std.testing.expectEqualStrings("hello", body.?);
 
     // Now reader should return cached body
-    const body_reader = response.reader();
-    const cached = try body_reader.allocRemaining(arena.allocator(), .unlimited);
+    var read_buf: [64]u8 = undefined;
+    var body_reader = try response.reader(&read_buf);
+    const cached = try body_reader.interface.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("hello", cached);
 }
 
@@ -1849,6 +1920,43 @@ test "ClientResponse.body: gzip decompression" {
 
     const body = try response.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse: decoding takes the headers that described the encoded body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqualStrings("gzip", response.headers().get("Content-Encoding").?);
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // A proxy forwarding these would send five plain bytes labelled as
+    // twenty-five gzipped ones.
+    try std.testing.expectEqual(@as(?[]const u8, null), response.headers().get("Content-Encoding"));
+    try std.testing.expectEqual(@as(?[]const u8, null), response.headers().get("Content-Length"));
+
+    // What arrived is still answerable, just not as a header.
+    try std.testing.expectEqual(ContentEncoding.gzip, response.contentEncoding());
+    try std.testing.expectEqual(@as(?usize, 25), response.contentLength());
 }
 
 test "ClientResponse.body: gzip decompression disabled" {

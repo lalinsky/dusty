@@ -18,6 +18,18 @@ pub const Request = struct {
     version_minor: u8 = 0,
     headers: http.Headers = .{},
     content_type: ?http.ContentType = null,
+    /// The coding the body arrived in. Undone by the body reader unless
+    /// `config.decompress` is off, in which case reading the body yields
+    /// what the wire carried.
+    ///
+    /// Once it is being undone the `Content-Encoding` header is removed,
+    /// because it would describe the body a handler is about to read as
+    /// something it is not. This still says what arrived.
+    content_encoding: http.ContentEncoding = .identity,
+    /// How long the body was on the wire, when the headers said. Removed
+    /// from the headers alongside the coding for the same reason, and kept
+    /// here for the same one.
+    content_length: ?usize = null,
     params: http.Params = .{},
     query: http.Params = .{},
     /// The peer this request arrived from. A Unix socket peer has no
@@ -36,10 +48,13 @@ pub const Request = struct {
     // Body reading support
     parser: *RequestParser,
     transport: Transport,
-    body_reader_buffer: [1024]u8 = undefined,
     config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
+    // Set up on the first body read that calls for decoding, and kept so a
+    // second `reader()` does not build a second decoder over the same body.
+    _decode: ?*RequestBodyReader.Decode = null,
+    _body_reader_taken: bool = false,
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
@@ -86,19 +101,57 @@ pub const Request = struct {
         set(self._timeout_context.?, self.io, timeout);
     }
 
-    pub fn reader(self: *Request) RequestBodyReader {
-        // If body has already been read, return a reader for the cached body
+    /// The request body: transfer framing undone, and the content coding
+    /// too unless `config.decompress` is off. Read through `.interface`,
+    /// and `.err` says what an `error.ReadFailed` from it actually was.
+    ///
+    /// `buffer` is where bytes wait between the connection and the caller,
+    /// the way `Response.stream` takes one for the other direction. It is
+    /// what `peek` and the `take` family read out of, so size it for the
+    /// longest thing they need to see at once; an empty slice is fine for a
+    /// caller that only ever streams.
+    ///
+    /// One per body. `body` takes it if you have not, so a handler that
+    /// streams cannot then ask for the body whole.
+    pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
+        var r = RequestBodyReader.init(self.parser, self.transport, buffer);
+
+        // Once the body is in memory there is nothing left on the wire, and
+        // what is cached has already been decoded.
         if (self._body_read) {
-            const cached_body = self._body orelse &.{};
-            var r = RequestBodyReader.init(self.parser, self.transport, &self.body_reader_buffer);
-            r.interface = std.Io.Reader.fixed(cached_body);
+            r.interface = .fixed(self._body orelse &.{});
             return r;
         }
 
-        // Return the streaming body reader
-        var r = RequestBodyReader.init(self.parser, self.transport, &self.body_reader_buffer);
+        // The buffer belongs to the caller, so a second reader starts empty
+        // and whatever the first one had buffered is unreachable -- bytes off
+        // the body, with nothing to say they went missing.
+        std.debug.assert(!self._body_reader_taken); // one body reader per request
+
         r.request = self;
+        if (self._decode) |decode| {
+            r.decode = decode;
+        } else if (self.config.decompress) {
+            try r.startDecoding(self.arena, self.content_encoding);
+            if (r.decode != null) self.dropEncodedBodyHeaders();
+            self._decode = r.decode;
+        }
+
+        // Claimed only once there is a reader to claim it for. A coding we
+        // cannot undo fails above, and nothing was read; a caller that
+        // handles that error has to be able to ask again.
+        self._body_reader_taken = true;
         return r;
+    }
+
+    /// Both of these describe the body as it arrived, and it is not going
+    /// to arrive that way any more: what the handler reads is decoded, and
+    /// a longer or shorter number of bytes. Leaving them is how a proxy
+    /// comes to forward plain bytes labelled `gzip`. `content_encoding` and
+    /// `content_length` keep the answer for a handler that wants it.
+    fn dropEncodedBodyHeaders(self: *Request) void {
+        _ = self.headers.remove("Content-Encoding");
+        _ = self.headers.remove("Content-Length");
     }
 
     /// Read the entire body into memory. Result is cached for subsequent calls.
@@ -107,7 +160,9 @@ pub const Request = struct {
             return self._body;
         }
 
-        var r = self.reader();
+        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        var no_buf: [0]u8 = .{};
+        var r = try self.reader(&no_buf);
         const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             // The interface can only say that a read failed; the reader
@@ -634,9 +689,16 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
         ErrorSetOf(Request.jsonValue),
         ErrorSetOf(Request.formData),
         ErrorSetOf(Request.multiFormData),
+        // The wrapper a streaming caller resolves through, not just the
+        // functions that resolve for them.
+        RequestBodyReader.Error,
     }) |Set| {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+            // Not a sentinel, but not a cause either: the body layer calls a
+            // stream that stopped early `IncompleteBody`, and `EndOfStream`
+            // here would be read as the peer having hung up.
+            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
         }
     }
 }
@@ -663,6 +725,271 @@ test "Request.body: basic POST" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.body: a gzip request body is decoded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "hello", gzip compressed.
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectEqual(http.ContentEncoding.gzip, req.content_encoding);
+    const body = try req.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.body: a chunked gzip body is unwrapped by both layers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "Hello from test!" gzipped, then cut across three chunks -- so the
+    // decoder is fed from a stream whose framing it cannot see.
+    const chunked_gzip = "6\r\n\x1f\x8b\x08\x00\x00\x00\r\n" ++
+        "e\r\n\x00\x00\x02\x03\xf3\x48\xcd\xc9\xc9\x57\x48\x2b\xca\xcf\r\n" ++
+        "10\r\n\x55\x28\x49\x2d\x2e\x51\x04\x00\x7c\xe6\xd9\x99\x10\x00\x00\x00\r\n" ++
+        "0\r\n\r\n";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n" ++ chunked_gzip;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const body = try req.body();
+    try std.testing.expectEqualStrings("Hello from test!", body.?);
+}
+
+test "Request: decoding takes the headers that described the encoded body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // Both are true of the body until the moment it is decoded.
+    try std.testing.expectEqualStrings("gzip", req.headers.get("Content-Encoding").?);
+    try std.testing.expectEqualStrings("25", req.headers.get("Content-Length").?);
+
+    const body = try req.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // A handler forwarding these would send five plain bytes labelled as
+    // twenty-five gzipped ones.
+    try std.testing.expectEqual(@as(?[]const u8, null), req.headers.get("Content-Encoding"));
+    try std.testing.expectEqual(@as(?[]const u8, null), req.headers.get("Content-Length"));
+
+    // What arrived is still answerable, just not as a header.
+    try std.testing.expectEqual(http.ContentEncoding.gzip, req.content_encoding);
+    try std.testing.expectEqual(@as(?usize, 25), req.content_length);
+}
+
+test "Request: decoding off leaves the headers alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+        .config = .{ .decompress = false },
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+    _ = try req.body();
+
+    // Nothing was undone, so both still describe what the handler has.
+    try std.testing.expectEqualStrings("gzip", req.headers.get("Content-Encoding").?);
+    try std.testing.expectEqualStrings("25", req.headers.get("Content-Length").?);
+}
+
+test "Request.body: decoding off yields what the wire carried" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+        .config = .{ .decompress = false },
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const body = try req.body();
+    try std.testing.expectEqualStrings(gzip_hello, body.?);
+}
+
+test "Request.body: a compressed body cut short is a bad body, not a departed peer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A valid gzip stream, truncated. The peer is still there and the HTTP
+    // message is whole; it is the compressed stream inside that stops early.
+    const cut_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xcb\x48\xcd\xc9\xc9";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 15\r\n\r\n" ++ cut_gzip;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // The decoder calls this `EndOfStream`, which is how a peer that hung up
+    // is spelled -- `Transport.isPeerGone` would believe it and tear the
+    // connection down rather than answering. The framing half already calls
+    // the same condition `IncompleteBody`, and so must this one.
+    try std.testing.expectError(error.IncompleteBody, req.body());
+    try std.testing.expect(!Transport.isPeerGone(error.IncompleteBody));
+}
+
+test "Request.body: a coding we cannot undo is refused rather than guessed at" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // Handing the handler brotli bytes it would read as the body is worse
+    // than saying we cannot.
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+}
+
+test "Request.body: a body read that failed before it started can be asked for again" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // Nothing was read, so nothing was taken. A handler that answers 415 by
+    // way of an error handler that logs the body -- or one that just tries
+    // again -- gets the same answer rather than tripping the one-reader
+    // assert on a request a peer chose the encoding for.
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.jsonValue());
+}
+
+test "Request: a streaming read resolves through the reader it hands out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++
+        ("not a gzip stream at all" ++ "12345678");
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // A handler streaming the body never calls `body`, so the reader itself
+    // has to answer -- including for a failure in the layer it added.
+    var read_buf: [64]u8 = undefined;
+    var r = try req.reader(&read_buf);
+    var sink: std.Io.Writer = .fixed(&[_]u8{});
+    try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
+    try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
 }
 
 test "Request.body: a body cut short reports the parse failure, not a failed read" {

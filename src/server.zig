@@ -58,6 +58,11 @@ pub const Connection = struct {
     tls_writer: tls.Connection.Writer = undefined,
 
     // Active reader/writer, whichever path is in use.
+    //
+    // Public, and bare interfaces, so they can only report
+    // `ReadFailed`/`WriteFailed`. That is allowed here because there is no
+    // layer above them to lose the answer: `getReadError`/`getWriteError`
+    // beside them resolve what actually failed.
     reader: *std.Io.Reader = undefined,
     writer: *std.Io.Writer = undefined,
 
@@ -846,12 +851,17 @@ pub fn Server(comptime Ctx: type) type {
                 if (!parser.isBodyComplete()) {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {
-                        const cl = request.headers.get("Content-Length") orelse break :blk false;
-                        const n = std.fmt.parseInt(usize, cl, 10) catch break :blk false;
+                        // What the wire carried, which is what there is left
+                        // to throw away -- and still readable after decoding
+                        // took the header off.
+                        const n = request.content_length orelse break :blk false;
                         break :blk n <= max;
                     };
                     if (drainable) {
                         var scratch: [4096]u8 = undefined;
+                        // No decoding: this is throwing the body away to get
+                        // back to the connection, and `max` bounds what the
+                        // peer sent rather than what it would decode to.
                         var body_reader = RequestBodyReader.init(&parser, connection.transport(), &scratch);
                         if (body_reader.interface.discardShort(max + 1)) |consumed| {
                             if (consumed > max) response.keepalive = false;

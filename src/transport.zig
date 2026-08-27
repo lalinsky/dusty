@@ -1,3 +1,54 @@
+//! The rule every layer in this library follows, stated once here because
+//! Zig will not enforce it and because this is where the descent it
+//! describes is implemented:
+//!
+//!   A `std.Io.Reader` or `std.Io.Writer` the public API hands out must be
+//!   reachable *through* something that also gives the caller the real
+//!   cause.
+//!
+//! The interfaces themselves cannot carry one: their error sets are fixed at
+//! `ReadFailed`/`WriteFailed` by the vtable, and those name nothing a caller
+//! can act on.
+//!
+//! In practice that is one shape, everywhere -- a small wrapper, passed
+//! around by value, with the interface to use and the cause beside it:
+//!
+//!   pub const X = struct {
+//!       interface: std.Io.Reader,  // or Writer
+//!       err: ?Error = null,        // what a failed read or write was
+//!   };
+//!
+//! None of them carries its own buffer. Where bytes have to wait between
+//! the caller and the connection, the caller passes the buffer in --
+//! `Request.reader`, `ClientResponse.reader`, `Response.stream`,
+//! `Response.startEventStream` -- and where they do not, because the
+//! response arena or the stream below is already the buffer, there is none
+//! at all. On a chunked body that buffer is also the chunk size, which is
+//! another reason it is not ours to pick.
+//!
+//! `BodyReader` (`parser.zig`) and `BodyWriter`, `StreamingBodyWriter` and
+//! `EventWriter` (`response.zig`) are all this -- `EventStream.startSend`
+//! hands out the last of them, and `EventStream.send` resolves inside
+//! itself for a caller who does not want one. `WebSocket` hands out no
+//! interface at all and resolves inside `send` / `receive`, which is the
+//! same promise kept a different way. `Transport` and `Connection` expose a
+//! bare interface with accessors beside it, which is allowed only because
+//! nothing sits above them to lose the answer.
+//!
+//! "Resolved" is the load-bearing word. An `err` holding a sentinel is no
+//! better than the sentinel, and layers do record sentinels: tls.zig stores
+//! `TransportReadFailed` when the layer below it failed, and
+//! `std.compress.flate.Decompress` stores `error.ReadFailed` for the same
+//! reason. Both mean "keep descending". So the code that reads them switches
+//! past them rather than comparing, which drops them from the inferred error
+//! set as well as from the answer -- making it true by construction that
+//! what a caller is handed names a cause.
+//!
+//! A new layer added above an existing one inherits the obligation: resolve
+//! through everything below it, or the answer stops at the wrapper. The
+//! guard tests spread across these files walk every wrapper's `Error` and
+//! fail at compile time if a sentinel is in one.
+
 const std = @import("std");
 const tls = @import("tls");
 const build_options = @import("build_options");
@@ -111,3 +162,19 @@ pub const Transport = struct {
         };
     }
 };
+
+test "Transport: no std.Io sentinel escapes a resolved error set" {
+    // The rule at the top of this file, checked. Everything above the
+    // transport resolves through these two, so a sentinel surviving here
+    // would survive everywhere.
+    inline for (.{ Transport.ReadError, Transport.WriteError }) |Set| {
+        inline for (@typeInfo(Set).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+            // The sentinels tls.zig stands in for them with, which mean
+            // "keep descending" and are equally useless to a caller.
+            try std.testing.expect(!std.mem.eql(u8, e.name, "TransportReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e.name, "TransportWriteFailed"));
+        }
+    }
+}

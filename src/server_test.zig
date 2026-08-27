@@ -63,7 +63,8 @@ test "Server: POST with body" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
 
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             const n = try reader.interface.streamRemaining(&writer);
@@ -81,6 +82,46 @@ test "Server: POST with body" {
     try testClientServer(TestContext, &ctx);
 
     try std.testing.expect(ctx.body_received);
+    try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
+}
+
+test "Server: a gzip request body reaches the handler decoded" {
+    const TestContext = struct {
+        const Self = @This();
+
+        // "Hello from test!", gzip compressed.
+        const gzip_body = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xf3\x48\xcd\xc9\xc9\x57" ++
+            "\x48\x2b\xca\xcf\x55\x28\x49\x2d\x2e\x51\x04\x00\x7c\xe6\xd9\x99\x10\x00\x00\x00";
+
+        received_body: [256]u8 = undefined,
+        received_len: usize = 0,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.post("/gzip", handlePost);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            try writer.print(
+                "POST /gzip HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}",
+                .{ gzip_body.len, gzip_body },
+            );
+            try writer.flush();
+        }
+
+        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
+            var writer = std.Io.Writer.fixed(&ctx.received_body);
+            ctx.received_len = try reader.interface.streamRemaining(&writer);
+            res.body = "OK\n";
+        }
+    };
+
+    var ctx: TestContext = .{};
+    try testClientServer(TestContext, &ctx);
+
     try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
 }
 
@@ -123,7 +164,8 @@ test "Server: POST with chunked encoding" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
 
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             const n = try reader.interface.streamRemaining(&writer);
@@ -163,7 +205,8 @@ test "Server: GET with no body" {
         }
 
         fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
 
             var body_buf: [256]u8 = undefined;
             var writer = std.Io.Writer.fixed(&body_buf);
@@ -404,7 +447,8 @@ test "Server: void context handlers" {
 
     server.router.post("/echo", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
             const body = try reader.interface.allocRemaining(req.arena, .limited(1024));
             res.body = try std.fmt.allocPrint(res.arena, "Echo: {s}\n", .{body});
         }
@@ -754,7 +798,8 @@ test "Server: an event stream is chunked and leaves the connection reusable" {
     server.router.get("/events", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             _ = req;
-            var events = try res.startEventStream();
+            var event_buf: [4096]u8 = undefined;
+            var events = try res.startEventStream(&event_buf);
             try events.send("first", .{ .event = "tick", .id = "1" });
             try events.send("second", .{});
         }
@@ -899,6 +944,75 @@ test "Server: handler error after streaming started aborts the connection" {
     var body2: [32]u8 = undefined;
     _ = readResponse(r, &status2, &body2) catch return;
     return error.TestExpectedConnectionToBeClosed;
+}
+
+test "Server: keepalive after handler ignores a compressed request body" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.post("/ignore", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "first";
+        }
+    }.handle);
+
+    server.router.get("/ping", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "second";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    // The handler never reads it, so the drain has to throw away the wire
+    // bytes -- and the header saying how many there are is one decoding
+    // would have removed, had anything asked it to.
+    const gzip_body = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\x2b\xc9\xc8\x2c\x56\x48" ++
+        "\xca\x4f\xa9\x54\x00\xd2\x99\xe9\x79\xf9\x45\xa9\x29\x00\x79\xf5\xd8\x44\x14\x00\x00\x00";
+    try w.print(
+        "POST /ignore HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ gzip_body.len, gzip_body },
+    );
+    try w.flush();
+
+    var status1: [64]u8 = undefined;
+    var body1: [32]u8 = undefined;
+    const resp1 = try readResponse(r, &status1, &body1);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.status, "200") != null);
+    try std.testing.expectEqualStrings("first", resp1.body);
+
+    try w.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    var status2: [64]u8 = undefined;
+    var body2: [32]u8 = undefined;
+    const resp2 = try readResponse(r, &status2, &body2);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.status, "200") != null);
+    try std.testing.expectEqualStrings("second", resp2.body);
 }
 
 test "Server: closes connection when unread body exceeds max_body_size" {

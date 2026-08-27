@@ -493,12 +493,13 @@ pub const Response = struct {
         try self.headers.add("Set-Cookie", serialized);
     }
 
-    /// How much of an event the stream holds before pushing it at the
-    /// connection. One write per event is the point, so this only has to
-    /// be large enough that an ordinary event does not split across two.
-    const event_stream_buffer = 4096;
-
-    pub fn startEventStream(self: *Response) !EventStream {
+    /// Opens a Server-Sent Events body.
+    ///
+    /// `buf` is what an event is assembled in before it goes at the
+    /// connection, and since the body is chunked it is also the chunk size.
+    /// One write per event is the point, so size it so an ordinary event
+    /// does not split across two.
+    pub fn startEventStream(self: *Response, buf: []u8) !EventStream {
         try self.header("Content-Type", "text/event-stream");
         try self.header("Cache-Control", "no-cache");
         // Chunked, like any other body of unknown length. An event stream
@@ -509,7 +510,6 @@ pub const Response = struct {
         // A HEAD gets the headers an event stream would have opened with
         // and none of the events; the body writer already drops what it is
         // given for a HEAD, so no send has to ask.
-        const buf = try self.arena.alloc(u8, event_stream_buffer);
         return .{ .body = try self.stream(buf) };
     }
 
@@ -1491,13 +1491,14 @@ const TestEventStream = struct {
     stream: EventStream,
     header_end: usize,
     decoded: [1024]u8,
+    event_buf: [4096]u8 = undefined,
 
     fn init(self: *TestEventStream, buf: []u8) !void {
         self.arena = .init(std.testing.allocator);
         self.conn_writer = .fixed(buf);
         self.connection.initWriterForTesting(&self.conn_writer);
         self.response = try Response.init(self.arena.allocator(), &self.connection, 32);
-        self.stream = try self.response.startEventStream();
+        self.stream = try self.response.startEventStream(&self.event_buf);
         self.header_end = self.conn_writer.end;
     }
 
@@ -1590,7 +1591,8 @@ test "Response: startEventStream" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var stream = try response.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
 
     try stream.send("connected", .{});
 
@@ -1637,7 +1639,8 @@ test "EventStream: send reports the real error, not error.WriteFailed" {
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
         var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
-        _ = try probe_res.startEventStream();
+        var event_buf: [4096]u8 = undefined;
+        _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
     };
 
@@ -1648,7 +1651,8 @@ test "EventStream: send reports the real error, not error.WriteFailed" {
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var stream = try response.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
 
     try std.testing.expectError(error.ConnectionResetByPeer, stream.send("hello", .{}));
     try std.testing.expectEqual(error.ConnectionResetByPeer, stream.body.err.?);
@@ -1664,7 +1668,8 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
         var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
-        _ = try probe_res.startEventStream();
+        var event_buf: [4096]u8 = undefined;
+        _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
     };
 
@@ -1675,7 +1680,8 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var stream = try response.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
 
     // The event is held in the stream's buffer, so nothing reaches the
     // connection until `end` closes it.
@@ -1694,7 +1700,8 @@ test "EventWriter: an event too long for the buffer reports the real error" {
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
         var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
-        _ = try probe_res.startEventStream();
+        var event_buf: [4096]u8 = undefined;
+        _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
     };
 
@@ -1705,14 +1712,15 @@ test "EventWriter: an event too long for the buffer reports the real error" {
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    var stream = try response.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
     var w = try stream.startSend(.{});
 
     // Longer than the stream holds, so it reaches the connection while it
     // is still being written rather than at `end`. That is what a caller
     // filling an event from a template does, and the interface can only
     // tell them the sentinel.
-    const long = try arena.allocator().alloc(u8, Response.event_stream_buffer + 1);
+    const long = try arena.allocator().alloc(u8, event_buf.len + 1);
     @memset(long, 'x');
 
     try std.testing.expectError(error.WriteFailed, w.interface.writeAll(long));
@@ -2121,7 +2129,8 @@ test "Response: a HEAD event stream sends the headers and no events" {
     var response = try Response.init(arena.allocator(), &connection, 32);
     response.head = true;
 
-    var stream = try response.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var stream = try response.startEventStream(&event_buf);
     try stream.send("hello", .{});
     var w = try stream.startSend(.{ .event = "tick" });
     try w.interface.writeAll("more");
