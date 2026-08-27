@@ -6,7 +6,8 @@ const AppContext = struct {
 };
 
 fn handleEvents(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    var stream = try res.startEventStream();
+    var event_buf: [4096]u8 = undefined;
+    var stream = try res.startEventStream(&event_buf);
 
     try stream.send("connected", .{});
 

@@ -798,7 +798,8 @@ test "Server: an event stream is chunked and leaves the connection reusable" {
     server.router.get("/events", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
             _ = req;
-            var events = try res.startEventStream();
+            var event_buf: [4096]u8 = undefined;
+            var events = try res.startEventStream(&event_buf);
             try events.send("first", .{ .event = "tick", .id = "1" });
             try events.send("second", .{});
         }

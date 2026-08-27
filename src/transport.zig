@@ -20,9 +20,11 @@
 //!
 //! None of them carries its own buffer. Where bytes have to wait between
 //! the caller and the connection, the caller passes the buffer in --
-//! `Request.reader`, `ClientResponse.reader`, `Response.stream` -- and
-//! where they do not, because the response arena or the stream below is
-//! already the buffer, there is none at all.
+//! `Request.reader`, `ClientResponse.reader`, `Response.stream`,
+//! `Response.startEventStream` -- and where they do not, because the
+//! response arena or the stream below is already the buffer, there is none
+//! at all. On a chunked body that buffer is also the chunk size, which is
+//! another reason it is not ours to pick.
 //!
 //! `BodyReader` (`parser.zig`) and `BodyWriter`, `StreamingBodyWriter` and
 //! `EventWriter` (`response.zig`) are all this. `WebSocket` and
