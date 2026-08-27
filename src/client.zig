@@ -512,13 +512,8 @@ pub const Connection = struct {
                     .tcp_writer = &self.tcp_writer,
                 };
                 return switch (err) {
-                    error.TransportReadFailed => ciphertext.getReadError() orelse error.Unexpected,
-                    // A failed ciphertext write arrives either way round
-                    // depending on where in the handshake it happened; both
-                    // mean the same thing and neither names a cause.
-                    error.TransportWriteFailed,
-                    error.WriteFailed,
-                    => ciphertext.getWriteError() orelse error.Unexpected,
+                    error.ReadFailed => ciphertext.getReadError() orelse error.Unexpected,
+                    error.WriteFailed => ciphertext.getWriteError() orelse error.Unexpected,
                     else => |e| e,
                 };
             };
@@ -891,22 +886,13 @@ pub const Client = struct {
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
-            client_cert = tls.config.CertKeyPair.fromFilePath(
+            client_cert = try tls.config.CertKeyPair.fromFilePath(
                 self.allocator,
                 self.io,
                 cc.dir orelse std.Io.Dir.cwd(),
                 cc.cert_path,
                 cc.key_path,
-                // Reads the certificate and key off disk through readers
-                // that belong to tls.zig, which keeps their causes to
-                // itself -- all that comes back is `error.ReadFailed`.
-                // Named here rather than passed on: in the error set of a
-                // request a bare read failure cannot be told from the socket
-                // failing, and this one is about a file the caller named.
-            ) catch |err| switch (err) {
-                error.ReadFailed => return error.TlsConfigUnreadable,
-                else => |e| return e,
-            };
+            );
         }
 
         self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };
