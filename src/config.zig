@@ -109,7 +109,7 @@ pub const ServerConfig = struct {
         /// header names and values are slices into this buffer rather than
         /// copies, so the head is held whole and cannot be read in pieces.
         /// A head that does not fit is answered with 431.
-        buffer_size: usize = 4096,
+        buffer_size: usize = 16384,
         /// Maximum number of headers allowed in a request
         max_header_count: usize = 32,
         /// Maximum number of route parameters (e.g., /user/:id/:action)

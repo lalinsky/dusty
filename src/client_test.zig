@@ -870,7 +870,7 @@ test "Client: a response head too large for the buffer is rejected, not a panic"
             var wbuf: [1024]u8 = undefined;
             var w = s.writer(_io, &wbuf);
             w.interface.writeAll("HTTP/1.1 200 OK\r\nX-Big: ") catch {};
-            w.interface.splatByteAll('A', 9000) catch {};
+            w.interface.splatByteAll('A', 20000) catch {};
             w.interface.writeAll("\r\nContent-Length: 0\r\n\r\n") catch {};
             w.interface.flush() catch {};
             s.shutdown(_io, .both) catch {};

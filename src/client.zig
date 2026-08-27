@@ -85,7 +85,7 @@ pub const ClientConfig = struct {
     /// and values are slices into this buffer rather than copies, so the head
     /// is held whole. A server that sends more gets error.HeadersTooLarge and
     /// its connection torn down.
-    buffer_size: usize = 4096,
+    buffer_size: usize = 16384,
     /// TLS settings for https:// (and wss://) connections. Requires the
     /// `use_tls` build option; with TLS compiled out any HTTPS request fails
     /// with error.TlsNotConfigured. Applies to every connection the client

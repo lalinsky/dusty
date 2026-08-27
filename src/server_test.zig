@@ -1251,15 +1251,15 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
             defer stream.close(_io);
 
             // Comfortably past the default buffer_size + body_read_reserve,
-            // in one header so max_header_count is not what rejects it.
+            // in one header so max_header_count is not what rejects it. The
+            // server answers and hangs up part way through, without reading
+            // the rest, so these writes are allowed to fail; what is asserted
+            // is the response.
             var write_buf: [1024]u8 = undefined;
             var writer = stream.writer(_io, &write_buf);
-            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Big: ");
-            try writer.interface.splatByteAll('A', 9000);
-            try writer.interface.writeAll("\r\n\r\n");
-            // The server answers and hangs up mid-head; it never reads the
-            // rest, so this flush may fail on a reset socket. That is the
-            // point, not a failure of the test.
+            writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Big: ") catch {};
+            writer.interface.splatByteAll('A', 20000) catch {};
+            writer.interface.writeAll("\r\n\r\n") catch {};
             writer.interface.flush() catch {};
 
             var read_buf: [1024]u8 = undefined;
@@ -1278,7 +1278,7 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
 test "Server: a head that just fits is still served" {
     const io = std.testing.io;
 
-    // 2 KB of header against the 4 KB default: comfortably under, so the
+    // 8 KB of header against the 16 KB default: comfortably under, so the
     // guard must not fire early.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
@@ -1309,7 +1309,7 @@ test "Server: a head that just fits is still served" {
             var write_buf: [1024]u8 = undefined;
             var writer = stream.writer(_io, &write_buf);
             try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Big: ");
-            try writer.interface.splatByteAll('A', 2048);
+            try writer.interface.splatByteAll('A', 8192);
             try writer.interface.writeAll("\r\n\r\n");
             try writer.interface.flush();
 
