@@ -127,7 +127,6 @@ pub const Request = struct {
         // and whatever the first one had buffered is unreachable -- bytes off
         // the body, with nothing to say they went missing.
         std.debug.assert(!self._body_reader_taken); // one body reader per request
-        self._body_reader_taken = true;
 
         r.request = self;
         if (self._decode) |decode| {
@@ -137,6 +136,11 @@ pub const Request = struct {
             if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
         }
+
+        // Claimed only once there is a reader to claim it for. A coding we
+        // cannot undo fails above, and nothing was read; a caller that
+        // handles that error has to be able to ask again.
+        self._body_reader_taken = true;
         return r;
     }
 
@@ -927,6 +931,35 @@ test "Request.body: a coding we cannot undo is refused rather than guessed at" {
     // Handing the handler brotli bytes it would read as the body is worse
     // than saying we cannot.
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+}
+
+test "Request.body: a body read that failed before it started can be asked for again" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // Nothing was read, so nothing was taken. A handler that answers 415 by
+    // way of an error handler that logs the body -- or one that just tries
+    // again -- gets the same answer rather than tripping the one-reader
+    // assert on a request a peer chose the encoding for.
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.jsonValue());
 }
 
 test "Request: a streaming read resolves through the reader it hands out" {

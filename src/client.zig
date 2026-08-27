@@ -806,7 +806,6 @@ pub const ClientResponse = struct {
         // and whatever the first one had buffered is unreachable -- bytes off
         // the body, with nothing to say they went missing.
         std.debug.assert(!self._body_reader_taken); // one body reader per response
-        self._body_reader_taken = true;
 
         if (self._decode) |decode| {
             r.decode = decode;
@@ -815,6 +814,11 @@ pub const ClientResponse = struct {
             if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
         }
+
+        // Claimed only once there is a reader to claim it for. A coding we
+        // cannot undo fails above, and nothing was read; a caller that
+        // handles that error has to be able to ask again.
+        self._body_reader_taken = true;
         return r;
     }
 };
@@ -1662,6 +1666,33 @@ test "ClientResponse: a streaming read can be resolved without going through bod
     // Asked of the reader that was handed out, which is the point: a caller
     // holding it needs nothing else to find out what a failed read was.
     try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
+}
+
+test "ClientResponse.body: a body read that failed before it started can be asked for again" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    // Nothing was read, so nothing was taken -- the server picked the
+    // encoding, and asking twice must not trip the one-reader assert.
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
+    try std.testing.expectError(error.UnsupportedContentEncoding, response.body());
 }
 
 test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
