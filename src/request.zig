@@ -710,6 +710,37 @@ test "Request.body: a gzip request body is decoded" {
     try std.testing.expectEqualStrings("hello", body.?);
 }
 
+test "Request.body: a chunked gzip body is unwrapped by both layers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // "Hello from test!" gzipped, then cut across three chunks -- so the
+    // decoder is fed from a stream whose framing it cannot see.
+    const chunked_gzip = "6\r\n\x1f\x8b\x08\x00\x00\x00\r\n" ++
+        "e\r\n\x00\x00\x02\x03\xf3\x48\xcd\xc9\xc9\x57\x48\x2b\xca\xcf\r\n" ++
+        "10\r\n\x55\x28\x49\x2d\x2e\x51\x04\x00\x7c\xe6\xd9\x99\x10\x00\x00\x00\r\n" ++
+        "0\r\n\r\n";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\n" ++
+        "Transfer-Encoding: chunked\r\n\r\n" ++ chunked_gzip;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    const body = try req.body();
+    try std.testing.expectEqualStrings("Hello from test!", body.?);
+}
+
 test "Request.body: decoding off yields what the wire carried" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
