@@ -1421,3 +1421,193 @@ test "Server: a head ending exactly at the buffer end gets 431, not a panic" {
     // and panics on the first fill.
     try expectStatusForHeadOfLength(head_buffer_len, "HTTP/1.1 431 Request Header Fields Too Large\r", null);
 }
+
+/// Counts how many handlers are in flight at once, so a test can see whether
+/// the cap held.
+const ConcurrencyCtx = struct {
+    active: std.atomic.Value(u32) = .init(0),
+    peak: std.atomic.Value(u32) = .init(0),
+    served: std.atomic.Value(u32) = .init(0),
+
+    pub fn handle(ctx: *ConcurrencyCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        const now = ctx.active.fetchAdd(1, .acq_rel) + 1;
+        _ = ctx.peak.fetchMax(now, .acq_rel);
+        // Long enough that the others are all waiting, so the cap is what
+        // limits overlap rather than the handlers being too brief to overlap.
+        try req.io.sleep(.fromMilliseconds(30), .awake);
+        _ = ctx.active.fetchSub(1, .acq_rel);
+        _ = ctx.served.fetchAdd(1, .acq_rel);
+        res.body = "OK";
+    }
+};
+
+test "Server: max_connections caps overlap without dropping anyone" {
+    const io = std.testing.io;
+    const S = dusty.Server(ConcurrencyCtx);
+    const clients = 8;
+    const cap = 2;
+
+    var ctx: ConcurrencyCtx = .{};
+    var server = S.init(std.testing.allocator, io, .{ .max_connections = cap }, &ctx);
+    defer server.deinit();
+    server.router.get("/", ConcurrencyCtx.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *S) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const One = struct {
+        fn run(s: *S, _io: std.Io) !void {
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            // Closing is what frees the slot.
+            defer stream.close(_io);
+
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            try writer.interface.flush();
+
+            var read_buf: [256]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r", status_line);
+        }
+    };
+
+    const Fut = @TypeOf(try io.concurrent(One.run, .{ &server, io }));
+    var futures: [clients]Fut = undefined;
+    for (&futures) |*f| f.* = try io.concurrent(One.run, .{ &server, io });
+    var first_err: ?anyerror = null;
+    for (&futures) |*f| f.await(io) catch |err| {
+        if (first_err == null) first_err = err;
+    };
+    if (first_err) |err| return err;
+
+    try std.testing.expectEqual(@as(u32, clients), ctx.served.load(.acquire));
+    // Equality rather than <=, so this cannot pass by nothing overlapping.
+    try std.testing.expectEqual(@as(u32, cap), ctx.peak.load(.acquire));
+}
+
+test "Server: a max_connections of zero is refused at listen" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .max_connections = 0 }, {});
+    defer server.deinit();
+    const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+    try std.testing.expectError(error.NoConnectionsAllowed, server.listen(addr));
+}
+
+/// Sends `head` and then stops, holding the connection open, and reports how
+/// long the server took to hang up on it. Returns null if the server answered
+/// instead of hanging up.
+fn millisUntilServerHangsUp(cfg: dusty.ServerConfig, head: []const u8) !?i64 {
+    const io = std.testing.io;
+    const S = dusty.Server(void);
+
+    var server = S.init(std.testing.allocator, io, cfg, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *S) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll(head);
+    try writer.interface.flush();
+
+    const started = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+
+    var read_buf: [256]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var sink = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer sink.deinit();
+    _ = reader.interface.streamRemaining(&sink.writer) catch {};
+
+    if (sink.written().len != 0) return null;
+    const ended = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    return @intCast(@divTrunc(ended - started, std.time.ns_per_ms));
+}
+
+test "Server: a stalled request head is cut off by timeout.request" {
+    // A head that never terminates.
+    const elapsed = try millisUntilServerHangsUp(
+        .{ .timeout = .{ .request = .fromMilliseconds(150) } },
+        "GET / HTTP/1.1\r\nHost: a\r\n",
+    ) orelse return error.ServerAnsweredInstead;
+
+    try std.testing.expect(elapsed >= 100);
+    try std.testing.expect(elapsed < 3000);
+}
+
+test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
+    const io = std.testing.io;
+    const S = dusty.Server(void);
+
+    var server = S.init(std.testing.allocator, io, .{
+        .timeout = .{ .keepalive = .fromMilliseconds(150) },
+    }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *S) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+    try writer.interface.flush();
+
+    var read_buf: [256]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const status_line = try reader.interface.takeDelimiterExclusive('\n');
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r", status_line);
+
+    const started = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    var sink = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer sink.deinit();
+    _ = reader.interface.streamRemaining(&sink.writer) catch {};
+    const elapsed = @divTrunc(std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds - started, std.time.ns_per_ms);
+
+    try std.testing.expect(elapsed >= 100);
+    try std.testing.expect(elapsed < 3000);
+}

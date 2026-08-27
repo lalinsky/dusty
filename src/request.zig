@@ -28,6 +28,11 @@ pub const Request = struct {
     arena: std.mem.Allocator,
     io: std.Io = undefined,
 
+    // Installed by the server for real requests. Kept as a callback so this
+    // module does not depend on the server's backend-specific timer type.
+    _timeout_context: ?*anyopaque = null,
+    _set_timeout: ?*const fn (*anyopaque, std.Io, std.Io.Timeout) void = null,
+
     // Body reading support
     parser: *RequestParser,
     transport: Transport,
@@ -52,6 +57,8 @@ pub const Request = struct {
         const transport = self.transport;
         const cfg = self.config;
         const res = self.response;
+        const timeout_context = self._timeout_context;
+        const set_timeout = self._set_timeout;
         // Belongs to the connection, not the request, so it outlives the
         // reset the way the reader and the parser do.
         const addr = self.remote_address;
@@ -63,7 +70,20 @@ pub const Request = struct {
             .config = cfg,
             .response = res,
             .remote_address = addr,
+            ._timeout_context = timeout_context,
+            ._set_timeout = set_timeout,
         };
+    }
+
+    /// Replaces the deadline for this request. A duration starts now, a
+    /// deadline is absolute, and `.none` disables the deadline. The server
+    /// installs its normal keepalive deadline after the handler returns.
+    ///
+    /// Call from the connection's handler task, not concurrently from a task
+    /// spawned by the handler.
+    pub fn setTimeout(self: *Request, timeout: std.Io.Timeout) void {
+        const set = self._set_timeout orelse return;
+        set(self._timeout_context.?, self.io, timeout);
     }
 
     pub fn reader(self: *Request) RequestBodyReader {
@@ -562,6 +582,43 @@ fn fixedMessageReader(gpa: std.mem.Allocator, raw: []const u8) !std.Io.Reader {
     var r: std.Io.Reader = .fixed(backing);
     r.end = raw.len;
     return r;
+}
+
+test "Request.setTimeout: forwards relative, absolute, and disabled deadlines" {
+    const Probe = struct {
+        calls: usize = 0,
+        last: std.Io.Timeout = .none,
+
+        fn set(context: *anyopaque, _: std.Io, timeout: std.Io.Timeout) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            self.last = timeout;
+        }
+    };
+
+    var probe: Probe = .{};
+    var req: Request = .{
+        .arena = std.testing.allocator,
+        .io = std.testing.io,
+        .parser = undefined,
+        .transport = undefined,
+        ._timeout_context = &probe,
+        ._set_timeout = Probe.set,
+    };
+
+    req.setTimeout(.{ .duration = .{ .raw = .fromSeconds(7), .clock = .awake } });
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(7), probe.last.duration.raw);
+
+    const deadline = std.Io.Clock.Timestamp.now(std.testing.io, .real).addDuration(.{
+        .raw = .fromSeconds(11),
+        .clock = .real,
+    });
+    req.setTimeout(.{ .deadline = deadline });
+    try std.testing.expectEqual(deadline, probe.last.deadline);
+
+    req.setTimeout(.none);
+    try std.testing.expect(probe.last == .none);
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
 }
 
 test "Request: no std.Io.Reader sentinel escapes the body-reading API" {

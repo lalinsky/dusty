@@ -3,6 +3,10 @@ const http = @import("dusty");
 
 const AppContext = struct {};
 
+const websocket_idle_timeout: std.Io.Timeout = .{
+    .duration = .{ .raw = .fromSeconds(60), .clock = .awake },
+};
+
 fn handleWebSocket(_: *AppContext, req: *http.Request, res: *http.Response) !void {
     var ws = try res.upgradeWebSocket(req) orelse {
         res.status = .bad_request;
@@ -14,6 +18,9 @@ fn handleWebSocket(_: *AppContext, req: *http.Request, res: *http.Response) !voi
     try ws.send(.text, "Welcome to the WebSocket echo server!");
 
     while (true) {
+        // Treat the request timeout as a WebSocket inactivity timeout by
+        // restarting it before every receive.
+        req.setTimeout(websocket_idle_timeout);
         const msg = ws.receive() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,

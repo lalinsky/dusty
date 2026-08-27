@@ -21,8 +21,9 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_http2", use_http2);
     mod.addOptions("build_options", build_options);
 
-    // Default `zio` import — a stub that no-ops `clear` and panics on `set`.
-    // Apps that want real timeouts override this in their own build.zig:
+    // Default `zio` import — a marker stub that selects the portable std.Io
+    // timeout watchdog. Apps using the zio runtime override it so timeouts use
+    // zio.AutoCancel instead:
     //   dusty_mod.addImport("zio", zio_dep.module("zio"));
     mod.addAnonymousImport("zio", .{
         .root_source_file = b.path("src/zio_stub.zig"),
