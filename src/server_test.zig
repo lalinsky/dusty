@@ -1322,3 +1322,102 @@ test "Server: a head that just fits is still served" {
 
     try client_future.await(io);
 }
+
+/// What the handler saw, so a test can tell a head that was accepted from
+/// one that was accepted and then could not read its body.
+const HeadBoundaryCtx = struct {
+    body: [16]u8 = undefined,
+    body_len: usize = 0,
+
+    pub fn handle(ctx: *HeadBoundaryCtx, req: *dusty.Request, res: *dusty.Response) !void {
+        const b = (try req.body()) orelse "";
+        ctx.body_len = @min(b.len, ctx.body.len);
+        @memcpy(ctx.body[0..ctx.body_len], b[0..ctx.body_len]);
+        res.body = "OK";
+    }
+};
+
+/// Sends a request whose head is exactly `head_len` bytes -- a header value
+/// padded so the terminating CRLFCRLF lands on the byte asked for -- with a
+/// body behind it, and checks the status line that comes back.
+///
+/// The body is the point. What the head does not use of the read buffer is
+/// all the body reader gets, so a head that parses but leaves nothing behind
+/// it fails only once something tries to read one.
+fn expectStatusForHeadOfLength(
+    head_len: usize,
+    expected_status: []const u8,
+    expected_body: ?[]const u8,
+) !void {
+    const io = std.testing.io;
+    const S = dusty.Server(HeadBoundaryCtx);
+
+    var ctx: HeadBoundaryCtx = .{};
+    var server = S.init(std.testing.allocator, io, .{}, &ctx);
+    defer server.deinit();
+    server.router.post("/", HeadBoundaryCtx.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *S) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *S, len: usize, want: []const u8, _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            const prefix = "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nX-Pad: ";
+            const suffix = "\r\n\r\n";
+            std.debug.assert(len >= prefix.len + suffix.len);
+
+            // A rejected head is answered part way through and the rest of it
+            // never read, so these writes are allowed to fail.
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            writer.interface.writeAll(prefix) catch {};
+            writer.interface.splatByteAll('A', len - prefix.len - suffix.len) catch {};
+            writer.interface.writeAll(suffix) catch {};
+            writer.interface.writeAll("hello") catch {};
+            writer.interface.flush() catch {};
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectEqualStrings(want, status_line);
+        }
+    }.run, .{ &server, head_len, expected_status, io });
+
+    try client_future.await(io);
+
+    if (expected_body) |want| {
+        try std.testing.expectEqualStrings(want, ctx.body[0..ctx.body_len]);
+    }
+}
+
+// The read buffer is buffer_size + body_read_reserve, and the head is
+// accepted exactly when it fits in buffer_size -- leaving the reserve for the
+// body reader that inherits the rest.
+const head_limit = 16384;
+const head_buffer_len = head_limit + 1024;
+
+test "Server: a head of exactly the limit is served, body and all" {
+    try expectStatusForHeadOfLength(head_limit, "HTTP/1.1 200 OK\r", "hello");
+}
+
+test "Server: a head one byte over the limit gets 431" {
+    try expectStatusForHeadOfLength(head_limit + 1, "HTTP/1.1 431 Request Header Fields Too Large\r", null);
+}
+
+test "Server: a head ending exactly at the buffer end gets 431, not a panic" {
+    // The head parses cleanly and consumes the reserve with it, so nothing
+    // during parsing objects -- the body reader is left a zero-length buffer
+    // and panics on the first fill.
+    try expectStatusForHeadOfLength(head_buffer_len, "HTTP/1.1 431 Request Header Fields Too Large\r", null);
+}

@@ -490,6 +490,7 @@ const ParseHeadersError = std.Io.Reader.Error || ParseError ||
 /// The head is bounded by `reader.buffer`, less `body_read_reserve`: it is
 /// never tossed while it is being parsed, because the header slices point
 /// into it, so whatever it does not use is all the body reader will have.
+/// A head is accepted exactly when it fits in that much.
 ///
 /// Returns error.EndOfStream if connection closed cleanly with no data.
 /// Returns error.IncompleteRequest if connection closed mid-request.
@@ -514,9 +515,9 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
             continue;
         }
         // Every buffered byte has been consumed as head and it is still
-        // open, so filling again is the only way forward -- and there is no
-        // room left to fill into. `fillMore` would ask its rebase to free a
-        // byte that nothing can free, and assert.
+        // open, so filling again is the only way forward -- and doing so
+        // would eat into the reserve. `fillMore` on a buffer with no room
+        // asks its rebase to free a byte that nothing can free, and asserts.
         if (reader.buffer.len - reader.end < body_read_reserve) return error.HeadersTooLarge;
         reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => {
@@ -526,6 +527,13 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
             else => |e| return e,
         };
     }
+    // A fill is free to use every byte it was given room for, so a head can
+    // still finish inside the reserve even though the check above passed
+    // each time it ran. What is left is all the body reader gets, and
+    // `BodyReader.stream` can no more fill a zero-length buffer than the
+    // loop above could -- so the head is over the limit either way.
+    if (reader.buffer.len - parsed_len < body_read_reserve) return error.HeadersTooLarge;
+
     reader.toss(parsed_len);
     parser.resumeParsing();
 
@@ -542,6 +550,18 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
         error.Paused => {},
         else => |e| return e,
     };
+}
+
+/// A reader over `raw` with `body_read_reserve` bytes of slack past it, the
+/// way a connection's read buffer has slack past the head it just parsed.
+/// `Reader.fixed` alone leaves none, and a head with nothing behind it is
+/// rejected -- the body reader would have nowhere to read into.
+fn fixedMessageReader(gpa: std.mem.Allocator, raw: []const u8) !std.Io.Reader {
+    const backing = try gpa.alloc(u8, raw.len + body_read_reserve);
+    @memcpy(backing[0..raw.len], raw);
+    var r: std.Io.Reader = .fixed(backing);
+    r.end = raw.len;
+    return r;
 }
 
 test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
@@ -569,7 +589,7 @@ test "Request.body: basic POST" {
     defer arena.deinit();
 
     const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -594,7 +614,7 @@ test "Request.body: a body cut short reports the parse failure, not a failed rea
 
     // The headers promise five bytes and the peer sends two, then stops.
     const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\nhe";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -621,7 +641,7 @@ test "Request.body: framing the parser rejects is reported as itself" {
 
     // A chunk size that is not a number.
     const raw_request = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -645,7 +665,7 @@ test "Request.body: large body over 128 bytes" {
 
     const body_content = "A" ** 256;
     const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 256\r\n\r\n" ++ body_content;
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -670,7 +690,7 @@ test "Request.cookies: parse cookies from header" {
     defer arena.deinit();
 
     const raw_request = "GET /test HTTP/1.1\r\nCookie: session=abc123; user=john\r\n\r\n";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -696,7 +716,7 @@ test "Request.formData: basic key and value" {
     defer arena.deinit();
 
     const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\nfoo=123&bar=abc";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -721,7 +741,7 @@ test "Request.formData: URL-encoded key and value" {
     defer arena.deinit();
 
     const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 17\r\n\r\nfoo+bar=123%21abc";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -745,7 +765,7 @@ test "Request.formData: entry with no value" {
     defer arena.deinit();
 
     const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nfoo";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -769,7 +789,7 @@ test "Request.multiFormData: basic key and value" {
     defer arena.deinit();
 
     const raw_request = "POST /test HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 155\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"\r\n\r\n123\r\n----boundary123\r\nContent-Disposition: form-data; name=\"bar\"\r\n\r\nabc\r\n----boundary123--\r\n";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -794,7 +814,7 @@ test "Request.multiFormData: entry with filename" {
     defer arena.deinit();
 
     const raw_request = "POST /test HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 133\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"; filename=\"foo.txt\"\r\nContent-Type: text/plain\r\n\r\n123\r\n----boundary123--\r\n";
-    var reader = std.Io.Reader.fixed(raw_request);
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -832,7 +852,7 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
     try req_buf.appendSlice(std.testing.allocator, "\r\n\r\n");
     try req_buf.appendSlice(std.testing.allocator, body);
 
-    var reader = std.Io.Reader.fixed(req_buf.items);
+    var reader = try fixedMessageReader(arena.allocator(), req_buf.items);
 
     var req: Request = .{
         .arena = arena.allocator(),
@@ -869,7 +889,7 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
     try req_buf.appendSlice(std.testing.allocator, "\r\n\r\n");
     try req_buf.appendSlice(std.testing.allocator, body);
 
-    var reader = std.Io.Reader.fixed(req_buf.items);
+    var reader = try fixedMessageReader(arena.allocator(), req_buf.items);
 
     var req: Request = .{
         .arena = arena.allocator(),

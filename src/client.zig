@@ -1435,6 +1435,12 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
             else => |e| return e,
         };
     }
+    // And, as there, a fill may use every byte it was given room for, so the
+    // head can finish inside the reserve without the check above ever
+    // firing. The body reader gets what is left, and cannot read into
+    // nothing.
+    if (reader.buffer.len - parsed_len < body_read_reserve) return error.HeadersTooLarge;
+
     reader.toss(parsed_len);
     parser.resumeParsing();
 
@@ -1454,6 +1460,18 @@ fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
 }
 
 // Tests
+
+/// A reader over `raw` with `body_read_reserve` bytes of slack past it, the
+/// way a connection's read buffer has slack past the head it just parsed.
+/// `Reader.fixed` alone leaves none, and a head with nothing behind it is
+/// rejected -- the body reader would have nowhere to read into.
+fn fixedMessageReader(gpa: std.mem.Allocator, raw: []const u8) !std.Io.Reader {
+    const backing = try gpa.alloc(u8, raw.len + body_read_reserve);
+    @memcpy(backing[0..raw.len], raw);
+    var r: std.Io.Reader = .fixed(backing);
+    r.end = raw.len;
+    return r;
+}
 
 test "parseUrl: basic URL" {
     const uri = try parseUrl("http://example.com/path");
@@ -1558,7 +1576,7 @@ test "ClientResponse.body: basic response" {
     defer arena.deinit();
 
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1583,7 +1601,7 @@ test "ClientResponse.body: a corrupt gzip body reports the decompression failure
     defer arena.deinit();
 
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++ ("not a gzip stream at all" ++ "12345678");
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1610,7 +1628,7 @@ test "ClientResponse: a streaming read can be resolved without going through bod
 
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++
         ("not a gzip stream at all" ++ "12345678");
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1664,7 +1682,7 @@ test "ClientResponse.body: large body over 128 bytes" {
 
     const body_content = "A" ** 256;
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n" ++ body_content;
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1690,7 +1708,7 @@ test "ClientResponse.body: no body" {
     defer arena.deinit();
 
     const raw_response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1718,7 +1736,7 @@ test "ClientResponse.body: connection-close (EOF-delimited) body" {
     // No Content-Length and no Transfer-Encoding: body is delimited by EOF.
     const body_content = "body delimited by connection close, not length.";
     const raw_response = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nconnection: close\r\n\r\n" ++ body_content;
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1744,7 +1762,7 @@ test "ClientResponse.reader: streaming read" {
     defer arena.deinit();
 
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1779,7 +1797,7 @@ test "ClientResponse.reader: after body() returns cached data" {
     defer arena.deinit();
 
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1812,7 +1830,7 @@ test "ClientResponse.body: gzip decompression" {
     // "hello" gzip compressed
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
@@ -1840,7 +1858,7 @@ test "ClientResponse.body: gzip decompression disabled" {
     // "hello" gzip compressed
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
-    var reader = std.Io.Reader.fixed(raw_response);
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;

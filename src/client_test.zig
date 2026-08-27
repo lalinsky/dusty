@@ -888,3 +888,69 @@ test "Client: a response head too large for the buffer is rejected, not a panic"
 
     peer_future.cancel(io);
 }
+
+/// Serves one response whose head is exactly `head_len` bytes -- a header
+/// value padded so the terminating CRLFCRLF lands on the byte asked for --
+/// with a five-byte body behind it, and checks what the client makes of it.
+///
+/// The body is the point: what the head does not use of the read buffer is
+/// all the body reader gets, so a head that parses but leaves nothing behind
+/// it fails only once something reads a body.
+fn expectClientResultForHeadOfLength(head_len: usize, expected_body: ?[]const u8) !void {
+    const io = std.testing.io;
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, len: usize, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            rd.interface.fillMore() catch {};
+
+            const prefix = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Pad: ";
+            const suffix = "\r\n\r\n";
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            w.interface.writeAll(prefix) catch {};
+            w.interface.splatByteAll('A', len - prefix.len - suffix.len) catch {};
+            w.interface.writeAll(suffix) catch {};
+            w.interface.writeAll("hello") catch {};
+            w.interface.flush() catch {};
+            s.shutdown(_io, .both) catch {};
+        }
+    }.run, .{ &listener, head_len, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    if (expected_body) |want| {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings(want, (try resp.body()) orelse "");
+    } else {
+        try std.testing.expectError(error.HeadersTooLarge, client.fetch(url, .{}));
+    }
+
+    peer_future.cancel(io);
+}
+
+test "Client: a response head of exactly the limit is read, body and all" {
+    try expectClientResultForHeadOfLength(16384, "hello");
+}
+
+test "Client: a response head one byte over the limit is rejected" {
+    try expectClientResultForHeadOfLength(16385, null);
+}
+
+test "Client: a response head ending exactly at the buffer end is rejected, not a panic" {
+    try expectClientResultForHeadOfLength(16384 + 1024, null);
+}
