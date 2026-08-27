@@ -290,16 +290,10 @@ const Timer = if (have_auto_cancel) struct {
         return .{};
     }
 
-    fn set(self: *@This(), io: std.Io, timeout: std.Io.Timeout) void {
-        // TODO(zio): drop the clear once we require a zio with
-        // lalinsky/zio#657. `set` is meant to handle a re-arm itself, and
-        // stopped: it arms on the executor the task is on now, so re-arming
-        // after a migration asks one loop for a timer live in another's heap.
-        self.inner.clear();
-        const duration = timeout.toDurationFromNow(io) orelse return;
-        const raw_ms = @divFloor(duration.raw.nanoseconds, std.time.ns_per_ms);
-        const milliseconds = std.math.cast(u64, @max(raw_ms, 0)) orelse std.math.maxInt(u64);
-        self.inner.set(.fromMilliseconds(milliseconds));
+    fn set(self: *@This(), _: std.Io, timeout: std.Io.Timeout) void {
+        // `Timeout.fromStd` keeps the value clockless and `Clock.fromStdTimeout`
+        // carries the clock, which is how zio wants the two halves.
+        self.inner.setClock(.fromStd(timeout), .fromStdTimeout(timeout));
     }
 
     fn clear(self: *@This(), _: std.Io) void {
