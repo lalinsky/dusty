@@ -40,7 +40,7 @@ fn handlePost(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     ctx.counter += 1;
 
     // Read the request body
-    var reader = req.reader();
+    var reader = try req.reader();
     const body = try reader.interface.allocRemaining(req.arena, .limited(1024 * 1024));
 
     if (body.len > 0) {

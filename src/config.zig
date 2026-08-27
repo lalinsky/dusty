@@ -117,8 +117,18 @@ pub const ServerConfig = struct {
     };
 
     pub const Request = struct {
-        /// Maximum size (bytes) for request body
+        /// Maximum size (bytes) for request body. Applies to the body a
+        /// handler sees, so for a compressed request it bounds what was
+        /// decoded rather than what arrived.
         max_body_size: usize = 1_048_576, // 1MB default
+        /// Undo `Content-Encoding` on request bodies. Turn off to read what
+        /// the wire carried; `Request.content_encoding` says what that is.
+        /// A coding we cannot undo fails the read with
+        /// `error.UnsupportedContentEncoding` either way.
+        ///
+        /// Costs a 64K sliding window from the connection's arena, on the
+        /// connections that actually receive a coded body and only once each.
+        decompress: bool = true,
         /// Buffer size (bytes) for reading the request head: the request
         /// line and all headers. This is also the limit on it -- the parsed
         /// header names and values are slices into this buffer rather than

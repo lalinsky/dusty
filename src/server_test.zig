@@ -63,7 +63,7 @@ test "Server: POST with body" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var reader = try req.reader();
 
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             const n = try reader.interface.streamRemaining(&writer);
@@ -81,6 +81,45 @@ test "Server: POST with body" {
     try testClientServer(TestContext, &ctx);
 
     try std.testing.expect(ctx.body_received);
+    try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
+}
+
+test "Server: a gzip request body reaches the handler decoded" {
+    const TestContext = struct {
+        const Self = @This();
+
+        // "Hello from test!", gzip compressed.
+        const gzip_body = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xf3\x48\xcd\xc9\xc9\x57" ++
+            "\x48\x2b\xca\xcf\x55\x28\x49\x2d\x2e\x51\x04\x00\x7c\xe6\xd9\x99\x10\x00\x00\x00";
+
+        received_body: [256]u8 = undefined,
+        received_len: usize = 0,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.post("/gzip", handlePost);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            try writer.print(
+                "POST /gzip HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}",
+                .{ gzip_body.len, gzip_body },
+            );
+            try writer.flush();
+        }
+
+        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            var reader = try req.reader();
+            var writer = std.Io.Writer.fixed(&ctx.received_body);
+            ctx.received_len = try reader.interface.streamRemaining(&writer);
+            res.body = "OK\n";
+        }
+    };
+
+    var ctx: TestContext = .{};
+    try testClientServer(TestContext, &ctx);
+
     try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
 }
 
@@ -123,7 +162,7 @@ test "Server: POST with chunked encoding" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var reader = try req.reader();
 
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             const n = try reader.interface.streamRemaining(&writer);
@@ -163,7 +202,7 @@ test "Server: GET with no body" {
         }
 
         fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var reader = try req.reader();
 
             var body_buf: [256]u8 = undefined;
             var writer = std.Io.Writer.fixed(&body_buf);
@@ -404,7 +443,7 @@ test "Server: void context handlers" {
 
     server.router.post("/echo", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = req.reader();
+            var reader = try req.reader();
             const body = try reader.interface.allocRemaining(req.arena, .limited(1024));
             res.body = try std.fmt.allocPrint(res.arena, "Echo: {s}\n", .{body});
         }

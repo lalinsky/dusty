@@ -30,10 +30,10 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n", .{});
 
-    const body_reader = response.reader();
+    var body_reader = try response.reader();
     var write_buf: [8192]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &write_buf);
-    const total_bytes = try body_reader.streamRemaining(&out.interface);
+    const total_bytes = try body_reader.interface.streamRemaining(&out.interface);
     try out.interface.flush();
     std.debug.print("Total bytes: {d}\n", .{total_bytes});
 }

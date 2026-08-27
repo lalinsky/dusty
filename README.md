@@ -10,6 +10,7 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 - Router with support for parameters and wildcards
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
+- Transparent gzip/deflate decoding of request and response bodies
 - Server-Sent Events (SSE) for streaming responses
 - WebSocket support (RFC 6455)
 - HTTP/HTTPS client with connection pooling

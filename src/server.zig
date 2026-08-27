@@ -852,6 +852,9 @@ pub fn Server(comptime Ctx: type) type {
                     };
                     if (drainable) {
                         var scratch: [4096]u8 = undefined;
+                        // No decoding: this is throwing the body away to get
+                        // back to the connection, and `max` bounds what the
+                        // peer sent rather than what it would decode to.
                         var body_reader = RequestBodyReader.init(&parser, connection.transport(), &scratch);
                         if (body_reader.interface.discardShort(max + 1)) |consumed| {
                             if (consumed > max) response.keepalive = false;
