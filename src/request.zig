@@ -40,7 +40,6 @@ pub const Request = struct {
     // Body reading support
     parser: *RequestParser,
     transport: Transport,
-    body_reader_buffer: [1024]u8 = undefined,
     config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
@@ -96,8 +95,14 @@ pub const Request = struct {
     /// The request body: transfer framing undone, and the content coding
     /// too unless `config.decompress` is off. Read through `.interface`,
     /// and `.err` says what an `error.ReadFailed` from it actually was.
-    pub fn reader(self: *Request) !RequestBodyReader {
-        var r = RequestBodyReader.init(self.parser, self.transport, &self.body_reader_buffer);
+    ///
+    /// `buffer` is where bytes wait between the connection and the caller,
+    /// the way `Response.stream` takes one for the other direction. It is
+    /// what `peek` and the `take` family read out of, so size it for the
+    /// longest thing they need to see at once; an empty slice is fine for a
+    /// caller that only ever streams.
+    pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
+        var r = RequestBodyReader.init(self.parser, self.transport, buffer);
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
@@ -122,7 +127,9 @@ pub const Request = struct {
             return self._body;
         }
 
-        var r = try self.reader();
+        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        var no_buf: [0]u8 = .{};
+        var r = try self.reader(&no_buf);
         const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             // The interface can only say that a read failed; the reader
@@ -815,7 +822,8 @@ test "Request: a streaming read resolves through the reader it hands out" {
 
     // A handler streaming the body never calls `body`, so the reader itself
     // has to answer -- including for a failure in the layer it added.
-    var r = try req.reader();
+    var read_buf: [64]u8 = undefined;
+    var r = try req.reader(&read_buf);
     var sink: std.Io.Writer = .fixed(&[_]u8{});
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
     try std.testing.expectEqual(error.BadGzipHeader, r.err.?);

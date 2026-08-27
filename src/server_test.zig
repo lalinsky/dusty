@@ -63,7 +63,8 @@ test "Server: POST with body" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = try req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
 
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             const n = try reader.interface.streamRemaining(&writer);
@@ -110,7 +111,8 @@ test "Server: a gzip request body reaches the handler decoded" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = try req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             ctx.received_len = try reader.interface.streamRemaining(&writer);
             res.body = "OK\n";
@@ -162,7 +164,8 @@ test "Server: POST with chunked encoding" {
         }
 
         fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = try req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
 
             var writer = std.Io.Writer.fixed(&ctx.received_body);
             const n = try reader.interface.streamRemaining(&writer);
@@ -202,7 +205,8 @@ test "Server: GET with no body" {
         }
 
         fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = try req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
 
             var body_buf: [256]u8 = undefined;
             var writer = std.Io.Writer.fixed(&body_buf);
@@ -443,7 +447,8 @@ test "Server: void context handlers" {
 
     server.router.post("/echo", struct {
         fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            var reader = try req.reader();
+            var read_buf: [1024]u8 = undefined;
+            var reader = try req.reader(&read_buf);
             const body = try reader.interface.allocRemaining(req.arena, .limited(1024));
             res.body = try std.fmt.allocPrint(res.arena, "Echo: {s}\n", .{body});
         }

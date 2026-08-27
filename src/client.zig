@@ -684,7 +684,6 @@ pub const ClientResponse = struct {
     _body: ?[]const u8 = null,
     _body_read: bool = false,
 
-    _body_reader_buffer: [1024]u8 = undefined,
     // Set up on the first body read that calls for decoding, and kept so a
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*ResponseBodyReader.Decode = null,
@@ -733,7 +732,9 @@ pub const ClientResponse = struct {
             return self._body;
         }
 
-        var r = try self.reader();
+        // Nothing to stage: `allocRemaining` streams straight into the arena.
+        var no_buf: [0]u8 = .{};
+        var r = try self.reader(&no_buf);
         const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
             error.ReadFailed => return r.err orelse error.Unexpected,
@@ -752,8 +753,14 @@ pub const ClientResponse = struct {
     /// The response body: transfer framing undone, and the content coding
     /// too unless `decompress` is off. Read through `.interface`, and
     /// `.err` says what an `error.ReadFailed` from it actually was.
-    pub fn reader(self: *ClientResponse) !ResponseBodyReader {
-        var r = ResponseBodyReader.init(self.parser, self.transport, &self._body_reader_buffer);
+    ///
+    /// `buffer` is where bytes wait between the connection and the caller,
+    /// the way `Response.stream` takes one for the other direction. It is
+    /// what `peek` and the `take` family read out of, so size it for the
+    /// longest thing they need to see at once; an empty slice is fine for a
+    /// caller that only ever streams.
+    pub fn reader(self: *ClientResponse, buffer: []u8) !ResponseBodyReader {
+        var r = ResponseBodyReader.init(self.parser, self.transport, buffer);
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
@@ -1607,7 +1614,8 @@ test "ClientResponse: a streaming read can be resolved without going through bod
 
     // Streaming the body rather than calling `body`, which is the case with
     // no other way to find out what happened.
-    var r = try response.reader();
+    var read_buf: [64]u8 = undefined;
+    var r = try response.reader(&read_buf);
     var sink: std.Io.Writer = .fixed(&[_]u8{});
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
 
@@ -1616,14 +1624,15 @@ test "ClientResponse: a streaming read can be resolved without going through bod
     try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
 }
 
-test "ClientResponse: neither it nor its reader carries decoding state" {
+test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
     // `fetch` returns a `ClientResponse` by value and `reader` returns the
     // body reader by value, so both are copied per response whether or not
-    // anything was coded. The decoder and its 64K window are allocated when
-    // the headers call for them.
+    // anything was coded. The read buffer comes from the caller, and the
+    // decoder and its 64K window are allocated when the headers call for
+    // them -- so neither of these grows with either.
     try std.testing.expect(@sizeOf(ClientResponse) < std.compress.flate.max_window_len);
     try std.testing.expect(@sizeOf(ResponseBodyReader) < std.compress.flate.max_window_len);
-    // Which is the thing they would otherwise be carrying.
+    // Which is what they would otherwise be carrying.
     try std.testing.expect(@sizeOf(ResponseBodyReader.Decode) > std.compress.flate.max_window_len);
 }
 
@@ -1757,7 +1766,8 @@ test "ClientResponse.reader: streaming read" {
         .max_response_size = 1024,
     };
 
-    var body_reader = try response.reader();
+    var read_buf: [64]u8 = undefined;
+    var body_reader = try response.reader(&read_buf);
 
     // Read in chunks
     var buf: [5]u8 = undefined;
@@ -1797,7 +1807,8 @@ test "ClientResponse.reader: after body() returns cached data" {
     try std.testing.expectEqualStrings("hello", body.?);
 
     // Now reader should return cached body
-    var body_reader = try response.reader();
+    var read_buf: [64]u8 = undefined;
+    var body_reader = try response.reader(&read_buf);
     const cached = try body_reader.interface.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("hello", cached);
 }

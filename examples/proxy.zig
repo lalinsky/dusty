@@ -43,7 +43,8 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     upstream_req.headers = &headers;
 
     // Forward request body if present
-    var reader = try req.reader();
+    var read_buf: [4096]u8 = undefined;
+    var reader = try req.reader(&read_buf);
     const body = try reader.interface.allocRemaining(req.arena, .limited(10 * 1024 * 1024)); // 10MB limit
     if (body.len > 0) {
         upstream_req.body = body;
@@ -86,7 +87,8 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     }
 
     // Stream response body
-    var body_reader = try upstream_res.reader();
+    var upstream_buf: [4096]u8 = undefined;
+    var body_reader = try upstream_res.reader(&upstream_buf);
     var buf: [4096]u8 = undefined;
     var body_writer = try res.stream(&buf);
     const bytes_written = try body_reader.interface.streamRemaining(&body_writer.interface);

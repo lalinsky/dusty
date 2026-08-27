@@ -18,6 +18,12 @@
 //!       err: ?Error = null,        // what a failed read or write was
 //!   };
 //!
+//! None of them carries its own buffer. Where bytes have to wait between
+//! the caller and the connection, the caller passes the buffer in --
+//! `Request.reader`, `ClientResponse.reader`, `Response.stream` -- and
+//! where they do not, because the response arena or the stream below is
+//! already the buffer, there is none at all.
+//!
 //! `BodyReader` (`parser.zig`) and `BodyWriter`, `StreamingBodyWriter` and
 //! `EventWriter` (`response.zig`) are all this. `WebSocket` and
 //! `EventStream` hand out no interface at all and resolve inside `send` /
