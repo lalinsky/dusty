@@ -40,6 +40,13 @@ pub const TlsCa = union(enum) {
     }
 };
 
+/// Kept free past the head in a connection's read buffer, which is sized
+/// `buffer_size + body_read_reserve`. `parseHeaders` gives the body reader
+/// whatever the head did not use, and a body reader with no buffer cannot
+/// read; refusing a head that would eat into this is what makes it a reserve
+/// rather than a hope.
+pub const body_read_reserve = 1024;
+
 pub const TlsPath = struct {
     path: []const u8,
     /// Directory `path` is resolved against. Defaults to the current working
@@ -97,8 +104,12 @@ pub const ServerConfig = struct {
     pub const Request = struct {
         /// Maximum size (bytes) for request body
         max_body_size: usize = 1_048_576, // 1MB default
-        /// Buffer size (bytes) for reading request headers
-        buffer_size: usize = 4096,
+        /// Buffer size (bytes) for reading the request head: the request
+        /// line and all headers. This is also the limit on it -- the parsed
+        /// header names and values are slices into this buffer rather than
+        /// copies, so the head is held whole and cannot be read in pieces.
+        /// A head that does not fit is answered with 431.
+        buffer_size: usize = 16384,
         /// Maximum number of headers allowed in a request
         max_header_count: usize = 32,
         /// Maximum number of route parameters (e.g., /user/:id/:action)
