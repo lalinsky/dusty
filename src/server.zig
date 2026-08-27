@@ -58,6 +58,11 @@ pub const Connection = struct {
     tls_writer: tls.Connection.Writer = undefined,
 
     // Active reader/writer, whichever path is in use.
+    //
+    // Public, and bare interfaces, so they can only report
+    // `ReadFailed`/`WriteFailed`. That is allowed here because there is no
+    // layer above them to lose the answer: `getReadError`/`getWriteError`
+    // beside them resolve what actually failed.
     reader: *std.Io.Reader = undefined,
     writer: *std.Io.Writer = undefined,
 

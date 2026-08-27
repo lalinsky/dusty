@@ -381,7 +381,12 @@ pub const Connection = struct {
     read_buffer: []u8,
     write_buffer: []u8,
 
-    // Pointers to the actual reader/writer interfaces used for HTTP I/O
+    // Pointers to the actual reader/writer interfaces used for HTTP I/O.
+    //
+    // Public, and bare interfaces, so they can only report
+    // `ReadFailed`/`WriteFailed`. That is allowed here because there is no
+    // layer above them to lose the answer: `getReadError`/`getWriteError`
+    // beside them resolve what actually failed.
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
@@ -1638,6 +1643,10 @@ test "Client: no std.Io sentinel escapes its public API" {
         ErrorSetOf(Client.connectWebSocket),
         ErrorSetOf(WebSocketClient.send),
         ErrorSetOf(WebSocketClient.receive),
+        // The wrapper a streaming caller resolves through, not just the
+        // functions that resolve for them.
+        ClientResponse.ReadError,
+        ResponseBodyReader.Error,
     }) |Set| {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));

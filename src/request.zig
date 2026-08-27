@@ -649,6 +649,9 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
         ErrorSetOf(Request.jsonValue),
         ErrorSetOf(Request.formData),
         ErrorSetOf(Request.multiFormData),
+        // The wrapper a streaming caller resolves through, not just the
+        // functions that resolve for them.
+        RequestBodyReader.Error,
     }) |Set| {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
