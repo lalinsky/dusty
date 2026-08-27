@@ -851,8 +851,10 @@ pub fn Server(comptime Ctx: type) type {
                 if (!parser.isBodyComplete()) {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {
-                        const cl = request.headers.get("Content-Length") orelse break :blk false;
-                        const n = std.fmt.parseInt(usize, cl, 10) catch break :blk false;
+                        // What the wire carried, which is what there is left
+                        // to throw away -- and still readable after decoding
+                        // took the header off.
+                        const n = request.content_length orelse break :blk false;
                         break :blk n <= max;
                     };
                     if (drainable) {

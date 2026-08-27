@@ -229,6 +229,10 @@ pub const RequestParser = struct {
             self.request.content_encoding = ContentEncoding.fromString(content_encoding);
         }
 
+        if (self.request.headers.get("Content-Length")) |content_length| {
+            self.request.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
+        }
+
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
     }
@@ -264,6 +268,7 @@ pub const ParsedResponse = struct {
     headers: Headers = .{},
     content_type: ?ContentType = null,
     content_encoding: ContentEncoding = .identity,
+    content_length: ?usize = null,
     arena: std.mem.Allocator,
 };
 
@@ -445,6 +450,10 @@ pub const ResponseParser = struct {
 
         if (self.response.headers.get("Content-Encoding")) |content_encoding| {
             self.response.content_encoding = ContentEncoding.fromString(content_encoding);
+        }
+
+        if (self.response.headers.get("Content-Length")) |content_length| {
+            self.response.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
         }
 
         self.state.headers_complete = true;

@@ -21,7 +21,15 @@ pub const Request = struct {
     /// The coding the body arrived in. Undone by the body reader unless
     /// `config.decompress` is off, in which case reading the body yields
     /// what the wire carried.
+    ///
+    /// Once it is being undone the `Content-Encoding` header is removed,
+    /// because it would describe the body a handler is about to read as
+    /// something it is not. This still says what arrived.
     content_encoding: http.ContentEncoding = .identity,
+    /// How long the body was on the wire, when the headers said. Removed
+    /// from the headers alongside the coding for the same reason, and kept
+    /// here for the same one.
+    content_length: ?usize = null,
     params: http.Params = .{},
     query: http.Params = .{},
     /// The peer this request arrived from. A Unix socket peer has no
@@ -126,9 +134,20 @@ pub const Request = struct {
             r.decode = decode;
         } else if (self.config.decompress) {
             try r.startDecoding(self.arena, self.content_encoding);
+            if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
         }
         return r;
+    }
+
+    /// Both of these describe the body as it arrived, and it is not going
+    /// to arrive that way any more: what the handler reads is decoded, and
+    /// a longer or shorter number of bytes. Leaving them is how a proxy
+    /// comes to forward plain bytes labelled `gzip`. `content_encoding` and
+    /// `content_length` keep the answer for a handler that wants it.
+    fn dropEncodedBodyHeaders(self: *Request) void {
+        _ = self.headers.remove("Content-Encoding");
+        _ = self.headers.remove("Content-Length");
     }
 
     /// Read the entire body into memory. Result is cached for subsequent calls.
@@ -760,6 +779,72 @@ test "Request.body: a chunked gzip body is unwrapped by both layers" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("Hello from test!", body.?);
+}
+
+test "Request: decoding takes the headers that described the encoded body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    // Both are true of the body until the moment it is decoded.
+    try std.testing.expectEqualStrings("gzip", req.headers.get("Content-Encoding").?);
+    try std.testing.expectEqualStrings("25", req.headers.get("Content-Length").?);
+
+    const body = try req.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // A handler forwarding these would send five plain bytes labelled as
+    // twenty-five gzipped ones.
+    try std.testing.expectEqual(@as(?[]const u8, null), req.headers.get("Content-Encoding"));
+    try std.testing.expectEqual(@as(?[]const u8, null), req.headers.get("Content-Length"));
+
+    // What arrived is still answerable, just not as a header.
+    try std.testing.expectEqual(http.ContentEncoding.gzip, req.content_encoding);
+    try std.testing.expectEqual(@as(?usize, 25), req.content_length);
+}
+
+test "Request: decoding off leaves the headers alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+        .config = .{ .decompress = false },
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+    _ = try req.body();
+
+    // Nothing was undone, so both still describe what the handler has.
+    try std.testing.expectEqualStrings("gzip", req.headers.get("Content-Encoding").?);
+    try std.testing.expectEqualStrings("25", req.headers.get("Content-Length").?);
 }
 
 test "Request.body: decoding off yields what the wire carried" {

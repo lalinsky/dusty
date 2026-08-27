@@ -13,6 +13,7 @@ const Method = http.Method;
 const Status = http.Status;
 const Headers = http.Headers;
 const ContentType = http.ContentType;
+const ContentEncoding = http.ContentEncoding;
 
 const WebSocket = @import("websocket.zig").WebSocket;
 
@@ -722,6 +723,34 @@ pub const ClientResponse = struct {
         return self.parsed.content_type;
     }
 
+    /// The coding the body arrived in. Undone by the body reader unless
+    /// `decompress` is off, in which case reading the body yields what the
+    /// wire carried.
+    ///
+    /// Once it is being undone the `Content-Encoding` header is removed,
+    /// because it would describe the body a caller is about to read as
+    /// something it is not. This still says what arrived.
+    pub fn contentEncoding(self: *const ClientResponse) ContentEncoding {
+        return self.parsed.content_encoding;
+    }
+
+    /// How long the body was on the wire, when the headers said. Removed
+    /// from the headers alongside the coding for the same reason, and kept
+    /// here for the same one.
+    pub fn contentLength(self: *const ClientResponse) ?usize {
+        return self.parsed.content_length;
+    }
+
+    /// Both of these describe the body as it arrived, and it is not going
+    /// to arrive that way any more: what the caller reads is decoded, and a
+    /// longer or shorter number of bytes. Leaving them is how a proxy comes
+    /// to forward plain bytes labelled `gzip`. `contentEncoding` and
+    /// `contentLength` keep the answer for a caller that wants it.
+    fn dropEncodedBodyHeaders(self: *ClientResponse) void {
+        _ = self.parsed.headers.remove("Content-Encoding");
+        _ = self.parsed.headers.remove("Content-Length");
+    }
+
     /// What a failed body read can turn out to be, sentinels resolved. The
     /// reader `reader` hands out carries one of these in `.err`.
     pub const ReadError = ResponseBodyReader.Error;
@@ -783,6 +812,7 @@ pub const ClientResponse = struct {
             r.decode = decode;
         } else if (self.decompress) {
             try r.startDecoding(self.arena, self.parsed.content_encoding);
+            if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
         }
         return r;
@@ -1859,6 +1889,43 @@ test "ClientResponse.body: gzip decompression" {
 
     const body = try response.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "ClientResponse: decoding takes the headers that described the encoded body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqualStrings("gzip", response.headers().get("Content-Encoding").?);
+
+    const body = try response.body();
+    try std.testing.expectEqualStrings("hello", body.?);
+
+    // A proxy forwarding these would send five plain bytes labelled as
+    // twenty-five gzipped ones.
+    try std.testing.expectEqual(@as(?[]const u8, null), response.headers().get("Content-Encoding"));
+    try std.testing.expectEqual(@as(?[]const u8, null), response.headers().get("Content-Length"));
+
+    // What arrived is still answerable, just not as a header.
+    try std.testing.expectEqual(ContentEncoding.gzip, response.contentEncoding());
+    try std.testing.expectEqual(@as(?usize, 25), response.contentLength());
 }
 
 test "ClientResponse.body: gzip decompression disabled" {
