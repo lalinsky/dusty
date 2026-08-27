@@ -200,32 +200,38 @@ const have_auto_cancel = !@hasDecl(zio, "is_stub");
 /// so it returns rather than sleeping on stale terms.
 const Watch = struct {
     generation: std.atomic.Value(u32) = .init(0),
-    /// Nanoseconds on the `.awake` clock, or `unarmed`.
-    deadline: std.atomic.Value(i64) = .init(unarmed),
-    finished: std.atomic.Value(bool) = .init(false),
+    mutex: std.Io.Mutex = .init,
+    /// Guarded by `mutex`. Never `.duration`: `set` pins one to the moment it
+    /// was published.
+    timeout: std.Io.Timeout = .none,
+    /// Guarded by `mutex`.
+    finished: bool = false,
 
-    const unarmed = std.math.maxInt(i64);
+    const State = struct {
+        timeout: std.Io.Timeout,
+        finished: bool,
+    };
 
     fn wake(self: *Watch, io: std.Io) void {
         _ = self.generation.fetchAdd(1, .acq_rel);
         io.futexWake(u32, &self.generation.raw, 1);
     }
 
+    fn published(self: *Watch, io: std.Io) State {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return .{ .timeout = self.timeout, .finished = self.finished };
+    }
+
     fn set(self: *Watch, io: std.Io, timeout: std.Io.Timeout) void {
-        const deadline = timeout.toTimestamp(io) orelse return self.disarm(io);
-        const awake_ns = if (deadline.clock == .awake)
-            deadline.raw.nanoseconds
-        else blk: {
-            // `Clock.Timestamp.toClock` in Zig 0.16 passes its wrapper where
-            // `Io.Timestamp.durationTo` expects the raw timestamp. Spell out
-            // the same conversion until that helper is fixed upstream.
-            const now_old = deadline.clock.now(io);
-            const now_awake = std.Io.Clock.awake.now(io);
-            const remaining = now_old.durationTo(deadline.raw);
-            break :blk now_awake.addDuration(remaining).nanoseconds;
-        };
-        const ns = std.math.cast(i64, awake_ns) orelse unarmed;
-        self.deadline.store(ns, .release);
+        // A duration runs from the call that published it, and the watcher may
+        // not read it until much later.
+        const deadline = timeout.toDeadline(io);
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.timeout = deadline;
+        }
         self.wake(io);
     }
 
@@ -234,12 +240,15 @@ const Watch = struct {
     }
 
     fn disarm(self: *Watch, io: std.Io) void {
-        self.deadline.store(unarmed, .release);
-        self.wake(io);
+        self.set(io, .none);
     }
 
     fn finish(self: *Watch, io: std.Io) void {
-        self.finished.store(true, .release);
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.finished = true;
+        }
         self.wake(io);
     }
 
@@ -247,23 +256,24 @@ const Watch = struct {
     /// overruns the deadline it last published.
     fn wait(self: *Watch, io: std.Io) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
         while (true) {
+            // Captured before the snapshot, so a `set` that lands in between
+            // is one the wait below refuses to sleep through.
             const generation = self.generation.load(.acquire);
-            if (self.finished.load(.acquire)) return;
-            const deadline = self.deadline.load(.acquire);
-
-            const timeout: std.Io.Timeout = if (deadline == unarmed) .none else .{
-                .deadline = .{ .raw = .{ .nanoseconds = deadline }, .clock = .awake },
-            };
-            try io.futexWaitTimeout(u32, &self.generation.raw, generation, timeout);
+            const state = self.published(io);
+            if (state.finished) return;
 
             // The wait does not report why it returned, and `generation` is
-            // only its wakeup token: `arm` publishes the deadline first, so an
-            // unchanged generation does not mean an unchanged deadline. Decide
-            // on what is published now, not on what was captured above.
-            if (self.finished.load(.acquire)) return;
-            const current = self.deadline.load(.acquire);
-            if (current == unarmed) continue;
-            if (std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds >= current) return error.Timeout;
+            // only its wakeup token: `set` publishes the deadline before the
+            // bump, so an unchanged generation does not mean an unchanged
+            // deadline. Every wakeup comes back here and judges the deadline
+            // published now, never the one it went to sleep on.
+            if (state.timeout.toTimestamp(io)) |deadline| {
+                if (std.Io.Clock.Timestamp.now(io, deadline.clock).compare(.gte, deadline)) {
+                    return error.Timeout;
+                }
+            }
+
+            try io.futexWaitTimeout(u32, &self.generation.raw, generation, state.timeout);
         }
     }
 };
@@ -1020,11 +1030,12 @@ test "Watch: a deadline republished before its generation does not expire the co
     // one the way `arm` does, but stop short of the generation bump -- the
     // window between its store and its wake.
     try io.sleep(.fromMilliseconds(25), .awake);
-    const later = std.math.cast(i64, std.Io.Timeout.toDeadline(
-        .{ .duration = .{ .raw = .fromMilliseconds(5_000), .clock = .awake } },
-        io,
-    ).deadline.raw.nanoseconds).?;
-    watch.deadline.store(later, .release);
+    const later: std.Io.Timeout = .{
+        .deadline = .fromNow(io, .{ .raw = .fromMilliseconds(5_000), .clock = .awake }),
+    };
+    watch.mutex.lockUncancelable(io);
+    watch.timeout = later;
+    watch.mutex.unlock(io);
 
     // Well past the first deadline, and nowhere near the second.
     try io.sleep(.fromMilliseconds(600), .awake);
