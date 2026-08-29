@@ -36,10 +36,10 @@
 //! nothing sits above them to lose the answer.
 //!
 //! "Resolved" is the load-bearing word. An `err` holding a sentinel is no
-//! better than the sentinel, and layers do record sentinels: tls.zig stores
-//! `TransportReadFailed` when the layer below it failed, and
-//! `std.compress.flate.Decompress` stores `error.ReadFailed` for the same
-//! reason. Both mean "keep descending". So the code that reads them switches
+//! better than the sentinel, and layers do record sentinels: both tls.zig
+//! and `std.compress.flate.Decompress` store `error.ReadFailed` when the
+//! layer below them failed, because that is all they were handed.
+//! It means "keep descending". So the code that reads them switches
 //! past them rather than comparing, which drops them from the inferred error
 //! set as well as from the answer -- making it true by construction that
 //! what a caller is handed names a cause.
@@ -85,23 +85,31 @@ pub const Transport = struct {
     tls_reader: ?*tls.Connection.Reader = null,
     tls_writer: ?*tls.Connection.Writer = null,
 
-    // tls.zig records `TransportReadFailed`/`TransportWriteFailed` when the
-    // layer below it failed, because all it saw was the ciphertext
-    // reader/writer's generic error; the real cause is on the TCP layer.
-    // So those two mean "keep descending". A TLS-level failure (bad record
-    // mac, bad version, ...) is recorded as itself and stops the search.
+    // tls.zig records `ReadFailed`/`WriteFailed` when the layer below it
+    // failed, because all it saw was the ciphertext reader/writer's generic
+    // error; the real cause is on the TCP layer. So those two mean "keep
+    // descending". A TLS-level failure (bad record mac, bad version, ...) is
+    // recorded as itself and stops the search.
     //
     // They are switched on rather than compared so that they drop out of
-    // the inferred error set as well as out of the answer: like the
-    // `ReadFailed`/`WriteFailed` they stand in for, they name no cause a
-    // caller could act on, and nothing that descends past them can return one.
+    // the inferred error set as well as out of the answer: they name no
+    // cause a caller could act on, and nothing that descends past them can
+    // return one.
 
     fn checkReadError(self: Transport) !void {
         if (build_options.use_tls) {
             if (self.tls_reader) |tls_reader| {
                 if (tls_reader.err) |e| switch (e) {
                     // Keep descending: the cause is on the TCP layer below.
-                    error.TransportReadFailed => {},
+                    error.ReadFailed => {},
+                    // Unreachable: tls.zig's read error set is built on
+                    // `std.Io.Reader.Error`, so it carries `EndOfStream`
+                    // along with the `ReadFailed` it wanted, but the read
+                    // itself turns a clean end into zero bytes and never
+                    // returns it. Named anyway so it stays out of the
+                    // resolved set, where it would read as the peer having
+                    // hung up on a caller that asked why a read failed.
+                    error.EndOfStream => return error.Unexpected,
                     else => |cause| return cause,
                 };
             }
@@ -124,7 +132,7 @@ pub const Transport = struct {
             if (self.tls_writer) |tls_writer| {
                 if (tls_writer.err) |e| switch (e) {
                     // Keep descending: the cause is on the TCP layer below.
-                    error.TransportWriteFailed => {},
+                    error.WriteFailed => {},
                     else => |cause| return cause,
                 };
             }
@@ -148,13 +156,12 @@ pub const Transport = struct {
     /// connection is worth a log line and whether shutdown() is worth a
     /// syscall.
     pub fn isPeerGone(err: anyerror) bool {
+        // A peer that closes the transport between TLS records without
+        // close_notify is rude but routine, and tls.zig reports it as
+        // `EndOfStream` like any other clean end. `TlsConnectionTruncated`,
+        // where a record was cut in half, is deliberately not here.
         return switch (err) {
             error.EndOfStream,
-            // Peer closed the transport between TLS records without
-            // close_notify. Rude, but routine from clients that just close
-            // the socket. `TlsTruncated`, where a record was cut in half, is
-            // deliberately not here.
-            error.TlsUnexpectedEof,
             error.ConnectionResetByPeer,
             error.BrokenPipe,
             => true,
@@ -171,10 +178,6 @@ test "Transport: no std.Io sentinel escapes a resolved error set" {
         inline for (@typeInfo(Set).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
             try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
-            // The sentinels tls.zig stands in for them with, which mean
-            // "keep descending" and are equally useless to a caller.
-            try std.testing.expect(!std.mem.eql(u8, e.name, "TransportReadFailed"));
-            try std.testing.expect(!std.mem.eql(u8, e.name, "TransportWriteFailed"));
         }
     }
 }

@@ -712,8 +712,8 @@ pub fn Server(comptime Ctx: type) type {
                             // layer down -- and when the handshake ran out
                             // of time, that cause is the cancel.
                             const cause = switch (err) {
-                                error.TransportReadFailed => connection.getReadError() orelse err,
-                                error.TransportWriteFailed => connection.getWriteError() orelse err,
+                                error.ReadFailed => connection.getReadError() orelse err,
+                                error.WriteFailed => connection.getWriteError() orelse err,
                                 else => err,
                             };
                             // Nothing was negotiated, so there is no TLS
@@ -953,13 +953,13 @@ test "Connection: error accessors descend past the TLS layer's generic error" {
 
     { // a transport write failure: TLS records WriteFailed, TCP has the cause
         var conn = testTlsConnection();
-        conn.tls_writer.err = error.TransportWriteFailed;
+        conn.tls_writer.err = error.WriteFailed;
         conn.tcp_writer.err = error.ConnectionResetByPeer;
         try std.testing.expectEqual(error.ConnectionResetByPeer, conn.getWriteError().?);
     }
     { // same on the read side
         var conn = testTlsConnection();
-        conn.tls_reader.err = error.TransportReadFailed;
+        conn.tls_reader.err = error.ReadFailed;
         conn.tcp_reader.err = error.Canceled;
         try std.testing.expectEqual(error.Canceled, conn.getReadError().?);
     }
@@ -981,25 +981,22 @@ test "Connection: a TLS-level failure is reported as itself" {
 }
 
 test "Connection: the placeholders it descends past stay out of its error sets" {
-    // `TransportReadFailed`/`TransportWriteFailed` mean only "the layer
-    // below failed", which is what the accessors exist to look past. They
-    // must not survive into what a caller can be handed, any more than the
-    // `ReadFailed`/`WriteFailed` they stand in for.
+    // `ReadFailed`/`WriteFailed` mean only "the layer below failed", which
+    // is what the accessors exist to look past. They must not survive into
+    // what a caller can be handed.
     inline for (@typeInfo(Connection.ReadError).error_set.?) |e| {
-        try std.testing.expect(!std.mem.eql(u8, e.name, "TransportReadFailed"));
+        try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
     }
     inline for (@typeInfo(Connection.WriteError).error_set.?) |e| {
-        try std.testing.expect(!std.mem.eql(u8, e.name, "TransportWriteFailed"));
+        try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
     }
 }
 
 test "Connection: isPeerGone separates a departed peer from a real failure" {
     try std.testing.expect(Connection.isPeerGone(error.EndOfStream));
     try std.testing.expect(Connection.isPeerGone(error.ConnectionResetByPeer));
-    // Closed between records: nothing was in flight, nothing was lost.
-    try std.testing.expect(Connection.isPeerGone(error.TlsUnexpectedEof));
     // Closed mid-record: a record was cut, which is worth hearing about.
-    try std.testing.expect(!Connection.isPeerGone(error.TlsTruncated));
+    try std.testing.expect(!Connection.isPeerGone(error.TlsConnectionTruncated));
     try std.testing.expect(!Connection.isPeerGone(error.TlsBadRecordMac));
     try std.testing.expect(!Connection.isPeerGone(error.Canceled));
 }

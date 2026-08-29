@@ -539,7 +539,7 @@ pub fn BodyReader(comptime Parser: type) type {
         /// What the decoder recorded, said in terms a caller can act on.
         /// Switched on rather than compared so what it rewrites drops out of
         /// the inferred error set as well as out of the answer, the same way
-        /// tls.zig's `TransportReadFailed` does in `Transport`.
+        /// tls.zig's `ReadFailed` does in `Transport`.
         fn decodeCause(e: std.compress.flate.Decompress.Error) !void {
             switch (e) {
                 // Records whatever the reader below it handed over, and on
