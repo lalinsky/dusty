@@ -1337,9 +1337,12 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         try writer.print("Host: {s}:{d}\r\n", .{ opts.host, opts.port });
     }
 
-    // Content-Length for body
+    // Content-Length for body. A method that usually carries one says so
+    // even when there is none: some servers answer 411 otherwise.
     if (opts.body) |b| {
         try writer.print("Content-Length: {d}\r\n", .{b.len});
+    } else if (opts.method == .post or opts.method == .put or opts.method == .patch) {
+        try writer.writeAll("Content-Length: 0\r\n");
     }
 
     // User-provided headers
@@ -2389,6 +2392,34 @@ test "redirect: once stripping triggered it persists across hops" {
     const written = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Authorization") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "writeRequest: a bodyless POST says Content-Length: 0, a GET says nothing" {
+    const uri = try parseUrl("http://example.com/path");
+    inline for (.{ .post, .put, .patch }) |method| {
+        var buf: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writeRequest(&writer, .{
+            .method = method,
+            .uri = uri,
+            .host = "example.com",
+            .port = 80,
+            .protocol = .http,
+        });
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Content-Length: 0\r\n") != null);
+    }
+    inline for (.{ .get, .head, .delete, .options }) |method| {
+        var buf: [1024]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        try writeRequest(&writer, .{
+            .method = method,
+            .uri = uri,
+            .host = "example.com",
+            .port = 80,
+            .protocol = .http,
+        });
+        try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Content-Length") == null);
+    }
 }
 
 test "writeRequest: strips body headers when body removed" {
