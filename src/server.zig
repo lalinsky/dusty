@@ -866,6 +866,10 @@ pub fn Server(comptime Ctx: type) type {
                 if (!parser.isBodyComplete()) {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {
+                        // The peer is holding the body until it hears 100
+                        // Continue, and nothing asked for it. There is
+                        // nothing to drain, and a read would wait for it.
+                        if (request.expects_continue) break :blk false;
                         // What the wire carried, which is what there is left
                         // to throw away -- and still readable after decoding
                         // took the header off.

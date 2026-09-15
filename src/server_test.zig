@@ -1197,6 +1197,14 @@ test "Server: more headers than the limit is a 431, not a dropped connection" {
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 431 ");
 }
 
+test "Server: a response written without reading the body does not wait for one held back by Expect" {
+    // No POST route, so the 404 is written by nothing that reads the body,
+    // and the peer never sends it: it is waiting for 100 Continue.
+    var buf: [256]u8 = undefined;
+    const status = try statusLineFor("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n", &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 404 ");
+}
+
 test "Server: HEAD is answered by the GET route with no body" {
     const io = std.testing.io;
 
