@@ -1127,3 +1127,43 @@ test "Client: a redirect the client cannot follow does not leave its body for th
     try std.testing.expectEqualStrings("second", (try resp.body()).?);
     peer_future.cancel(io);
 }
+
+test "Client: an IPv6 literal URL connects, with the brackets kept in the Host header" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("::1", 0);
+    var listener = addr.listen(io, .{ .reuse_address = true }) catch |err| switch (err) {
+        // No IPv6 loopback here.
+        error.AddressUnavailable, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io, expected_port: u16) !void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [256]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            try rd.interface.fillMore();
+            var host_line_buf: [64]u8 = undefined;
+            const host_line = try std.fmt.bufPrint(&host_line_buf, "Host: [::1]:{d}\r\n", .{expected_port});
+            try std.testing.expect(std.mem.indexOf(u8, rd.interface.buffered(), host_line) != null);
+            try w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            try w.interface.flush();
+        }
+    }.run, .{ &listener, io, port });
+    defer peer_future.cancel(io) catch {};
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://[::1]:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var resp = try client.fetch(url, .{});
+    defer resp.deinit();
+    try std.testing.expectEqualStrings("ok", (try resp.body()).?);
+    try peer_future.await(io);
+}
