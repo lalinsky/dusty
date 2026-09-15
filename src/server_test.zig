@@ -1119,6 +1119,72 @@ test "Server: 417 Expectation Failed for unknown Expect value" {
 
     try client_future.await(io);
 }
+/// Sends `raw` to a server with one GET route at `/` and returns the status
+/// line it answers with.
+fn statusLineFor(raw: []const u8, out: []u8) ![]const u8 {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, request: []const u8, status_out: []u8) ![]const u8 {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            defer stream.shutdown(_io, .both) catch {};
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+
+            try writer.interface.writeAll(request);
+            try writer.interface.flush();
+
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            @memcpy(status_out[0..status_line.len], status_line);
+            return status_out[0..status_line.len];
+        }
+    }.run, .{ &server, io, raw, out });
+
+    return client_future.await(io);
+}
+
+test "Server: a bad percent escape in the query is a 400, not a dropped connection" {
+    var buf: [256]u8 = undefined;
+    const status = try statusLineFor("GET /?q=100% HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
+}
+
+test "Server: too many query parameters is a 400, not a dropped connection" {
+    // One past the default limit of 32, each under its own name.
+    const query = comptime blk: {
+        var q: []const u8 = "";
+        for (0..33) |i| q = q ++ std.fmt.comptimePrint("k{d}=v&", .{i});
+        break :blk q;
+    };
+    var buf: [256]u8 = undefined;
+    const status = try statusLineFor("GET /?" ++ query ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
+}
+
 test "Server: HEAD is answered by the GET route with no body" {
     const io = std.testing.io;
 
