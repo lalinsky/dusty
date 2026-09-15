@@ -1197,6 +1197,77 @@ test "Server: more headers than the limit is a 431, not a dropped connection" {
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 431 ");
 }
 
+test "Server: a response written without reading the body does not wait for one held back by Expect" {
+    // No POST route, so the 404 is written by nothing that reads the body,
+    // and the peer never sends it: it is waiting for 100 Continue.
+    var buf: [256]u8 = undefined;
+    const status = try statusLineFor("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nExpect: 100-continue\r\n\r\n", &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 404 ");
+}
+
+test "Server: a body sent without waiting for 100 Continue is drained and the connection kept" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.post("/ignore", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "first";
+        }
+    }.handle);
+
+    server.router.get("/ping", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "second";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    // Expect, and the body right behind it: the peer is not waiting.
+    const body = "this body is ignored";
+    try w.print("POST /ignore HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\nExpect: 100-continue\r\n\r\n{s}", .{ body.len, body });
+    try w.flush();
+
+    var status1: [64]u8 = undefined;
+    var body1: [32]u8 = undefined;
+    const resp1 = try readResponse(r, &status1, &body1);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.status, "200") != null);
+    try std.testing.expectEqualStrings("first", resp1.body);
+
+    try w.writeAll("GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try w.flush();
+
+    var status2: [64]u8 = undefined;
+    var body2: [32]u8 = undefined;
+    const resp2 = try readResponse(r, &status2, &body2);
+    try std.testing.expect(std.mem.indexOf(u8, resp2.status, "200") != null);
+    try std.testing.expectEqualStrings("second", resp2.body);
+}
+
 test "Server: HEAD is answered by the GET route with no body" {
     const io = std.testing.io;
 
