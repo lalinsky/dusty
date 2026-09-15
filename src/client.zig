@@ -767,11 +767,15 @@ pub const ClientResponse = struct {
         // Nothing to stage: `allocRemaining` streams straight into the arena.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
-        const result = r.interface.allocRemaining(self.arena, .limited(self.max_response_size)) catch |err| switch (err) {
+        // One past the limit, as `allocRemaining` gives up when the limit
+        // is used up without asking whether the stream ended there.
+        const max = self.max_response_size;
+        const result = r.interface.allocRemaining(self.arena, .limited(max +| 1)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
             error.ReadFailed => return r.err orelse error.Unexpected,
             else => |e| return e,
         };
+        if (result.len > max) return error.ResponseTooLarge;
 
         self._body_read = true;
         if (result.len == 0) {
@@ -1915,6 +1919,54 @@ test "ClientResponse.body: chunked trailers are not headers" {
 
     try std.testing.expectEqualStrings("hello", (try response.body()).?);
     try std.testing.expectEqual(null, response.headers().get("X-Trailer"));
+}
+
+test "ClientResponse.body: max_response_size is inclusive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n" ++ "a" ** 1024;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqual(1024, (try response.body()).?.len);
+}
+
+test "ClientResponse.body: one byte over max_response_size is too large" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 1025\r\n\r\n" ++ "a" ** 1025;
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectError(error.ResponseTooLarge, response.body());
 }
 
 test "ClientResponse.body: connection-close (EOF-delimited) body" {

@@ -163,13 +163,17 @@ pub const Request = struct {
         // Nothing to stage: `allocRemaining` streams straight into the arena.
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
-        const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
+        // One past the limit, as `allocRemaining` gives up when the limit
+        // is used up without asking whether the stream ended there.
+        const max = self.config.max_body_size;
+        const result = r.interface.allocRemaining(self.arena, .limited(max +| 1)) catch |err| switch (err) {
             error.StreamTooLong => return error.BodyTooBig,
             // The interface can only say that a read failed; the reader
             // holds what it was.
             error.ReadFailed => return r.err orelse error.Unexpected,
             else => |e| return e,
         };
+        if (result.len > max) return error.BodyTooBig;
 
         self._body_read = true;
         if (result.len == 0) {
@@ -725,6 +729,54 @@ test "Request.body: basic POST" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.body: max_body_size is inclusive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 16\r\n\r\n" ++ "a" ** 16;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+        .config = .{ .max_body_size = 16 },
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectEqual(16, (try req.body()).?.len);
+}
+
+test "Request.body: one byte over max_body_size is too big" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 17\r\n\r\n" ++ "a" ** 17;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+        .config = .{ .max_body_size = 16 },
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectError(error.BodyTooBig, req.body());
 }
 
 test "Request.body: a gzip request body is decoded" {
