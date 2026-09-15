@@ -210,6 +210,13 @@ fn uriPortAndProtocol(uri: Uri) error{UnsupportedScheme}!struct { port: u16, pro
     return .{ .port = port, .protocol = protocol };
 }
 
+/// An IPv6 literal keeps its brackets in the URI, in the pool key and in
+/// the Host header, where they belong. The address parser wants them off.
+fn unbracketed(host: []const u8) []const u8 {
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') return host[1 .. host.len - 1];
+    return host;
+}
+
 /// Get host string from URI.
 fn uriHost(uri: Uri, buffer: *[255]u8) ![]const u8 {
     const hostname = uri.getHost(buffer) catch return error.InvalidUrl;
@@ -943,7 +950,7 @@ pub const Client = struct {
             const stream = if (unix_socket_path) |path| unix: {
                 const unix_addr = try std.Io.net.UnixAddress.init(path);
                 break :unix try unix_addr.connect(self.io);
-            } else if (std.Io.net.IpAddress.parse(host, port)) |addr| tcp: {
+            } else if (std.Io.net.IpAddress.parse(unbracketed(host), port)) |addr| tcp: {
                 break :tcp try addr.connect(self.io, .{ .mode = .stream });
             } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
             errdefer stream.close(self.io);
@@ -1509,6 +1516,22 @@ fn fixedMessageReader(gpa: std.mem.Allocator, raw: []const u8) !std.Io.Reader {
     var r: std.Io.Reader = .fixed(backing);
     r.end = raw.len;
     return r;
+}
+
+test "unbracketed: takes the brackets off an IPv6 literal and nothing else" {
+    try std.testing.expectEqualStrings("::1", unbracketed("[::1]"));
+    try std.testing.expectEqualStrings("127.0.0.1", unbracketed("127.0.0.1"));
+    try std.testing.expectEqualStrings("example.com", unbracketed("example.com"));
+    try std.testing.expectEqualStrings("[", unbracketed("["));
+}
+
+test "parseUrl: IPv6 literal keeps its brackets" {
+    const uri = try parseUrl("http://[::1]:8080/path");
+    var host_buf: [255]u8 = undefined;
+    const host = try uriHost(uri, &host_buf);
+    try std.testing.expectEqualStrings("[::1]", host);
+    const info = try uriPortAndProtocol(uri);
+    try std.testing.expectEqual(8080, info.port);
 }
 
 test "parseUrl: basic URL" {
