@@ -650,7 +650,7 @@ pub const Connection = struct {
 
             // Update idle deadline after each request
             if (self.keep_alive.timeout) |timeout| {
-                self.idle_deadline = std.Io.Timestamp.now(self.io, .awake).addDuration(.fromMilliseconds(@as(i64, timeout)));
+                self.idle_deadline = std.Io.Timestamp.now(self.io, .awake).addDuration(.fromSeconds(@as(i64, timeout)));
             }
 
             // Check if we've reached max requests
@@ -2393,4 +2393,48 @@ test "writeRequest: strips body headers when body removed" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Language") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Custom: keep-me") != null);
+}
+
+test "Connection.release: the Keep-Alive timeout is in seconds" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [256]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nKeep-Alive: timeout=5, max=100\r\nContent-Length: 0\r\n\r\n") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        _ = try resp.body();
+    }
+
+    try std.testing.expectEqual(1, client.pool.idle_len);
+    const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", client.pool.idle.first.?));
+    const now = std.Io.Timestamp.now(io, .awake);
+    const left = conn.idle_deadline.?.nanoseconds - now.nanoseconds;
+    // Five seconds, less however long the release took to get here.
+    try std.testing.expect(left > 4 * std.time.ns_per_s);
+    try std.testing.expect(left <= 5 * std.time.ns_per_s);
+    peer_future.cancel(io);
 }
