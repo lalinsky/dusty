@@ -20,6 +20,7 @@ pub const ParseError = error{
     InvalidChunkSize,
     UnexpectedContentLength,
     ClosedConnection,
+    TooManyHeaders,
     ParseFailed,
 };
 
@@ -34,6 +35,9 @@ fn mapError(err: c.llhttp_errno_t) ParseError {
         // callback returned. `onStatusComplete` only fails on a code
         // `Status` cannot name, so this is that.
         c.HPE_CB_STATUS_COMPLETE => ParseError.InvalidStatus,
+        // Likewise: `onHeaderValueComplete` only fails when `Headers.add`
+        // is out of room.
+        c.HPE_CB_HEADER_VALUE_COMPLETE => ParseError.TooManyHeaders,
         c.HPE_INVALID_CHUNK_SIZE => ParseError.InvalidChunkSize,
         c.HPE_UNEXPECTED_CONTENT_LENGTH => ParseError.UnexpectedContentLength,
         c.HPE_CLOSED_CONNECTION => ParseError.ClosedConnection,

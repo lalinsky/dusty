@@ -800,6 +800,12 @@ pub fn Server(comptime Ctx: type) type {
                             return connection.getWriteError() orelse error.Unexpected;
                         return;
                     },
+                    error.TooManyHeaders => {
+                        log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
+                        sendHeadersTooLarge(connection.writer) catch
+                            return connection.getWriteError() orelse error.Unexpected;
+                        return;
+                    },
                     else => |e| return e,
                 };
 
