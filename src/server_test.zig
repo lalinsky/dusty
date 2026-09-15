@@ -1378,6 +1378,153 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     try std.testing.expect(elapsed_ns >= 100 * std.time.ns_per_ms);
     try std.testing.expect(elapsed_ns < 2000 * std.time.ns_per_ms);
 }
+/// Leaves one connection idle after a request and one that never sent any,
+/// shuts the server down with a budget long enough that waiting it out would
+/// be unmistakable, and checks that both were closed at once.
+fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !void {
+    const io = std.testing.io;
+
+    var config: dusty.ServerConfig = .{ .timeout = timeout };
+    config.timeout.shutdown = .fromMilliseconds(5000);
+    var server = dusty.Server(void).init(std.testing.allocator, io, config, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    // One connection idle after a request, one that never sent any.
+    const used = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer used.close(io);
+    const fresh = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer fresh.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var writer = used.writer(io, &write_buf);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = used.reader(io, &read_buf);
+    var status: [64]u8 = undefined;
+    var body: [16]u8 = undefined;
+    const resp = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectEqualStrings("OK", resp.body);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Canceled, server_future.cancel(io));
+    const elapsed_ns = std.Io.Timestamp.now(io, .awake).nanoseconds - start.nanoseconds;
+    try std.testing.expect(elapsed_ns < 1000 * std.time.ns_per_ms);
+
+    // Both were closed by the server, not abandoned to the cancel.
+    try std.testing.expectError(error.EndOfStream, reader.interface.fillMore());
+    var fresh_buf: [64]u8 = undefined;
+    var fresh_reader = fresh.reader(io, &fresh_buf);
+    try std.testing.expectError(error.EndOfStream, fresh_reader.interface.fillMore());
+}
+
+test "Server: a request arriving during the shutdown drain is refused, not served" {
+    const io = std.testing.io;
+
+    const sync = struct {
+        var started: std.Io.Event = .unset;
+        var release: std.Io.Event = .unset;
+    };
+    sync.started = .unset;
+    sync.release = .unset;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .timeout = .{ .shutdown = .fromMilliseconds(5000) },
+    }, {});
+    defer server.deinit();
+
+    // Holds the drain open until the test lets it go.
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            sync.started.set(req.io);
+            try sync.release.wait(req.io);
+            res.body = "slow";
+        }
+    }.handle);
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        // Spelled out so the future can be named below.
+        fn run(s: *dusty.Server(void)) anyerror!void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const slow = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer slow.close(io);
+    var slow_write_buf: [256]u8 = undefined;
+    var slow_writer = slow.writer(io, &slow_write_buf);
+    try slow_writer.interface.writeAll("GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try slow_writer.interface.flush();
+    try sync.started.wait(io);
+
+    // Idle by the time the drain starts.
+    const idle = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer idle.close(io);
+
+    // The drain blocks on the slow handler, so it runs on a task of its own.
+    var shutdown_future = try io.concurrent(struct {
+        fn run(f: *std.Io.Future(anyerror!void), _io: std.Io) !void {
+            try std.testing.expectError(error.Canceled, f.cancel(_io));
+        }
+    }.run, .{ &server_future, io });
+    defer shutdown_future.cancel(io) catch {};
+    while (!server.busy.load(.acquire).draining) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    var write_buf: [256]u8 = undefined;
+    var writer = idle.writer(io, &write_buf);
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = idle.reader(io, &read_buf);
+    var status: [64]u8 = undefined;
+    var body: [16]u8 = undefined;
+    const resp = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectStringStartsWith(resp.status, "HTTP/1.1 503 ");
+    try std.testing.expectError(error.EndOfStream, reader.interface.fillMore());
+
+    sync.release.set(io);
+    try shutdown_future.await(io);
+}
+
+test "Server: graceful shutdown closes idle connections without waiting out the budget" {
+    try expectIdleConnectionsClosedOnShutdown(.{});
+}
+
+test "Server: graceful shutdown closes idle connections with no deadlines configured" {
+    try expectIdleConnectionsClosedOnShutdown(.{ .request = null, .keepalive = null });
+}
+
 test "Server: request carries the peer address" {
     const io = std.testing.io;
 

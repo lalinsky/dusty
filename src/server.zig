@@ -173,6 +173,14 @@ pub const Connection = struct {
 /// that would have said how to frame it. Fixed bytes instead, and
 /// `Connection: close`, because the rest of that head is still queued on the
 /// socket and there is no framing to skip it by.
+fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
+    try w.writeAll("HTTP/1.1 503 Service Unavailable\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
+    return w.flush();
+}
+
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
         "Connection: close\r\n" ++
@@ -342,8 +350,16 @@ pub fn Server(comptime Ctx: type) type {
         router: Router(Ctx),
         ctx: if (Ctx == void) void else *Ctx,
         config: ServerConfig,
-        shutting_down: std.atomic.Value(bool),
         active_connections: std.atomic.Value(u32),
+        /// What the drain waits on: connections with a request in flight,
+        /// from accept or the first byte of a request until they go back to
+        /// waiting for one, and whether the drain is on. One word, so a
+        /// request arriving as the drain starts is either counted before
+        /// the drain looks or refused after seeing the flag: the two
+        /// updates are ordered by the word, whichever comes second sees the
+        /// first. A connection waiting between requests is not counted; it
+        /// has nothing to lose to the cancel that follows the drain.
+        busy: std.atomic.Value(Busy),
         address: Address,
         ready: std.Io.Event,
         _middleware_registry: std.SinglyLinkedList,
@@ -353,6 +369,11 @@ pub fn Server(comptime Ctx: type) type {
         /// when config.tls.client_auth is set.
         tls_client_ca: ?std.crypto.Certificate.Bundle = null,
 
+        const Busy = packed struct(u32) {
+            count: u31 = 0,
+            draining: bool = false,
+        };
+
         pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
             return .{
                 .allocator = allocator,
@@ -360,8 +381,8 @@ pub fn Server(comptime Ctx: type) type {
                 .router = Router(Ctx).init(allocator),
                 .ctx = ctx,
                 .config = config,
-                .shutting_down = std.atomic.Value(bool).init(false),
                 .active_connections = std.atomic.Value(u32).init(0),
+                .busy = .init(.{}),
                 .address = undefined,
                 .ready = .unset,
                 ._middleware_registry = .{},
@@ -478,7 +499,7 @@ pub fn Server(comptime Ctx: type) type {
 
             var group: std.Io.Group = .init;
             defer {
-                self.shutting_down.store(true, .release);
+                _ = self.busy.fetchOr(.{ .draining = true }, .release);
                 group.cancel(self.io);
             }
 
@@ -534,8 +555,10 @@ pub fn Server(comptime Ctx: type) type {
                 backoff_ms = 0;
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
+                _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
                 group.concurrent(self.io, handleConnectionWrapper, .{ self, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
+                    self.finishRequest();
                     self.releaseConnectionSlot();
                     stream.close(self.io);
                     continue;
@@ -562,7 +585,7 @@ pub fn Server(comptime Ctx: type) type {
             defer _ = self.io.swapCancelProtection(protection);
 
             log.info("Graceful shutdown requested", .{});
-            self.shutting_down.store(true, .release);
+            _ = self.busy.fetchOr(.{ .draining = true }, .acq_rel);
 
             // Turned into a deadline once, so the budget covers the drain as
             // a whole. A per-wait duration would restart it every time a
@@ -574,21 +597,22 @@ pub fn Server(comptime Ctx: type) type {
                 .none;
 
             while (true) {
-                const remaining = self.active_connections.load(.acquire);
+                const state = self.busy.load(.acquire);
+                const remaining = state.count;
                 if (remaining == 0) return;
 
                 if (timeout.toTimestamp(self.io)) |deadline| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
-                        log.warn("Shutdown timed out with {d} connection(s) still open", .{remaining});
+                        log.warn("Shutdown timed out with {d} request(s) still in flight", .{remaining});
                         return;
                     }
                 }
 
-                log.info("Waiting for {} remaining connections to close", .{remaining});
-                // Wakes when a connection closes, or when the deadline
+                log.info("Waiting for {} in-flight request(s) to finish", .{remaining});
+                // Wakes when a request finishes, or when the deadline
                 // arrives; the loop above decides which happened. Spurious
                 // wakeups just re-read the count.
-                self.io.futexWaitTimeout(u32, &self.active_connections.raw, remaining, timeout) catch |err| switch (err) {
+                self.io.futexWaitTimeout(Busy, &self.busy.raw, state, timeout) catch |err| switch (err) {
                     // Cannot happen: protection is blocked for this whole
                     // function, so no Io call here is a cancelation point.
                     error.Canceled => unreachable,
@@ -615,6 +639,51 @@ pub fn Server(comptime Ctx: type) type {
             self.io.futexWake(u32, &self.active_connections.raw, 1);
         }
 
+        /// Wakes the drain when this was the last one: zero is the only
+        /// count it acts on, so the others are not worth a syscall.
+        fn finishRequest(self: *Self) void {
+            const was = self.busy.fetchSub(.{ .count = 1 }, .acq_rel);
+            if (was.count == 1) self.io.futexWake(Busy, &self.busy.raw, 1);
+        }
+
+        const RequestWait = enum {
+            arrived,
+            peer_gone,
+            /// The drain is on. The peer was told so, with a 503, and the
+            /// connection is done.
+            refused,
+        };
+
+        /// Waits for the first byte of a request, with nothing in flight:
+        /// the drain does not wait for a connection here, and the cancel
+        /// that follows it closes the socket cleanly.
+        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool) !RequestWait {
+            busy.* = false;
+            self.finishRequest();
+
+            connection.reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return .peer_gone,
+                error.ReadFailed => {
+                    const e = connection.getReadError() orelse error.Unexpected;
+                    // Nothing is in flight between requests, so a peer that
+                    // went away here has cost us nothing.
+                    if (Connection.isPeerGone(e)) return .peer_gone;
+                    return e;
+                },
+            };
+
+            const was = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+            busy.* = true;
+            if (was.draining) {
+                busy.* = false;
+                self.finishRequest();
+                sendServiceUnavailable(connection.writer) catch
+                    return connection.getWriteError() orelse error.Unexpected;
+                return .refused;
+            }
+            return .arrived;
+        }
+
         fn handleConnectionWrapper(self: *Self, stream: std.Io.net.Stream) std.Io.Cancelable!void {
             if (comptime have_auto_cancel) return runConnection(self, stream, null);
 
@@ -625,6 +694,7 @@ pub fn Server(comptime Ctx: type) type {
             var watch: Watch = .{};
             var future = self.io.concurrent(runConnection, .{ self, stream, &watch }) catch |err| {
                 log.warn("No task to watch the connection deadline: {}; refusing", .{err});
+                self.finishRequest();
                 self.releaseConnectionSlot();
                 stream.close(self.io);
                 return;
@@ -665,6 +735,11 @@ pub fn Server(comptime Ctx: type) type {
 
         pub fn handleConnection(self: *Self, stream: std.Io.net.Stream, watch: ?*Watch) !void {
             defer self.releaseConnectionSlot();
+
+            // Counted since accept, so a handshake in progress is waited for
+            // like a request. Handed back and taken again in `waitForRequest`.
+            var busy = true;
+            defer if (busy) self.finishRequest();
 
             defer stream.close(self.io);
 
@@ -736,12 +811,12 @@ pub fn Server(comptime Ctx: type) type {
                     // between keepalive requests reuses the connection's memory
                     // without touching the TLS buffers carved above.
                     var request_arena = std.heap.ArenaAllocator.init(connection.arena.allocator());
-                    return self.handleRequests(&connection, &request_arena, &needs_shutdown, &timer);
+                    return self.handleRequests(&connection, &request_arena, &needs_shutdown, &timer, &busy);
                 }
             }
 
             connection.initPlain(self.allocator, self.io, stream);
-            return self.handleRequests(&connection, &connection.arena, &needs_shutdown, &timer);
+            return self.handleRequests(&connection, &connection.arena, &needs_shutdown, &timer, &busy);
         }
 
         /// Runs the HTTP request/keepalive loop over a connection.
@@ -751,6 +826,7 @@ pub fn Server(comptime Ctx: type) type {
             arena: *std.heap.ArenaAllocator,
             needs_shutdown: *bool,
             timer: *Timer,
+            busy: *bool,
         ) !void {
             var request: Request = .{
                 .arena = arena.allocator(),
@@ -786,6 +862,19 @@ pub fn Server(comptime Ctx: type) type {
                     timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
                 } else {
                     timer.clear(self.io);
+                }
+
+                // Only before the first request: the keepalive wait below
+                // has already brought in the start of any later one.
+                if (connection.reader.bufferedLen() == 0) {
+                    switch (try self.waitForRequest(connection, busy)) {
+                        .arrived => {},
+                        .peer_gone => {
+                            needs_shutdown.* = false;
+                            return;
+                        },
+                        .refused => return,
+                    }
                 }
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
@@ -897,7 +986,7 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
 
-                if (self.shutting_down.load(.acquire)) {
+                if (self.busy.load(.acquire).draining) {
                     response.keepalive = false;
                 }
 
@@ -931,24 +1020,17 @@ pub fn Server(comptime Ctx: type) type {
                     timer.clear(self.io);
                 }
 
-                // Fill some data here, under the keepalive timeout
-                connection.reader.fillMore() catch |err| switch (err) {
-                    error.EndOfStream => {
+                // Wait for the next request, under the keepalive timeout.
+                switch (try self.waitForRequest(connection, busy)) {
+                    .arrived => {},
+                    // The socket is already gone, so skip the shutdown
+                    // syscall too.
+                    .peer_gone => {
                         needs_shutdown.* = false;
                         return;
                     },
-                    error.ReadFailed => {
-                        const e = connection.getReadError() orelse error.Unexpected;
-                        // Nothing is in flight between requests, so a peer
-                        // that went away here has cost us nothing. The socket
-                        // is already gone, so skip the shutdown syscall too.
-                        if (Connection.isPeerGone(e)) {
-                            needs_shutdown.* = false;
-                            return;
-                        }
-                        return e;
-                    },
-                };
+                    .refused => return,
+                }
             }
         }
     };
