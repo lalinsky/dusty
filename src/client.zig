@@ -1862,6 +1862,32 @@ test "parseResponseHeaders: an endless run of interim responses is refused" {
     try std.testing.expectError(error.TooManyInterimResponses, parseResponseHeaders(&reader, &parser));
 }
 
+test "ClientResponse.body: chunked trailers are not headers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n0\r\nX-Trailer: value\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqualStrings("hello", (try response.body()).?);
+    try std.testing.expectEqual(null, response.headers().get("X-Trailer"));
+}
+
 test "ClientResponse.body: connection-close (EOF-delimited) body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

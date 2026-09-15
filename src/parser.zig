@@ -41,6 +41,14 @@ fn mapError(err: c.llhttp_errno_t) ParseError {
     };
 }
 
+/// Chunked trailers come through the header callbacks too, but in the
+/// middle of body reading, where the buffer is refilled under them and a
+/// trailer split across two fills is delivered from two places. Nothing
+/// exposes trailers, so the callbacks drop them.
+fn inTrailers(parser: *const c.llhttp_t) bool {
+    return parser.flags & @as(u16, @intCast(c.F_TRAILING)) != 0;
+}
+
 pub const RequestParser = struct {
     settings: c.llhttp_settings_t,
     parser: c.llhttp_t,
@@ -185,12 +193,14 @@ pub const RequestParser = struct {
     }
 
     fn onHeaderField(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         appendSlice(&self.state.header_field, at, length);
         return 0;
     }
 
     fn onHeaderFieldComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         std.debug.assert(self.state.header_field.len > 0);
         self.state.has_header_field = true;
@@ -198,12 +208,14 @@ pub const RequestParser = struct {
     }
 
     fn onHeaderValue(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         appendSlice(&self.state.header_value, at, length);
         return 0;
     }
 
     fn onHeaderValueComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
 
         std.debug.assert(self.state.has_header_field);
@@ -421,12 +433,14 @@ pub const ResponseParser = struct {
     }
 
     fn onHeaderField(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
         appendSlice(&self.state.header_field, at, length);
         return 0;
     }
 
     fn onHeaderFieldComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
         std.debug.assert(self.state.header_field.len > 0);
         self.state.has_header_field = true;
@@ -434,12 +448,14 @@ pub const ResponseParser = struct {
     }
 
     fn onHeaderValue(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
         appendSlice(&self.state.header_value, at, length);
         return 0;
     }
 
     fn onHeaderValueComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        if (inTrailers(parser.?)) return 0;
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
 
         std.debug.assert(self.state.has_header_field);

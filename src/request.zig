@@ -785,6 +785,82 @@ test "Request.body: a chunked gzip body is unwrapped by both layers" {
     try std.testing.expectEqualStrings("Hello from test!", body.?);
 }
 
+/// Serves `source` into the reader's buffer, as much as fits each time, the
+/// way a socket read does when the peer is ahead. That is what puts a fill
+/// boundary at the end of the buffer.
+const SourceReader = struct {
+    source: []const u8,
+    pos: usize = 0,
+    interface: std.Io.Reader,
+
+    fn init(source: []const u8, buffer: []u8) SourceReader {
+        return .{
+            .source = source,
+            .interface = .{
+                .vtable = &.{ .stream = stream, .readVec = readVec },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn readVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+        _ = data;
+        const self: *SourceReader = @fieldParentPtr("interface", r);
+        const rest = self.source[self.pos..];
+        if (rest.len == 0) return error.EndOfStream;
+        const dest = r.buffer[r.end..];
+        const n = @min(dest.len, rest.len);
+        @memcpy(dest[0..n], rest[0..n]);
+        r.end += n;
+        self.pos += n;
+        return 0;
+    }
+
+    // The body reader only ever fills; nothing here streams.
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = r;
+        _ = w;
+        _ = limit;
+        return error.EndOfStream;
+    }
+};
+
+test "Request.body: a chunked trailer split across a buffer wrap is dropped, not asserted on" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The body region is what the head leaves of the buffer. The body is
+    // sized so the region ends inside the trailer name: the first fill
+    // stops there, the body reader drains it, and the next fill lands at
+    // the start of the buffer with the rest of the name.
+    const head = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const region = 2048;
+    const data = "a" ** 2033;
+    const body = "7f1\r\n" ++ data ++ "\r\n0\r\n" ++ "X-Trailer: value\r\n\r\n";
+    comptime std.debug.assert(("7f1\r\n" ++ data ++ "\r\n0\r\n" ++ "X-Tra").len == region);
+
+    var buffer: [head.len + region]u8 = undefined;
+    var source = SourceReader.init(head ++ body, &buffer);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &source.interface, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&source.interface, &parser);
+
+    try std.testing.expectEqualStrings(data, (try req.body()).?);
+    try std.testing.expectEqual(null, req.headers.get("X-Trailer"));
+}
+
 test "Request: decoding takes the headers that described the encoded body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
