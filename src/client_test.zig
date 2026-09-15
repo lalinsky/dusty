@@ -1076,3 +1076,54 @@ test "Client: an interim response is not the response, and does not poison the c
     }
     peer_future.cancel(io);
 }
+
+test "Client: a redirect the client cannot follow does not leave its body for the next request" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    // A Location the client cannot resolve, on a response with a body and
+    // a connection the server keeps open. The second response is served to
+    // the next request wherever it arrives: on that connection, if the
+    // client kept it, or on a new one.
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const responses = [_][]const u8{
+                "HTTP/1.1 302 Found\r\nLocation: mailto:someone@example.com\r\nContent-Length: 2\r\n\r\nok",
+                "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond",
+            };
+            var next: usize = 0;
+            while (next < responses.len) {
+                const s = l.accept(_io) catch return;
+                defer s.close(_io);
+                var rbuf: [4096]u8 = undefined;
+                var rd = s.reader(_io, &rbuf);
+                var wbuf: [1024]u8 = undefined;
+                var w = s.writer(_io, &wbuf);
+                while (next < responses.len) {
+                    rd.interface.fillMore() catch break;
+                    rd.interface.tossBuffered();
+                    w.interface.writeAll(responses[next]) catch return;
+                    w.interface.flush() catch return;
+                    next += 1;
+                }
+            }
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.UnsupportedScheme, client.fetch(url, .{}));
+
+    // Either a fresh connection, or the same one with nothing left over.
+    var resp = try client.fetch(url, .{});
+    defer resp.deinit();
+    try std.testing.expectEqualStrings("second", (try resp.body()).?);
+    peer_future.cancel(io);
+}
