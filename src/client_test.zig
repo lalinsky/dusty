@@ -1025,3 +1025,54 @@ test "Client: HEAD response with chunked Transfer-Encoding has no body" {
 test "Client: HEAD response with Content-Encoding has no body to decode" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
 }
+
+// The exchange in #159: a server that sends Early Hints ahead of the real
+// response, and then answers a second request on the same connection.
+// That second answer is what shows the first one left nothing behind.
+test "Client: an interim response is not the response, and does not poison the connection" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            rd.interface.tossBuffered();
+            w.interface.writeAll("HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n") catch return;
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch return;
+            w.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqual(.ok, resp.status());
+        try std.testing.expectEqual(null, resp.headers().get("Link"));
+        try std.testing.expectEqualStrings("first", (try resp.body()).?);
+    }
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings("second", (try resp.body()).?);
+    }
+    peer_future.cancel(io);
+}

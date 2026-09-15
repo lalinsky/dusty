@@ -1407,35 +1407,65 @@ fn isDomainOrSubdomain(sub: []const u8, parent: []const u8) bool {
     return sub[dot_idx] == '.' and std.ascii.eqlIgnoreCase(sub[dot_idx + 1 ..], parent);
 }
 
-/// Parse HTTP response headers from a reader.
+/// How many interim responses may precede the final one. Go's limit, and
+/// what keeps an endless stream of them from keeping a request open forever.
+const max_interim_responses = 5;
+
+/// 1xx, less 101: that one ends the HTTP exchange rather than preceding
+/// the response to it.
+fn isInterim(status: http.Status) bool {
+    const code = @intFromEnum(status);
+    return code >= 100 and code < 200 and status != .switching_protocols;
+}
+
+/// Parse HTTP response headers from a reader. Interim responses are read
+/// and dropped on the way, so what is parsed on return is the final one.
 fn parseResponseHeaders(reader: *std.Io.Reader, parser: *ResponseParser) !void {
     var parsed_len: usize = 0;
-    while (!parser.state.headers_complete) {
-        const buffered = reader.buffered();
-        const unparsed = buffered[parsed_len..];
-        if (unparsed.len > 0) {
-            parser.feed(unparsed) catch |err| switch (err) {
-                error.Paused => {
-                    const consumed = parser.getConsumedBytes(unparsed.ptr);
-                    parsed_len += consumed;
-                    continue;
+    var interim: usize = 0;
+    while (true) {
+        while (!parser.state.headers_complete) {
+            const buffered = reader.buffered();
+            const unparsed = buffered[parsed_len..];
+            if (unparsed.len > 0) {
+                parser.feed(unparsed) catch |err| switch (err) {
+                    error.Paused => {
+                        const consumed = parser.getConsumedBytes(unparsed.ptr);
+                        parsed_len += consumed;
+                        continue;
+                    },
+                    else => return err,
+                };
+                parsed_len += unparsed.len;
+                continue;
+            }
+            // Same ceiling as the server's `parseHeaders`, and for the same
+            // reason: the head is held whole, so a buffer with no room left is a
+            // head that will never complete.
+            if (reader.buffer.len - reader.end < body_read_reserve) return error.HeadersTooLarge;
+            reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (parsed_len == 0) return error.EndOfStream;
+                    return error.IncompleteResponse;
                 },
-                else => return err,
+                else => |e| return e,
             };
-            parsed_len += unparsed.len;
-            continue;
         }
-        // Same ceiling as the server's `parseHeaders`, and for the same
-        // reason: the head is held whole, so a buffer with no room left is a
-        // head that will never complete.
-        if (reader.buffer.len - reader.end < body_read_reserve) return error.HeadersTooLarge;
-        reader.fillMore() catch |err| switch (err) {
-            error.EndOfStream => {
-                if (parsed_len == 0) return error.EndOfStream;
-                return error.IncompleteResponse;
-            },
-            else => |e| return e,
-        };
+        if (!isInterim(parser.response.status)) break;
+
+        if (interim == max_interim_responses) return error.TooManyInterimResponses;
+        interim += 1;
+
+        // The interim head is thrown away, and so is the room it took: the
+        // final head gets the whole buffer. Moved by hand because a fixed
+        // reader refuses to rebase.
+        reader.toss(parsed_len);
+        parsed_len = 0;
+        const rest = reader.buffered();
+        @memmove(reader.buffer[0..rest.len], rest);
+        reader.seek = 0;
+        reader.end = rest.len;
+        try parser.restart();
     }
     // And, as there, a fill may use every byte it was given room for, so the
     // head can finish inside the reserve without the check above ever
@@ -1786,6 +1816,50 @@ test "ClientResponse.body: no body" {
     const body = try response.body();
     try std.testing.expectEqual(null, body);
     try std.testing.expectEqual(.no_content, response.status());
+}
+
+test "parseResponseHeaders: interim responses are dropped on the way to the final one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 100 Continue\r\n\r\n" ++
+        "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n" ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqual(.ok, response.status());
+    // Nothing of the interim heads survives.
+    try std.testing.expectEqual(null, response.headers().get("Link"));
+    try std.testing.expectEqualStrings("hello", (try response.body()).?);
+}
+
+test "parseResponseHeaders: an endless run of interim responses is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_response = "HTTP/1.1 100 Continue\r\n\r\n" ** (max_interim_responses + 1) ++
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try std.testing.expectError(error.TooManyInterimResponses, parseResponseHeaders(&reader, &parser));
 }
 
 test "ClientResponse.body: connection-close (EOF-delimited) body" {

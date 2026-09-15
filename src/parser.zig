@@ -278,6 +278,7 @@ pub const ResponseParser = struct {
     settings: c.llhttp_settings_t,
     parser: c.llhttp_t,
     response: *ParsedResponse,
+    max_headers: usize,
     state: State = .{},
     /// The request was HEAD, so the response has no body whatever its
     /// headers say. llhttp cannot tell from the response alone.
@@ -305,6 +306,7 @@ pub const ResponseParser = struct {
             .parser = undefined,
             .settings = undefined,
             .response = response,
+            .max_headers = max_headers,
         };
         response.headers = try Headers.init(response.arena, max_headers);
 
@@ -329,6 +331,14 @@ pub const ResponseParser = struct {
     pub fn reset(self: *ResponseParser) void {
         self.state = .{};
         c.llhttp_reset(&self.parser);
+    }
+
+    /// Forgets the message parsed so far and starts on the next one in the
+    /// stream: the final response behind an interim one.
+    pub fn restart(self: *ResponseParser) !void {
+        self.response.* = .{ .arena = self.response.arena };
+        self.response.headers = try Headers.init(self.response.arena, self.max_headers);
+        self.reset();
     }
 
     pub fn feed(self: *ResponseParser, data: []const u8) !void {
