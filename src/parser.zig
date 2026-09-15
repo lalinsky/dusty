@@ -279,6 +279,9 @@ pub const ResponseParser = struct {
     parser: c.llhttp_t,
     response: *ParsedResponse,
     state: State = .{},
+    /// The request was HEAD, so the response has no body whatever its
+    /// headers say. llhttp cannot tell from the response alone.
+    head_request: bool = false,
 
     const State = struct {
         has_status: bool = false,
@@ -455,6 +458,11 @@ pub const ResponseParser = struct {
         if (self.response.headers.get("Content-Length")) |content_length| {
             self.response.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
         }
+
+        // Returning 1 is how a callback normally asks llhttp to skip the
+        // body, but this one has to return HPE_PAUSED, so set the flag it
+        // would have set.
+        if (self.head_request) self.parser.flags |= @intCast(c.F_SKIPBODY);
 
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes

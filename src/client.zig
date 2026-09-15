@@ -802,9 +802,12 @@ pub const ClientResponse = struct {
         // the body, with nothing to say they went missing.
         std.debug.assert(!self._body_reader_taken); // one body reader per response
 
+        // A message complete at the head has no body, whatever the coding
+        // headers say -- a HEAD response, a 204, a Content-Length of zero.
+        // A decoder started on nothing would report a body cut short.
         if (self._decode) |decode| {
             r.decode = decode;
-        } else if (self.decompress) {
+        } else if (self.decompress and !self.parser.isBodyComplete()) {
             try r.startDecoding(self.arena, self.parsed.content_encoding);
             if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
@@ -1103,6 +1106,7 @@ pub const Client = struct {
 
         // Parse response headers. Any failure leaves the connection at an
         // unknown stream position, so it must not be pooled.
+        conn.parser.head_request = state.options.method == .head;
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
             conn.closing = true;
             switch (err) {
@@ -1973,6 +1977,32 @@ test "ClientResponse.body: gzip decompression disabled" {
     const body = try response.body();
     try std.testing.expectEqual(25, body.?.len);
     try std.testing.expectEqualStrings(gzip_hello, body.?);
+}
+
+test "ClientResponse.body: an empty body with a Content-Encoding is not decoded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Not a gzip stream, not even an empty one; a decoder would call it cut short.
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectEqual(null, try response.body());
+    try std.testing.expectEqualStrings("gzip", response.headers().get("Content-Encoding").?);
 }
 
 test "Protocol.fromScheme: http" {
