@@ -954,3 +954,74 @@ test "Client: a response head one byte over the limit is rejected" {
 test "Client: a response head ending exactly at the buffer end is rejected, not a panic" {
     try expectClientResultForHeadOfLength(16384 + 1024, null);
 }
+
+/// Serves `first` to whatever arrives, then `second` to the next request on
+/// the same connection, and holds the connection open so that a client
+/// waiting for a body that is not coming waits on the socket.
+fn twoResponsePeer(comptime first: []const u8, comptime second: []const u8) type {
+    return struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [1024]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            rd.interface.tossBuffered();
+            w.interface.writeAll(first) catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch return;
+            w.interface.writeAll(second) catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    };
+}
+
+/// A HEAD response is allowed to carry the headers a GET would have, body
+/// length and coding included, without the body. The client must not wait
+/// for that body, and the connection must be reusable afterwards.
+fn expectHeadThenGet(comptime head_response: []const u8) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer(
+        head_response,
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ).run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{ .method = .head });
+        defer resp.deinit();
+        try std.testing.expectEqual(.ok, resp.status());
+        try std.testing.expectEqual(null, try resp.body());
+    }
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings("ok", (try resp.body()).?);
+    }
+    peer_future.cancel(io);
+}
+
+test "Client: HEAD response with Content-Length has no body and keeps the connection" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+}
+
+test "Client: HEAD response with chunked Transfer-Encoding has no body" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+}
+
+test "Client: HEAD response with Content-Encoding has no body to decode" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
+}
