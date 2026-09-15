@@ -1115,9 +1115,15 @@ pub const Client = struct {
             }
         };
 
+        // From here on an error leaves the body where it is, and the
+        // errdefer above pools the connection. A body still on the wire
+        // would be read as the next response, so it may not go back.
+        errdefer if (!conn_released and !conn.parser.isBodyComplete()) {
+            conn.closing = true;
+        };
+
         // Check for unsupported content encoding
         if (state.options.decompress and conn.parsed_response.content_encoding == .unknown) {
-            if (!conn.parser.isBodyComplete()) conn.closing = true;
             return error.UnsupportedContentEncoding;
         }
 
