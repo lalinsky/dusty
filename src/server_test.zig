@@ -1185,6 +1185,18 @@ test "Server: too many query parameters is a 400, not a dropped connection" {
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
 }
 
+test "Server: more headers than the limit is a 431, not a dropped connection" {
+    // One past the default limit of 32.
+    const headers = comptime blk: {
+        var h: []const u8 = "";
+        for (0..33) |i| h = h ++ std.fmt.comptimePrint("X-H{d}: v\r\n", .{i});
+        break :blk h;
+    };
+    var buf: [256]u8 = undefined;
+    const status = try statusLineFor("GET / HTTP/1.1\r\nHost: localhost\r\n" ++ headers ++ "\r\n", &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 431 ");
+}
+
 test "Server: HEAD is answered by the GET route with no body" {
     const io = std.testing.io;
 
