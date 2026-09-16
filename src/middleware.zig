@@ -96,10 +96,10 @@ pub fn Executor(comptime Ctx: type) type {
                         // with framing that doesn't account for an error body.
                         // We can't safely rewrite it as a 500; abort the
                         // connection instead of corrupting the response.
-                        log.err("unhandled error after response headers were sent: {}", .{err});
+                        log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
-                    log.err("unhandled error in request handler: {}", .{err});
+                    log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     self.handleError(err);
                 },
             };
@@ -208,6 +208,11 @@ fn testHandler(req: *Request, res: *Response) !void {
     res.body = "handler called";
 }
 
+/// A request with a method and a path, which the error log reads.
+fn testRequest() Request {
+    return .{ .arena = undefined, .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
+}
+
 fn makeTestResponse(conn: *Connection) Response {
     return Response{
         .body = "",
@@ -233,7 +238,7 @@ test "Middleware: single middleware executes before handler" {
     var mw = TestMiddleware{ .tracker = &tracker, .id = 1 };
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
 
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -266,7 +271,7 @@ test "Middleware: multiple middlewares execute in order" {
         Middleware(void).init(&mw3),
     };
 
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -301,7 +306,7 @@ test "Middleware: short-circuit prevents handler execution" {
         Middleware(void).init(&mw3),
     };
 
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -324,7 +329,7 @@ test "Middleware: short-circuit prevents handler execution" {
 }
 
 test "Middleware: no middlewares calls handler directly" {
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -347,7 +352,7 @@ test "Middleware: no action returns 404" {
     var mw = TestMiddleware{ .tracker = &tracker, .id = 1 };
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
 
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -372,7 +377,7 @@ fn errorHandler(_: *Request, _: *Response) !void {
 }
 
 test "Executor: default 500 handler on action error" {
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -396,7 +401,7 @@ fn goneHandler(_: *Request, _: *Response) !void {
 }
 
 test "Executor: a departed peer is not the handler's fault" {
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -419,7 +424,7 @@ test "Executor: a departed peer is not the handler's fault" {
 }
 
 test "Executor: a peer-shaped error of the handler's own is still a 500" {
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -439,7 +444,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
 }
 
 test "Executor: error after headers written propagates instead of rewriting the response" {
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -506,7 +511,7 @@ const ErrorMiddleware = struct {
 
 test "Executor: custom notFound handler" {
     var ctx = CustomCtx{};
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -528,7 +533,7 @@ test "Executor: custom notFound handler" {
 
 test "Executor: custom uncaughtError handler" {
     var ctx = CustomCtx{};
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -551,7 +556,7 @@ test "Executor: custom uncaughtError handler" {
 
 test "Executor: custom dispatch method" {
     var ctx = CustomCtx{};
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -572,7 +577,7 @@ test "Executor: custom dispatch method" {
 
 test "Executor: middleware error triggers custom uncaughtError" {
     var ctx = CustomCtx{};
-    var req: Request = undefined;
+    var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
@@ -605,7 +610,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
     var res = try Response.init(arena.allocator(), &connection, 32);
 
     var executor = Executor(void){
@@ -651,7 +656,7 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
     var res = try Response.init(arena.allocator(), &connection, 32);
 
     var mw = WritingMiddleware{};
