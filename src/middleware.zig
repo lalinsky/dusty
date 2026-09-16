@@ -87,7 +87,9 @@ pub fn Executor(comptime Ctx: type) type {
                     // `ConnectionResetByPeer` rather than `WriteFailed` --
                     // just as fatal, and just as much not the handler's
                     // fault, so it is neither a 500 nor worth an error log.
-                    if (Connection.isPeerGone(err)) return err;
+                    // The connection is asked, not the error: a handler
+                    // can return an `EndOfStream` of its own.
+                    if (self.res.conn.peerGone()) return err;
                     if (self.res.headers_written) {
                         // The response already started (e.g. streaming/chunked
                         // body or a WebSocket upgrade), so headers were sent
@@ -206,7 +208,7 @@ fn testHandler(req: *Request, res: *Response) !void {
     res.body = "handler called";
 }
 
-fn makeTestResponse() Response {
+fn makeTestResponse(conn: *Connection) Response {
     return Response{
         .body = "",
         .status = .ok,
@@ -217,7 +219,7 @@ fn makeTestResponse() Response {
         // the buffer, and `init` allocates nothing until something is
         // written, so a test that writes no body still leaks nothing.
         .buffer = .init(std.testing.allocator),
-        .conn = undefined,
+        .conn = conn,
         .written = false,
         .headers_written = false,
         .keepalive = true,
@@ -232,7 +234,9 @@ test "Middleware: single middleware executes before handler" {
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
 
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -263,7 +267,9 @@ test "Middleware: multiple middlewares execute in order" {
     };
 
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -296,7 +302,9 @@ test "Middleware: short-circuit prevents handler execution" {
     };
 
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -317,7 +325,9 @@ test "Middleware: short-circuit prevents handler execution" {
 
 test "Middleware: no middlewares calls handler directly" {
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -338,7 +348,9 @@ test "Middleware: no action returns 404" {
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
 
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -361,7 +373,9 @@ fn errorHandler(_: *Request, _: *Response) !void {
 
 test "Executor: default 500 handler on action error" {
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -383,7 +397,9 @@ fn goneHandler(_: *Request, _: *Response) !void {
 
 test "Executor: a departed peer is not the handler's fault" {
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -393,15 +409,40 @@ test "Executor: a departed peer is not the handler's fault" {
         .middlewares = &.{},
     };
 
+    // What the connection recorded when the write failed under the handler.
+    connection.tcp_writer.err = error.ConnectionResetByPeer;
+
     // Propagated rather than turned into a 500: there is nothing left to
     // write one to, and the handler did nothing wrong.
     try std.testing.expectError(error.ConnectionResetByPeer, executor.run());
     try std.testing.expectEqual(.ok, res.status);
 }
 
+test "Executor: a peer-shaped error of the handler's own is still a 500" {
+    var req: Request = undefined;
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .ctx = {},
+        .action = goneHandler,
+        .middlewares = &.{},
+    };
+
+    // Nothing failed on this connection, so the error came from elsewhere:
+    // a file, an upstream call, a std helper at the end of the body.
+    executor.run() catch {};
+    try std.testing.expectEqual(.internal_server_error, res.status);
+}
+
 test "Executor: error after headers written propagates instead of rewriting the response" {
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
     // Simulate a response that already started (e.g. a streamed/chunked body
     // or a WebSocket upgrade) before the handler failed.
     res.headers_written = true;
@@ -466,7 +507,9 @@ const ErrorMiddleware = struct {
 test "Executor: custom notFound handler" {
     var ctx = CustomCtx{};
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(CustomCtx){
         .req = &req,
@@ -486,7 +529,9 @@ test "Executor: custom notFound handler" {
 test "Executor: custom uncaughtError handler" {
     var ctx = CustomCtx{};
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(CustomCtx){
         .req = &req,
@@ -507,7 +552,9 @@ test "Executor: custom uncaughtError handler" {
 test "Executor: custom dispatch method" {
     var ctx = CustomCtx{};
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var executor = Executor(CustomCtx){
         .req = &req,
@@ -526,7 +573,9 @@ test "Executor: custom dispatch method" {
 test "Executor: middleware error triggers custom uncaughtError" {
     var ctx = CustomCtx{};
     var req: Request = undefined;
-    var res = makeTestResponse();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
 
     var mw = ErrorMiddleware{};
     const middlewares = [_]Middleware(CustomCtx){Middleware(CustomCtx).init(&mw)};
