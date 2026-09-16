@@ -167,6 +167,16 @@ pub const Connection = struct {
     }
 
     pub const isPeerGone = Transport.isPeerGone;
+
+    /// Whether a read or write on this connection failed because the peer
+    /// is gone. Asked instead of judging an error by its name: a handler's
+    /// own `EndOfStream`, from a file or from a std helper at the end of
+    /// the body, is spelled like a disconnect and is not one.
+    pub fn peerGone(self: *Connection) bool {
+        if (self.getWriteError()) |e| if (isPeerGone(e)) return true;
+        if (self.getReadError()) |e| if (isPeerGone(e)) return true;
+        return false;
+    }
 };
 
 /// The one reply that cannot go through `Response`: what overran is the head
