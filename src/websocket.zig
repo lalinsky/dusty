@@ -53,6 +53,15 @@ pub const WebSocket = struct {
         mandatory_extension = 1010,
         internal_error = 1011,
         _,
+
+        /// Whether a peer may put this code in a close frame: RFC 6455
+        /// §7.4 reserves 1005, 1006 and 1015 for local use, and anything
+        /// below 1000 or between the registered range and 3000 is not a
+        /// code at all.
+        fn validOnTheWire(self: CloseCode) bool {
+            const v = @intFromEnum(self);
+            return (v >= 1000 and v <= 1003) or (v >= 1007 and v <= 1014) or (v >= 3000 and v <= 4999);
+        }
     };
 
     pub const Error = error{
@@ -65,6 +74,8 @@ pub const WebSocket = struct {
         MessageTooLarge,
         UnmaskedClientFrame,
         MaskedServerFrame,
+        FragmentedControlFrame,
+        InvalidClosePayload,
     };
 
     const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -116,6 +127,9 @@ pub const WebSocket = struct {
                     continue;
                 },
                 .close => {
+                    // A code is two bytes; one byte is neither a code nor
+                    // nothing.
+                    if (frame.payload.len == 1) return Error.InvalidClosePayload;
                     var close_code: ?CloseCode = null;
                     var reason: []const u8 = "";
                     if (frame.payload.len >= 2) {
@@ -123,8 +137,21 @@ pub const WebSocket = struct {
                         close_code = @enumFromInt(code);
                         reason = frame.payload[2..];
                     }
-                    // Echo close frame back
-                    try self.writeClose(close_code orelse .normal, reason);
+                    // Echo the close, unless the peer's code is one that
+                    // must not go on the wire; that is answered as the
+                    // protocol error it is, with nothing of the peer's
+                    // reason behind it.
+                    const valid = if (close_code) |code| code.validOnTheWire() else true;
+                    if (!valid) {
+                        try self.writeClose(.protocol_error, "");
+                    } else if (!std.unicode.utf8ValidateSlice(reason)) {
+                        // A reason is text, and this one is not.
+                        try self.writeClose(.invalid_payload, "");
+                        self.auto_responded = true;
+                        return Error.InvalidUtf8;
+                    } else {
+                        try self.writeClose(close_code orelse .normal, reason);
+                    }
                     self.auto_responded = true;
                     return .{ .type = .close, .data = reason, .close_code = close_code };
                 },
@@ -147,6 +174,11 @@ pub const WebSocket = struct {
                     }
                 },
                 .text, .binary => {
+                    // A message may not begin while another is still in
+                    // pieces, whether or not the new one is whole.
+                    if (self.fragmented_type != null) {
+                        return Error.NestedFragment;
+                    }
                     if (frame.fin) {
                         // Complete message in single frame
                         if (frame.opcode == .text and !std.unicode.utf8ValidateSlice(frame.payload)) {
@@ -155,9 +187,6 @@ pub const WebSocket = struct {
                         return .{ .type = frame.opcode, .data = frame.payload };
                     } else {
                         // Start of fragmented message
-                        if (self.fragmented_type != null) {
-                            return Error.NestedFragment;
-                        }
                         if (frame.payload.len > self.max_message_size) {
                             return Error.MessageTooLarge;
                         }
@@ -222,6 +251,9 @@ pub const WebSocket = struct {
         };
         if (is_control and payload_len > 125) {
             return Error.LargeControlFrame;
+        }
+        if (is_control and !fin) {
+            return Error.FragmentedControlFrame;
         }
 
         // Extended payload length
@@ -513,6 +545,89 @@ test "WebSocket: receive handles ping automatically" {
     try std.testing.expectEqual(0x8A, written[0]); // FIN + pong
     try std.testing.expectEqual(4, written[1]); // length
     try std.testing.expectEqualStrings("ping", written[2..6]);
+}
+
+/// A server-side socket fed `frames`, with what it writes in `out`.
+fn serverSocketOver(frames: []const u8, reader: *std.Io.Reader, out: *std.Io.Writer) WebSocket {
+    reader.* = .fixed(frames);
+    return WebSocket.init(std.testing.io, .{ .writer = out, .reader = reader }, std.testing.allocator, 0);
+}
+
+test "WebSocket: a whole message in the middle of a fragmented one is a protocol error" {
+    // Masked with a zero key, so the payload bytes are the plaintext.
+    const frames = [_]u8{
+        // Text, FIN clear: the first piece of a message.
+        0x01, 0x82, 0x00, 0x00, 0x00, 0x00, 'h', 'i',
+        // Text, FIN set: a whole new message before the first is done.
+        0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 'n', 'o',
+    };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    try std.testing.expectError(WebSocket.Error.NestedFragment, ws.receive());
+}
+
+test "WebSocket: a fragmented control frame is a protocol error" {
+    // Ping with FIN clear.
+    const frames = [_]u8{ 0x09, 0x80, 0x00, 0x00, 0x00, 0x00 };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    try std.testing.expectError(WebSocket.Error.FragmentedControlFrame, ws.receive());
+}
+
+test "WebSocket: a close frame with a one-byte payload is a protocol error" {
+    const frames = [_]u8{ 0x88, 0x81, 0x00, 0x00, 0x00, 0x00, 0x03 };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    try std.testing.expectError(WebSocket.Error.InvalidClosePayload, ws.receive());
+}
+
+test "WebSocket: a close code that may not be sent is answered with 1002, not echoed" {
+    // 1005: reserved for a close with no code, never for the wire. With a
+    // reason behind it that is not even UTF-8.
+    const frames = [_]u8{ 0x88, 0x83, 0x00, 0x00, 0x00, 0x00, 0x03, 0xED, 0xFF };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const msg = try ws.receive();
+    try std.testing.expectEqual(.close, msg.type);
+    // What arrived is still reported as it was.
+    try std.testing.expectEqual(1005, @intFromEnum(msg.close_code.?));
+    // What went back is 1002, and none of the peer's reason.
+    const written = out.buffered();
+    try std.testing.expectEqual(0x88, written[0]);
+    try std.testing.expectEqual(2, written[1]);
+    try std.testing.expectEqual(1002, std.mem.readInt(u16, written[2..4], .big));
+}
+
+test "WebSocket: a close reason that is not UTF-8 is answered with 1007" {
+    // 1000 with a reason of one stray continuation byte.
+    const frames = [_]u8{ 0x88, 0x83, 0x00, 0x00, 0x00, 0x00, 0x03, 0xE8, 0x80 };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    try std.testing.expectError(WebSocket.Error.InvalidUtf8, ws.receive());
+    const written = out.buffered();
+    try std.testing.expectEqual(0x88, written[0]);
+    try std.testing.expectEqual(2, written[1]);
+    try std.testing.expectEqual(1007, std.mem.readInt(u16, written[2..4], .big));
 }
 
 test "WebSocket: readFrame rejects RSV bits" {
