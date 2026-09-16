@@ -170,11 +170,12 @@ pub const BodyWriter = struct {
     res: *Response,
     interface: std.Io.Writer,
     /// The real cause behind the generic `error.WriteFailed`. Nothing here
-    /// talks to the connection, so this only ever holds an allocation
-    /// failure.
+    /// talks to the connection, so this is an allocation failure, or a
+    /// write after the headers went out with a length taken from the body
+    /// as it was then.
     err: ?Error = null,
 
-    pub const Error = std.mem.Allocator.Error;
+    pub const Error = std.mem.Allocator.Error || error{HeadersAlreadySent};
 
     fn init(res: *Response) BodyWriter {
         return .{
@@ -187,23 +188,27 @@ pub const BodyWriter = struct {
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        // The headers carried the body's length as it was when they went
+        // out; anything more would be read by the peer as the next
+        // response.
+        if (self.res.headers_written) return self.fail(error.HeadersAlreadySent);
         const out = &self.res.buffer.writer;
         var total: usize = 0;
         // Allocating's writer only fails by running out of memory.
         for (data[0 .. data.len - 1]) |bytes| {
-            out.writeAll(bytes) catch return self.fail();
+            out.writeAll(bytes) catch return self.fail(error.OutOfMemory);
             total += bytes.len;
         }
         const pattern = data[data.len - 1];
         for (0..splat) |_| {
-            out.writeAll(pattern) catch return self.fail();
+            out.writeAll(pattern) catch return self.fail(error.OutOfMemory);
             total += pattern.len;
         }
         return w.consume(total);
     }
 
-    fn fail(self: *BodyWriter) std.Io.Writer.Error {
-        self.err = error.OutOfMemory;
+    fn fail(self: *BodyWriter, err: Error) std.Io.Writer.Error {
+        self.err = err;
         return error.WriteFailed;
     }
 
@@ -217,6 +222,9 @@ pub const BodyWriter = struct {
         self.interface.flush() catch |err| switch (err) {
             error.WriteFailed => return self.err orelse error.OutOfMemory,
         };
+        // A write that failed was reported then; the body is not complete
+        // for having stopped.
+        if (self.err) |err| return err;
     }
 };
 
@@ -390,6 +398,9 @@ pub const Response = struct {
     content_length: ?usize = null,
     /// Body bytes handed to the connection by a streaming writer.
     body_sent: usize = 0,
+    /// The Content-Length the headers went out with, when it was taken
+    /// from the buffered body: `write` checks the body is still that long.
+    declared_length: ?usize = null,
 
     /// What shaping a header can fail with. Nothing here touches the
     /// connection: a header set after the headers went out, a name or value
@@ -408,8 +419,11 @@ pub const Response = struct {
     /// a fixed buffer running out, say -- comes back as `Unexpected`.
     pub const SendError = Connection.WriteError || error{Unexpected};
 
-    /// What `writeHeader` and `write` can fail with.
-    pub const WriteError = HeaderError || SendError;
+    /// What `writeHeader` and `write` can fail with. `ContentLengthMismatch`
+    /// is a body of another length than the one promised, by `writeHeader`
+    /// or by a handler-set Content-Length; `InvalidContentLength` is such a
+    /// header that is not a number.
+    pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
@@ -639,9 +653,9 @@ pub const Response = struct {
                 // Write Content-Length if not manually set (skip for streaming responses like SSE)
                 const has_content_length = self.headers.get("Content-Length") != null;
                 if (!has_content_length) {
-                    const buffer_end = self.buffer.writer.end;
-                    const body_len = if (buffer_end > 0) buffer_end else self.body.len;
+                    const body_len = self.bufferedBody().len;
                     try w.print("Content-Length: {d}\r\n", .{body_len});
+                    self.declared_length = body_len;
                 }
             }
         }
@@ -681,7 +695,35 @@ pub const Response = struct {
         // Already false for a chunked response: the streaming writer
         // settled the headers when it sent them.
         const send_header = try self.prepareHeader();
+        // A length already promised, by headers that went out with the
+        // body's length as it was then or by a Content-Length the handler
+        // set itself: a body of another length cannot be framed as
+        // promised, and the connection cannot carry another response
+        // after it.
+        // A streamed body is the streaming writer's to account for.
+        if (self.sendsBody() and !self.chunked and !self.streaming and self.content_length == null) {
+            if (try self.declaredLength()) |declared| {
+                if (self.bufferedBody().len != declared) {
+                    self.keepalive = false;
+                    return error.ContentLengthMismatch;
+                }
+            }
+        }
         return self.resolve(self.sendBody(self.conn.writer, send_header));
+    }
+
+    /// The Content-Length the peer has been, or is about to be, told.
+    fn declaredLength(self: *const Response) error{InvalidContentLength}!?usize {
+        if (self.declared_length) |declared| return declared;
+        const value = self.headers.get("Content-Length") orelse return null;
+        return std.fmt.parseInt(usize, value, 10) catch error.InvalidContentLength;
+    }
+
+    /// The body as set so far: what the body writer collected, else the
+    /// `body` field.
+    fn bufferedBody(self: *const Response) []const u8 {
+        const buffered = self.buffer.writer.buffered();
+        return if (buffered.len > 0) buffered else self.body;
     }
 
     /// Whatever this response still owes the peer, on the wire. Reports the
@@ -701,9 +743,7 @@ pub const Response = struct {
         // Write body (either from buffer or body field). A HEAD response
         // has already reported its length and must stop here.
         if (self.sendsBody()) {
-            const buffered = self.buffer.writer.buffered();
-            const body = if (buffered.len > 0) buffered else self.body;
-            try w.writeAll(body);
+            try w.writeAll(self.bufferedBody());
         }
 
         return w.flush();
@@ -2096,6 +2136,83 @@ test "Response: a HEAD streamed to an HTTP/1.0 peer keeps the connection" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
     try std.testing.expect(response.keepalive);
+}
+
+test "Response: the body writer refuses to grow a body whose length is on the wire" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    try body.interface.writeAll("abc");
+    try response.writeHeader();
+    // Content-Length: 3 is on the wire now.
+    try std.testing.expectError(error.WriteFailed, body.interface.writeAll("def"));
+    try std.testing.expectEqual(error.HeadersAlreadySent, body.err.?);
+    try std.testing.expectError(error.HeadersAlreadySent, body.end());
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 3\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nabc"));
+    try std.testing.expect(response.keepalive);
+}
+
+test "Response: a body changed after its length went out is refused, and ends the connection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.body = "abc";
+    try response.writeHeader();
+    response.body = "abcdef";
+    try std.testing.expectError(error.ContentLengthMismatch, response.write());
+    try std.testing.expect(!response.keepalive);
+    // Nothing of the mismatched body went out behind the headers.
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "\r\n\r\n"));
+}
+
+test "Response: a handler's own Content-Length must match the buffered body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "10");
+    response.body = "hello";
+    try std.testing.expectError(error.ContentLengthMismatch, response.write());
+    try std.testing.expect(!response.keepalive);
+    try std.testing.expectEqual(0, conn_writer.buffered().len);
+}
+
+test "Response: a handler's Content-Length that is not a number is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "five");
+    response.body = "hello";
+    try std.testing.expectError(error.InvalidContentLength, response.write());
+    try std.testing.expectEqual(0, conn_writer.buffered().len);
 }
 
 test "Response: a 204 carries no Content-Length and no body" {
