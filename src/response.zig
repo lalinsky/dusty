@@ -270,7 +270,7 @@ pub const StreamingBodyWriter = struct {
         // A HEAD reports the length its GET would have and sends none of
         // it. The handler still writes, and is still charged for what it
         // wrote, so a declared Content-Length is checked the same way.
-        if (self.res.head) {
+        if (!self.res.sendsBody()) {
             self.res.body_sent += total;
             return w.consume(total);
         }
@@ -343,7 +343,7 @@ pub const StreamingBodyWriter = struct {
         errdefer res.keepalive = false;
 
         try res.resolve(self.interface.flush());
-        if (res.chunked and !res.head) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
+        if (res.chunked and res.sendsBody()) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
         try res.resolve(res.conn.writer.flush());
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
@@ -352,6 +352,14 @@ pub const StreamingBodyWriter = struct {
         }
     }
 };
+
+/// Whether a response with this status carries a body at all. A 1xx, a
+/// 204 and a 304 do not, so a peer reads whatever follows their head as
+/// the next response.
+fn statusHasBody(status: http.Status) bool {
+    const code = @intFromEnum(status);
+    return code >= 200 and status != .no_content and status != .not_modified;
+}
 
 pub const Response = struct {
     status: http.Status = .ok,
@@ -572,6 +580,12 @@ pub const Response = struct {
         return true;
     }
 
+    /// A HEAD sends none of its body, and neither does a status that has
+    /// none, whatever the handler wrote.
+    fn sendsBody(self: *const Response) bool {
+        return !self.head and statusHasBody(self.status);
+    }
+
     pub fn writeHeader(self: *Response) WriteError!void {
         if (!try self.prepareHeader()) return;
         return self.resolve(self.sendHeaderAlone(self.conn.writer));
@@ -604,16 +618,20 @@ pub const Response = struct {
             try w.writeAll("Connection: close\r\n");
         }
 
-        // Write Transfer-Encoding or Content-Length
-        if (self.chunked) {
-            try w.writeAll("Transfer-Encoding: chunked\r\n");
-        } else if (!self.streaming) {
-            // Write Content-Length if not manually set (skip for streaming responses like SSE)
-            const has_content_length = self.headers.get("Content-Length") != null;
-            if (!has_content_length) {
-                const buffer_end = self.buffer.writer.end;
-                const body_len = if (buffer_end > 0) buffer_end else self.body.len;
-                try w.print("Content-Length: {d}\r\n", .{body_len});
+        // Framing, for a status that has a body to frame. RFC 9112 §6.1
+        // and RFC 9110 §8.6 forbid both headers on a 1xx or 204; a HEAD
+        // still reports the length its GET would have.
+        if (statusHasBody(self.status)) {
+            if (self.chunked) {
+                try w.writeAll("Transfer-Encoding: chunked\r\n");
+            } else if (!self.streaming) {
+                // Write Content-Length if not manually set (skip for streaming responses like SSE)
+                const has_content_length = self.headers.get("Content-Length") != null;
+                if (!has_content_length) {
+                    const buffer_end = self.buffer.writer.end;
+                    const body_len = if (buffer_end > 0) buffer_end else self.body.len;
+                    try w.print("Content-Length: {d}\r\n", .{body_len});
+                }
             }
         }
 
@@ -663,7 +681,7 @@ pub const Response = struct {
             // A streaming writer sent the headers; all that is left is the
             // terminator, which is body framing and so is not sent for a
             // HEAD either.
-            if (!self.head) try w.writeAll("0\r\n\r\n");
+            if (self.sendsBody()) try w.writeAll("0\r\n\r\n");
             return w.flush();
         }
 
@@ -671,7 +689,7 @@ pub const Response = struct {
 
         // Write body (either from buffer or body field). A HEAD response
         // has already reported its length and must stop here.
-        if (!self.head) {
+        if (self.sendsBody()) {
             const buffered = self.buffer.writer.buffered();
             const body = if (buffered.len > 0) buffered else self.body;
             try w.writeAll(body);
@@ -2016,6 +2034,72 @@ test "Response: resetBody drops the headers that described the old body" {
     // Headers that say nothing about the body are left alone.
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Request-Id: abc") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "oops\n"));
+}
+
+test "Response: a 204 carries no Content-Length and no body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.status = .no_content;
+    // A handler's mistake, which must not reach the wire.
+    response.body = "hello";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 204 "));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+}
+
+test "Response: a 204 streamed is neither chunked nor terminated" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.status = .no_content;
+    var stream_buf: [64]u8 = undefined;
+    var body = try response.stream(&stream_buf);
+    try body.interface.writeAll("hello");
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+    // The head, and nothing after it: no chunk and no terminator.
+    try std.testing.expectEqual(written.len, std.mem.indexOf(u8, written, "\r\n\r\n").? + 4);
+}
+
+test "Response: a 304 sends no body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.status = .not_modified;
+    response.body = "hello";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
 }
 
 test "Response: a HEAD reports the length but sends no body" {
