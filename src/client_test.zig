@@ -1167,3 +1167,42 @@ test "Client: an IPv6 literal URL connects, with the brackets kept in the Host h
     try std.testing.expectEqualStrings("ok", (try resp.body()).?);
     try peer_future.await(io);
 }
+
+/// A peer answers with `status_line` and a Location; following it would
+/// fetch the second response, so the first one coming back is the proof.
+fn expectLocationNotFollowed(comptime status_line: []const u8, expected: dusty.Status) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer(
+        status_line ++ "\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nfollowed",
+    ).run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var resp = try client.fetch(url, .{});
+    defer resp.deinit();
+    try std.testing.expectEqual(expected, resp.status());
+    try std.testing.expectEqual(null, try resp.body());
+    peer_future.cancel(io);
+}
+
+test "Client: a 304 with a Location is not a redirect" {
+    try expectLocationNotFollowed("HTTP/1.1 304 Not Modified", .not_modified);
+}
+
+test "Client: a 300 with a Location is not a redirect" {
+    try expectLocationNotFollowed("HTTP/1.1 300 Multiple Choices", .multiple_choices);
+}
+
+test "Client: a 305 with a Location is not a redirect" {
+    try expectLocationNotFollowed("HTTP/1.1 305 Use Proxy", .use_proxy);
+}

@@ -1136,7 +1136,7 @@ pub const Client = struct {
 
         // Check for redirects
         const status_code = @intFromEnum(conn.parsed_response.status);
-        if (status_code >= 300 and status_code < 400 and state.redirects_remaining > 0) {
+        if (isRedirect(conn.parsed_response.status) and state.redirects_remaining > 0) {
             if (conn.parsed_response.headers.get("Location")) |location| {
                 // Resolve redirect URL using RFC 3986
                 var resolve_buf: [2048]u8 = undefined;
@@ -1421,6 +1421,15 @@ fn isDomainOrSubdomain(sub: []const u8, parent: []const u8) bool {
     if (sub.len <= parent.len + 1) return false;
     const dot_idx = sub.len - parent.len - 1;
     return sub[dot_idx] == '.' and std.ascii.eqlIgnoreCase(sub[dot_idx + 1 ..], parent);
+}
+
+/// The statuses a Location is followed for. The rest of 3xx are not
+/// redirects: a 304 answers a conditional request, a 300 offers choices.
+fn isRedirect(status: http.Status) bool {
+    return switch (status) {
+        .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => true,
+        else => false,
+    };
 }
 
 /// How many interim responses may precede the final one. Go's limit, and
