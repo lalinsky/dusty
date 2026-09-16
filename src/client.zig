@@ -1929,6 +1929,31 @@ test "ClientResponse.body: chunked trailers are not headers" {
     try std.testing.expectEqual(null, response.headers().get("X-Trailer"));
 }
 
+test "ClientResponse.body: a body cut short is IncompleteBody" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // Five bytes promised, two sent.
+    const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectError(error.IncompleteBody, response.body());
+}
+
 test "ClientResponse.body: connection-close (EOF-delimited) body" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

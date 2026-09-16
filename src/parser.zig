@@ -24,6 +24,19 @@ pub const ParseError = error{
     ParseFailed,
 };
 
+pub const FinishError = ParseError || error{IncompleteBody};
+
+/// Tells the parser the stream ended. Only called from inside a body, so
+/// an end the message was not ready for is a body cut short.
+fn finishParser(parser: *c.llhttp_t) FinishError!void {
+    const err = c.llhttp_finish(parser);
+    // HPE_PAUSED means our on_message_complete callback fired and paused,
+    // i.e. the message was completed by EOF (connection-close framing).
+    if (err == c.HPE_OK or err == c.HPE_PAUSED) return;
+    if (err == c.HPE_INVALID_EOF_STATE) return error.IncompleteBody;
+    return mapError(err);
+}
+
 fn mapError(err: c.llhttp_errno_t) ParseError {
     return switch (err) {
         c.HPE_INVALID_METHOD => ParseError.InvalidMethod,
@@ -124,13 +137,8 @@ pub const RequestParser = struct {
         return mapError(err);
     }
 
-    pub fn finish(self: *RequestParser) ParseError!void {
-        const err = c.llhttp_finish(&self.parser);
-        // HPE_PAUSED means our on_message_complete callback fired and paused,
-        // i.e. the message was completed by EOF (connection-close framing).
-        if (err != c.HPE_OK and err != c.HPE_PAUSED) {
-            return mapError(err);
-        }
+    pub fn finish(self: *RequestParser) FinishError!void {
+        return finishParser(&self.parser);
     }
 
     pub fn shouldKeepAlive(self: *RequestParser) bool {
@@ -371,13 +379,8 @@ pub const ResponseParser = struct {
         return mapError(err);
     }
 
-    pub fn finish(self: *ResponseParser) !void {
-        const err = c.llhttp_finish(&self.parser);
-        // HPE_PAUSED means our on_message_complete callback fired and paused,
-        // i.e. the message was completed by EOF (connection-close framing).
-        if (err != c.HPE_OK and err != c.HPE_PAUSED) {
-            return mapError(err);
-        }
+    pub fn finish(self: *ResponseParser) FinishError!void {
+        return finishParser(&self.parser);
     }
 
     pub fn shouldKeepAlive(self: *ResponseParser) bool {
@@ -571,7 +574,7 @@ pub fn BodyReader(comptime Parser: type) type {
             // Stated above, checked here: a parser outside `ParseError` would
             // otherwise fail somewhere inside `stream` with no hint as to why.
             assertFailsWithin(@TypeOf(Parser.feed), ParseError || error{Paused});
-            assertFailsWithin(@TypeOf(Parser.finish), ParseError);
+            assertFailsWithin(@TypeOf(Parser.finish), FinishError);
         }
 
         /// What the decoder recorded, said in terms a caller can act on.

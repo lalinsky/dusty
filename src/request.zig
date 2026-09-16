@@ -1068,7 +1068,7 @@ test "Request: a streaming read resolves through the reader it hands out" {
     try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
 }
 
-test "Request.body: a body cut short reports the parse failure, not a failed read" {
+test "Request.body: a body cut short is IncompleteBody, not a failed read" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1089,10 +1089,33 @@ test "Request.body: a body cut short reports the parse failure, not a failed rea
 
     try parseHeaders(&reader, &parser);
 
-    // Nothing is wrong with the connection, so it has no cause to offer.
-    // The parser does: it is the layer that knows the body was short, and
-    // the reader carries its answer up.
-    try std.testing.expectError(error.ParseFailed, req.body());
+    // Nothing is wrong with the connection, so it has no cause to offer,
+    // and nothing is wrong with the framing either: the peer stopped early.
+    try std.testing.expectError(error.IncompleteBody, req.body());
+}
+
+test "Request.body: a chunked body cut short is IncompleteBody" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // A chunk of five bytes, two of them sent.
+    const raw_request = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe";
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectError(error.IncompleteBody, req.body());
 }
 
 test "Request.body: framing the parser rejects is reported as itself" {
