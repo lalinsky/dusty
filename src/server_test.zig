@@ -267,6 +267,55 @@ test "Server: HTTP/1.0 GET request" {
     try std.testing.expectEqual(0, ctx.version_minor);
 }
 
+test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/stream", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req;
+            var buf: [64]u8 = undefined;
+            var body = try res.stream(&buf);
+            try body.interface.writeAll("hello ");
+            try body.interface.flush();
+            try body.interface.writeAll("world");
+            try body.end();
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("GET /stream HTTP/1.0\r\n\r\n");
+    try writer.interface.flush();
+
+    // The body ends when the connection does.
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const raw = try reader.interface.allocRemaining(std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(raw);
+
+    try std.testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Transfer-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "Connection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n\r\nhello world"));
+}
+
 test "Server: WebSocket echo" {
     const io = std.testing.io;
 

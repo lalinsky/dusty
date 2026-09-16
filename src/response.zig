@@ -381,6 +381,9 @@ pub const Response = struct {
     head: bool = false,
     /// A body writer was handed out and has not been ended yet.
     body_writer_open: bool = false,
+    /// The request was HTTP/1.0, so the peer does not understand chunked
+    /// encoding. Set by the server.
+    http10: bool = false,
     /// Length declared before streaming, if any. On the response rather
     /// than the writer so that `write` can still tell whether the body
     /// that went out matched it, even if the writer was abandoned.
@@ -438,7 +441,9 @@ pub const Response = struct {
 
     /// A writer that sends the headers now and streams the body as it is
     /// written. Chunked, unless a `Content-Length` header says how long the
-    /// body will be, in which case it is streamed as-is.
+    /// body will be, in which case it is streamed as-is. An HTTP/1.0 peer
+    /// gets neither: the body is streamed as-is and the connection closed
+    /// after it.
     ///
     /// The headers are on the wire when this returns, so nothing can change
     /// them afterwards. Call `end` on the result before returning.
@@ -446,6 +451,12 @@ pub const Response = struct {
         self.startBody();
         if (self.headers.get("Content-Length")) |v| {
             self.content_length = std.fmt.parseInt(usize, v, 10) catch return error.InvalidContentLength;
+        } else if (self.http10) {
+            // Chunked encoding came with HTTP/1.1. Before it, a body of
+            // unknown length ends when the connection does. A response
+            // that sends no body needs no such end.
+            self.streaming = true;
+            if (self.sendsBody()) self.keepalive = false;
         } else {
             self.chunked = true;
         }
@@ -2034,6 +2045,57 @@ test "Response: resetBody drops the headers that described the old body" {
     // Headers that say nothing about the body are left alone.
     try std.testing.expect(std.mem.indexOf(u8, written, "X-Request-Id: abc") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "oops\n"));
+}
+
+test "Response: a stream to an HTTP/1.0 peer is delimited by closing, not chunked" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.http10 = true;
+    var stream_buf: [64]u8 = undefined;
+    var body = try response.stream(&stream_buf);
+    try body.interface.writeAll("hello ");
+    try body.interface.writeAll("world");
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhello world"));
+    try std.testing.expect(!response.keepalive);
+}
+
+test "Response: a HEAD streamed to an HTTP/1.0 peer keeps the connection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.http10 = true;
+    response.head = true;
+    var stream_buf: [64]u8 = undefined;
+    var body = try response.stream(&stream_buf);
+    try body.interface.writeAll("hello");
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") == null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
+    try std.testing.expect(response.keepalive);
 }
 
 test "Response: a 204 carries no Content-Length and no body" {

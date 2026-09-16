@@ -912,6 +912,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 var response = try Response.init(arena.allocator(), connection, self.config.request.max_header_count);
                 response.head = request.method == .head;
+                response.http10 = request.version_major == 1 and request.version_minor == 0;
                 request.response = &response;
 
                 // Handle Expect header (100-continue)
