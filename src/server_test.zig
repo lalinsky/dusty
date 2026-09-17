@@ -1791,6 +1791,66 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
                 "HTTP/1.1 431 Request Header Fields Too Large\r",
                 status_line,
             );
+            // The server hangs up with a FIN, not a reset, although it
+            // never read the whole head: the rest of the answer arrives
+            // and the end of it is clean.
+            _ = try reader.interface.discardRemaining();
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
+test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
+    const io = std.testing.io;
+
+    // No request deadline, so the drain's own is what ends it.
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .timeout = .{ .request = null } }, {});
+    defer server.deinit();
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            s.listen(addr) catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\nX-Big: ") catch {};
+            writer.interface.splatByteAll('A', 20000) catch {};
+            writer.interface.writeAll("\r\n\r\n") catch {};
+            writer.interface.flush() catch {};
+
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectEqualStrings(
+                "HTTP/1.1 431 Request Header Fields Too Large\r",
+                status_line,
+            );
+            // The server's half-close is the end of what it sends.
+            _ = try reader.interface.discardRemaining();
+            // Keep the connection open and keep sending: a write is taken
+            // while the server is still draining, and refused once the
+            // drain deadline has passed and the server has closed.
+            var probes: usize = 0;
+            while (probes < 100) : (probes += 1) {
+                try _io.sleep(.fromMilliseconds(50), .awake);
+                writer.interface.writeByte('B') catch break;
+                writer.interface.flush() catch break;
+            }
+            try std.testing.expect(probes < 100);
         }
     }.run, .{ &server, io });
 
