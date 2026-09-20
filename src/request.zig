@@ -32,9 +32,12 @@ pub const Request = struct {
     content_length: ?usize = null,
     params: http.Params = .{},
     query: http.Params = .{},
-    /// The peer this request arrived from. A Unix socket peer has no
-    /// address of its own and is reported as IPv4 loopback, which is what
-    /// both zio and `std.Io.Threaded` substitute on accept.
+    /// The client address. This is the socket peer unless
+    /// `ServerConfig.trusted_proxy_hops` resolves it through
+    /// `X-Forwarded-For`. A Unix socket peer has no address of its own and is
+    /// reported as IPv4 loopback, which is what both zio and
+    /// `std.Io.Threaded` substitute on accept. A forwarded address has port
+    /// zero because the header does not carry the client's source port.
     remote_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
 
     arena: std.mem.Allocator,

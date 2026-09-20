@@ -36,7 +36,8 @@ docker run -d \
   --memory 256m \
   --cpus 1 \
   -p 127.0.0.1:8080:8080 \
-  dusty-httpbin:0.3.0
+  dusty-httpbin:0.3.0 \
+  -l 0.0.0.0:8080 --trusted-proxy-hops 1
 ```
 
 Use `GET /status/204` as a health check. A minimal nginx upstream configuration is:
@@ -46,10 +47,13 @@ location / {
     proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header Connection "";
 }
 ```
 
 If the proxy is another container, attach both containers to a private Docker network and do not publish port 8080 on the host.
 
-The application currently reports the directly connected peer, which will be the reverse proxy. It deliberately does not trust `Forwarded` or `X-Forwarded-For` headers yet. Add rate limits and request-size limits at the proxy before exposing a public instance.
+`--trusted-proxy-hops 1` tells Dusty that the directly connected nginx is trusted, so `/ip` and the reflected `origin` use the rightmost address in `X-Forwarded-For`. Set it to `2` when two trusted proxies sit in front of the application, and so on; Dusty selects the corresponding address from the right, ignoring any extra values a client prepended. A missing, too-short, or malformed chain falls back to the socket peer.
+
+Do not enable proxy trust if clients can reach the application port directly. The hop count is safe only when every path to the application passes through exactly that many trusted proxies. Add rate limits and request-size limits at the proxy before exposing a public instance.

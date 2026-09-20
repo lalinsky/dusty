@@ -1637,7 +1637,7 @@ test "Server: graceful shutdown closes idle connections with no deadlines config
     try expectIdleConnectionsClosedOnShutdown(.{ .request = null, .keepalive = null });
 }
 
-test "Server: request carries the peer address" {
+test "Server: request resolves the client through a trusted proxy" {
     const io = std.testing.io;
 
     const Ctx = struct {
@@ -1646,7 +1646,7 @@ test "Server: request carries the peer address" {
     };
     var ctx: Ctx = .{};
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{}, &ctx);
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .trusted_proxy_hops = 1 }, &ctx);
     defer server.deinit();
 
     server.router.get("/whoami", struct {
@@ -1678,17 +1678,15 @@ test "Server: request carries the peer address" {
             var conn_buf: [1024]u8 = undefined;
             var reader = stream.reader(_io, &conn_buf);
 
-            // Two requests on the one connection: the address belongs to
-            // the connection, so the reset between them must not drop it.
-            // Sent one at a time, since a pipelined second request is not
-            // picked up. The second asks the server to close, so reading
-            // to EOF proves its handler finished rather than guessing at
-            // the framing.
+            // Two requests on one connection. The first has no forwarding
+            // chain and therefore falls back to the peer. The second must be
+            // resolved afresh rather than inheriting the first request's
+            // address through the keepalive reset.
             try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\n\r\n");
             try writer.interface.flush();
             try readOneResponse(&reader.interface);
 
-            try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 192.0.2.25\r\nConnection: close\r\n\r\n");
             try writer.interface.flush();
             var rest: [2048]u8 = undefined;
             var sink: std.Io.Writer = .fixed(&rest);
@@ -1713,17 +1711,15 @@ test "Server: request carries the peer address" {
     try client_future.await(io);
 
     try std.testing.expectEqual(@as(usize, 2), ctx.count);
-    for (ctx.seen) |maybe| {
-        const seen = maybe orelse return error.HandlerNeverRan;
-        // The client connects over IPv4 loopback, so that is what the peer
-        // must be -- not the unspecified default, and not the listen
-        // address, whose port belongs to the server.
-        try std.testing.expect(seen == .ip4);
-        try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, seen.ip4.bytes);
-        try std.testing.expect(seen.ip4.port != 0);
-    }
-    // The same connection, so the same peer both times.
-    try std.testing.expect(ctx.seen[0].?.ip4.eql(ctx.seen[1].?.ip4));
+    const peer = ctx.seen[0] orelse return error.HandlerNeverRan;
+    try std.testing.expect(peer == .ip4);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, peer.ip4.bytes);
+    try std.testing.expect(peer.ip4.port != 0);
+
+    const forwarded = ctx.seen[1] orelse return error.HandlerNeverRan;
+    try std.testing.expect(forwarded == .ip4);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 25 }, forwarded.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 0), forwarded.ip4.port);
 }
 
 test "Server: client_auth with ca .none is rejected by listen" {

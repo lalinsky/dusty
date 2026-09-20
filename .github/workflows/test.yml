@@ -92,7 +92,8 @@ jobs:
           --cap-drop ALL \
           --security-opt no-new-privileges \
           -p 127.0.0.1:18080:8080 \
-          dusty-httpbin:test
+          dusty-httpbin:test \
+          -l 0.0.0.0:8080 --trusted-proxy-hops 1
         cleanup() {
           docker logs dusty-httpbin-test || true
           docker rm --force dusty-httpbin-test || true
@@ -103,6 +104,9 @@ jobs:
           http://127.0.0.1:18080/status/204
         curl --fail --silent --show-error \
           'http://127.0.0.1:18080/get?container=yes' | grep -q '"container":"yes"'
+        curl --fail --silent --show-error \
+          -H 'X-Forwarded-For: 198.51.100.99, 192.0.2.10' \
+          http://127.0.0.1:18080/ip | grep -q '"origin":"192.0.2.10"'
         test "$(docker inspect dusty-httpbin-test --format '{{.Config.User}}')" = "65532:65532"
 
     - name: Set up Docker Buildx

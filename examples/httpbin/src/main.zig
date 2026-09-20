@@ -356,6 +356,8 @@ const default_port = 8080;
 const Options = struct {
     /// -l ADDR
     listen: std.Io.net.IpAddress = .{ .ip4 = .loopback(default_port) },
+    /// --trusted-proxy-hops N
+    trusted_proxy_hops: usize = 0,
 };
 
 /// The value following a flag, or an error naming the flag that is
@@ -387,6 +389,12 @@ fn parseArgs(init: std.process.Init) !Options {
             // An address given without a port parses as port 0, which
             // would listen on whatever the kernel handed out.
             if (opts.listen.getPort() == 0) opts.listen.setPort(default_port);
+        } else if (std.mem.eql(u8, arg, "--trusted-proxy-hops")) {
+            const text = try flagValue(&args, arg);
+            opts.trusted_proxy_hops = std.fmt.parseInt(usize, text, 10) catch |err| {
+                std.log.err("{s} {s}: {t}", .{ arg, text, err });
+                return error.InvalidArgument;
+            };
         } else {
             std.log.warn("ignoring unknown argument: {s}", .{arg});
         }
@@ -396,7 +404,8 @@ fn parseArgs(init: std.process.Init) !Options {
 
 pub fn main(init: std.process.Init) !void {
     // Options:
-    //   -l ADDR   address to listen on (default: 127.0.0.1:8080)
+    //   -l ADDR                  address to listen on (default: 127.0.0.1:8080)
+    //   --trusted-proxy-hops N   resolve remote_address through N proxies
     const opts = try parseArgs(init);
 
     var rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
@@ -404,6 +413,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx: Ctx = .{};
     var server = http.Server(Ctx).init(init.gpa, rt.io(), .{
+        .trusted_proxy_hops = opts.trusted_proxy_hops,
         .timeout = .{
             .request = request_timeout,
             .keepalive = keepalive_timeout,
