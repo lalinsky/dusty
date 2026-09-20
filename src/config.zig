@@ -58,6 +58,16 @@ pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
     listen: std.Io.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
+    /// Number of reverse-proxy hops between the server and the client. Zero
+    /// reports the socket peer and ignores `X-Forwarded-For`. A positive
+    /// value selects that address from the right of the forwarding chain:
+    /// one trusts the directly connected proxy, two trusts it and the proxy
+    /// before it, and so on.
+    ///
+    /// Only enable this when the server is unreachable except through that
+    /// many trusted proxies. Otherwise a client can supply the header itself
+    /// and choose the address reported to handlers.
+    trusted_proxy_hops: usize = 0,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `listen.kernel_backlog` deep. Null lifts the cap.
@@ -162,4 +172,5 @@ test "ServerConfig: connection timeouts are finite by default" {
     const cfg: ServerConfig = .{};
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(30), cfg.timeout.request.?);
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(60), cfg.timeout.keepalive.?);
+    try std.testing.expectEqual(@as(usize, 0), cfg.trusted_proxy_hops);
 }

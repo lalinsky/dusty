@@ -9,6 +9,7 @@ const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
+const Headers = @import("http.zig").Headers;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
 const body_read_reserve = @import("config.zig").body_read_reserve;
@@ -25,6 +26,60 @@ const log = std.log.scoped(.dusty);
 /// one attempt a second rather than a spin.
 const min_accept_backoff_ms = 5;
 const max_accept_backoff_ms = 1000;
+
+/// Walks all X-Forwarded-For fields as one comma-separated list. Repeated
+/// fields are equivalent to one combined field, in their wire order.
+const ForwardedForIterator = struct {
+    headers: Headers.Iterator,
+    addresses: ?std.mem.SplitIterator(u8, .scalar) = null,
+
+    fn init(headers: *const Headers) ForwardedForIterator {
+        return .{ .headers = headers.iterator() };
+    }
+
+    fn next(self: *ForwardedForIterator) ?[]const u8 {
+        while (true) {
+            if (self.addresses) |*addresses| {
+                if (addresses.next()) |address| return std.mem.trim(u8, address, " \t");
+                self.addresses = null;
+            }
+
+            const header = self.headers.next() orelse return null;
+            if (std.ascii.eqlIgnoreCase(header.key, "X-Forwarded-For")) {
+                self.addresses = std.mem.splitScalar(u8, header.value, ',');
+            }
+        }
+    }
+};
+
+/// Returns the address `trusted_proxy_hops` hops away from this server. The
+/// socket peer is hop zero, so hop one is the rightmost forwarded address.
+/// Rejecting the whole chain on malformed input fails closed to the peer.
+fn forwardedRemoteAddress(headers: *const Headers, trusted_proxy_hops: usize) ?std.Io.net.IpAddress {
+    if (trusted_proxy_hops == 0) return null;
+
+    var count: usize = 0;
+    var counting = ForwardedForIterator.init(headers);
+    while (counting.next()) |text| {
+        if (text.len == 0) return null;
+        count += 1;
+    }
+    if (count < trusted_proxy_hops) return null;
+
+    const wanted = count - trusted_proxy_hops;
+    var index: usize = 0;
+    var selected: ?std.Io.net.IpAddress = null;
+    var parsing = ForwardedForIterator.init(headers);
+    while (parsing.next()) |text| : (index += 1) {
+        const address = std.Io.net.IpAddress.parse(text, 0) catch return null;
+        if (index == wanted) selected = address;
+    }
+    return selected;
+}
+
+fn remoteAddress(peer: std.Io.net.IpAddress, headers: *const Headers, trusted_proxy_hops: usize) std.Io.net.IpAddress {
+    return forwardedRemoteAddress(headers, trusted_proxy_hops) orelse peer;
+}
 
 /// Borrowed view of the client-certificate settings, handed to each accepted
 /// connection. The bundle is owned by the Server and outlives every connection.
@@ -956,6 +1011,17 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
 
+                // This is per request, not per connection: a keepalive
+                // connection may carry a different forwarding chain on every
+                // request. Starting from the socket peer also makes an absent
+                // or invalid chain fail closed instead of retaining the last
+                // request's forwarded address.
+                request.remote_address = remoteAddress(
+                    connection.stream.socket.address,
+                    &request.headers,
+                    self.config.trusted_proxy_hops,
+                );
+
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = try Response.init(arena.allocator(), connection, self.config.request.max_header_count);
@@ -1097,6 +1163,39 @@ pub fn Server(comptime Ctx: type) type {
 
 test {
     _ = RequestParser;
+}
+
+test "trusted proxy hops select X-Forwarded-For from the right" {
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.add("X-Forwarded-For", "192.0.2.99, 203.0.113.10");
+    try headers.add("x-forwarded-for", "198.51.100.7");
+
+    const peer = try std.Io.net.IpAddress.parse("127.0.0.1", 4321);
+
+    const direct = remoteAddress(peer, &headers, 0);
+    try std.testing.expect(direct.ip4.eql(peer.ip4));
+
+    const one = remoteAddress(peer, &headers, 1);
+    try std.testing.expectEqual([4]u8{ 198, 51, 100, 7 }, one.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 0), one.ip4.port);
+
+    const two = remoteAddress(peer, &headers, 2);
+    try std.testing.expectEqual([4]u8{ 203, 0, 113, 10 }, two.ip4.bytes);
+
+    const three = remoteAddress(peer, &headers, 3);
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 99 }, three.ip4.bytes);
+
+    // More trusted hops than the proxy supplied cannot establish a client
+    // address, so it is safer to expose the connected peer.
+    const too_short = remoteAddress(peer, &headers, 4);
+    try std.testing.expect(too_short.ip4.eql(peer.ip4));
+
+    // A malformed address anywhere in the chain makes its ordering
+    // ambiguous/untrustworthy and likewise falls back to the peer.
+    try headers.put("X-Forwarded-For", "not-an-address, 203.0.113.10");
+    const malformed = remoteAddress(peer, &headers, 2);
+    try std.testing.expect(malformed.ip4.eql(peer.ip4));
 }
 
 /// A Connection with no real transport, in TLS mode, so the error accessors

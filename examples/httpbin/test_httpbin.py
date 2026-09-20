@@ -232,6 +232,14 @@ class HttpbinTest(unittest.TestCase):
         data = self.get_json("/user-agent", headers={"User-Agent": "integration/1.0"})
         self.assertEqual(data["user_agent"], "integration/1.0")
         self.assertEqual(self.get_json("/ip")["origin"], HOST)
+        # Proxy headers are untrusted unless the server is explicitly
+        # configured with a non-zero trusted hop count.
+        self.assertEqual(
+            self.get_json(
+                "/ip", headers={"X-Forwarded-For": "203.0.113.10"}
+            )["origin"],
+            HOST,
+        )
 
     # Bodies
 

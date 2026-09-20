@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added trusted reverse-proxy hop handling to the HTTP server. Configure `ServerConfig.trusted_proxy_hops` to resolve `Request.remote_address` safely from the right side of `X-Forwarded-For`; direct peers remain the default and malformed or incomplete chains fall back to them.
+
 ## [0.3.0] - 2026-09-20
 
 This is a substantial release focused on making Dusty runtime-independent, safer under load, and more predictable at HTTP protocol boundaries.
