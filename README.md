@@ -169,12 +169,14 @@ var client = http.Client.init(gpa, io, .{ .timeout = .fromSeconds(5) });
 
 // Inherits the five seconds.
 var a = try client.fetch(url, .{});
-// Its own limit.
+// Its own limit, counted from this call.
 var b = try client.fetch(url, .{
     .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } },
 });
+// An absolute deadline, such as one shared with other work.
+var c = try client.fetch(url, .{ .timeout = .{ .deadline = deadline } });
 // No limit at all.
-var c = try client.fetch(url, .{ .timeout = .none });
+var d = try client.fetch(url, .{ .timeout = .none });
 ```
 
 A request with `.stream = true` leaves the body on the wire for the caller to
