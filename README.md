@@ -20,7 +20,7 @@ The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlse
 ## Installation
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/dusty"
+zig fetch --save "git+https://github.com/lalinsky/dusty#v0.3.0"
 ```
 
 Then in your `build.zig`, add the module as a dependency:
