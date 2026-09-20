@@ -191,6 +191,12 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
     return w.flush();
 }
 
+/// How much of a refused request is thrown away before hanging up on it,
+/// and how long that is given: a peer that has read the answer hangs up
+/// within a round trip, and the request deadline may be off.
+const refused_drain_limit: usize = 64 * 1024;
+const refused_drain_timeout: std.Io.Duration = .fromSeconds(1);
+
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
         "Connection: close\r\n" ++
@@ -322,6 +328,10 @@ const Timer = if (have_auto_cancel) struct {
     fn clear(self: *@This(), _: std.Io) void {
         self.inner.clear();
     }
+
+    fn canBound(_: *const @This()) bool {
+        return true;
+    }
 } else struct {
     /// Null when no deadline was configured.
     watch: ?*Watch = null,
@@ -338,6 +348,12 @@ const Timer = if (have_auto_cancel) struct {
     fn clear(self: *@This(), io: std.Io) void {
         const w = self.watch orelse return;
         w.disarm(io);
+    }
+
+    /// Whether `set` does anything: there is no watcher when no deadline
+    /// was configured for the connection.
+    fn canBound(self: *const @This()) bool {
+        return self.watch != null;
     }
 };
 
@@ -743,6 +759,34 @@ pub fn Server(comptime Ctx: type) type {
             };
         }
 
+        /// Hangs up on a peer whose request was refused before it was all
+        /// read, so the peer still gets the answer. Closing with input
+        /// unread makes the kernel send a reset instead of a FIN, and a
+        /// Windows peer throws the buffered answer away when a reset
+        /// arrives. So the send side is shut first, which tells the peer
+        /// there is nothing more to wait for, and what it sent is thrown
+        /// away until it hangs up, or `refused_drain_timeout` passes, or
+        /// `refused_drain_limit` bytes for a peer that keeps sending.
+        /// Without a deadline to arm, the wait could be held open, so the
+        /// close stays immediate, reset and all.
+        fn hangUpOnRefused(self: *Self, connection: *Connection, timer: *Timer) !void {
+            if (!timer.canBound()) return;
+            timer.set(self.io, .{ .duration = .{ .raw = refused_drain_timeout, .clock = .awake } });
+            defer timer.clear(self.io);
+            connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
+                // Already gone: nothing left to throw away.
+                error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
+                else => |e| return e,
+            };
+            _ = connection.reader.discardShort(refused_drain_limit) catch {
+                const cause = connection.getReadError() orelse error.Unexpected;
+                // The peer hanging up is the end this waits for. The
+                // deadline arrives as a cancel, and stays one.
+                if (Connection.isPeerGone(cause)) return;
+                return cause;
+            };
+        }
+
         pub fn handleConnection(self: *Self, stream: std.Io.net.Stream, watch: ?*Watch) !void {
             defer self.releaseConnectionSlot();
 
@@ -897,12 +941,16 @@ pub fn Server(comptime Ctx: type) type {
                         log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
+                        needs_shutdown.* = false;
+                        try self.hangUpOnRefused(connection, timer);
                         return;
                     },
                     error.TooManyHeaders => {
                         log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
+                        needs_shutdown.* = false;
+                        try self.hangUpOnRefused(connection, timer);
                         return;
                     },
                     else => |e| return e,
