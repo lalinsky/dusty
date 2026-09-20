@@ -15,6 +15,9 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     var upstream_req: http.FetchOptions = .{
         .method = req.method,
         .decompress = false, // Important: disable decompression to preserve original body
+        // The body goes straight through to the client, so it is not
+        // read into memory first.
+        .stream = true,
     };
 
     // Forward request headers (excluding hop-by-hop headers)

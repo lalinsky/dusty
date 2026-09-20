@@ -344,7 +344,7 @@ test "Client: connection with unread response body is not pooled" {
     // an unknown stream position and must be closed, not pooled, or the
     // next request on it would read leftover body bytes as its response.
     {
-        var response = try client.fetch(url, .{});
+        var response = try client.fetch(url, .{ .stream = true });
         defer response.deinit();
 
         try std.testing.expectEqual(.ok, response.status());
@@ -1205,4 +1205,190 @@ test "Client: a 300 with a Location is not a redirect" {
 
 test "Client: a 305 with a Location is not a redirect" {
     try expectLocationNotFollowed("HTTP/1.1 305 Use Proxy", .use_proxy);
+}
+
+/// A peer that accepts one connection, sends `head` once the request has
+/// arrived, and then holds the connection open without another byte until
+/// canceled.
+fn stallingPeer(listener: *std.Io.net.Server, io: std.Io, head: []const u8) void {
+    const s = listener.accept(io) catch return;
+    defer s.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rd = s.reader(io, &rbuf);
+    var wbuf: [256]u8 = undefined;
+    var w = s.writer(io, &wbuf);
+    rd.interface.fillMore() catch return;
+    w.interface.writeAll(head) catch return;
+    w.interface.flush() catch return;
+    // Nothing more is coming. The peer hanging up ends this early.
+    rd.interface.fillMore() catch {};
+}
+
+const StallingServer = struct {
+    listener: std.Io.net.Server,
+    future: std.Io.Future(void),
+    url_buf: [64]u8 = undefined,
+
+    /// In place: the peer task holds a pointer to `listener`.
+    fn start(self: *StallingServer, io: std.Io, head: []const u8) !void {
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.listener = try addr.listen(io, .{ .reuse_address = true });
+        errdefer self.listener.deinit(io);
+        self.future = try io.concurrent(stallingPeer, .{ &self.listener, io, head });
+    }
+
+    fn url(self: *StallingServer) ![]const u8 {
+        const port = self.listener.socket.address.getPort();
+        return std.fmt.bufPrint(&self.url_buf, "http://127.0.0.1:{d}/", .{port});
+    }
+
+    fn stop(self: *StallingServer, io: std.Io) void {
+        self.future.cancel(io);
+        self.listener.deinit(io);
+    }
+};
+
+fn millisSince(io: std.Io, started: std.Io.Clock.Timestamp) i64 {
+    const ended = std.Io.Clock.Timestamp.now(io, .awake);
+    return @intCast(@divTrunc(ended.raw.nanoseconds - started.raw.nanoseconds, std.time.ns_per_ms));
+}
+
+test "Client: a response head that never arrives is cut off by ClientConfig.timeout" {
+    const io = std.testing.io;
+    var peer: StallingServer = undefined;
+    try peer.start(io, "");
+    defer peer.stop(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{
+        .timeout = .fromMilliseconds(150),
+    });
+    defer client.deinit();
+
+    const started = std.Io.Clock.Timestamp.now(io, .awake);
+    try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
+    const elapsed = millisSince(io, started);
+    try std.testing.expect(elapsed >= 150);
+    try std.testing.expect(elapsed < 3000);
+
+    // A request cut short leaves nothing behind to be reused.
+    try std.testing.expectEqual(0, client.pool.idle_len);
+}
+
+test "Client: FetchOptions.timeout replaces the client default" {
+    const io = std.testing.io;
+
+    { // no default, but a limit on this request
+        var peer: StallingServer = undefined;
+        try peer.start(io, "");
+        defer peer.stop(io);
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = null });
+        defer client.deinit();
+        try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{
+            .timeout = .{ .duration = .{ .raw = .fromMilliseconds(150), .clock = .awake } },
+        }));
+    }
+    { // a default, lifted for this request
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+        defer server.deinit();
+        server.router.get("/slow", struct {
+            fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+                try req.io.sleep(.fromMilliseconds(300), .awake);
+                res.body = "late";
+            }
+        }.handle);
+        var server_future = try io.concurrent(struct {
+            fn run(s: *dusty.Server(void)) !void {
+                const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+                try s.listen(addr);
+            }
+        }.run, .{&server});
+        defer server_future.cancel(io) catch {};
+        try server.ready.wait(io);
+
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(100) });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/slow", .{server.address.ip.getPort()});
+
+        var response = try client.fetch(url, .{ .timeout = .none });
+        defer response.deinit();
+        try std.testing.expectEqualStrings("late", (try response.body()).?);
+    }
+}
+
+test "Client: the request deadline covers the body, unless it is streamed" {
+    const io = std.testing.io;
+    // Ten bytes promised, five delivered, and then silence.
+    const head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
+
+    { // fetch reads the body, so it is fetch that runs out of time
+        var peer: StallingServer = undefined;
+        try peer.start(io, head);
+        defer peer.stop(io);
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(150) });
+        defer client.deinit();
+
+        try std.testing.expectError(error.Timeout, client.fetch(try peer.url(), .{}));
+        try std.testing.expectEqual(0, client.pool.idle_len);
+    }
+    { // streamed: fetch returns at the head, and what follows is on the caller's time
+        var peer: StallingServer = undefined;
+        try peer.start(io, head);
+        defer peer.stop(io);
+        // Room for the head on a loaded runner, and well past by the time
+        // the body is read.
+        var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(500) });
+        defer client.deinit();
+
+        var response = try client.fetch(try peer.url(), .{ .stream = true });
+        defer response.deinit();
+        try std.testing.expectEqual(.ok, response.status());
+
+        try io.sleep(.fromMilliseconds(800), .awake);
+        var buf: [64]u8 = undefined;
+        var reader = try response.reader(&buf);
+        try std.testing.expectEqualStrings("hello", try reader.interface.take(5));
+    }
+}
+
+test "Client: redirects share the request's budget" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+    const Hops = struct {
+        fn first(req: *dusty.Request, res: *dusty.Response) !void {
+            try req.io.sleep(.fromMilliseconds(100), .awake);
+            res.status = .found;
+            try res.headers.put("Location", "/second");
+        }
+        fn second(req: *dusty.Request, res: *dusty.Response) !void {
+            try req.io.sleep(.fromMilliseconds(100), .awake);
+            res.body = "done";
+        }
+    };
+    server.router.get("/first", Hops.first);
+    server.router.get("/second", Hops.second);
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/first", .{server.address.ip.getPort()});
+
+    // Each hop alone is within the limit; the two together are not.
+    var client = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(150) });
+    defer client.deinit();
+    try std.testing.expectError(error.Timeout, client.fetch(url, .{}));
+
+    var patient = dusty.Client.init(std.testing.allocator, io, .{ .timeout = .fromMilliseconds(2000) });
+    defer patient.deinit();
+    var response = try patient.fetch(url, .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("done", (try response.body()).?);
 }

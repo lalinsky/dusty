@@ -1,5 +1,4 @@
 const std = @import("std");
-const zio = @import("zio");
 const tls = @import("tls");
 const build_options = @import("build_options");
 
@@ -16,6 +15,9 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
+const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
+const Watch = @import("deadline.zig").Watch;
+const Timer = @import("deadline.zig").Timer;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 
 const log = std.log.scoped(.dusty);
@@ -269,146 +271,6 @@ pub const Address = union(enum) {
             .ip => |ip| try ip.format(w),
             .unix => |unix| try w.writeAll(unix.path),
         }
-    }
-};
-
-/// Whether the injected `zio` can arm a timer against the running task. The
-/// stub says so by declaring `is_stub`; the real package does not.
-const have_auto_cancel = !@hasDecl(zio, "is_stub");
-
-/// A deadline one task publishes and another waits on.
-///
-/// The watcher sleeps on `generation`, which every re-arm and the finish bump
-/// before waking it. That order is what makes the wait lossless: a re-arm
-/// racing the watcher leaves the word different from what the wait expects,
-/// so it returns rather than sleeping on stale terms.
-const Watch = struct {
-    generation: std.atomic.Value(u32) = .init(0),
-    mutex: std.Io.Mutex = .init,
-    /// Guarded by `mutex`. Never `.duration`: `set` pins one to the moment it
-    /// was published.
-    timeout: std.Io.Timeout = .none,
-    /// Guarded by `mutex`.
-    finished: bool = false,
-
-    const State = struct {
-        timeout: std.Io.Timeout,
-        finished: bool,
-    };
-
-    fn wake(self: *Watch, io: std.Io) void {
-        _ = self.generation.fetchAdd(1, .acq_rel);
-        io.futexWake(u32, &self.generation.raw, 1);
-    }
-
-    fn published(self: *Watch, io: std.Io) State {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-        return .{ .timeout = self.timeout, .finished = self.finished };
-    }
-
-    fn set(self: *Watch, io: std.Io, timeout: std.Io.Timeout) void {
-        // A duration runs from the call that published it, and the watcher may
-        // not read it until much later.
-        const deadline = timeout.toDeadline(io);
-        {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            self.timeout = deadline;
-        }
-        self.wake(io);
-    }
-
-    fn arm(self: *Watch, io: std.Io, duration: std.Io.Duration) void {
-        self.set(io, .{ .duration = .{ .raw = duration, .clock = .awake } });
-    }
-
-    fn disarm(self: *Watch, io: std.Io) void {
-        self.set(io, .none);
-    }
-
-    fn finish(self: *Watch, io: std.Io) void {
-        {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            self.finished = true;
-        }
-        self.wake(io);
-    }
-
-    /// Blocks until the connection finishes, or `error.Timeout` if it
-    /// overruns the deadline it last published.
-    fn wait(self: *Watch, io: std.Io) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
-        while (true) {
-            // Captured before the snapshot, so a `set` that lands in between
-            // is one the wait below refuses to sleep through.
-            const generation = self.generation.load(.acquire);
-            const state = self.published(io);
-            if (state.finished) return;
-
-            // The wait does not report why it returned, and `generation` is
-            // only its wakeup token: `set` publishes the deadline before the
-            // bump, so an unchanged generation does not mean an unchanged
-            // deadline. Every wakeup comes back here and judges the deadline
-            // published now, never the one it went to sleep on.
-            if (state.timeout.toTimestamp(io)) |deadline| {
-                if (std.Io.Clock.Timestamp.now(io, deadline.clock).compare(.gte, deadline)) {
-                    return error.Timeout;
-                }
-            }
-
-            try io.futexWaitTimeout(u32, &self.generation.raw, generation, state.timeout);
-        }
-    }
-};
-
-/// Bounds how long a connection may spend on any one blocking step.
-///
-/// zio arms a timer against the running task. `std.Io` has no deadline for a
-/// stream read, only cancelation, so elsewhere the deadline goes to a second
-/// task that cancels this one when it passes.
-const Timer = if (have_auto_cancel) struct {
-    inner: zio.AutoCancel = .init,
-
-    fn init(_: ?*Watch) @This() {
-        return .{};
-    }
-
-    fn set(self: *@This(), _: std.Io, timeout: std.Io.Timeout) void {
-        // `Timeout.fromStd` keeps the value clockless and `Clock.fromStdTimeout`
-        // carries the clock, which is how zio wants the two halves.
-        self.inner.setClock(.fromStd(timeout), .fromStdTimeout(timeout));
-    }
-
-    fn clear(self: *@This(), _: std.Io) void {
-        self.inner.clear();
-    }
-
-    fn canBound(_: *const @This()) bool {
-        return true;
-    }
-} else struct {
-    /// Null when no deadline was configured.
-    watch: ?*Watch = null,
-
-    fn init(w: ?*Watch) @This() {
-        return .{ .watch = w };
-    }
-
-    fn set(self: *@This(), io: std.Io, timeout: std.Io.Timeout) void {
-        const w = self.watch orelse return;
-        w.set(io, timeout);
-    }
-
-    fn clear(self: *@This(), io: std.Io) void {
-        const w = self.watch orelse return;
-        w.disarm(io);
-    }
-
-    /// Whether `set` does anything: there is no watcher when no deadline
-    /// was configured for the connection.
-    fn canBound(self: *const @This()) bool {
-        return self.watch != null;
     }
 };
 
@@ -1260,48 +1122,4 @@ test "Connection: isPeerGone separates a departed peer from a real failure" {
     try std.testing.expect(!Connection.isPeerGone(error.TlsConnectionTruncated));
     try std.testing.expect(!Connection.isPeerGone(error.TlsBadRecordMac));
     try std.testing.expect(!Connection.isPeerGone(error.Canceled));
-}
-
-test "Watch: accepts an absolute deadline on another clock" {
-    const io = std.testing.io;
-    var watch: Watch = .{};
-    const deadline = std.Io.Clock.Timestamp.now(io, .real).addDuration(.{
-        .raw = .fromMilliseconds(50),
-        .clock = .real,
-    });
-    watch.set(io, .{ .deadline = deadline });
-    try std.testing.expectError(error.Timeout, watch.wait(io));
-}
-
-test "Watch: a deadline republished before its generation does not expire the connection" {
-    const io = std.testing.io;
-    var watch: Watch = .{};
-
-    // Leave enough room for the watcher and this test task both to be
-    // scheduled on a loaded runner before the first deadline arrives.
-    watch.arm(io, .fromMilliseconds(500));
-
-    var watcher = try io.concurrent(struct {
-        fn go(w: *Watch, i: std.Io) (std.Io.Cancelable || std.Io.Timeout.Error)!void {
-            return w.wait(i);
-        }
-    }.go, .{ &watch, io });
-    defer watcher.cancel(io) catch {};
-
-    // The watcher is now asleep holding the first deadline. Publish a later
-    // one the way `arm` does, but stop short of the generation bump -- the
-    // window between its store and its wake.
-    try io.sleep(.fromMilliseconds(25), .awake);
-    const later: std.Io.Timeout = .{
-        .deadline = .fromNow(io, .{ .raw = .fromMilliseconds(5_000), .clock = .awake }),
-    };
-    watch.mutex.lockUncancelable(io);
-    watch.timeout = later;
-    watch.mutex.unlock(io);
-
-    // Well past the first deadline, and nowhere near the second.
-    try io.sleep(.fromMilliseconds(600), .awake);
-    watch.finish(io);
-
-    try watcher.await(io);
 }

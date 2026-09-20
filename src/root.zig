@@ -46,6 +46,7 @@ comptime {
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");
+    _ = @import("deadline.zig");
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
 }

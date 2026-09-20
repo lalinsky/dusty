@@ -33,4 +33,8 @@ pub const AutoCancel = struct {
     }
 
     pub fn clear(_: *AutoCancel) void {}
+
+    pub fn check(_: *AutoCancel, _: anyerror) bool {
+        unreachable;
+    }
 };
