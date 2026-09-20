@@ -21,6 +21,7 @@ const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
 const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
 const Transport = @import("transport.zig").Transport;
+const Deadline = @import("deadline.zig").Deadline;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
 const parseKeepAliveHeader = @import("parser.zig").parseKeepAliveHeader;
 
@@ -95,6 +96,17 @@ pub const ClientConfig = struct {
     tls: TlsConfig = .{},
     /// Maximum number of headers allowed in a response.
     max_response_header_count: usize = 64,
+    /// Maximum time for `fetch`: connecting, the TLS handshake, sending,
+    /// every redirect, and the response through the end of its body, or
+    /// through the end of its head for a request that streams the body.
+    /// Defaults to 30 seconds; set to null for no limit, or replace it for
+    /// one request with `FetchOptions.timeout`.
+    ///
+    /// Costs a second task per request on any backend but zio, so on
+    /// `std.Io.Threaded` a request with a timeout runs on a thread of its
+    /// own, and where no second task can be had, as in a single-threaded
+    /// build, the request fails with `error.ConcurrencyUnavailable`.
+    timeout: ?std.Io.Duration = .fromSeconds(30),
     /// User-Agent header sent with requests. Set to null to omit it.
     /// A per-request User-Agent header takes precedence over this default.
     user_agent: ?[]const u8 = default_user_agent,
@@ -142,8 +154,16 @@ pub const FetchOptions = struct {
     body: ?[]const u8 = null,
     /// Override default redirect limit for this request.
     max_redirects: ?u8 = null,
+    /// Replaces `ClientConfig.timeout` for this request. Null inherits it;
+    /// `.none` lifts it. A duration runs from the call to `fetch`, and a
+    /// deadline is taken as given.
+    timeout: ?std.Io.Timeout = null,
     /// Decompress response body automatically (sends Accept-Encoding header).
     decompress: bool = true,
+    /// Leave the response body on the wire for the caller to read through
+    /// `ClientResponse.reader`, rather than reading it whole inside `fetch`.
+    /// Unbounded by `timeout`, and by `ClientConfig.max_response_size`.
+    stream: bool = false,
     /// Connect over a Unix domain socket instead of TCP.
     /// Useful for communicating with Docker Engine (e.g. "/var/run/docker.sock").
     /// The URL host and path are still used for the HTTP request line and Host header.
@@ -923,13 +943,20 @@ pub const Client = struct {
         const uri = try parseUrl(url);
         const info = try uriPortAndProtocol(uri);
         const max_redirects = options.max_redirects orelse self.config.max_redirects;
-        return self.fetchInternal(.{
+        // Pinned here, so every redirect and the body share one budget.
+        const deadline: Deadline = .init(self.io, options.timeout orelse self.defaultTimeout());
+        return deadline.run(fetchInternal, .{ self, FetchState{
             .uri = uri,
             .port = info.port,
             .protocol = info.protocol,
             .options = options,
             .redirects_remaining = max_redirects,
-        });
+        } });
+    }
+
+    fn defaultTimeout(self: *const Client) std.Io.Timeout {
+        const duration = self.config.timeout orelse return .none;
+        return .{ .duration = .{ .raw = duration, .clock = .awake } };
     }
 
     /// Acquire a connection from the pool or create a new one.
@@ -1229,7 +1256,7 @@ pub const Client = struct {
         }
 
         // Build response with direct pointers for reading
-        return ClientResponse{
+        var response = ClientResponse{
             .arena = conn.arena.allocator(),
             .parser = &conn.parser,
             .transport = conn.transport(),
@@ -1238,6 +1265,10 @@ pub const Client = struct {
             .decompress = state.options.decompress,
             .owner = conn,
         };
+        // Under the request's deadline, which ends with this call. A body
+        // left on the wire is the caller's to read, on the caller's time.
+        if (!state.options.stream) _ = try response.body();
+        return response;
     }
 };
 

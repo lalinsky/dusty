@@ -157,10 +157,37 @@ Long-lived handlers can use this as an inactivity timeout by re-arming it
 before each WebSocket message or event, without disabling the resilient server
 default for ordinary requests.
 
+The client bounds each request the same way. `ClientConfig.timeout` defaults
+to 30 seconds and covers the whole of `fetch`: connecting, the TLS handshake,
+sending the request, every redirect, and the response through the end of its
+body, which `fetch` reads before returning. A request that runs past it fails
+with `error.Timeout`. `FetchOptions.timeout` replaces the default for one
+request:
+
+```zig
+var client = http.Client.init(gpa, io, .{ .timeout = .fromSeconds(5) });
+
+// Inherits the five seconds.
+var a = try client.fetch(url, .{});
+// Its own limit, counted from this call.
+var b = try client.fetch(url, .{
+    .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } },
+});
+// An absolute deadline, such as one shared with other work.
+var c = try client.fetch(url, .{ .timeout = .{ .deadline = deadline } });
+// No limit at all.
+var d = try client.fetch(url, .{ .timeout = .none });
+```
+
+A request with `.stream = true` leaves the body on the wire for the caller to
+read through `ClientResponse.reader`. The deadline then covers `fetch` through
+the end of the head, and the body reads are not bounded at all.
+
 On zio, deadlines cancel the connection task directly, which needs a zio new
 enough to have `AutoCancel.setClock`. Other I/O backends use a watchdog task;
 with `std.Io.Threaded`, that means a second OS thread for each connection while
-either request or keepalive timeouts are enabled.
+either request or keepalive timeouts are enabled, and on the client side a
+second thread for each `fetch` while a timeout is set.
 
 ## Selecting the I/O Backend
 

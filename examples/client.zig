@@ -17,7 +17,8 @@ pub fn main(init: std.process.Init) !void {
     var client = http.Client.init(allocator, io, .{});
     defer client.deinit();
 
-    var response = try client.fetch(url, .{});
+    // Streamed to stdout below rather than read whole.
+    var response = try client.fetch(url, .{ .stream = true });
     defer response.deinit();
 
     std.debug.print("Status: {any}\n", .{response.status()});
