@@ -3,10 +3,12 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_tls = b.option(bool, "use_tls", "Build Dusty with TLS support") orelse true;
 
     const dusty = b.dependency("dusty", .{
         .target = target,
         .optimize = optimize,
+        .use_tls = use_tls,
     });
 
     const zio = b.dependency("zio", .{

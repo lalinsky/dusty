@@ -1,0 +1,5 @@
+**
+!zig-out/
+!zig-out/container/
+!zig-out/container/bin/
+!zig-out/container/bin/server

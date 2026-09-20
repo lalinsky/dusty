@@ -3,8 +3,11 @@ name: CI
 on:
   push:
     branches: [ main ]
-    tags:
+    tags: [ 'v*' ]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -53,3 +56,85 @@ jobs:
       run: .\zig-out\bin\client-example.exe https://httpbin.org/get
       timeout-minutes: 1
       if: runner.os == 'Windows'
+
+  container:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.16.0
+
+    - name: Build static httpbin binary
+      run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Duse_tls=false --prefix zig-out/container
+      working-directory: examples/httpbin
+      timeout-minutes: 5
+
+    - name: Build container image
+      run: docker build -t dusty-httpbin:test .
+      working-directory: examples/httpbin
+      timeout-minutes: 2
+
+    - name: Test container image
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker run -d \
+          --name dusty-httpbin-test \
+          --read-only \
+          --cap-drop ALL \
+          --security-opt no-new-privileges \
+          -p 127.0.0.1:18080:8080 \
+          dusty-httpbin:test
+        cleanup() {
+          docker logs dusty-httpbin-test || true
+          docker rm --force dusty-httpbin-test || true
+        }
+        trap cleanup EXIT
+        curl --fail --silent --show-error \
+          --retry 20 --retry-connrefused --retry-delay 1 \
+          http://127.0.0.1:18080/status/204
+        curl --fail --silent --show-error \
+          'http://127.0.0.1:18080/get?container=yes' | grep -q '"container":"yes"'
+        test "$(docker inspect dusty-httpbin-test --format '{{.Config.User}}')" = "65532:65532"
+
+    - name: Set up Docker Buildx
+      if: github.event_name != 'pull_request'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GitHub Container Registry
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Generate container metadata
+      if: github.event_name != 'pull_request'
+      id: container-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository_owner }}/dusty-httpbin
+        tags: |
+          type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+
+    - name: Push container image
+      if: github.event_name != 'pull_request'
+      uses: docker/build-push-action@v6
+      with:
+        context: examples/httpbin
+        file: examples/httpbin/Dockerfile
+        platforms: linux/amd64
+        push: true
+        tags: ${{ steps.container-meta.outputs.tags }}
+        labels: ${{ steps.container-meta.outputs.labels }}
