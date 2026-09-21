@@ -774,6 +774,225 @@ test "Server: keepalive after handler ignores request body" {
     try std.testing.expectEqualStrings("second", resp2.body);
 }
 
+/// Serves `/a`, `/b` and `/c` with their names, `/b` from its request body
+/// and `/a` for any method without reading one. What a pipelining test
+/// needs: enough routes to tell the responses apart, and bodies read and
+/// unread for the parser to get past.
+const PipelineCtx = struct {
+    fn setup(server: *dusty.Server(void)) void {
+        server.router.any("/a", struct {
+            fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+                res.body = "a";
+            }
+        }.handle);
+        server.router.post("/b", struct {
+            fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+                res.body = (try req.body()) orelse "no body";
+            }
+        }.handle);
+        server.router.get("/c", struct {
+            fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+                res.body = "c";
+            }
+        }.handle);
+    }
+};
+
+/// Sends `requests` in a single write and checks that every response in
+/// `expected` comes back, in order, on the same connection.
+fn expectPipelinedResponses(
+    server: *dusty.Server(void),
+    requests: []const u8,
+    expected: []const []const u8,
+) !void {
+    const io = std.testing.io;
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll(requests);
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+
+    for (expected) |want| {
+        var status: [64]u8 = undefined;
+        var body: [64]u8 = undefined;
+        const resp = try readResponse(&reader.interface, &status, &body);
+        try std.testing.expect(std.mem.indexOf(u8, resp.status, "200") != null);
+        try std.testing.expectEqualStrings(want, resp.body);
+    }
+}
+
+test "Server: pipelined requests are answered in order on one connection" {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{}, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    try expectPipelinedResponses(
+        &server,
+        "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+            "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+            "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        &.{ "a", "c", "a" },
+    );
+}
+
+test "Server: a pipelined request behind a body is served after it" {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{}, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    try expectPipelinedResponses(
+        &server,
+        "POST /b HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello" ++
+            "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        &.{ "hello", "c" },
+    );
+}
+
+test "Server: a pipelined request behind an unread body is served after it is drained" {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{}, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    // `/a` never reads its body, so the server has to skip it to find the
+    // request behind it.
+    try expectPipelinedResponses(
+        &server,
+        "POST /a HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\n\r\nignored" ++
+            "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        &.{ "a", "c" },
+    );
+}
+
+test "Server: a pipelined head that needs the whole read buffer is served" {
+    // Under a 1024-byte head limit the read buffer is 2048 bytes, so two
+    // heads of 1000 bytes arrive in one read. The second parses only if the
+    // first has been moved out of its way: what it left the reader would
+    // be too small for the reserve the body reader is owed.
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{
+        .request = .{ .buffer_size = 1024 },
+    }, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    var requests: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer requests.deinit();
+    for (0..2) |_| {
+        const prefix = "GET /c HTTP/1.1\r\nHost: localhost\r\nX-Pad: ";
+        const suffix = "\r\n\r\n";
+        try requests.writer.writeAll(prefix);
+        try requests.writer.splatByteAll('A', 1000 - prefix.len - suffix.len);
+        try requests.writer.writeAll(suffix);
+    }
+
+    try expectPipelinedResponses(&server, requests.written(), &.{ "c", "c" });
+}
+
+test "Server: a pipelined head that arrives in two parts is served" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    // The start of the second head rides behind the first request, and the
+    // rest only comes once the first has been answered.
+    try w.writeAll("GET /a HTTP/1.1\r\nHost: localhost\r\n\r\nGET /c HTTP/1.1\r\nHo");
+    try w.flush();
+
+    var status1: [64]u8 = undefined;
+    var body1: [32]u8 = undefined;
+    const resp1 = try readResponse(r, &status1, &body1);
+    try std.testing.expectEqualStrings("a", resp1.body);
+
+    try w.writeAll("st: localhost\r\n\r\n");
+    try w.flush();
+
+    var status2: [64]u8 = undefined;
+    var body2: [32]u8 = undefined;
+    const resp2 = try readResponse(r, &status2, &body2);
+    try std.testing.expectEqualStrings("c", resp2.body);
+}
+
+test "Server: Connection: close on a pipelined request ends the connection after it" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+            try s.listen(addr);
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("GET /a HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" ++
+        "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    var status1: [64]u8 = undefined;
+    var body1: [32]u8 = undefined;
+    const resp1 = try readResponse(r, &status1, &body1);
+    try std.testing.expectEqualStrings("a", resp1.body);
+
+    var status2: [64]u8 = undefined;
+    var body2: [32]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, readResponse(r, &status2, &body2));
+}
+
 test "Server: a handler's own EndOfStream is a 500, not a vanished peer" {
     const io = std.testing.io;
 

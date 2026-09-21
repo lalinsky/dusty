@@ -572,6 +572,9 @@ pub const Response = struct {
         try self.header("Sec-WebSocket-Accept", &accept_key);
         self.streaming = true;
         try self.writeHeader();
+        // The connection is the WebSocket's now, and whatever the peer sends
+        // after the session is not an HTTP request.
+        self.keepalive = false;
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
