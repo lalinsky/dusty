@@ -231,3 +231,26 @@ pub fn main(init: std.process.Init) !void {
     // ... continue as before ...
 }
 ```
+
+## Recommended libraries
+
+Databases:
+
+- [pg.zig](https://github.com/lalinsky/pg.zig) - PostgreSQL client (fork that uses [tls.zig](https://github.com/ianic/tls.zig) instead of `OpenSSL` for `std.Io` compatibility)
+- [mysql](https://github.com/speed2exe/myzql) - MySQL client
+- [redis.zig](https://github.com/lalinsky/redis.zig) - Redis client
+- [memcached.zig](https://github.com/lalinsky/memcached.zig) - Memcached client
+
+Serialization:
+
+- [msgpack.zig](https://github.com/lalinsky/msgpack.zig) - Fast MsgPack serialization library for static types
+- [json.zig](https://github.com/lalinsky/json.zig) - Fast JSON serialization library for static types
+
+Templating:
+
+- [zmpl](https://github.com/jetzig-framework/zmpl) - Templating language inspired by Go Templ
+- [zt](https://github.com/lalinsky/zt) - Another templating language inspired by Go Templ
+
+Others:
+
+- [xsync.zig](https://github.com/lalinsky/xsync.zig) - Synchronization primitives that work across multiple `std.Io` implementations
