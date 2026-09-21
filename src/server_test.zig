@@ -1958,6 +1958,184 @@ test "Server: client_auth with ca .none is rejected by listen" {
     try std.testing.expectError(error.NoCertificateAuthority, server.listen(addr));
 }
 
+test "Server: run refuses a config that sets tls" {
+    if (!@import("build_options").use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .tls = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" },
+    }, {});
+    defer server.deinit();
+
+    const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+    try std.testing.expectError(error.TlsBelongsToListener, server.run(&.{.{ .address = addr }}));
+}
+
+test "Server: run with no listeners is rejected" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    try std.testing.expectError(error.NoListeners, server.run(&.{}));
+}
+
+test "Server: run serves every listener and tells the handler which one" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    const listeners = [_]dusty.Listener{
+        .{ .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) } },
+        .{ .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) } },
+    };
+
+    const Handler = struct {
+        var first: *const dusty.Listener = undefined;
+
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expect(!req.secure);
+            res.body = if (req.listener == first) "first" else "second";
+        }
+    };
+    Handler.first = &listeners[0];
+    server.router.get("/", Handler.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), l: []const dusty.Listener) !void {
+            try s.run(l);
+        }
+    }.run, .{ &server, &listeners });
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+    try std.testing.expectEqual(2, server.addresses.len);
+    try std.testing.expect(server.addresses[0].ip.getPort() != server.addresses[1].ip.getPort());
+    try std.testing.expectEqual(server.addresses[0].ip.getPort(), server.address.ip.getPort());
+
+    for (server.addresses, [_][]const u8{ "first", "second" }) |address, expected| {
+        const stream = try address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        defer stream.shutdown(io, .both) catch {};
+
+        var write_buf: [256]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        try writer.interface.flush();
+
+        var read_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var status: [64]u8 = undefined;
+        var body: [16]u8 = undefined;
+        const resp = try readResponse(&reader.interface, &status, &body);
+        try std.testing.expectStringStartsWith(resp.status, "HTTP/1.1 200 ");
+        try std.testing.expectEqualStrings(expected, resp.body);
+    }
+
+    try std.testing.expectError(error.Canceled, server_future.cancel(io));
+    try std.testing.expectEqual(0, server.addresses.len);
+}
+
+test "Server: a listener that fails to open releases the ones opened before it" {
+    if (!@import("build_options").use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    // A fixed port, so the second attempt to bind it below proves the first
+    // listener's socket was closed when the second listener failed.
+    var probe = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(io, .{ .reuse_address = true });
+    const addr: dusty.Address = .{ .ip = probe.socket.address };
+    probe.deinit(io);
+
+    const listeners = [_]dusty.Listener{
+        .{ .address = addr },
+        .{
+            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) },
+            .tls = .{ .cert_path = "examples/certs/missing.pem", .key_path = "examples/certs/key.pem" },
+        },
+    };
+    try std.testing.expectError(error.FileNotFound, server.run(&listeners));
+
+    var again = try addr.ip.listen(io, .{ .reuse_address = true });
+    again.deinit(io);
+}
+
+test "Server: a listener with tls set is refused when TLS is compiled out" {
+    if (@import("build_options").use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    try std.testing.expectError(error.TlsNotConfigured, server.run(&.{.{
+        .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) },
+        .tls = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" },
+    }}));
+}
+
+test "Server: graceful shutdown waits for a request in flight on a later listener" {
+    const io = std.testing.io;
+
+    const sync = struct {
+        var started: std.Io.Event = .unset;
+        var finished: bool = false;
+    };
+    sync.started = .unset;
+    sync.finished = false;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .timeout = .{ .shutdown = .fromMilliseconds(5000) },
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/slow", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            sync.started.set(req.io);
+            try req.io.sleep(.fromMilliseconds(200), .awake);
+            sync.finished = true;
+            res.body = "slow";
+        }
+    }.handle);
+
+    const listeners = [_]dusty.Listener{
+        .{ .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) } },
+        .{ .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) } },
+    };
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), l: []const dusty.Listener) !void {
+            try s.run(l);
+        }
+    }.run, .{ &server, &listeners });
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.addresses[1].ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    try writer.interface.flush();
+
+    try sync.started.wait(io);
+    try std.testing.expectError(error.Canceled, server_future.cancel(io));
+    try std.testing.expect(sync.finished);
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var status: [64]u8 = undefined;
+    var body: [16]u8 = undefined;
+    const resp = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectStringStartsWith(resp.status, "HTTP/1.1 200 ");
+    try std.testing.expectEqualStrings("slow", resp.body);
+}
+
 test "Server: a request head too large for the buffer gets 431, not a panic" {
     const io = std.testing.io;
 

@@ -87,7 +87,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
     std.log.info("WebSocket echo server running at http://127.0.0.1:8080", .{});
-    try server.listen(addr);
+    try server.run(&.{.{ .address = addr }});
 }
 
 pub fn main(init: std.process.Init) !void {

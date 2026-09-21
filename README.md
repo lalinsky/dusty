@@ -54,9 +54,14 @@ pub fn main(init: std.process.Init) !void {
     server.router.get("/user/:id", handleUser);
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    try server.listen(addr);
+    try server.run(&.{.{ .address = addr }});
 }
 ```
+
+`run` takes any number of listeners, each with its own TLS, so one server can
+serve HTTPS on 443 and plain HTTP on 80 with the same router. A handler can
+tell them apart through `req.listener` and `req.secure`, and `server.addresses`
+has each listener's bound address once `server.ready` is set.
 
 ### Client Example
 
@@ -100,10 +105,12 @@ The key must be an unencrypted PKCS#8 (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC P
 These settings apply to every connection a client makes; connections are pooled and reused
 across requests, so they cannot be varied per request. Use a separate `Client` per identity.
 
-The server side is symmetric — `client_auth` makes it ask connecting clients for a certificate:
+The server side is symmetric. TLS is configured per listener, and `client_auth`
+makes it ask connecting clients for a certificate:
 
 ```zig
-var server = http.Server(void).init(gpa, io, .{
+try server.run(&.{.{
+    .address = addr,
     .tls = .{
         .cert_path = "server.pem",
         .key_path = "server.key",
@@ -114,7 +121,7 @@ var server = http.Server(void).init(gpa, io, .{
             .mode = .require,
         },
     },
-}, {});
+}});
 ```
 
 ### Unix Socket Client Example

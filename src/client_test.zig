@@ -587,6 +587,61 @@ const build_options = @import("build_options");
 const test_cert_path = "examples/certs/cert.pem";
 const test_key_path = "examples/certs/key.pem";
 
+test "Client: one server serves a plain listener and a TLS listener" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = if (req.secure) "over tls" else "in the clear";
+        }
+    }.handle);
+
+    const listeners = [_]dusty.Listener{
+        .{ .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) } },
+        .{
+            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) },
+            .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+        },
+    };
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), l: []const dusty.Listener) !void {
+            try s.run(l);
+        }
+    }.run, .{ &server, &listeners });
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const plain_url = try std.fmt.bufPrint(&url_buf, "http://localhost:{d}/", .{s.addresses[0].ip.getPort()});
+            var plain = try client.fetch(plain_url, .{});
+            defer plain.deinit();
+            try std.testing.expectEqual(.ok, plain.status());
+            try std.testing.expectEqualStrings("in the clear", (try plain.body()).?);
+
+            const tls_url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.addresses[1].ip.getPort()});
+            var secure = try client.fetch(tls_url, .{});
+            defer secure.deinit();
+            try std.testing.expectEqual(.ok, secure.status());
+            try std.testing.expectEqualStrings("over tls", (try secure.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
 test "Client: HTTPS with a custom CA file" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;

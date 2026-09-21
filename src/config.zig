@@ -54,6 +54,28 @@ pub const TlsPath = struct {
     dir: ?std.Io.Dir = null,
 };
 
+pub const Address = union(enum) {
+    ip: std.Io.net.IpAddress,
+    unix: std.Io.net.UnixAddress,
+
+    pub fn format(self: Address, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .ip => |ip| try ip.format(w),
+            .unix => |unix| try w.writeAll(unix.path),
+        }
+    }
+};
+
+/// One socket a server accepts on. `Server.run` takes several, each with
+/// its own TLS, so one server can serve HTTPS on 443 and plain HTTP on 80.
+pub const Listener = struct {
+    address: Address,
+    /// When set, every connection accepted here is TLS. Requires the
+    /// `use_tls` build option (enabled by default); with TLS compiled out,
+    /// setting this fails `Server.run`.
+    tls: ?ServerConfig.Tls = null,
+};
+
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
@@ -76,9 +98,9 @@ pub const ServerConfig = struct {
     /// under TLS, and 70K more for a connection that receives a body with a
     /// `Content-Encoding` while `request.decompress` is on.
     max_connections: ?u32 = 10_000,
-    /// TLS configuration. When set, the server performs a TLS handshake on every
-    /// accepted connection and speaks HTTPS. Requires the `use_tls` build option
-    /// (enabled by default); with TLS compiled out, setting this fails listen().
+    /// Deprecated: TLS belongs to the `Listener`, and `Server.run` refuses a
+    /// config that sets this. Only `Server.listen` still honors it, as the TLS
+    /// of the one listener it serves.
     tls: ?Tls = null,
 
     pub const Tls = struct {

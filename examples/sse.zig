@@ -48,7 +48,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     }.run, .{ &ctx.counter, io });
     defer ticker_future.cancel(io) catch {};
 
-    try server.listen(addr);
+    try server.run(&.{.{ .address = addr }});
 }
 
 pub fn main(init: std.process.Init) !void {

@@ -326,17 +326,8 @@ fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     return w.flush();
 }
 
-pub const Address = union(enum) {
-    ip: std.Io.net.IpAddress,
-    unix: std.Io.net.UnixAddress,
-
-    pub fn format(self: Address, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        switch (self) {
-            .ip => |ip| try ip.format(w),
-            .unix => |unix| try w.writeAll(unix.path),
-        }
-    }
-};
+pub const Address = @import("config.zig").Address;
+pub const Listener = @import("config.zig").Listener;
 
 fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
     const timer: *Timer = @ptrCast(@alignCast(context));
@@ -367,14 +358,46 @@ pub fn Server(comptime Ctx: type) type {
         /// first. A connection waiting between requests is not counted; it
         /// has nothing to lose to the cancel that follows the drain.
         busy: std.atomic.Value(Busy),
+        /// The first listener's bound address, once `ready` is set. A
+        /// listener given port zero has its real port here.
         address: Address,
+        /// Every listener's bound address, in the order given to `run`.
+        /// Filled in before `ready` is set, and empty again once `run` has
+        /// returned.
+        addresses: []const Address = &.{},
         ready: std.Io.Event,
         _middleware_registry: std.SinglyLinkedList,
-        /// Server certificate/key, loaded once in listen() when config.tls is set.
-        tls_auth: ?tls.config.CertKeyPair = null,
-        /// CAs for verifying client certificates, loaded alongside tls_auth
-        /// when config.tls.client_auth is set.
-        tls_client_ca: ?std.crypto.Certificate.Bundle = null,
+
+        /// A listener while `run` serves it: the socket, and the TLS
+        /// material every connection accepted on it shares.
+        const ActiveListener = struct {
+            config: *const Listener,
+            address: Address,
+            server: std.Io.net.Server,
+            tls_auth: ?tls.config.CertKeyPair = null,
+            tls_client_ca: ?std.crypto.Certificate.Bundle = null,
+            client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
+            /// Why its accept loop gave up, once it has.
+            err: ?anyerror = null,
+
+            fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
+                if (build_options.use_tls) {
+                    if (l.tls_auth) |*auth| {
+                        auth.deinit(allocator);
+                        l.tls_auth = null;
+                    }
+                    if (l.tls_client_ca) |*bundle| {
+                        bundle.deinit(allocator);
+                        l.tls_client_ca = null;
+                    }
+                }
+            }
+
+            fn close(l: *ActiveListener, io: std.Io, allocator: std.mem.Allocator) void {
+                l.server.deinit(io);
+                l.freeTls(allocator);
+            }
+        };
 
         const Busy = packed struct(u32) {
             count: u31 = 0,
@@ -432,57 +455,29 @@ pub fn Server(comptime Ctx: type) type {
             return mw;
         }
 
+        /// Deprecated: use `run` with a `Listener`, which is where TLS is
+        /// configured. Serves one address, with `config.tls` if set.
         pub fn listen(self: *Self, addr: Address) !void {
-            // Load the server certificate/key once, shared across all connections.
-            if (build_options.use_tls) {
-                if (self.config.tls) |tls_cfg| {
-                    // Checked before anything is loaded, so the early return
-                    // has nothing to clean up.
-                    if (tls_cfg.client_auth) |client_auth| {
-                        if (client_auth.ca == .none) {
-                            log.err("config.tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
-                            return error.NoCertificateAuthority;
-                        }
-                    }
+            return self.runListeners(&.{.{ .address = addr, .tls = self.config.tls }});
+        }
 
-                    const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
-                    self.tls_auth = tls.config.CertKeyPair.fromFilePath(
-                        self.allocator,
-                        self.io,
-                        dir,
-                        tls_cfg.cert_path,
-                        tls_cfg.key_path,
-                    ) catch |err| {
-                        log.err("Failed to load TLS certificate/key: {}", .{err});
-                        return err;
-                    };
-                    errdefer {
-                        self.tls_auth.?.deinit(self.allocator);
-                        self.tls_auth = null;
-                    }
-
-                    if (tls_cfg.client_auth) |client_auth| {
-                        self.tls_client_ca = client_auth.ca.load(self.allocator, self.io) catch |err| {
-                            log.err("Failed to load client certificate authorities: {}", .{err});
-                            return err;
-                        };
-                    }
-                }
-            } else if (self.config.tls != null) {
-                log.err("config.tls is set but the library was built with use_tls=false", .{});
-                return error.TlsNotConfigured;
+        /// Accepts on every listener until canceled, then drains the
+        /// connections in flight. TLS is per listener, so `config.tls` must
+        /// be unset. The slice is borrowed for the whole run, and requests
+        /// point back into it through `Request.listener`.
+        pub fn run(self: *Self, listeners: []const Listener) !void {
+            if (self.config.tls != null) {
+                log.err("config.tls is set, but with run() TLS belongs to the Listener", .{});
+                return error.TlsBelongsToListener;
             }
-            defer if (build_options.use_tls) {
-                if (self.tls_auth) |*auth| {
-                    auth.deinit(self.allocator);
-                    self.tls_auth = null;
-                }
-                if (self.tls_client_ca) |*bundle| {
-                    bundle.deinit(self.allocator);
-                    self.tls_client_ca = null;
-                }
-            };
+            return self.runListeners(listeners);
+        }
 
+        fn runListeners(self: *Self, listeners: []const Listener) !void {
+            if (listeners.len == 0) {
+                log.err("No listeners were given, so no connection could ever be served", .{});
+                return error.NoListeners;
+            }
             if (self.config.max_connections) |max| {
                 if (max == 0) {
                     log.err("config.max_connections is 0, so no connection could ever be served", .{});
@@ -490,41 +485,140 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
-            var server = switch (addr) {
+            const active = try self.allocator.alloc(ActiveListener, listeners.len);
+            defer self.allocator.free(active);
+            const addresses = try self.allocator.alloc(Address, listeners.len);
+            defer self.allocator.free(addresses);
+            var opened: usize = 0;
+            defer for (active[0..opened]) |*l| l.close(self.io, self.allocator);
+            for (listeners, active, addresses) |*cfg, *l, *address| {
+                l.* = try self.open(cfg);
+                opened += 1;
+                address.* = l.address;
+            }
+
+            self.addresses = addresses;
+            defer self.addresses = &.{};
+            self.address = addresses[0];
+            self.ready.set(self.io);
+
+            for (active) |*l| log.info("Listening on {f}", .{l.address});
+
+            var connections: std.Io.Group = .init;
+            defer {
+                _ = self.busy.fetchOr(.{ .draining = true }, .release);
+                connections.cancel(self.io);
+            }
+
+            // Set by the first accept loop to give up; a cancel arrives
+            // through the wait instead. Either way the accept loops are
+            // stopped before the connections are, so nothing new arrives
+            // while the drain waits, and the drain runs either way: a
+            // listener failing takes the whole server down, and the
+            // requests in flight on the others deserve the same chance to
+            // finish as on a shutdown.
+            var stopped: std.Io.Event = .unset;
+            var accepting: std.Io.Group = .init;
+            defer accepting.cancel(self.io);
+            for (active) |*l| {
+                accepting.concurrent(self.io, acceptLoop, .{ self, l, &connections, &stopped }) catch |err| {
+                    log.err("Failed to spawn the accept loop for {f}: {}", .{ l.address, err });
+                    return err;
+                };
+            }
+
+            stopped.wait(self.io) catch |err| switch (err) {
+                error.Canceled => {
+                    accepting.cancel(self.io);
+                    self.drainConnections();
+                    return err;
+                },
+            };
+
+            accepting.cancel(self.io);
+            self.drainConnections();
+            for (active) |*l| {
+                if (l.err) |err| return err;
+            }
+            // Cannot happen: `stopped` is only set by an accept loop that
+            // stored its error first, and every loop was joined above.
+            unreachable;
+        }
+
+        /// Loads the listener's TLS material and binds its socket.
+        fn open(self: *Self, cfg: *const Listener) !ActiveListener {
+            var l: ActiveListener = .{ .config = cfg, .address = cfg.address, .server = undefined };
+            errdefer l.freeTls(self.allocator);
+
+            if (cfg.tls) |tls_cfg| {
+                if (!build_options.use_tls) {
+                    log.err("Listener.tls is set but the library was built with use_tls=false", .{});
+                    return error.TlsNotConfigured;
+                }
+                if (tls_cfg.client_auth) |client_auth| {
+                    if (client_auth.ca == .none) {
+                        log.err("tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
+                        return error.NoCertificateAuthority;
+                    }
+                    l.client_auth_mode = client_auth.mode;
+                }
+
+                const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
+                l.tls_auth = tls.config.CertKeyPair.fromFilePath(
+                    self.allocator,
+                    self.io,
+                    dir,
+                    tls_cfg.cert_path,
+                    tls_cfg.key_path,
+                ) catch |err| {
+                    log.err("Failed to load TLS certificate/key: {}", .{err});
+                    return err;
+                };
+
+                if (tls_cfg.client_auth) |client_auth| {
+                    l.tls_client_ca = client_auth.ca.load(self.allocator, self.io) catch |err| {
+                        log.err("Failed to load client certificate authorities: {}", .{err});
+                        return err;
+                    };
+                }
+            }
+
+            l.server = switch (cfg.address) {
                 .ip => |ip| try ip.listen(self.io, self.config.listen),
                 .unix => |unix| try unix.listen(self.io, .{}),
             };
-            defer server.deinit(self.io);
+            if (cfg.address == .ip) l.address = .{ .ip = l.server.socket.address };
+            return l;
+        }
 
-            self.address = switch (addr) {
-                .ip => .{ .ip = server.socket.address },
-                .unix => |unix| .{ .unix = unix },
+        /// A cancel is the normal end and is reported to nobody: the group
+        /// swallows it, and `run` learns of it from its own wait. Anything
+        /// else is the listener failing, and stops the whole run.
+        fn acceptLoop(
+            self: *Self,
+            l: *ActiveListener,
+            connections: *std.Io.Group,
+            stopped: *std.Io.Event,
+        ) std.Io.Cancelable!void {
+            self.acceptConnections(l, connections) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    log.err("Listener {f} failed: {}", .{ l.address, err });
+                    l.err = err;
+                    stopped.set(self.io);
+                },
             };
-            self.ready.set(self.io);
+        }
 
-            log.info("Listening on {f}", .{self.address});
-
-            var group: std.Io.Group = .init;
-            defer {
-                _ = self.busy.fetchOr(.{ .draining = true }, .release);
-                group.cancel(self.io);
-            }
-
+        fn acceptConnections(self: *Self, l: *ActiveListener, connections: *std.Io.Group) !void {
             // Grows while accepting keeps failing for want of resources, and
             // is reset by the first connection that gets through.
             var backoff_ms: u64 = 0;
 
             while (true) {
-                self.waitForConnectionSlot() catch |err| {
-                    self.drainConnections();
-                    return err;
-                };
+                try self.waitForConnectionSlot();
 
-                const stream = server.accept(self.io) catch |err| switch (err) {
-                    error.Canceled => {
-                        self.drainConnections();
-                        return err;
-                    },
+                const stream = l.server.accept(self.io) catch |err| switch (err) {
                     // One connection went away between its SYN and our
                     // accept, which says nothing about the listener. Routine
                     // on a public address, where clients reset and scanners
@@ -541,20 +635,14 @@ pub fn Server(comptime Ctx: type) type {
                     => {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
                         log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
-                        self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake) catch |sleep_err| {
-                            // Acted on here, not deferred to the accept
-                            // above with `recancel`. That accept keeps
-                            // failing for its own reason -- the fd table is
-                            // full, which is why we are in the backoff --
-                            // and an operation that completes with a result
-                            // of its own has the cancellation re-armed
-                            // rather than reported, so the caller gets its
-                            // result. Deferring therefore livelocks: the
-                            // cancellation is re-armed by turns here and in
-                            // the runtime, and never delivered.
-                            self.drainConnections();
-                            return sleep_err;
-                        };
+                        // A cancel is taken here, not deferred to the accept
+                        // above with `recancel`. That accept keeps failing
+                        // for its own reason -- the fd table is full, which
+                        // is why we are in the backoff -- and an operation
+                        // that completes with a result of its own has the
+                        // cancellation re-armed rather than reported, so
+                        // deferring would livelock.
+                        try self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake);
                         continue;
                     },
                     else => return err,
@@ -563,7 +651,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 _ = self.active_connections.fetchAdd(1, .acq_rel);
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-                group.concurrent(self.io, handleConnectionWrapper, .{ self, stream }) catch |err| {
+                connections.concurrent(self.io, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
                     self.finishRequest();
                     self.releaseConnectionSlot();
@@ -573,18 +661,16 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
-        /// Stops accepting and waits for the connections already in flight.
-        /// Reached from every way the accept loop can learn it was canceled,
-        /// so a shutdown drains whether the cancel landed on the accept or
-        /// on a backoff wait.
+        /// Waits for the connections already in flight, once the accept
+        /// loops have been stopped.
         ///
         /// Runs under cancel protection: this is the shutdown, and a further
         /// cancel arriving mid-drain would abandon connections rather than
         /// finish with them. What bounds it is its own policy below, not
         /// whoever asked it to stop.
         ///
-        /// Infallible, so that `listen` reports the cancellation that stopped
-        /// it rather than a detail of how the drain went. Connections that
+        /// Infallible, so that `run` reports what stopped it rather than a
+        /// detail of how the drain went. Connections that
         /// outlast the wait are logged and left to the caller's deferred
         /// `group.cancel`, which tears them down either way.
         fn drainConnections(self: *Self) void {
@@ -691,15 +777,15 @@ pub fn Server(comptime Ctx: type) type {
             return .arrived;
         }
 
-        fn handleConnectionWrapper(self: *Self, stream: std.Io.net.Stream) std.Io.Cancelable!void {
-            if (comptime have_auto_cancel) return runConnection(self, stream, null);
+        fn handleConnectionWrapper(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream) std.Io.Cancelable!void {
+            if (comptime have_auto_cancel) return runConnection(self, l, stream, null);
 
             if (self.config.timeout.request == null and self.config.timeout.keepalive == null) {
-                return runConnection(self, stream, null);
+                return runConnection(self, l, stream, null);
             }
 
             var watch: Watch = .{};
-            var future = self.io.concurrent(runConnection, .{ self, stream, &watch }) catch |err| {
+            var future = self.io.concurrent(runConnection, .{ self, l, stream, &watch }) catch |err| {
                 log.warn("No task to watch the connection deadline: {}; refusing", .{err});
                 self.finishRequest();
                 self.releaseConnectionSlot();
@@ -722,10 +808,10 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// Runs on this task under zio, on a task of its own otherwise.
-        fn runConnection(self: *Self, stream: std.Io.net.Stream, watch: ?*Watch) void {
+        fn runConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) void {
             defer if (watch) |w| w.finish(self.io);
 
-            handleConnection(self, stream, watch) catch |err| {
+            handleConnection(self, l, stream, watch) catch |err| {
                 if (err == error.Canceled) {
                     log.debug("Connection canceled", .{});
                     return;
@@ -768,7 +854,7 @@ pub fn Server(comptime Ctx: type) type {
             };
         }
 
-        pub fn handleConnection(self: *Self, stream: std.Io.net.Stream, watch: ?*Watch) !void {
+        fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
             defer self.releaseConnectionSlot();
 
             // Counted since accept, so a handshake in progress is waited for
@@ -793,11 +879,11 @@ pub fn Server(comptime Ctx: type) type {
             var timer: Timer = .init(watch);
             defer timer.clear(self.io);
 
-            // When TLS is configured, upgrade the accepted stream and run the
-            // request loop over the cleartext reader/writer. Otherwise run it
-            // directly over the raw stream.
+            // When the listener is TLS, upgrade the accepted stream and run
+            // the request loop over the cleartext reader/writer. Otherwise
+            // run it directly over the raw stream.
             if (build_options.use_tls) {
-                if (self.tls_auth) |*auth| {
+                if (l.tls_auth) |*auth| {
                     // The handshake is the one part of a connection's life
                     // the request loop's timeout cannot cover, since that
                     // loop does not exist yet. A peer that opens a socket
@@ -809,9 +895,9 @@ pub fn Server(comptime Ctx: type) type {
                         defer timer.clear(self.io);
                         self.armTimer(&timer, self.config.timeout.request);
 
-                        const client_auth: ?ClientAuthRef = if (self.tls_client_ca) |*bundle| .{
+                        const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*bundle| .{
                             .bundle = bundle,
-                            .mode = self.config.tls.?.client_auth.?.mode,
+                            .mode = l.client_auth_mode,
                         } else null;
 
                         connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth, client_auth) catch |err| {
@@ -840,12 +926,12 @@ pub fn Server(comptime Ctx: type) type {
                         };
                     }
 
-                    return self.handleRequests(&connection, &needs_shutdown, &timer, &busy);
+                    return self.handleRequests(l, &connection, &needs_shutdown, &timer, &busy);
                 }
             }
 
             try connection.initPlain(self.allocator, self.io, stream, self.config.request.buffer_size);
-            return self.handleRequests(&connection, &needs_shutdown, &timer, &busy);
+            return self.handleRequests(l, &connection, &needs_shutdown, &timer, &busy);
         }
 
         /// Cleared when `duration` is unset, so an earlier deadline does not
@@ -864,6 +950,7 @@ pub fn Server(comptime Ctx: type) type {
         /// machinery than a keepalive connection needs.
         fn handleRequests(
             self: *Self,
+            l: *ActiveListener,
             connection: *Connection,
             needs_shutdown: *bool,
             timer: *Timer,
@@ -876,6 +963,8 @@ pub fn Server(comptime Ctx: type) type {
                 .parser = undefined,
                 .config = self.config.request,
                 .remote_address = connection.stream.socket.address,
+                .listener = l.config,
+                .secure = build_options.use_tls and l.tls_auth != null,
                 ._timeout_context = timer,
                 ._set_timeout = setRequestTimeout,
             };
