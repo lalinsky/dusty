@@ -241,6 +241,10 @@ Databases:
 - [redis.zig](https://github.com/lalinsky/redis.zig) - Redis client
 - [memcached.zig](https://github.com/lalinsky/memcached.zig) - Memcached client
 
+Message brokers:
+
+- [nats.zig](https://github.com/lalinsky/nats.zig) - NATS client library
+
 Serialization:
 
 - [msgpack.zig](https://github.com/lalinsky/msgpack.zig) - Fast MsgPack serialization library for static types
