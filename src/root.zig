@@ -9,6 +9,7 @@ pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
+pub const BodyWriter = @import("response.zig").BodyWriter;
 pub const StreamingBodyWriter = @import("response.zig").StreamingBodyWriter;
 pub const EventStream = @import("response.zig").EventStream;
 pub const EventWriter = @import("response.zig").EventWriter;

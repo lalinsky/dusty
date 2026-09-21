@@ -4,7 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-21
+
+- Added whole-request HTTP client deadlines. `ClientConfig.timeout` defaults to 30 seconds, and `FetchOptions.timeout` can replace or disable it for an individual request. Buffered response bodies remain covered through completion; explicitly streamed responses are left to the caller.
 - Added trusted reverse-proxy hop handling to the HTTP server. Configure `ServerConfig.trusted_proxy_hops` to resolve `Request.remote_address` safely from the right side of `X-Forwarded-For`; direct peers remain the default and malformed or incomplete chains fall back to them.
+- Re-exported `BodyWriter` and `StreamingBodyWriter` from the root module so callers can name the concrete types returned by `Response.writer` and `Response.stream`.
+- Added the Dusty httpbin container image and release-tagged publishing workflow.
+- Added timeout and buffered-response controls to the HTTP client example.
 
 ## [0.3.0] - 2026-09-20
 
@@ -70,7 +76,8 @@ Initial release.
 - Cookie support.
 - Request/keepalive timeouts via coroutine auto-cancellation.
 
-[Unreleased]: https://github.com/lalinsky/dusty/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/lalinsky/dusty/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/lalinsky/dusty/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lalinsky/dusty/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lalinsky/dusty/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lalinsky/dusty/releases/tag/v0.1.0
