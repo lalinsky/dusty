@@ -126,7 +126,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const
     std.log.info("Try: curl http://127.0.0.1:8080/get", .{});
     std.log.info("     curl -X POST http://127.0.0.1:8080/post -d 'hello=world'", .{});
 
-    try server.run(&.{.{ .address = addr }});
+    try server.listen(addr, .{});
 }
 
 pub fn main(init: std.process.Init) !void {

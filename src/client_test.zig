@@ -17,7 +17,7 @@ test "Client: simple GET request" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -66,7 +66,7 @@ test "Client: fetch GET request" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -118,7 +118,7 @@ test "Client: connection pooling" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -183,7 +183,7 @@ test "Client: pool evicts dead connection after server goes away" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -270,7 +270,7 @@ test "Client: redirect failing after connection release does not double-release"
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(Ctx)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -326,7 +326,7 @@ test "Client: connection with unread response body is not pooled" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -378,7 +378,7 @@ test "Client: pool survives concurrent fetches on a shared client" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -471,7 +471,7 @@ test "Client: WebSocket upgrade" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -646,13 +646,12 @@ test "Client: HTTPS with a custom CA file" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
-    }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
 
     server.router.get("/secure", struct {
-        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expect(req.secure);
             res.body = "over tls";
         }
     }.handle);
@@ -660,7 +659,7 @@ test "Client: HTTPS with a custom CA file" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{ .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } });
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -695,13 +694,7 @@ test "Client: presents a client certificate for mutual TLS" {
     // The test certificate is CA:TRUE and self-signed, so the same file serves
     // as the server certificate, the client certificate, and the CA that
     // validates both.
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
-            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
-        },
-    }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -713,7 +706,11 @@ test "Client: presents a client certificate for mutual TLS" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{ .tls = .{
+                .cert_path = test_cert_path,
+                .key_path = test_key_path,
+                .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            } });
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -747,13 +744,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
-            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
-        },
-    }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -765,7 +756,11 @@ test "Server: client_auth .require rejects a client with no certificate" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{ .tls = .{
+                .cert_path = test_cert_path,
+                .key_path = test_key_path,
+                .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
+            } });
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -797,13 +792,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
-            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
-        },
-    }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -815,7 +804,11 @@ test "Server: client_auth .request accepts a client with no certificate" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{ .tls = .{
+                .cert_path = test_cert_path,
+                .key_path = test_key_path,
+                .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
+            } });
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -846,9 +839,7 @@ test "Client: rejects a server certificate the configured CA does not cover" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
-    }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -860,7 +851,7 @@ test "Client: rejects a server certificate the configured CA does not cover" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{ .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } });
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1354,7 +1345,7 @@ test "Client: FetchOptions.timeout replaces the client default" {
         var server_future = try io.concurrent(struct {
             fn run(s: *dusty.Server(void)) !void {
                 const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-                try s.listen(addr);
+                try s.listen(addr, .{});
             }
         }.run, .{&server});
         defer server_future.cancel(io) catch {};
@@ -1427,7 +1418,7 @@ test "Client: redirects share the request's budget" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};

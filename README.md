@@ -54,14 +54,22 @@ pub fn main(init: std.process.Init) !void {
     server.router.get("/user/:id", handleUser);
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    try server.run(&.{.{ .address = addr }});
+    try server.listen(addr, .{});
 }
 ```
 
-`run` takes any number of listeners, each with its own TLS, so one server can
-serve HTTPS on 443 and plain HTTP on 80 with the same router. A handler can
-tell them apart through `req.listener` and `req.secure`, and `server.addresses`
-has each listener's bound address once `server.ready` is set.
+`Server.run` serves several listeners at once, each with its own TLS, so one
+server can serve HTTPS on 443 and plain HTTP on 80 with the same router:
+
+```zig
+try server.run(&.{
+    .{ .address = addr443, .tls = .{ .cert_path = "server.pem", .key_path = "server.key" } },
+    .{ .address = addr80 },
+});
+```
+
+A handler can tell them apart through `req.listener` and `req.secure`, and
+`server.addresses` has each listener's bound address once `server.ready` is set.
 
 ### Client Example
 
@@ -109,8 +117,7 @@ The server side is symmetric. TLS is configured per listener, and `client_auth`
 makes it ask connecting clients for a certificate:
 
 ```zig
-try server.run(&.{.{
-    .address = addr,
+try server.listen(addr, .{
     .tls = .{
         .cert_path = "server.pem",
         .key_path = "server.key",
@@ -121,7 +128,7 @@ try server.run(&.{.{
             .mode = .require,
         },
     },
-}});
+});
 ```
 
 ### Unix Socket Client Example

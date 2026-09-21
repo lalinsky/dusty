@@ -328,6 +328,7 @@ fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
+pub const ListenOptions = @import("config.zig").ListenOptions;
 
 fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
     const timer: *Timer = @ptrCast(@alignCast(context));
@@ -455,25 +456,16 @@ pub fn Server(comptime Ctx: type) type {
             return mw;
         }
 
-        /// Deprecated: use `run` with a `Listener`, which is where TLS is
-        /// configured. Serves one address, with `config.tls` if set.
-        pub fn listen(self: *Self, addr: Address) !void {
-            return self.runListeners(&.{.{ .address = addr, .tls = self.config.tls }});
+        /// Serves one address until canceled, then drains the connections in
+        /// flight. The same as `run` with a single `Listener`.
+        pub fn listen(self: *Self, addr: Address, options: ListenOptions) !void {
+            return self.run(&.{.{ .address = addr, .tls = options.tls }});
         }
 
         /// Accepts on every listener until canceled, then drains the
-        /// connections in flight. TLS is per listener, so `config.tls` must
-        /// be unset. The slice is borrowed for the whole run, and requests
-        /// point back into it through `Request.listener`.
+        /// connections in flight. The slice is borrowed for the whole run,
+        /// and requests point back into it through `Request.listener`.
         pub fn run(self: *Self, listeners: []const Listener) !void {
-            if (self.config.tls != null) {
-                log.err("config.tls is set, but with run() TLS belongs to the Listener", .{});
-                return error.TlsBelongsToListener;
-            }
-            return self.runListeners(listeners);
-        }
-
-        fn runListeners(self: *Self, listeners: []const Listener) !void {
             if (listeners.len == 0) {
                 log.err("No listeners were given, so no connection could ever be served", .{});
                 return error.NoListeners;
@@ -552,7 +544,7 @@ pub fn Server(comptime Ctx: type) type {
 
             if (cfg.tls) |tls_cfg| {
                 if (!build_options.use_tls) {
-                    log.err("Listener.tls is set but the library was built with use_tls=false", .{});
+                    log.err("tls is set but the library was built with use_tls=false", .{});
                     return error.TlsNotConfigured;
                 }
                 if (tls_cfg.client_auth) |client_auth| {

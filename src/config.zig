@@ -66,13 +66,19 @@ pub const Address = union(enum) {
     }
 };
 
+/// What `Server.listen` takes besides the address.
+pub const ListenOptions = struct {
+    /// When set, every connection accepted is TLS. Requires the `use_tls`
+    /// build option (enabled by default); with TLS compiled out, setting
+    /// this fails `Server.listen`.
+    tls: ?ServerConfig.Tls = null,
+};
+
 /// One socket a server accepts on. `Server.run` takes several, each with
 /// its own TLS, so one server can serve HTTPS on 443 and plain HTTP on 80.
 pub const Listener = struct {
     address: Address,
-    /// When set, every connection accepted here is TLS. Requires the
-    /// `use_tls` build option (enabled by default); with TLS compiled out,
-    /// setting this fails `Server.run`.
+    /// As `ListenOptions.tls`.
     tls: ?ServerConfig.Tls = null,
 };
 
@@ -98,11 +104,7 @@ pub const ServerConfig = struct {
     /// under TLS, and 70K more for a connection that receives a body with a
     /// `Content-Encoding` while `request.decompress` is on.
     max_connections: ?u32 = 10_000,
-    /// Deprecated: TLS belongs to the `Listener`, and `Server.run` refuses a
-    /// config that sets this. Only `Server.listen` still honors it, as the TLS
-    /// of the one listener it serves.
-    tls: ?Tls = null,
-
+    /// TLS is per listener: see `ListenOptions.tls` and `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.
         cert_path: []const u8,

@@ -13,7 +13,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     var server_future = try io.concurrent(struct {
         fn run(s: *TestServer) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -288,7 +288,7 @@ test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -366,7 +366,7 @@ test "Server: WebSocket echo" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(TestContext)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -506,7 +506,7 @@ test "Server: void context handlers" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -570,7 +570,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     // cancel() is idempotent, so this is a no-op after the expectError below
@@ -640,7 +640,7 @@ test "Server: 100-continue" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -735,7 +735,7 @@ test "Server: keepalive after handler ignores request body" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -810,7 +810,7 @@ fn expectPipelinedResponses(
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{server});
     defer server_future.cancel(io) catch {};
@@ -914,7 +914,7 @@ test "Server: a pipelined head that arrives in two parts is served" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -962,7 +962,7 @@ test "Server: Connection: close on a pipelined request ends the connection after
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1020,7 +1020,7 @@ test "Server: a handler's own EndOfStream is a 500, not a vanished peer" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1080,7 +1080,7 @@ test "Server: handler error yields 500 and keeps the connection alive" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1146,7 +1146,7 @@ test "Server: an event stream is chunked and leaves the connection reusable" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1226,7 +1226,7 @@ test "Server: handler error after streaming started aborts the connection" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1300,7 +1300,7 @@ test "Server: keepalive after handler ignores a compressed request body" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1367,7 +1367,7 @@ test "Server: closes connection when unread body exceeds max_body_size" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1421,7 +1421,7 @@ test "Server: 417 Expectation Failed for unknown Expect value" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1468,7 +1468,7 @@ fn statusLineFor(raw: []const u8, out: []u8) ![]const u8 {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1559,7 +1559,7 @@ test "Server: a body sent without waiting for 100 Continue is drained and the co
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1615,7 +1615,7 @@ test "Server: HEAD is answered by the GET route with no body" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1681,7 +1681,7 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1730,7 +1730,7 @@ fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !v
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1801,7 +1801,7 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
         // Spelled out so the future can be named below.
         fn run(s: *dusty.Server(void)) anyerror!void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1879,7 +1879,7 @@ test "Server: request resolves the client through a trusted proxy" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(Ctx)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr);
+            try s.listen(addr, .{});
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1945,30 +1945,17 @@ test "Server: client_auth with ca .none is rejected by listen" {
     if (!@import("build_options").use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+
+    const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
+    try std.testing.expectError(error.NoCertificateAuthority, server.listen(addr, .{
         .tls = .{
             .cert_path = "examples/certs/cert.pem",
             .key_path = "examples/certs/key.pem",
             .client_auth = .{ .ca = .none },
         },
-    }, {});
-    defer server.deinit();
-
-    const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-    try std.testing.expectError(error.NoCertificateAuthority, server.listen(addr));
-}
-
-test "Server: run refuses a config that sets tls" {
-    if (!@import("build_options").use_tls) return error.SkipZigTest;
-    const io = std.testing.io;
-
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .tls = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" },
-    }, {});
-    defer server.deinit();
-
-    const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-    try std.testing.expectError(error.TlsBelongsToListener, server.run(&.{.{ .address = addr }}));
+    }));
 }
 
 test "Server: run with no listeners is rejected" {
@@ -2151,7 +2138,7 @@ test "Server: a request head too large for the buffer gets 431, not a panic" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }
@@ -2204,7 +2191,7 @@ test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }
@@ -2267,7 +2254,7 @@ test "Server: a head that just fits is still served" {
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }
@@ -2335,7 +2322,7 @@ fn expectStatusForHeadOfLength(
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }
@@ -2430,7 +2417,7 @@ test "Server: max_connections caps overlap without dropping anyone" {
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }
@@ -2476,7 +2463,7 @@ test "Server: a max_connections of zero is refused at listen" {
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .max_connections = 0 }, {});
     defer server.deinit();
     const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-    try std.testing.expectError(error.NoConnectionsAllowed, server.listen(addr));
+    try std.testing.expectError(error.NoConnectionsAllowed, server.listen(addr, .{}));
 }
 
 /// Sends `head` and then stops, holding the connection open, and reports how
@@ -2497,7 +2484,7 @@ fn millisUntilServerHangsUp(cfg: dusty.ServerConfig, head: []const u8) !?i64 {
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }
@@ -2555,7 +2542,7 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
             const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            s.listen(addr) catch |err| {
+            s.listen(addr, .{}) catch |err| {
                 if (err != error.Canceled) return err;
             };
         }

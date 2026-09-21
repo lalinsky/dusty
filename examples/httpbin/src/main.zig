@@ -454,5 +454,5 @@ pub fn main(init: std.process.Init) !void {
     server.router.delete("/delete", handleWithBody);
 
     std.log.info("httpbin on http://{f}", .{opts.listen});
-    try server.listen(.{ .ip = opts.listen });
+    try server.listen(.{ .ip = opts.listen }, .{});
 }

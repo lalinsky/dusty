@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Server = @import("server.zig").Server;
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
+pub const ListenOptions = @import("config.zig").ListenOptions;
 pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsPath = @import("config.zig").TlsPath;
