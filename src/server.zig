@@ -90,8 +90,13 @@ const ClientAuthRef = struct {
     mode: ServerConfig.Tls.ClientAuth.Mode,
 };
 
+/// Primed into a connection's request arena, so an ordinary request is
+/// served without growing it. A request that needs more grows it once, and
+/// the arena keeps what it grew to for the rest of the connection.
+const request_arena_reserve = 8 * 1024;
+
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
-/// layer), plus the arena backing their buffers, for one accepted
+/// layer), their buffers and the request arena, for one accepted
 /// connection. Initialized in place: `tls_conn` stores pointers into
 /// `tcp_reader`/`tcp_writer`, and `tls_reader`/`tls_writer` store a pointer
 /// back into `tls_conn`, so a `Connection` must never be moved after
@@ -99,7 +104,18 @@ const ClientAuthRef = struct {
 pub const Connection = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
-    arena: std.heap.ArenaAllocator = undefined,
+    allocator: std.mem.Allocator,
+
+    /// Per-request memory, reset between requests.
+    arena: std.heap.ArenaAllocator,
+    /// One allocation for what lives as long as the connection: the TLS
+    /// record buffers, under TLS, and `read_buffer` after them.
+    buffers: []u8,
+    /// Where request heads are read. The parsed headers are slices into it,
+    /// and what a head does not use is what the body reader reads into, so
+    /// the reader's view of it shrinks as a request is parsed;
+    /// `rewindReader` restores it for the next one.
+    read_buffer: []u8,
 
     tcp_reader: std.Io.net.Stream.Reader = undefined,
     tcp_writer: std.Io.net.Stream.Writer = undefined,
@@ -123,10 +139,43 @@ pub const Connection = struct {
     reader: *std.Io.Reader = undefined,
     writer: *std.Io.Writer = undefined,
 
-    pub fn initPlain(self: *Connection, allocator: std.mem.Allocator, io: std.Io, stream: std.Io.net.Stream) void {
-        self.* = .{ .io = io, .stream = stream };
-        self.arena = .init(allocator);
-        self.tcp_reader = stream.reader(io, &.{});
+    /// Whole before anything can fail, so `deinit` is safe after a failed
+    /// init. `tls_buffers_len` is how much of `buffers` the TLS layer gets,
+    /// ahead of the read buffer.
+    fn init(
+        self: *Connection,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        request_buffer_size: usize,
+        tls_buffers_len: usize,
+    ) !void {
+        self.* = .{
+            .io = io,
+            .stream = stream,
+            .allocator = allocator,
+            .arena = .init(allocator),
+            .buffers = &.{},
+            .read_buffer = &.{},
+        };
+        self.buffers = try allocator.alloc(u8, tls_buffers_len + request_buffer_size + body_read_reserve);
+        self.read_buffer = self.buffers[tls_buffers_len..];
+
+        // Reset keeps the memory, as one node the requests are then carved
+        // from.
+        _ = try self.arena.allocator().alloc(u8, request_arena_reserve);
+        _ = self.arena.reset(.retain_capacity);
+    }
+
+    pub fn initPlain(
+        self: *Connection,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        request_buffer_size: usize,
+    ) !void {
+        try self.init(allocator, io, stream, request_buffer_size, 0);
+        self.tcp_reader = stream.reader(io, self.read_buffer);
         self.tcp_writer = stream.writer(io, &self.write_buffer);
         self.reader = &self.tcp_reader.interface;
         self.writer = &self.tcp_writer.interface;
@@ -141,23 +190,11 @@ pub const Connection = struct {
         auth: *tls.config.CertKeyPair,
         client_auth: ?ClientAuthRef,
     ) !void {
-        self.* = .{ .io = io, .stream = stream };
-        self.arena = .init(allocator);
+        try self.init(allocator, io, stream, request_buffer_size, tls.input_buffer_len + tls.output_buffer_len);
 
-        // Aim for a single backing allocation per connection: prime the
-        // arena with room for the two TLS record buffers plus a working
-        // budget, then recycle it (reset keeps the memory). The TLS buffers
-        // and the per-request arena are then carved from that one
-        // allocation; only unusually large requests grow it.
-        const conn_reserve = tls.input_buffer_len + tls.output_buffer_len + 2 * (request_buffer_size + body_read_reserve);
-        _ = try self.arena.allocator().alloc(u8, conn_reserve);
-        _ = self.arena.reset(.retain_capacity);
-
-        // The TLS record buffers live for the whole connection (the
-        // tls.Connection points into them) and must survive the per-request
-        // arena resets, so they come from the connection arena.
-        const tcp_read_buffer = try self.arena.allocator().alloc(u8, tls.input_buffer_len);
-        const tcp_write_buffer = try self.arena.allocator().alloc(u8, tls.output_buffer_len);
+        // The tls.Connection points into these for the whole connection.
+        const tcp_read_buffer = self.buffers[0..tls.input_buffer_len];
+        const tcp_write_buffer = self.buffers[tls.input_buffer_len..][0..tls.output_buffer_len];
 
         self.tcp_reader = stream.reader(io, tcp_read_buffer);
         self.tcp_writer = stream.writer(io, tcp_write_buffer);
@@ -176,23 +213,50 @@ pub const Connection = struct {
             .now = std.Io.Clock.real.now(io),
             .rng = self.tls_rng.interface(),
         });
-        self.tls_reader = self.tls_conn.?.reader(&.{});
+        self.tls_reader = self.tls_conn.?.reader(self.read_buffer);
         self.tls_writer = self.tls_conn.?.writer(&self.tls_cleartext_write_buffer);
         self.reader = &self.tls_reader.interface;
         self.writer = &self.tls_writer.interface;
+    }
+
+    /// Gives the reader the whole read buffer back for the next request.
+    /// What the last request left unread is the start of the next one,
+    /// pipelined behind it, and it moves to the front.
+    pub fn rewindReader(self: *Connection) void {
+        const r = self.reader;
+        // `parseHeaders` left the reader a window past the head, with its
+        // positions relative to that window.
+        const head_len = self.read_buffer.len - r.buffer.len;
+        r.buffer = self.read_buffer;
+        r.seek += head_len;
+        r.end += head_len;
+        // Neither the stream reader nor the TLS reader overrides the
+        // default rebase, which is a move within the buffer and cannot
+        // fail.
+        r.rebase(r.buffer.len) catch unreachable;
     }
 
     /// For tests: wraps a bare writer with no real TLS/TCP layer behind it.
     /// `tcp_writer.err` is left settable so a test can simulate the real
     /// error a write failure should surface.
     pub fn initWriterForTesting(self: *Connection, w: *std.Io.Writer) void {
-        self.* = .{ .io = undefined, .stream = undefined, .reader = undefined, .writer = w };
+        self.* = .{
+            .io = undefined,
+            .stream = undefined,
+            .allocator = undefined,
+            .arena = undefined,
+            .buffers = &.{},
+            .read_buffer = &.{},
+            .reader = undefined,
+            .writer = w,
+        };
         self.tcp_reader.err = null;
         self.tcp_writer.err = null;
     }
 
     pub fn deinit(self: *Connection) void {
         self.arena.deinit();
+        self.allocator.free(self.buffers);
     }
 
     /// A borrowed view of the layers above, for the parts of the library
@@ -743,9 +807,7 @@ pub fn Server(comptime Ctx: type) type {
                     // slow request, which is bounded.
                     {
                         defer timer.clear(self.io);
-                        if (self.config.timeout.request) |duration| {
-                            timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
-                        }
+                        self.armTimer(&timer, self.config.timeout.request);
 
                         const client_auth: ?ClientAuthRef = if (self.tls_client_ca) |*bundle| .{
                             .bundle = bundle,
@@ -778,29 +840,37 @@ pub fn Server(comptime Ctx: type) type {
                         };
                     }
 
-                    // Per-request arena nested on the connection arena: resetting it
-                    // between keepalive requests reuses the connection's memory
-                    // without touching the TLS buffers carved above.
-                    var request_arena = std.heap.ArenaAllocator.init(connection.arena.allocator());
-                    return self.handleRequests(&connection, &request_arena, &needs_shutdown, &timer, &busy);
+                    return self.handleRequests(&connection, &needs_shutdown, &timer, &busy);
                 }
             }
 
-            connection.initPlain(self.allocator, self.io, stream);
-            return self.handleRequests(&connection, &connection.arena, &needs_shutdown, &timer, &busy);
+            try connection.initPlain(self.allocator, self.io, stream, self.config.request.buffer_size);
+            return self.handleRequests(&connection, &needs_shutdown, &timer, &busy);
         }
 
-        /// Runs the HTTP request/keepalive loop over a connection.
+        /// Cleared when `duration` is unset, so an earlier deadline does not
+        /// carry into a wait meant to be unbounded.
+        fn armTimer(self: *Self, timer: *Timer, duration: ?std.Io.Duration) void {
+            if (duration) |d| {
+                timer.set(self.io, .{ .duration = .{ .raw = d, .clock = .awake } });
+            } else {
+                timer.clear(self.io);
+            }
+        }
+
+        /// Runs the HTTP request loop over a connection: each request is
+        /// parsed, served and answered before the next is looked at, so
+        /// pipelined requests are answered in order without any more
+        /// machinery than a keepalive connection needs.
         fn handleRequests(
             self: *Self,
             connection: *Connection,
-            arena: *std.heap.ArenaAllocator,
             needs_shutdown: *bool,
             timer: *Timer,
             busy: *bool,
         ) !void {
             var request: Request = .{
-                .arena = arena.allocator(),
+                .arena = connection.arena.allocator(),
                 .io = self.io,
                 .transport = connection.transport(),
                 .parser = undefined,
@@ -818,28 +888,19 @@ pub fn Server(comptime Ctx: type) type {
 
             var request_count: usize = 0;
 
-            // Allocate initial buffer from arena
-            connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + body_read_reserve) catch |err| {
-                log.err("Failed to allocate read buffer: {}", .{err});
-                return err;
-            };
-
             while (true) {
-                request_count += 1;
-
-                // Cleared when unset, so a keepalive deadline does not carry
-                // into a request meant to be unbounded.
-                if (self.config.timeout.request) |duration| {
-                    timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
-                } else {
-                    timer.clear(self.io);
-                }
-
-                // Only before the first request: the keepalive wait below
-                // has already brought in the start of any later one.
+                // Nothing buffered means the next request has not begun.
+                // The first is waited for under the request deadline, which
+                // runs from accept; a later one under the keepalive
+                // deadline, and its request deadline runs from arrival. A
+                // request pipelined behind the last one is already here.
+                const first = request_count == 0;
                 if (connection.reader.bufferedLen() == 0) {
+                    self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
                     switch (try self.waitForRequest(connection, busy)) {
                         .arrived => {},
+                        // The socket is already gone, so skip the shutdown
+                        // syscall too.
                         .peer_gone => {
                             needs_shutdown.* = false;
                             return;
@@ -847,6 +908,8 @@ pub fn Server(comptime Ctx: type) type {
                         .refused => return,
                     }
                 }
+                if (!first) self.armTimer(timer, self.config.timeout.request);
+                request_count += 1;
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
                     error.EndOfStream => {
@@ -886,7 +949,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
-                var response = try Response.init(arena.allocator(), connection, self.config.request.max_header_count);
+                var response = try Response.init(request.arena, connection, self.config.request.max_header_count);
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
                 request.response = &response;
@@ -985,39 +1048,8 @@ pub fn Server(comptime Ctx: type) type {
 
                 parser.reset();
                 request.reset();
-
-                // If there's buffered data (pipelining), close connection - we don't support it
-                if (connection.reader.end > connection.reader.seek) {
-                    break;
-                }
-
-                _ = arena.reset(.retain_capacity);
-
-                // Allocate fresh buffer for keepalive wait (previous buffer was freed by arena reset)
-                connection.reader.buffer = request.arena.alloc(u8, self.config.request.buffer_size + body_read_reserve) catch |err| {
-                    log.err("Failed to allocate read buffer: {}", .{err});
-                    return err;
-                };
-                connection.reader.seek = 0;
-                connection.reader.end = 0;
-
-                if (self.config.timeout.keepalive) |duration| {
-                    timer.set(self.io, .{ .duration = .{ .raw = duration, .clock = .awake } });
-                } else {
-                    timer.clear(self.io);
-                }
-
-                // Wait for the next request, under the keepalive timeout.
-                switch (try self.waitForRequest(connection, busy)) {
-                    .arrived => {},
-                    // The socket is already gone, so skip the shutdown
-                    // syscall too.
-                    .peer_gone => {
-                        needs_shutdown.* = false;
-                        return;
-                    },
-                    .refused => return,
-                }
+                _ = connection.arena.reset(.retain_capacity);
+                connection.rewindReader();
             }
         }
     };

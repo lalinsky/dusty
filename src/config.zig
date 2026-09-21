@@ -72,8 +72,8 @@ pub const ServerConfig = struct {
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `listen.kernel_backlog` deep. Null lifts the cap.
     ///
-    /// Costs about `request.buffer_size + 8K` per connection, 33K more under
-    /// TLS, and 70K more for a connection that receives a body with a
+    /// Costs about `request.buffer_size + 13K` per connection, 33K more
+    /// under TLS, and 70K more for a connection that receives a body with a
     /// `Content-Encoding` while `request.decompress` is on.
     max_connections: ?u32 = 10_000,
     /// TLS configuration. When set, the server performs a TLS handshake on every
