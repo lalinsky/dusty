@@ -27,12 +27,13 @@ fn handleEvents(ctx: *AppContext, req: *http.Request, res: *http.Response) !void
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     var ctx: AppContext = .{ .counter = std.atomic.Value(u64).init(0) };
 
-    var server = http.Server(AppContext).init(allocator, io, .{}, &ctx);
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    var server = http.Server(AppContext).init(allocator, io, .{
+        .listen = &.{.{ .address = addr }},
+    }, &ctx);
     defer server.deinit();
 
     server.router.get("/events", handleEvents);
-
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
     std.log.info("SSE server running at http://127.0.0.1:8080", .{});
     std.log.info("Try: curl http://127.0.0.1:8080/events", .{});
@@ -48,7 +49,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     }.run, .{ &ctx.counter, io });
     defer ticker_future.cancel(io) catch {};
 
-    try server.listen(addr, .{});
+    try server.run();
 }
 
 pub fn main(init: std.process.Init) !void {

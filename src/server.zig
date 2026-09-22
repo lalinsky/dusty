@@ -328,7 +328,6 @@ fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
-pub const ListenOptions = @import("config.zig").ListenOptions;
 
 fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) void {
     const timer: *Timer = @ptrCast(@alignCast(context));
@@ -362,8 +361,8 @@ pub fn Server(comptime Ctx: type) type {
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
-        /// Every listener's bound address, in the order given to `run`.
-        /// Filled in before `ready` is set, and empty again once `run` has
+        /// Every listener's bound address, in `config.listen` order. Filled
+        /// in before `ready` is set, and empty again once `run` has
         /// returned.
         addresses: []const Address = &.{},
         ready: std.Io.Event,
@@ -456,18 +455,12 @@ pub fn Server(comptime Ctx: type) type {
             return mw;
         }
 
-        /// Serves one address until canceled, then drains the connections in
-        /// flight. The same as `run` with a single `Listener`.
-        pub fn listen(self: *Self, addr: Address, options: ListenOptions) !void {
-            return self.run(&.{.{ .address = addr, .tls = options.tls }});
-        }
-
-        /// Accepts on every listener until canceled, then drains the
-        /// connections in flight. The slice is borrowed for the whole run,
-        /// and requests point back into it through `Request.listener`.
-        pub fn run(self: *Self, listeners: []const Listener) !void {
+        /// Accepts on every listener in `config.listen` until canceled, then
+        /// drains the connections in flight.
+        pub fn run(self: *Self) !void {
+            const listeners = self.config.listen;
             if (listeners.len == 0) {
-                log.err("No listeners were given, so no connection could ever be served", .{});
+                log.err("config.listen is empty, so no connection could ever be served", .{});
                 return error.NoListeners;
             }
             if (self.config.max_connections) |max| {
@@ -515,6 +508,9 @@ pub fn Server(comptime Ctx: type) type {
             for (active) |*l| {
                 accepting.concurrent(self.io, acceptLoop, .{ self, l, &connections, &stopped }) catch |err| {
                     log.err("Failed to spawn the accept loop for {f}: {}", .{ l.address, err });
+                    // The loops already running may have accepted by now.
+                    accepting.cancel(self.io);
+                    self.drainConnections();
                     return err;
                 };
             }
@@ -576,8 +572,11 @@ pub fn Server(comptime Ctx: type) type {
             }
 
             l.server = switch (cfg.address) {
-                .ip => |ip| try ip.listen(self.io, self.config.listen),
-                .unix => |unix| try unix.listen(self.io, .{}),
+                .ip => |ip| try ip.listen(self.io, .{
+                    .kernel_backlog = cfg.kernel_backlog,
+                    .reuse_address = cfg.reuse_address,
+                }),
+                .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = cfg.kernel_backlog }),
             };
             if (cfg.address == .ip) l.address = .{ .ip = l.server.socket.address };
             return l;
@@ -641,7 +640,10 @@ pub fn Server(comptime Ctx: type) type {
                 };
                 backoff_ms = 0;
 
-                _ = self.active_connections.fetchAdd(1, .acq_rel);
+                self.reserveConnectionSlot() catch |err| {
+                    stream.close(self.io);
+                    return err;
+                };
                 _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
                 connections.concurrent(self.io, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
@@ -707,7 +709,7 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Blocks while every connection slot is taken. Not accepting is the
         /// backpressure: what arrives meanwhile waits in the kernel's accept
-        /// queue, `listen.kernel_backlog` deep.
+        /// queue, `Listener.kernel_backlog` deep.
         fn waitForConnectionSlot(self: *Self) std.Io.Cancelable!void {
             const max = self.config.max_connections orelse return;
             while (true) {
@@ -715,6 +717,28 @@ pub fn Server(comptime Ctx: type) type {
                 if (active < max) return;
                 log.debug("At the {d} connection cap; waiting for a slot", .{max});
                 try self.io.futexWait(u32, &self.active_connections.raw, active);
+            }
+        }
+
+        /// Takes the slot for a connection just accepted. The check above is
+        /// what keeps a loop from accepting at the cap, but it is not one
+        /// step with this, and one accept loop per listener races for the
+        /// same slots. A loop that lost the race waits here, holding its
+        /// connection the way the backlog would have, so the cap is exact.
+        fn reserveConnectionSlot(self: *Self) std.Io.Cancelable!void {
+            const max = self.config.max_connections orelse {
+                _ = self.active_connections.fetchAdd(1, .acq_rel);
+                return;
+            };
+            var active = self.active_connections.load(.acquire);
+            while (true) {
+                if (active >= max) {
+                    log.debug("At the {d} connection cap; waiting for a slot", .{max});
+                    try self.io.futexWait(u32, &self.active_connections.raw, active);
+                    active = self.active_connections.load(.acquire);
+                    continue;
+                }
+                active = self.active_connections.cmpxchgWeak(active, active + 1, .acq_rel, .acquire) orelse return;
             }
         }
 

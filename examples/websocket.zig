@@ -78,16 +78,17 @@ fn handleIndex(_: *AppContext, _: *http.Request, res: *http.Response) !void {
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
     var ctx: AppContext = .{};
 
-    var server = http.Server(AppContext).init(allocator, io, .{}, &ctx);
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    var server = http.Server(AppContext).init(allocator, io, .{
+        .listen = &.{.{ .address = addr }},
+    }, &ctx);
     defer server.deinit();
 
     server.router.get("/", handleIndex);
     server.router.get("/ws", handleWebSocket);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-
     std.log.info("WebSocket echo server running at http://127.0.0.1:8080", .{});
-    try server.listen(addr, .{});
+    try server.run();
 }
 
 pub fn main(init: std.process.Init) !void {

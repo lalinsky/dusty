@@ -112,13 +112,14 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const
         .upstream_url = upstream_url,
     };
 
-    var server = http.Server(AppContext).init(allocator, io, .{}, &ctx);
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    var server = http.Server(AppContext).init(allocator, io, .{
+        .listen = &.{.{ .address = addr }},
+    }, &ctx);
     defer server.deinit();
 
     // Catch-all route - proxy everything for all common HTTP methods
     server.router.any("/*", handleProxy);
-
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
 
     std.log.info("Reverse proxy server running at http://127.0.0.1:8080", .{});
     std.log.info("Forwarding all requests to: {s}", .{upstream_url});
@@ -126,7 +127,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const
     std.log.info("Try: curl http://127.0.0.1:8080/get", .{});
     std.log.info("     curl -X POST http://127.0.0.1:8080/post -d 'hello=world'", .{});
 
-    try server.listen(addr, .{});
+    try server.run();
 }
 
 pub fn main(init: std.process.Init) !void {

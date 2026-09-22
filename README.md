@@ -48,24 +48,26 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var server = http.Server(void).init(init.gpa, init.io, .{}, {});
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    var server = http.Server(void).init(init.gpa, init.io, .{
+        .listen = &.{.{ .address = addr }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/user/:id", handleUser);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    try server.listen(addr, .{});
+    try server.run();
 }
 ```
 
-`Server.run` serves several listeners at once, each with its own TLS, so one
-server can serve HTTPS on 443 and plain HTTP on 80 with the same router:
+`listen` takes any number of listeners, each with its own TLS, so one server
+can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 
 ```zig
-try server.run(&.{
+.listen = &.{
     .{ .address = addr443, .tls = .{ .cert_path = "server.pem", .key_path = "server.key" } },
     .{ .address = addr80 },
-});
+},
 ```
 
 A handler can tell them apart through `req.listener` and `req.secure`, and
@@ -117,7 +119,8 @@ The server side is symmetric. TLS is configured per listener, and `client_auth`
 makes it ask connecting clients for a certificate:
 
 ```zig
-try server.listen(addr, .{
+.listen = &.{.{
+    .address = addr,
     .tls = .{
         .cert_path = "server.pem",
         .key_path = "server.key",
@@ -128,7 +131,7 @@ try server.listen(addr, .{
             .mode = .require,
         },
     },
-});
+}},
 ```
 
 ### Unix Socket Client Example
@@ -239,7 +242,9 @@ pub fn main(init: std.process.Init) !void {
     var rt = try zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
 
-    var server = http.Server(void).init(init.gpa, rt.io(), .{}, {});
+    var server = http.Server(void).init(init.gpa, rt.io(), .{
+        .listen = &.{.{ .address = addr }},
+    }, {});
     defer server.deinit();
 
     // ... continue as before ...

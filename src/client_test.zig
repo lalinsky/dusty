@@ -1,10 +1,12 @@
 const std = @import("std");
 const dusty = @import("root.zig");
+const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
+const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
 
 test "Client: simple GET request" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -16,8 +18,7 @@ test "Client: simple GET request" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -53,7 +54,7 @@ test "Client: simple GET request" {
 test "Client: fetch GET request" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/api", struct {
@@ -65,8 +66,7 @@ test "Client: fetch GET request" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -105,7 +105,7 @@ test "Client: fetch GET request" {
 test "Client: connection pooling" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -117,8 +117,7 @@ test "Client: connection pooling" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -170,7 +169,7 @@ test "Client: connection pooling" {
 test "Client: pool evicts dead connection after server goes away" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -182,8 +181,7 @@ test "Client: pool evicts dead connection after server goes away" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -248,7 +246,7 @@ test "Client: redirect failing after connection release does not double-release"
         .location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.1:{d}/", .{dead_port}),
     };
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{}, &ctx);
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listen = loopback }, &ctx);
     defer server.deinit();
 
     server.router.get("/redirect", struct {
@@ -269,8 +267,7 @@ test "Client: redirect failing after connection release does not double-release"
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(Ctx)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -313,7 +310,7 @@ test "Client: redirect failing after connection release does not double-release"
 test "Client: connection with unread response body is not pooled" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -325,8 +322,7 @@ test "Client: connection with unread response body is not pooled" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -365,7 +361,7 @@ test "Client: connection with unread response body is not pooled" {
 test "Client: pool survives concurrent fetches on a shared client" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -377,8 +373,7 @@ test "Client: pool survives concurrent fetches on a shared client" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -443,7 +438,7 @@ test "Client: pool survives concurrent fetches on a shared client" {
 test "Client: WebSocket upgrade" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
 
     server.router.get("/ws", struct {
@@ -470,8 +465,7 @@ test "Client: WebSocket upgrade" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -591,7 +585,15 @@ test "Client: one server serves a plain listener and a TLS listener" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{
+            .{ .address = loopback_addr },
+            .{
+                .address = loopback_addr,
+                .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+            },
+        },
+    }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -600,19 +602,11 @@ test "Client: one server serves a plain listener and a TLS listener" {
         }
     }.handle);
 
-    const listeners = [_]dusty.Listener{
-        .{ .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) } },
-        .{
-            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) },
-            .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
-        },
-    };
-
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(void), l: []const dusty.Listener) !void {
-            try s.run(l);
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
         }
-    }.run, .{ &server, &listeners });
+    }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
@@ -646,7 +640,9 @@ test "Client: HTTPS with a custom CA file" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/secure", struct {
@@ -658,8 +654,7 @@ test "Client: HTTPS with a custom CA file" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{ .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } });
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -694,7 +689,13 @@ test "Client: presents a client certificate for mutual TLS" {
     // The test certificate is CA:TRUE and self-signed, so the same file serves
     // as the server certificate, the client certificate, and the CA that
     // validates both.
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+        } }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -705,12 +706,7 @@ test "Client: presents a client certificate for mutual TLS" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{ .tls = .{
-                .cert_path = test_cert_path,
-                .key_path = test_key_path,
-                .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
-            } });
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -744,7 +740,13 @@ test "Server: client_auth .require rejects a client with no certificate" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
+        } }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -755,12 +757,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{ .tls = .{
-                .cert_path = test_cert_path,
-                .key_path = test_key_path,
-                .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
-            } });
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -792,7 +789,13 @@ test "Server: client_auth .request accepts a client with no certificate" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
+        } }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -803,12 +806,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{ .tls = .{
-                .cert_path = test_cert_path,
-                .key_path = test_key_path,
-                .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
-            } });
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -839,7 +837,9 @@ test "Client: rejects a server certificate the configured CA does not cover" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -850,8 +850,7 @@ test "Client: rejects a server certificate the configured CA does not cover" {
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{ .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } });
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
@@ -1334,7 +1333,7 @@ test "Client: FetchOptions.timeout replaces the client default" {
         }));
     }
     { // a default, lifted for this request
-        var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
         defer server.deinit();
         server.router.get("/slow", struct {
             fn handle(req: *dusty.Request, res: *dusty.Response) !void {
@@ -1344,8 +1343,7 @@ test "Client: FetchOptions.timeout replaces the client default" {
         }.handle);
         var server_future = try io.concurrent(struct {
             fn run(s: *dusty.Server(void)) !void {
-                const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-                try s.listen(addr, .{});
+                try s.run();
             }
         }.run, .{&server});
         defer server_future.cancel(io) catch {};
@@ -1400,7 +1398,7 @@ test "Client: the request deadline covers the body, unless it is streamed" {
 test "Client: redirects share the request's budget" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
     defer server.deinit();
     const Hops = struct {
         fn first(req: *dusty.Request, res: *dusty.Response) !void {
@@ -1417,8 +1415,7 @@ test "Client: redirects share the request's budget" {
     server.router.get("/second", Hops.second);
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
-            const addr: dusty.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 0) };
-            try s.listen(addr, .{});
+            try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};

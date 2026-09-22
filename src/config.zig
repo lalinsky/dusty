@@ -66,26 +66,30 @@ pub const Address = union(enum) {
     }
 };
 
-/// What `Server.listen` takes besides the address.
-pub const ListenOptions = struct {
-    /// When set, every connection accepted is TLS. Requires the `use_tls`
-    /// build option (enabled by default); with TLS compiled out, setting
-    /// this fails `Server.listen`.
-    tls: ?ServerConfig.Tls = null,
-};
-
-/// One socket a server accepts on. `Server.run` takes several, each with
-/// its own TLS, so one server can serve HTTPS on 443 and plain HTTP on 80.
+/// One socket a server accepts on. `ServerConfig.listen` holds any number,
+/// each with its own TLS, so one server can serve HTTPS on 443 and plain
+/// HTTP on 80.
 pub const Listener = struct {
     address: Address,
-    /// As `ListenOptions.tls`.
+    /// When set, every connection accepted here is TLS. Requires the
+    /// `use_tls` build option (enabled by default); with TLS compiled out,
+    /// setting this fails `Server.run`.
     tls: ?ServerConfig.Tls = null,
+    /// How many connections the kernel accepts on the server's behalf
+    /// while it is not accepting itself. Past this, clients see the
+    /// connection refused.
+    kernel_backlog: u31 = 1024,
+    /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
+    reuse_address: bool = true,
 };
 
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
-    listen: std.Io.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
+    /// Where the server accepts connections. `Server.run` serves all of
+    /// them and refuses an empty list. Borrowed for the server's life, and
+    /// requests point back into it through `Request.listener`.
+    listen: []const Listener = &.{},
     /// Number of reverse-proxy hops between the server and the client. Zero
     /// reports the socket peer and ignores `X-Forwarded-For`. A positive
     /// value selects that address from the right of the forwarding chain:
@@ -98,13 +102,13 @@ pub const ServerConfig = struct {
     trusted_proxy_hops: usize = 0,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
-    /// `listen.kernel_backlog` deep. Null lifts the cap.
+    /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
     /// Costs about `request.buffer_size + 13K` per connection, 33K more
     /// under TLS, and 70K more for a connection that receives a body with a
     /// `Content-Encoding` while `request.decompress` is on.
     max_connections: ?u32 = 10_000,
-    /// TLS is per listener: see `ListenOptions.tls` and `Listener.tls`.
+    /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.
         cert_path: []const u8,

@@ -413,6 +413,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx: Ctx = .{};
     var server = http.Server(Ctx).init(init.gpa, rt.io(), .{
+        .listen = &.{.{ .address = .{ .ip = opts.listen } }},
         .trusted_proxy_hops = opts.trusted_proxy_hops,
         .timeout = .{
             .request = request_timeout,
@@ -454,5 +455,5 @@ pub fn main(init: std.process.Init) !void {
     server.router.delete("/delete", handleWithBody);
 
     std.log.info("httpbin on http://{f}", .{opts.listen});
-    try server.listen(.{ .ip = opts.listen }, .{});
+    try server.run();
 }

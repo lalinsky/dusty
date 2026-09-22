@@ -42,9 +42,9 @@ pub const Request = struct {
     /// `std.Io.Threaded` substitute on accept. A forwarded address has port
     /// zero because the header does not carry the client's source port.
     remote_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
-    /// The listener the connection came in on: one of those given to
-    /// `Server.run`, so a handler can compare it against them or read its
-    /// address. A placeholder in a request the server did not build.
+    /// The listener the connection came in on: one of those in
+    /// `ServerConfig.listen`, so a handler can compare it against them or
+    /// read its address. A placeholder in a request the server did not build.
     listener: *const Listener = &placeholder_listener,
     /// Whether the connection is TLS.
     secure: bool = false,
