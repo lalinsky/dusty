@@ -312,11 +312,11 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
     return w.flush();
 }
 
-/// How much of a refused request is thrown away before hanging up on it,
+/// How much unread input is thrown away before hanging up on the peer,
 /// and how long that is given: a peer that has read the answer hangs up
 /// within a round trip, and the request deadline may be off.
-const refused_drain_limit: usize = 64 * 1024;
-const refused_drain_timeout: std.Io.Duration = .fromSeconds(1);
+const linger_limit: usize = 64 * 1024;
+const linger_timeout: std.Io.Duration = .fromSeconds(1);
 
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
@@ -889,26 +889,25 @@ pub fn Server(comptime Ctx: type) type {
             };
         }
 
-        /// Hangs up on a peer whose request was refused before it was all
-        /// read, so the peer still gets the answer. Closing with input
-        /// unread makes the kernel send a reset instead of a FIN, and a
-        /// Windows peer throws the buffered answer away when a reset
-        /// arrives. So the send side is shut first, which tells the peer
-        /// there is nothing more to wait for, and what it sent is thrown
-        /// away until it hangs up, or `refused_drain_timeout` passes, or
-        /// `refused_drain_limit` bytes for a peer that keeps sending.
+        /// Hangs up on a peer whose input was not all read, so the peer
+        /// still gets the answer. Closing with input unread makes the kernel
+        /// send a reset instead of a FIN, and a peer can throw the buffered
+        /// answer away when a reset arrives. So the send side is shut first,
+        /// which tells the peer there is nothing more to wait for, and what
+        /// it sent is thrown away until it hangs up, or `linger_timeout`
+        /// passes, or `linger_limit` bytes for a peer that keeps sending.
         /// Without a deadline to arm, the wait could be held open, so the
-        /// close stays immediate, reset and all.
-        fn hangUpOnRefused(self: *Self, connection: *Connection, timer: *Timer) !void {
-            if (!timer.canBound()) return;
-            timer.set(self.io, .{ .duration = .{ .raw = refused_drain_timeout, .clock = .awake } });
-            defer timer.clear(self.io);
+        /// FIN goes out and the close follows it at once.
+        fn lingeringClose(self: *Self, connection: *Connection, timer: *Timer) !void {
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
                 else => |e| return e,
             };
-            _ = connection.reader.discardShort(refused_drain_limit) catch {
+            if (!timer.canBound()) return;
+            timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
+            defer timer.clear(self.io);
+            _ = connection.reader.discardShort(linger_limit) catch {
                 const cause = connection.getReadError() orelse error.Unexpected;
                 // The peer hanging up is the end this waits for. The
                 // deadline arrives as a cancel, and stays one.
@@ -926,15 +925,6 @@ pub fn Server(comptime Ctx: type) type {
             defer if (busy) self.finishRequest();
 
             defer stream.close(self.io);
-
-            var needs_shutdown = true;
-            defer if (needs_shutdown) stream.shutdown(self.io, .both) catch |err| {
-                if (err == error.SocketUnconnected) {
-                    log.debug("Failed to shutdown client connection: {}", .{err});
-                } else {
-                    log.warn("Failed to shutdown client connection: {}", .{err});
-                }
-            };
 
             var connection: Connection = undefined;
             defer connection.deinit();
@@ -973,9 +963,6 @@ pub fn Server(comptime Ctx: type) type {
                                 error.WriteFailed => connection.getWriteError() orelse err,
                                 else => err,
                             };
-                            // Nothing was negotiated, so there is no TLS
-                            // session to shut down politely either way.
-                            needs_shutdown = false;
                             if (cause == error.Canceled) {
                                 log.debug("TLS handshake canceled", .{});
                                 return error.Canceled;
@@ -989,12 +976,18 @@ pub fn Server(comptime Ctx: type) type {
                         };
                     }
 
-                    return self.handleRequests(l, &connection, &needs_shutdown, &timer, &busy);
+                    return self.handleRequests(l, &connection, &timer, &busy);
                 }
             }
 
             try connection.initPlain(self.allocator, self.io, stream, self.config.request.buffer_size);
-            return self.handleRequests(l, &connection, &needs_shutdown, &timer, &busy);
+            return self.handleRequests(l, &connection, &timer, &busy);
+        }
+
+        /// Whether the peer sent, or may still send, input that was not
+        /// read: the rest of a body, or a request pipelined behind this one.
+        fn hasUnreadInput(connection: *Connection, parser: *RequestParser) bool {
+            return !parser.isBodyComplete() or connection.reader.bufferedLen() > 0;
         }
 
         /// Cleared when `duration` is unset, so an earlier deadline does not
@@ -1015,7 +1008,6 @@ pub fn Server(comptime Ctx: type) type {
             self: *Self,
             l: *ActiveListener,
             connection: *Connection,
-            needs_shutdown: *bool,
             timer: *Timer,
             busy: *bool,
         ) !void {
@@ -1051,39 +1043,28 @@ pub fn Server(comptime Ctx: type) type {
                     self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
                     switch (try self.waitForRequest(connection, busy)) {
                         .arrived => {},
-                        // The socket is already gone, so skip the shutdown
-                        // syscall too.
-                        .peer_gone => {
-                            needs_shutdown.* = false;
-                            return;
-                        },
-                        .refused => return,
+                        .peer_gone => return,
+                        // The request it refused was not read.
+                        .refused => return self.lingeringClose(connection, timer),
                     }
                 }
                 if (!first) self.armTimer(timer, self.config.timeout.request);
                 request_count += 1;
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
-                    error.EndOfStream => {
-                        needs_shutdown.* = false;
-                        return;
-                    },
+                    error.EndOfStream => return,
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.HeadersTooLarge => {
                         log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        needs_shutdown.* = false;
-                        try self.hangUpOnRefused(connection, timer);
-                        return;
+                        return self.lingeringClose(connection, timer);
                     },
                     error.TooManyHeaders => {
                         log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        needs_shutdown.* = false;
-                        try self.hangUpOnRefused(connection, timer);
-                        return;
+                        return self.lingeringClose(connection, timer);
                     },
                     else => |e| return e,
                 };
@@ -1115,6 +1096,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.status = .expectation_failed;
                         response.keepalive = false;
                         try response.write();
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer);
                         return;
                     }
                 }
@@ -1137,6 +1119,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.status = .bad_request;
                         response.keepalive = false;
                         try response.write();
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer);
                         return;
                     },
                     else => |e| return e,
@@ -1195,6 +1178,10 @@ pub fn Server(comptime Ctx: type) type {
                 try response.write();
 
                 if (!response.keepalive) {
+                    // Input after a 101 belongs to the upgraded protocol.
+                    if (response.status != .switching_protocols and hasUnreadInput(connection, &parser)) {
+                        try self.lingeringClose(connection, timer);
+                    }
                     break;
                 }
 

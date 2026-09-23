@@ -153,8 +153,7 @@ pub const Transport = struct {
 
     /// True when `err` means the peer is gone rather than something being
     /// wrong. Teardown is the same either way; this only decides whether the
-    /// connection is worth a log line and whether shutdown() is worth a
-    /// syscall.
+    /// connection is worth a log line.
     pub fn isPeerGone(err: anyerror) bool {
         // A peer that closes the transport between TLS records without
         // close_notify is rude but routine, and tls.zig reports it as
