@@ -81,7 +81,41 @@ pub const Listener = struct {
     kernel_backlog: u31 = 1024,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
     reuse_address: bool = true,
+    /// How many accepts are kept waiting on the socket at once.
+    acceptors: Acceptors = .auto,
 };
+
+/// How many accept loops share one listener's socket. With io_uring, an
+/// accept completes at most once per trip through the event loop, so a single
+/// loop takes one connection per trip however many are queued, which is what
+/// limits a server taking many short connections. Several accepts waiting
+/// together let one trip take several. An idle one costs a parked task, and on
+/// Windows a socket created ahead for the connection it will get.
+pub const Acceptors = enum(u16) {
+    /// A quarter of the CPUs this process may use, honoring a cgroup CPU
+    /// quota, and at least two.
+    auto = 0,
+    _,
+
+    pub fn exact(n: u16) Acceptors {
+        std.debug.assert(n >= 1);
+        return @enumFromInt(n);
+    }
+
+    /// `cpu_count` is only used for `.auto`.
+    pub fn resolve(self: Acceptors, cpu_count: usize) u16 {
+        return switch (self) {
+            .auto => @intCast(@min(@max(2, cpu_count / 4), std.math.maxInt(u16))),
+            _ => @intFromEnum(self),
+        };
+    }
+};
+
+test "Acceptors: resolve" {
+    try std.testing.expectEqual(2, Acceptors.auto.resolve(1));
+    try std.testing.expectEqual(16, Acceptors.auto.resolve(64));
+    try std.testing.expectEqual(5, Acceptors.exact(5).resolve(64));
+}
 
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
