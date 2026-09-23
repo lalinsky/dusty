@@ -1043,6 +1043,16 @@ pub fn Server(comptime Ctx: type) type {
                 try response.write();
 
                 if (!response.keepalive) {
+                    // With the request read to the end, the close is enough
+                    // to end the connection cleanly. The shutdown is only
+                    // worth it with input left unread, which it throws away
+                    // on BSD so the close sends a FIN rather than a reset,
+                    // and it costs a syscall per connection -- on io_uring a
+                    // trip through a worker thread, as it never completes
+                    // inline.
+                    if (parser.isBodyComplete() and connection.reader.bufferedLen() == 0) {
+                        needs_shutdown.* = false;
+                    }
                     break;
                 }
 
