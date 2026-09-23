@@ -778,8 +778,11 @@ pub fn Server(comptime Ctx: type) type {
 
             defer stream.close(self.io);
 
-            var needs_shutdown = true;
-            defer if (needs_shutdown) stream.shutdown(self.io, .both) catch |err| {
+            // Only on the way out from an error. Otherwise the connection has
+            // ended the way it should, and the close is enough -- the
+            // shutdown would cost a syscall per connection, and on io_uring a
+            // trip through a worker thread, as it never completes inline.
+            errdefer stream.shutdown(self.io, .both) catch |err| {
                 if (err == error.SocketUnconnected) {
                     log.debug("Failed to shutdown client connection: {}", .{err});
                 } else {
@@ -824,9 +827,6 @@ pub fn Server(comptime Ctx: type) type {
                                 error.WriteFailed => connection.getWriteError() orelse err,
                                 else => err,
                             };
-                            // Nothing was negotiated, so there is no TLS
-                            // session to shut down politely either way.
-                            needs_shutdown = false;
                             if (cause == error.Canceled) {
                                 log.debug("TLS handshake canceled", .{});
                                 return error.Canceled;
@@ -840,12 +840,12 @@ pub fn Server(comptime Ctx: type) type {
                         };
                     }
 
-                    return self.handleRequests(&connection, &needs_shutdown, &timer, &busy);
+                    return self.handleRequests(&connection, &timer, &busy);
                 }
             }
 
             try connection.initPlain(self.allocator, self.io, stream, self.config.request.buffer_size);
-            return self.handleRequests(&connection, &needs_shutdown, &timer, &busy);
+            return self.handleRequests(&connection, &timer, &busy);
         }
 
         /// Cleared when `duration` is unset, so an earlier deadline does not
@@ -865,7 +865,6 @@ pub fn Server(comptime Ctx: type) type {
         fn handleRequests(
             self: *Self,
             connection: *Connection,
-            needs_shutdown: *bool,
             timer: *Timer,
             busy: *bool,
         ) !void {
@@ -899,12 +898,7 @@ pub fn Server(comptime Ctx: type) type {
                     self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
                     switch (try self.waitForRequest(connection, busy)) {
                         .arrived => {},
-                        // The socket is already gone, so skip the shutdown
-                        // syscall too.
-                        .peer_gone => {
-                            needs_shutdown.* = false;
-                            return;
-                        },
+                        .peer_gone => return,
                         .refused => return,
                     }
                 }
@@ -912,16 +906,12 @@ pub fn Server(comptime Ctx: type) type {
                 request_count += 1;
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
-                    error.EndOfStream => {
-                        needs_shutdown.* = false;
-                        return;
-                    },
+                    error.EndOfStream => return,
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.HeadersTooLarge => {
                         log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        needs_shutdown.* = false;
                         try self.hangUpOnRefused(connection, timer);
                         return;
                     },
@@ -929,7 +919,6 @@ pub fn Server(comptime Ctx: type) type {
                         log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        needs_shutdown.* = false;
                         try self.hangUpOnRefused(connection, timer);
                         return;
                     },
@@ -1043,16 +1032,6 @@ pub fn Server(comptime Ctx: type) type {
                 try response.write();
 
                 if (!response.keepalive) {
-                    // With the request read to the end, the close is enough
-                    // to end the connection cleanly. The shutdown is only
-                    // worth it with input left unread, which it throws away
-                    // on BSD so the close sends a FIN rather than a reset,
-                    // and it costs a syscall per connection -- on io_uring a
-                    // trip through a worker thread, as it never completes
-                    // inline.
-                    if (parser.isBodyComplete() and connection.reader.bufferedLen() == 0) {
-                        needs_shutdown.* = false;
-                    }
                     break;
                 }
 
