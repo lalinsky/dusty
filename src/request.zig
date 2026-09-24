@@ -6,10 +6,13 @@ const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
+const Listener = @import("config.zig").Listener;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
+
+const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
 
 pub const Request = struct {
     method: http.Method = undefined,
@@ -39,6 +42,12 @@ pub const Request = struct {
     /// `std.Io.Threaded` substitute on accept. A forwarded address has port
     /// zero because the header does not carry the client's source port.
     remote_address: std.Io.net.IpAddress = .{ .ip4 = .unspecified(0) },
+    /// The listener the connection came in on: one of those in
+    /// `ServerConfig.listen`, so a handler can compare it against them or
+    /// read its address. A placeholder in a request the server did not build.
+    listener: *const Listener = &placeholder_listener,
+    /// Whether the connection is TLS.
+    secure: bool = false,
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,
@@ -80,6 +89,8 @@ pub const Request = struct {
         // Belongs to the connection, not the request, so it outlives the
         // reset the way the reader and the parser do.
         const addr = self.remote_address;
+        const listener = self.listener;
+        const secure = self.secure;
         self.* = .{
             .arena = arena,
             .io = io,
@@ -88,6 +99,8 @@ pub const Request = struct {
             .config = cfg,
             .response = res,
             .remote_address = addr,
+            .listener = listener,
+            .secure = secure,
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,
         };

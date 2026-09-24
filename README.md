@@ -4,8 +4,6 @@ The library was originally written for [zio](https://github.com/lalinsky/zio), a
 implementation of the `std.Io` interface, especially if you need to communicate with other services over the network in your HTTP request handlers,
 or if you are using WebSocket. However, it's usable with any implementation, like `std.Io.Threaded`, or even the simulated implementation from [Marionette](https://github.com/sb2bg/marionette).
 
-The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlseguin/http.zig), and tries to be as compatible as possible.
-
 ## Features
 - Router with support for parameters and wildcards
 - Supports HTTP/1.0 and HTTP/1.1
@@ -48,15 +46,30 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var server = http.Server(void).init(init.gpa, init.io, .{}, {});
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    var server = http.Server(void).init(init.gpa, init.io, .{
+        .listen = &.{.{ .address = addr }},
+    }, {});
     defer server.deinit();
 
     server.router.get("/user/:id", handleUser);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    try server.listen(addr);
+    try server.run();
 }
 ```
+
+`listen` takes any number of listeners, each with its own TLS, so one server
+can serve HTTPS on 443 and plain HTTP on 80 with the same router:
+
+```zig
+.listen = &.{
+    .{ .address = addr443, .tls = .{ .cert_path = "server.pem", .key_path = "server.key" } },
+    .{ .address = addr80 },
+},
+```
+
+A handler can tell them apart through `req.listener` and `req.secure`, and
+`server.addresses` has each listener's bound address once `server.ready` is set.
 
 ### Client Example
 
@@ -100,10 +113,12 @@ The key must be an unencrypted PKCS#8 (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC P
 These settings apply to every connection a client makes; connections are pooled and reused
 across requests, so they cannot be varied per request. Use a separate `Client` per identity.
 
-The server side is symmetric — `client_auth` makes it ask connecting clients for a certificate:
+The server side is symmetric. TLS is configured per listener, and `client_auth`
+makes it ask connecting clients for a certificate:
 
 ```zig
-var server = http.Server(void).init(gpa, io, .{
+.listen = &.{.{
+    .address = addr,
     .tls = .{
         .cert_path = "server.pem",
         .key_path = "server.key",
@@ -114,7 +129,7 @@ var server = http.Server(void).init(gpa, io, .{
             .mode = .require,
         },
     },
-}, {});
+}},
 ```
 
 ### Unix Socket Client Example
@@ -225,7 +240,9 @@ pub fn main(init: std.process.Init) !void {
     var rt = try zio.Runtime.init(init.gpa, .{});
     defer rt.deinit();
 
-    var server = http.Server(void).init(init.gpa, rt.io(), .{}, {});
+    var server = http.Server(void).init(init.gpa, rt.io(), .{
+        .listen = &.{.{ .address = addr }},
+    }, {});
     defer server.deinit();
 
     // ... continue as before ...

@@ -54,10 +54,42 @@ pub const TlsPath = struct {
     dir: ?std.Io.Dir = null,
 };
 
+pub const Address = union(enum) {
+    ip: std.Io.net.IpAddress,
+    unix: std.Io.net.UnixAddress,
+
+    pub fn format(self: Address, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .ip => |ip| try ip.format(w),
+            .unix => |unix| try w.writeAll(unix.path),
+        }
+    }
+};
+
+/// One socket a server accepts on. `ServerConfig.listen` holds any number,
+/// each with its own TLS, so one server can serve HTTPS on 443 and plain
+/// HTTP on 80.
+pub const Listener = struct {
+    address: Address,
+    /// When set, every connection accepted here is TLS. Requires the
+    /// `use_tls` build option (enabled by default); with TLS compiled out,
+    /// setting this fails `Server.run`.
+    tls: ?ServerConfig.Tls = null,
+    /// How many connections the kernel accepts on the server's behalf
+    /// while it is not accepting itself. Past this, clients see the
+    /// connection refused.
+    kernel_backlog: u31 = 1024,
+    /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
+    reuse_address: bool = true,
+};
+
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
-    listen: std.Io.net.IpAddress.ListenOptions = .{ .reuse_address = true, .kernel_backlog = 1024 },
+    /// Where the server accepts connections. `Server.run` serves all of
+    /// them and refuses an empty list. Borrowed for the server's life, and
+    /// requests point back into it through `Request.listener`.
+    listen: []const Listener = &.{},
     /// Number of reverse-proxy hops between the server and the client. Zero
     /// reports the socket peer and ignores `X-Forwarded-For`. A positive
     /// value selects that address from the right of the forwarding chain:
@@ -70,17 +102,13 @@ pub const ServerConfig = struct {
     trusted_proxy_hops: usize = 0,
     /// How many connections may be open at once. At the cap the server stops
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
-    /// `listen.kernel_backlog` deep. Null lifts the cap.
+    /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
     /// Costs about `request.buffer_size + 13K` per connection, 33K more
     /// under TLS, and 70K more for a connection that receives a body with a
     /// `Content-Encoding` while `request.decompress` is on.
     max_connections: ?u32 = 10_000,
-    /// TLS configuration. When set, the server performs a TLS handshake on every
-    /// accepted connection and speaks HTTPS. Requires the `use_tls` build option
-    /// (enabled by default); with TLS compiled out, setting this fails listen().
-    tls: ?Tls = null,
-
+    /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.
         cert_path: []const u8,

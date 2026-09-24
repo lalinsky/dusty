@@ -1,8 +1,8 @@
 const std = @import("std");
 const http = @import("dusty");
 
-fn handleRoot(_: *http.Request, res: *http.Response) !void {
-    res.body = "Hello over TLS!\n";
+fn handleRoot(req: *http.Request, res: *http.Response) !void {
+    res.body = if (req.secure) "Hello over TLS!\n" else "Hello over plain HTTP!\n";
 }
 
 fn handleJson(req: *http.Request, res: *http.Response) !void {
@@ -19,19 +19,29 @@ pub fn main(init: std.process.Init) !void {
 
     // Usage: tls_server-example [cert.pem] [key.pem]
     // Defaults to the bundled self-signed localhost test certificate (run from
-    // the repo root). Test with: curl -k https://127.0.0.1:8443/
+    // the repo root). Test with: curl -k https://127.0.0.1:8443/ and
+    // curl http://127.0.0.1:8080/
     const cert_path = if (args.len > 1) args[1] else "examples/certs/cert.pem";
     const key_path = if (args.len > 2) args[2] else "examples/certs/key.pem";
 
+    // TLS is a property of the listener, so one server can serve HTTPS on
+    // 8443 and plain HTTP on 8080 at the same time.
     var server = http.Server(void).init(init.gpa, io, .{
-        .tls = .{ .cert_path = cert_path, .key_path = key_path },
+        .listen = &.{
+            .{
+                .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8443) },
+                .tls = .{ .cert_path = cert_path, .key_path = key_path },
+            },
+            .{
+                .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) },
+            },
+        },
     }, {});
     defer server.deinit();
 
     server.router.get("/", handleRoot);
     server.router.get("/json", handleJson);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8443) };
-    std.log.info("Starting TLS server on https://127.0.0.1:8443 (cert={s}, key={s})", .{ cert_path, key_path });
-    try server.listen(addr);
+    std.log.info("Starting TLS server on https://127.0.0.1:8443 and http://127.0.0.1:8080 (cert={s}, key={s})", .{ cert_path, key_path });
+    try server.run();
 }
