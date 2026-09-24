@@ -742,10 +742,13 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
-        /// Wakes whoever is waiting for one: the accept loop, or the drain.
+        /// Wakes every accept loop waiting for a slot. Waking one is not
+        /// enough: it may be a loop that goes back to blocking in `accept`
+        /// on an idle listener, while another holds a connection it cannot
+        /// serve until it is woken.
         fn releaseConnectionSlot(self: *Self) void {
             _ = self.active_connections.fetchSub(1, .acq_rel);
-            self.io.futexWake(u32, &self.active_connections.raw, 1);
+            self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
         }
 
         /// Wakes the drain when this was the last one: zero is the only

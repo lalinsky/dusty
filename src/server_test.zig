@@ -2442,6 +2442,77 @@ test "Server: max_connections caps overlap without dropping anyone" {
     try std.testing.expectEqual(@as(u32, cap), ctx.peak.load(.acquire));
 }
 
+test "Server: a slot freed on one listener reaches a connection waiting on another" {
+    const io = std.testing.io;
+    const listeners = [_]dusty.Listener{
+        .{ .address = loopback_addr },
+        .{ .address = loopback_addr },
+    };
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = &listeners, .max_connections = 1 }, {});
+    defer server.deinit();
+    server.router.get("/", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            s.run() catch |err| {
+                if (err != error.Canceled) return err;
+            };
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const Get = struct {
+        fn run(address: dusty.Address, _io: std.Io, served: *std.atomic.Value(bool), hold: ?*std.Io.Event) !void {
+            const stream = try address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+            try writer.interface.flush();
+
+            var read_buf: [256]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r", status_line);
+            served.store(true, .release);
+
+            if (hold) |event| try event.wait(_io);
+        }
+    };
+
+    // The first connection takes the only slot and keeps it, so the first
+    // listener's accept loop goes to wait for one.
+    var first_served: std.atomic.Value(bool) = .init(false);
+    var release_first: std.Io.Event = .unset;
+    var first = try io.concurrent(Get.run, .{ server.addresses[0], io, &first_served, &release_first });
+    defer first.cancel(io) catch {};
+    while (!first_served.load(.acquire)) try io.sleep(.fromMilliseconds(10), .awake);
+    try io.sleep(.fromMilliseconds(100), .awake);
+
+    // Accepted on the second listener, and held there until a slot frees.
+    var second_served: std.atomic.Value(bool) = .init(false);
+    var second = try io.concurrent(Get.run, .{ server.addresses[1], io, &second_served, null });
+    defer second.cancel(io) catch {};
+    try io.sleep(.fromMilliseconds(100), .awake);
+
+    release_first.set(io);
+    try first.await(io);
+
+    var waited: usize = 0;
+    while (!second_served.load(.acquire) and waited < 200) : (waited += 1) {
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(second_served.load(.acquire));
+    try second.await(io);
+}
+
 test "Server: a max_connections of zero is refused by run" {
     const io = std.testing.io;
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback, .max_connections = 0 }, {});
