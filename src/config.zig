@@ -88,8 +88,34 @@ pub const Listener = struct {
     /// waiting together let one trip take several. An idle one costs a
     /// parked task, and on Windows a socket created ahead for the
     /// connection it will get. Zero is taken as one.
-    acceptors: u16 = 2,
+    ///
+    /// Null picks log2 of the CPUs the process may use, honoring a cgroup
+    /// CPU quota, and at least two: 2 on 4 CPUs, 5 on 48, 7 on 128. Past
+    /// that, more loops on one socket stop paying for themselves, and on
+    /// short connections start to cost.
+    acceptors: ?u16 = null,
+
+    /// The number of accept loops, with `cpu_count` standing in for the
+    /// CPUs the process may use when `acceptors` is null.
+    pub fn acceptorCount(self: *const Listener, cpu_count: usize) u16 {
+        if (self.acceptors) |n| return @max(1, n);
+        return @intCast(@min(@max(2, std.math.log2_int(usize, @max(1, cpu_count))), std.math.maxInt(u16)));
+    }
 };
+
+test "Listener.acceptorCount: log2 of the CPUs, at least two, unless given" {
+    const auto: Listener = .{ .address = undefined };
+    try std.testing.expectEqual(2, auto.acceptorCount(1));
+    try std.testing.expectEqual(2, auto.acceptorCount(4));
+    try std.testing.expectEqual(3, auto.acceptorCount(8));
+    try std.testing.expectEqual(5, auto.acceptorCount(48));
+    try std.testing.expectEqual(7, auto.acceptorCount(128));
+
+    const given: Listener = .{ .address = undefined, .acceptors = 9 };
+    try std.testing.expectEqual(9, given.acceptorCount(128));
+    const zero: Listener = .{ .address = undefined, .acceptors = 0 };
+    try std.testing.expectEqual(1, zero.acceptorCount(128));
+}
 
 pub const ServerConfig = struct {
     timeout: Timeout = .{},

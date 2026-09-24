@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- `Listener.acceptors` now defaults to null, which picks log2 of the CPUs the process may use (honoring cgroup CPU quotas), and at least two, instead of a fixed two.
+
 ## [0.3.1] - 2026-09-21
 
 - Added whole-request HTTP client deadlines. `ClientConfig.timeout` defaults to 30 seconds, and `FetchOptions.timeout` can replace or disable it for an individual request. Buffered response bodies remain covered through completion; explicitly streamed responses are left to the caller.
