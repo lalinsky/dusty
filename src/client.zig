@@ -1427,8 +1427,9 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
         }
     }
 
-    // Add default Accept-Encoding if decompress enabled and user didn't provide one
-    if (opts.decompress and !has_accept_encoding) {
+    // Add default Accept-Encoding if decompress enabled and user didn't
+    // provide one, and only for codings this build can undo.
+    if (build_options.use_zlib and opts.decompress and !has_accept_encoding) {
         try writer.writeAll("Accept-Encoding: gzip, deflate\r\n");
     }
 
@@ -1701,6 +1702,7 @@ test "ClientResponse.body: basic response" {
 }
 
 test "ClientResponse.body: a corrupt gzip body reports the decompression failure" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1727,6 +1729,7 @@ test "ClientResponse.body: a corrupt gzip body reports the decompression failure
 }
 
 test "ClientResponse: a streaming read can be resolved without going through body" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2081,6 +2084,7 @@ test "ClientResponse.reader: after body() returns cached data" {
 }
 
 test "ClientResponse.body: gzip decompression" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2109,6 +2113,7 @@ test "ClientResponse.body: gzip decompression" {
 }
 
 test "ClientResponse: decoding takes the headers that described the encoded body" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

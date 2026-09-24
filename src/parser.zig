@@ -3,6 +3,7 @@ const Transport = @import("transport.zig").Transport;
 
 const c = @import("llhttp");
 const zlib = @import("zlib");
+const build_options = @import("build_options");
 
 const Method = @import("http.zig").Method;
 const Status = @import("http.zig").Status;
@@ -658,6 +659,8 @@ pub fn BodyReader(comptime Parser: type) type {
             allocator: std.mem.Allocator,
             encoding: ContentEncoding,
         ) StartDecodingError!void {
+            // Built without zlib, nothing here can undo a coding.
+            if (!build_options.use_zlib and encoding != .identity) return error.UnsupportedContentEncoding;
             const container: zlib.Container = switch (encoding) {
                 .identity => return,
                 .gzip => .gzip,

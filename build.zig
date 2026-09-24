@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     // the nghttp2 C library. Defaults off until the implementation lands. Requires
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
+    const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -19,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
+    build_options.addOption(bool, "use_zlib", use_zlib);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -45,12 +47,22 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    // Content decoding (gzip, deflate) of request and response bodies.
-    const zlib_dep = b.dependency("zlib", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    mod.addImport("zlib", zlib_dep.module("zlib"));
+    // Content decoding (gzip, deflate) of request and response bodies is a
+    // lazy dependency, like TLS: only fetched when `use_zlib` is set (the
+    // default). When disabled, a stub is imported so everything still builds,
+    // and a coded body is refused with error.UnsupportedContentEncoding.
+    if (use_zlib) {
+        if (b.lazyDependency("zlib", .{
+            .target = target,
+            .optimize = optimize,
+        })) |zlib_dep| {
+            mod.addImport("zlib", zlib_dep.module("zlib"));
+        }
+    } else {
+        mod.addAnonymousImport("zlib", .{
+            .root_source_file = b.path("src/zlib_stub.zig"),
+        });
+    }
 
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/llhttp/llhttp.h"),
