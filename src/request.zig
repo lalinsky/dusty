@@ -221,8 +221,6 @@ pub const Request = struct {
         if (!build_options.use_msgpack) @compileError("Request.msgpack needs the use_msgpack build option");
         const b = try self.body() orelse return null;
         return msgpack_lib.decodeFromSliceLeaky(T, self.arena, b) catch |err| switch (err) {
-            // Decoded from a slice, whose reader cannot fail.
-            error.ReadFailed => unreachable,
             // The body ended in the middle of a value, which is what
             // `json` calls it too.
             error.EndOfStream => return error.UnexpectedEndOfInput,

@@ -48,8 +48,8 @@
             .lazy = true,
         },
         .msgpack = .{
-            .url = "git+https://github.com/lalinsky/msgpack.zig?ref=v0.9.0#451da35e104935d07fa46aa7a80499097929966f",
-            .hash = "msgpack-0.9.0-ZOu9PEGgAgDvbGsCCi8OPV-n25bHqJniaZYM45BMJT4a",
+            .url = "git+https://github.com/lalinsky/msgpack.zig?ref=v0.10.0#42fb39c08d859bc24bfc1798a8604ce0635b8a4a",
+            .hash = "msgpack-0.10.0-ZOu9PJ_mAgBPNCyrHsb4Un8aB2-0SGBZR1gWsg7EdV7R",
             .lazy = true,
         },
     },
