@@ -5,6 +5,9 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
+const build_options = @import("build_options");
+const json_lib = if (build_options.use_json) @import("json") else struct {};
+const msgpack_lib = if (build_options.use_msgpack) @import("msgpack") else struct {};
 
 var no_buf: [0]u8 = .{};
 
@@ -683,15 +686,33 @@ pub const Response = struct {
         _ = self.headers.remove("Content-Length");
     }
 
-    pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
+    /// Options for `json`: json.zig's, when it is built in.
+    pub const JsonOptions = if (build_options.use_json) json_lib.EncodeOptions else struct {};
+
+    /// Sets the body to `value` encoded as JSON, with json.zig. A type can
+    /// shape its encoding with json.zig's `jsonFormat` or `jsonWrite`. Needs
+    /// the `use_json` build option.
+    pub fn json(self: *Response, value: anytype, options: JsonOptions) !void {
+        if (!build_options.use_json) @compileError("Response.json needs the use_json build option");
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
         if (self.body_writer_buffering) return error.BodyWriterOpen;
-        const json_formatter = std.json.fmt(value, options);
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
-        try json_formatter.format(&w.interface);
+        try json_lib.encodeWithOptions(value, &w.interface, options);
         try self.header("Content-Type", "application/json; charset=UTF-8");
+    }
+
+    /// Sets the body to `value` encoded as MessagePack, with msgpack.zig. A
+    /// type can shape its encoding with msgpack.zig's `msgpackWrite`. Needs
+    /// the `use_msgpack` build option.
+    pub fn msgpack(self: *Response, value: anytype) !void {
+        if (!build_options.use_msgpack) @compileError("Response.msgpack needs the use_msgpack build option");
+        if (self.body_writer_buffering) return error.BodyWriterOpen;
+        var w: BodyWriter = .init(self);
+        defer w.interface.flush() catch unreachable;
+        try msgpack_lib.encode(value, &w.interface);
+        try self.header("Content-Type", "application/vnd.msgpack");
     }
 
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
@@ -1648,6 +1669,7 @@ test "StreamingBodyWriter: a failed end does not leave a second terminator" {
 }
 
 test "Response: json() with simple object" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1671,6 +1693,7 @@ test "Response: json() with simple object" {
 }
 
 test "Response: json() writes complete response" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1699,6 +1722,7 @@ test "Response: json() writes complete response" {
 }
 
 test "Response: json() with array" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1718,6 +1742,7 @@ test "Response: json() with array" {
 }
 
 test "Response: json() with nested object" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1739,6 +1764,44 @@ test "Response: json() with nested object" {
     var body_buf: [256]u8 = undefined;
     const buffered = try testBody(&response, &body_buf);
     try std.testing.expectEqualStrings("{\"user\":{\"name\":\"Bob\",\"id\":42},\"active\":true}", buffered);
+}
+
+test "Response: json() leaves out null optional fields" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    const User = struct { name: []const u8, email: ?[]const u8 = null };
+    try response.json(User{ .name = "Bob" }, .{});
+
+    var body_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"name\":\"Bob\"}", try testBody(&response, &body_buf));
+}
+
+test "Response: msgpack() sets the body and its content type" {
+    if (comptime !build_options.use_msgpack) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.msgpack(.{ .id = @as(u8, 7) });
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Type: application/vnd.msgpack\r\n") != null);
+    // A map of one: "id" => 7.
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n\x81\xa2id\x07"));
 }
 
 /// An event stream over a fixed buffer. Built in place: the response points
@@ -2508,6 +2571,7 @@ test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
 }
 
 test "Response: json is refused while a body writer is open" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

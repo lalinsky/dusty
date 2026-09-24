@@ -11,6 +11,9 @@ const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
+const build_options = @import("build_options");
+const json_lib = if (build_options.use_json) @import("json") else struct {};
+const msgpack_lib = if (build_options.use_msgpack) @import("msgpack") else struct {};
 
 const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
 
@@ -196,25 +199,32 @@ pub const Request = struct {
         return result;
     }
 
-    /// Parse body as JSON into type T
+    /// Decodes the body as JSON into `T`, with json.zig, into the request
+    /// arena. Null when there is no body. Needs the `use_json` build option.
     pub fn json(self: *Request, comptime T: type) !?T {
+        if (!build_options.use_json) @compileError("Request.json needs the use_json build option");
         const b = try self.body() orelse return null;
-        return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});
+        return json_lib.decodeFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
+            // Decoded from a slice, whose reader cannot fail.
+            error.ReadFailed => unreachable,
+            else => |e| return e,
+        };
     }
 
-    /// Parse body as a generic JSON value
-    pub fn jsonValue(self: *Request) !?std.json.Value {
+    /// Decodes the body as MessagePack into `T`, with msgpack.zig, into the
+    /// request arena. Null when there is no body. Needs the `use_msgpack`
+    /// build option.
+    pub fn msgpack(self: *Request, comptime T: type) !?T {
+        if (!build_options.use_msgpack) @compileError("Request.msgpack needs the use_msgpack build option");
         const b = try self.body() orelse return null;
-        return try std.json.parseFromSliceLeaky(std.json.Value, self.arena, b, .{});
-    }
-
-    /// Parse body as a JSON object
-    pub fn jsonObject(self: *Request) !?std.json.ObjectMap {
-        const value = try self.jsonValue() orelse return null;
-        switch (value) {
-            .object => |o| return o,
-            else => return null,
-        }
+        return msgpack_lib.decodeFromSliceLeaky(T, self.arena, b) catch |err| switch (err) {
+            // Decoded from a slice, whose reader cannot fail.
+            error.ReadFailed => unreachable,
+            // The body ended in the middle of a value, which is what
+            // `json` calls it too.
+            error.EndOfStream => return error.UnexpectedEndOfInput,
+            else => |e| return e,
+        };
     }
 
     /// Get cookies from the request
@@ -700,9 +710,21 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
             return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
         }
     }.f;
+    // `json` and `msgpack` are generic, so an instance of each stands in.
+    const json_errors = if (build_options.use_json) ErrorSetOf(struct {
+        fn f(r: *Request) !?u8 {
+            return r.json(u8);
+        }
+    }.f) else error{};
+    const msgpack_errors = if (build_options.use_msgpack) ErrorSetOf(struct {
+        fn f(r: *Request) !?u8 {
+            return r.msgpack(u8);
+        }
+    }.f) else error{};
     inline for (.{
         ErrorSetOf(Request.body),
-        ErrorSetOf(Request.jsonValue),
+        json_errors,
+        msgpack_errors,
         ErrorSetOf(Request.formData),
         ErrorSetOf(Request.multiFormData),
         // The wrapper a streaming caller resolves through, not just the
@@ -741,6 +763,64 @@ test "Request.body: basic POST" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("hello", body.?);
+}
+
+test "Request.json: decodes the body into a type" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const body = "{\"name\":\"Ann\",\"age\":30}";
+    const raw_request = std.fmt.comptimePrint("POST /test HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{body.len}) ++ body;
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+    try parseHeaders(&reader, &parser);
+
+    const User = struct { name: []const u8, age: u32 };
+    const user = (try req.json(User)).?;
+    try std.testing.expectEqualStrings("Ann", user.name);
+    try std.testing.expectEqual(30, user.age);
+}
+
+test "Request.msgpack: decodes the body into a type, and a truncated one fails" {
+    if (comptime !build_options.use_msgpack) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const User = struct { name: []const u8, age: u32 };
+    // {"name": "Ann", "age": 30}
+    const body = "\x82\xa4name\xa3Ann\xa3age\x1e";
+    inline for (.{ body, body[0 .. body.len - 1] }, 0..) |b, i| {
+        const raw_request = std.fmt.comptimePrint("POST /test HTTP/1.1\r\nContent-Length: {d}\r\n\r\n", .{b.len}) ++ b;
+        var reader = try fixedMessageReader(arena.allocator(), raw_request);
+        var req: Request = .{
+            .arena = arena.allocator(),
+            .transport = .{ .reader = &reader, .writer = undefined },
+            .parser = undefined,
+        };
+        var parser: RequestParser = undefined;
+        try parser.init(&req);
+        defer parser.deinit();
+        req.parser = &parser;
+        try parseHeaders(&reader, &parser);
+
+        if (i == 0) {
+            const user = (try req.msgpack(User)).?;
+            try std.testing.expectEqualStrings("Ann", user.name);
+            try std.testing.expectEqual(30, user.age);
+        } else {
+            try std.testing.expectError(error.UnexpectedEndOfInput, req.msgpack(User));
+        }
+    }
 }
 
 test "Request.body: a gzip request body is decoded" {
@@ -1051,7 +1131,9 @@ test "Request.body: a body read that failed before it started can be asked for a
     // assert on a request a peer chose the encoding for.
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
-    try std.testing.expectError(error.UnsupportedContentEncoding, req.jsonValue());
+    if (comptime build_options.use_json) {
+        try std.testing.expectError(error.UnsupportedContentEncoding, req.json(u8));
+    }
 }
 
 test "Request: a streaming read resolves through the reader it hands out" {
