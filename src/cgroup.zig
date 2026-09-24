@@ -12,9 +12,9 @@ const builtin = @import("builtin");
 
 /// CPUs this process can use: the affinity count, lowered to the cgroup CPU
 /// quota when there is a tighter one. At least 1.
-pub fn cpuCount(io: std.Io) usize {
+pub fn cpuCount(io: std.Io) std.Io.Cancelable!usize {
     const affinity = std.Thread.getCpuCount() catch 1;
-    const limit = cpuLimit(io) orelse return affinity;
+    const limit = try cpuLimit(io) orelse return affinity;
     return @min(affinity, limit);
 }
 
@@ -25,9 +25,9 @@ pub fn cpuCount(io: std.Io) usize {
 /// and a limit below 2 is raised to 2 to avoid pathological behavior under a
 /// tight quota. Callers still take the min with the affinity-based CPU count,
 /// so a genuinely single-CPU affinity mask still wins.
-pub fn cpuLimit(io: std.Io) ?u32 {
+pub fn cpuLimit(io: std.Io) std.Io.Cancelable!?u32 {
     if (builtin.os.tag != .linux) return null;
-    return roundRatio(quotaRatio(io) orelse return null);
+    return roundRatio(try quotaRatio(io) orelse return null);
 }
 
 /// Round a quota/period ratio up to a whole CPU count, with a floor of 2 (see
@@ -38,15 +38,15 @@ fn roundRatio(ratio: f64) u32 {
 }
 
 /// The raw quota/period ratio from the cgroup, or null if unlimited/unavailable.
-fn quotaRatio(io: std.Io) ?f64 {
+fn quotaRatio(io: std.Io) std.Io.Cancelable!?f64 {
     // cgroup v2 (unified hierarchy). Resolve the process's own cgroup path from
     // /proc/self/cgroup so we read the right cpu.max whether the limit lives at
     // the mount root (namespaced container) or in a leaf slice (systemd
     // CPUQuota=, or a container without a cgroup namespace).
     var path_buf: [512]u8 = undefined;
-    if (v2CpuMaxPath(io, &path_buf)) |cpu_max_path| {
+    if (try v2CpuMaxPath(io, &path_buf)) |cpu_max_path| {
         var buf: [128]u8 = undefined;
-        if (readFile(io, cpu_max_path, &buf)) |content| {
+        if (try readFile(io, cpu_max_path, &buf)) |content| {
             // cpu.max holds "<quota> <period>", with <quota> being the literal
             // "max" when there is no limit.
             return parseV2(content);
@@ -57,12 +57,12 @@ fn quotaRatio(io: std.Io) ?f64 {
     // use the fixed well-known path, which covers namespaced v1 containers.
     // cpu.cfs_quota_us is -1 when there is no limit.
     var quota_buf: [32]u8 = undefined;
-    const quota_str = readFile(io, "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", &quota_buf) orelse return null;
+    const quota_str = try readFile(io, "/sys/fs/cgroup/cpu/cpu.cfs_quota_us", &quota_buf) orelse return null;
     const quota = std.fmt.parseInt(i64, std.mem.trim(u8, quota_str, " \n"), 10) catch return null;
     if (quota < 0) return null;
 
     var period_buf: [32]u8 = undefined;
-    const period_str = readFile(io, "/sys/fs/cgroup/cpu/cpu.cfs_period_us", &period_buf) orelse return null;
+    const period_str = try readFile(io, "/sys/fs/cgroup/cpu/cpu.cfs_period_us", &period_buf) orelse return null;
     const period = std.fmt.parseInt(i64, std.mem.trim(u8, period_str, " \n"), 10) catch return null;
     if (period <= 0) return null;
 
@@ -73,9 +73,9 @@ fn quotaRatio(io: std.Io) ?f64 {
 /// or null if the process is not on a unified (v2) hierarchy. The v2 line in
 /// /proc/self/cgroup has the form "0::<path>"; the file lives at
 /// /sys/fs/cgroup<path>/cpu.max.
-fn v2CpuMaxPath(io: std.Io, out: []u8) ?[]const u8 {
+fn v2CpuMaxPath(io: std.Io, out: []u8) std.Io.Cancelable!?[]const u8 {
     var buf: [1024]u8 = undefined;
-    const content = readFile(io, "/proc/self/cgroup", &buf) orelse return null;
+    const content = try readFile(io, "/proc/self/cgroup", &buf) orelse return null;
     return buildV2Path(content, out);
 }
 
@@ -104,10 +104,14 @@ fn parseV2(content: []const u8) ?f64 {
 }
 
 /// Read a small pseudo-file into `buf`, returning the bytes read, or null on
-/// any error (missing controller, permission, etc.) so detection degrades to
-/// the affinity-only path.
-fn readFile(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
-    const content = std.Io.Dir.cwd().readFile(io, path, buf) catch return null;
+/// any other error (missing controller, permission, etc.) so detection
+/// degrades to the affinity-only path. A cancel is not such an error: the
+/// caller is being stopped, and hears about it.
+fn readFile(io: std.Io, path: []const u8, buf: []u8) std.Io.Cancelable!?[]const u8 {
+    const content = std.Io.Dir.cwd().readFile(io, path, buf) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return null,
+    };
     if (content.len == 0) return null;
     return content;
 }

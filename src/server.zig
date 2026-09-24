@@ -492,7 +492,7 @@ pub fn Server(comptime Ctx: type) type {
 
             // Read once, and only when a listener sizes itself from it.
             const cpu_count: usize = for (listeners) |cfg| {
-                if (cfg.acceptors == null) break cgroup.cpuCount(self.io);
+                if (cfg.acceptors == null) break try cgroup.cpuCount(self.io);
             } else 1;
             var acceptor_count: usize = 0;
             for (listeners) |cfg| acceptor_count += cfg.acceptorCount(cpu_count);
