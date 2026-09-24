@@ -332,7 +332,9 @@ pub const BodyWriter = struct {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
         const pattern = data[data.len - 1];
         var needed: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| needed += bytes.len;
+        for (data[0 .. data.len - 1]) |bytes| {
+            needed = std.math.add(usize, needed, bytes.len) catch return self.fail(error.OutOfMemory);
+        }
         const splat_len = std.math.mul(usize, pattern.len, splat) catch return self.fail(error.OutOfMemory);
         needed = std.math.add(usize, needed, splat_len) catch return self.fail(error.OutOfMemory);
         // Called only when `data` does not fit in what is left, so move on
@@ -653,7 +655,10 @@ pub const Response = struct {
         self.body_writer_open = true;
     }
 
+    /// Throws away the body written so far. Not while a body writer is
+    /// open: its unflushed bytes are its own, and it would put them back.
     pub fn clearWriter(self: *Response) void {
+        std.debug.assert(!self.body_writer_buffering);
         self.body_buffer.clear();
     }
 
@@ -667,10 +672,12 @@ pub const Response = struct {
     /// swapped.
     pub fn resetBody(self: *Response) void {
         std.debug.assert(!self.headers_written);
-        self.clearWriter();
-        self.body = "";
+        // An open writer is abandoned with the body: `end` on it does
+        // nothing once it is no longer the open one.
         self.body_writer_open = false;
         self.body_writer_buffering = false;
+        self.clearWriter();
+        self.body = "";
         // Everything that described the old body has to go with it.
         // `content_type` is the usual way to set one, but a handler can
         // write either header directly, and then a stale Content-Length
@@ -683,6 +690,9 @@ pub const Response = struct {
     }
 
     pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
+        // The open writer owns the segment being filled, and would write
+        // over this, or publish a length past the end of it.
+        if (self.body_writer_buffering) return error.BodyWriterOpen;
         const json_formatter = std.json.fmt(value, options);
         var w: BodyWriter = .init(self);
         defer w.interface.flush() catch unreachable;
@@ -2509,6 +2519,26 @@ test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
     try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Length: 6\r\n\r\nabcdef"));
 }
 
+test "Response: json is refused while a body writer is open" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    try body.interface.writeAll("[");
+    try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }, .{}));
+    try body.interface.writeAll("]");
+    try body.end();
+    try response.write();
+
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Length: 2\r\n\r\n[]"));
+}
+
 test "BodyWriter: resetBody after several segments leaves only the replacement" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2520,7 +2550,11 @@ test "BodyWriter: resetBody after several segments leaves only the replacement" 
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     var body = response.writer();
+    try body.interface.splatByteAll('y', 300);
     try body.interface.splatByteAll('z', 5000);
+    try body.interface.flush();
+    try std.testing.expect(response.body_buffer.segments.len() > 1);
+    try std.testing.expectEqual(5300, response.body_buffer.len());
     response.resetBody();
     var again = response.writer();
     try again.interface.writeAll("fresh");
