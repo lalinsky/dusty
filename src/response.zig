@@ -425,10 +425,16 @@ pub const Response = struct {
     /// header that is not a number.
     pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
+    /// Reserved for the body up front, from the request arena, so a short
+    /// body is written without growing the buffer. The arena keeps its
+    /// memory across a connection's requests, so this costs a bump, not an
+    /// allocation.
+    pub const initial_body_capacity = 512;
+
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .buffer = .init(arena),
+            .buffer = try .initCapacity(arena, initial_body_capacity),
             .conn = conn,
             .headers = try http.Headers.init(arena, max_headers),
         };

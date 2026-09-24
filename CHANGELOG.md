@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- `Response` reserves 512 bytes of body buffer up front from the request arena, so a short body written through `Response.writer` or `Response.json` no longer grows the buffer.
+
 ## [0.3.1] - 2026-09-21
 
 - Added whole-request HTTP client deadlines. `ClientConfig.timeout` defaults to 30 seconds, and `FetchOptions.timeout` can replace or disable it for an individual request. Buffered response bodies remain covered through completion; explicitly streamed responses are left to the caller.
