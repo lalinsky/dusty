@@ -45,6 +45,13 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    // Content decoding (gzip, deflate) of request and response bodies.
+    const zlib_dep = b.dependency("zlib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("zlib", zlib_dep.module("zlib"));
+
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/llhttp/llhttp.h"),
         .target = target,

@@ -1079,9 +1079,10 @@ test "Request: a streaming read resolves through the reader it hands out" {
     // has to answer -- including for a failure in the layer it added.
     var read_buf: [64]u8 = undefined;
     var r = try req.reader(&read_buf);
-    var sink: std.Io.Writer = .fixed(&[_]u8{});
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
-    try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
+    try std.testing.expectEqual(error.CorruptInput, r.err.?);
 }
 
 test "Request.body: a body cut short is IncompleteBody, not a failed read" {

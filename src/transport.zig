@@ -37,8 +37,8 @@
 //!
 //! "Resolved" is the load-bearing word. An `err` holding a sentinel is no
 //! better than the sentinel, and layers do record sentinels: both tls.zig
-//! and `std.compress.flate.Decompress` store `error.ReadFailed` when the
-//! layer below them failed, because that is all they were handed.
+//! and `zlib.Decompress` store `error.ReadFailed` when the layer below them
+//! failed, because that is all they were handed.
 //! It means "keep descending". So the code that reads them switches
 //! past them rather than comparing, which drops them from the inferred error
 //! set as well as from the answer -- making it true by construction that

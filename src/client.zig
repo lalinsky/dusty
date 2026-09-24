@@ -1723,7 +1723,7 @@ test "ClientResponse.body: a corrupt gzip body reports the decompression failure
 
     // The bytes arrived intact; it is the layer above the body reader that
     // could not make sense of them, so that is where the answer is.
-    try std.testing.expectError(error.BadGzipHeader, response.body());
+    try std.testing.expectError(error.CorruptInput, response.body());
 }
 
 test "ClientResponse: a streaming read can be resolved without going through body" {
@@ -1752,12 +1752,13 @@ test "ClientResponse: a streaming read can be resolved without going through bod
     // no other way to find out what happened.
     var read_buf: [64]u8 = undefined;
     var r = try response.reader(&read_buf);
-    var sink: std.Io.Writer = .fixed(&[_]u8{});
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
 
     // Asked of the reader that was handed out, which is the point: a caller
     // holding it needs nothing else to find out what a failed read was.
-    try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
+    try std.testing.expectEqual(error.CorruptInput, r.err.?);
 }
 
 test "ClientResponse.body: a body read that failed before it started can be asked for again" {
@@ -1791,12 +1792,10 @@ test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
     // `fetch` returns a `ClientResponse` by value and `reader` returns the
     // body reader by value, so both are copied per response whether or not
     // anything was coded. The read buffer comes from the caller, and the
-    // decoder and its 64K window are allocated when the headers call for
-    // them -- so neither of these grows with either.
-    try std.testing.expect(@sizeOf(ClientResponse) < std.compress.flate.max_window_len);
-    try std.testing.expect(@sizeOf(ResponseBodyReader) < std.compress.flate.max_window_len);
-    // Which is what they would otherwise be carrying.
-    try std.testing.expect(@sizeOf(ResponseBodyReader.Decode) > std.compress.flate.max_window_len);
+    // decoder is allocated when the headers call for it -- so neither of
+    // these grows with either.
+    try std.testing.expect(@sizeOf(ClientResponse) < @sizeOf(ResponseBodyReader.Decode));
+    try std.testing.expect(@sizeOf(ResponseBodyReader) < @sizeOf(ResponseBodyReader.Decode));
 }
 
 test "Client: no std.Io sentinel escapes its public API" {
