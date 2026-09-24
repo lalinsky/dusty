@@ -2,6 +2,8 @@ const std = @import("std");
 const Uri = std.Uri;
 const tls = @import("tls");
 const build_options = @import("build_options");
+const json_lib = if (build_options.use_json) @import("json") else struct {};
+const msgpack_lib = if (build_options.use_msgpack) @import("msgpack") else struct {};
 
 const unix_path_max = 108;
 
@@ -800,6 +802,34 @@ pub const ClientResponse = struct {
         }
         self._body = result;
         return result;
+    }
+
+    /// Decodes the body as JSON into `T`, with json.zig, into the response's
+    /// arena. Null when there is no body. Needs the `use_json` build option.
+    pub fn json(self: *ClientResponse, comptime T: type) !?T {
+        if (!build_options.use_json) @compileError("ClientResponse.json needs the use_json build option");
+        const b = try self.body() orelse return null;
+        return json_lib.decodeFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
+            // Decoded from a slice, whose reader cannot fail.
+            error.ReadFailed => unreachable,
+            else => |e| return e,
+        };
+    }
+
+    /// Decodes the body as MessagePack into `T`, with msgpack.zig, into the
+    /// response's arena. Null when there is no body. Needs the `use_msgpack`
+    /// build option.
+    pub fn msgpack(self: *ClientResponse, comptime T: type) !?T {
+        if (!build_options.use_msgpack) @compileError("ClientResponse.msgpack needs the use_msgpack build option");
+        const b = try self.body() orelse return null;
+        return msgpack_lib.decodeFromSliceLeaky(T, self.arena, b) catch |err| switch (err) {
+            // Decoded from a slice, whose reader cannot fail.
+            error.ReadFailed => unreachable,
+            // The body ended in the middle of a value, which is what `json`
+            // calls it too.
+            error.EndOfStream => return error.UnexpectedEndOfInput,
+            else => |e| return e,
+        };
     }
 
     /// The response body: transfer framing undone, and the content coding
@@ -1800,6 +1830,8 @@ test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
 }
 
 test "Client: no std.Io sentinel escapes its public API" {
+    // Every error of every set below, compared by name at comptime.
+    @setEvalBranchQuota(10_000);
     // `ReadFailed`/`WriteFailed` say only that a read or write failed, which
     // the caller knew when it called. The client stacks more layers than the
     // server does -- socket, TLS, request and response framing,
@@ -1809,8 +1841,21 @@ test "Client: no std.Io sentinel escapes its public API" {
             return @typeInfo(@typeInfo(@TypeOf(func)).@"fn".return_type.?).error_union.error_set;
         }
     }.f;
+    // `json` and `msgpack` are generic, so an instance of each stands in.
+    const json_errors = if (build_options.use_json) ErrorSetOf(struct {
+        fn f(r: *ClientResponse) !?u8 {
+            return r.json(u8);
+        }
+    }.f) else error{};
+    const msgpack_errors = if (build_options.use_msgpack) ErrorSetOf(struct {
+        fn f(r: *ClientResponse) !?u8 {
+            return r.msgpack(u8);
+        }
+    }.f) else error{};
     inline for (.{
         ErrorSetOf(ClientResponse.body),
+        json_errors,
+        msgpack_errors,
         ErrorSetOf(Client.fetch),
         ErrorSetOf(Client.connectWebSocket),
         ErrorSetOf(WebSocketClient.send),
@@ -2079,6 +2124,77 @@ test "ClientResponse.reader: after body() returns cached data" {
     var body_reader = try response.reader(&read_buf);
     const cached = try body_reader.interface.allocRemaining(arena.allocator(), .unlimited);
     try std.testing.expectEqualStrings("hello", cached);
+}
+
+/// A response to `raw_response`, parsed as far as its body, for the tests
+/// of the body decoders below.
+fn testClientResponse(arena: std.mem.Allocator, raw_response: []const u8, reader: *std.Io.Reader, parsed: *ParsedResponse, parser: *ResponseParser) !ClientResponse {
+    reader.* = try fixedMessageReader(arena, raw_response);
+    parsed.* = .{ .arena = arena };
+    try parser.init(parsed, 64);
+    try parseResponseHeaders(reader, parser);
+    return .{
+        .arena = arena,
+        .parser = parser,
+        .transport = .{ .reader = reader, .writer = undefined },
+        .parsed = parsed,
+        .max_response_size = 1024,
+    };
+}
+
+test "ClientResponse.json: decodes the body into a type" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const body = "{\"name\":\"Ann\",\"age\":30}";
+    const raw = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{body.len}) ++ body;
+    var reader: std.Io.Reader = undefined;
+    var parsed: ParsedResponse = undefined;
+    var parser: ResponseParser = undefined;
+    var response = try testClientResponse(arena.allocator(), raw, &reader, &parsed, &parser);
+
+    const User = struct { name: []const u8, age: u32 };
+    const user = (try response.json(User)).?;
+    try std.testing.expectEqualStrings("Ann", user.name);
+    try std.testing.expectEqual(30, user.age);
+}
+
+test "ClientResponse.msgpack: decodes the body into a type, and a truncated one fails" {
+    if (comptime !build_options.use_msgpack) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const User = struct { name: []const u8, age: u32 };
+    // {"name": "Ann", "age": 30}
+    const body = "\x82\xa4name\xa3Ann\xa3age\x1e";
+    inline for (.{ body, body[0 .. body.len - 1] }, 0..) |b, i| {
+        const raw = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Type: application/vnd.msgpack\r\nContent-Length: {d}\r\n\r\n", .{b.len}) ++ b;
+        var reader: std.Io.Reader = undefined;
+        var parsed: ParsedResponse = undefined;
+        var parser: ResponseParser = undefined;
+        var response = try testClientResponse(arena.allocator(), raw, &reader, &parsed, &parser);
+
+        if (i == 0) {
+            const user = (try response.msgpack(User)).?;
+            try std.testing.expectEqualStrings("Ann", user.name);
+            try std.testing.expectEqual(30, user.age);
+        } else {
+            try std.testing.expectError(error.UnexpectedEndOfInput, response.msgpack(User));
+        }
+    }
+}
+
+test "ClientResponse.json: no body is null" {
+    if (comptime !build_options.use_json) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var reader: std.Io.Reader = undefined;
+    var parsed: ParsedResponse = undefined;
+    var parser: ResponseParser = undefined;
+    var response = try testClientResponse(arena.allocator(), "HTTP/1.1 204 No Content\r\n\r\n", &reader, &parsed, &parser);
+    try std.testing.expectEqual(null, try response.json(u32));
 }
 
 test "ClientResponse.body: gzip decompression" {
