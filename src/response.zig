@@ -158,46 +158,80 @@ pub const EventStream = struct {
 /// length is known before the headers go out, so it is never gathered into
 /// one piece; it is sent a segment at a time.
 ///
-/// The segment being filled belongs to whichever `BodyWriter` is open, and
-/// `tail_len` catches up with it when that writer is flushed or ended, or
-/// moves to the next segment.
+/// The last segment belongs to whichever `BodyWriter` is open, and its
+/// `len` catches up with it when that writer is flushed or ended, or moves
+/// to the next segment.
 const BodyBuffer = struct {
-    /// The filled segments before the tail, in order.
-    sealed: std.ArrayList([]const u8) = .empty,
+    segments: std.DoublyLinkedList = .{},
+    /// The bytes in every segment but the last.
     sealed_len: usize = 0,
-    tail: []u8 = &.{},
-    tail_len: usize = 0,
 
     const first_segment_len = 512;
     const max_segment_len = 64 * 1024;
+
+    /// A segment's header, with its bytes right behind it in the same
+    /// allocation.
+    const Segment = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        len: usize = 0,
+        capacity: usize,
+
+        fn create(arena: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!*Segment {
+            const size = std.math.add(usize, @sizeOf(Segment), capacity) catch return error.OutOfMemory;
+            const memory = try arena.alignedAlloc(u8, .of(Segment), size);
+            const segment: *Segment = @ptrCast(memory.ptr);
+            segment.* = .{ .capacity = capacity };
+            return segment;
+        }
+
+        fn fromNode(node: *std.DoublyLinkedList.Node) *Segment {
+            return @fieldParentPtr("node", node);
+        }
+
+        fn bytes(self: *Segment) []u8 {
+            const base: [*]u8 = @ptrCast(self);
+            return base[@sizeOf(Segment)..][0..self.capacity];
+        }
+    };
 
     /// With the first segment reserved up front: a short body then never
     /// reaches a writer's vtable, and a writer is never unbuffered, which
     /// `std.Io.Writer.sendFileAll` asserts against. The request arena keeps
     /// its memory between a connection's requests, so this is a bump.
     fn init(arena: std.mem.Allocator) std.mem.Allocator.Error!BodyBuffer {
-        return .{ .tail = try arena.alloc(u8, first_segment_len) };
+        var self: BodyBuffer = .{};
+        self.segments.append(&(try Segment.create(arena, first_segment_len)).node);
+        return self;
+    }
+
+    fn last(self: *const BodyBuffer) ?*Segment {
+        return if (self.segments.last) |node| Segment.fromNode(node) else null;
     }
 
     fn len(self: *const BodyBuffer) usize {
-        return self.sealed_len + self.tail_len;
+        return self.sealed_len + if (self.last()) |segment| segment.len else 0;
     }
 
     fn writeTo(self: *const BodyBuffer, out: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (self.sealed.items) |segment| try out.writeAll(segment);
-        try out.writeAll(self.tail[0..self.tail_len]);
+        var it = self.segments.first;
+        while (it) |node| : (it = node.next) {
+            const segment = Segment.fromNode(node);
+            try out.writeAll(segment.bytes()[0..segment.len]);
+        }
     }
 
-    /// Forgets the body, keeping the tail segment to write into again.
+    /// Forgets the body, keeping the last segment to write into again.
     fn clear(self: *BodyBuffer) void {
-        self.sealed.clearRetainingCapacity();
+        const segment = self.last() orelse return;
+        segment.* = .{ .capacity = segment.capacity };
+        self.segments = .{};
+        self.segments.append(&segment.node);
         self.sealed_len = 0;
-        self.tail_len = 0;
     }
 
     /// Seals what `w` holds, except its last `preserve` bytes, which start
-    /// the next segment, and makes that next segment the tail and `w`'s
-    /// buffer, with room for `needed` more.
+    /// the next segment, and makes that next segment `w`'s buffer, with
+    /// room for `needed` more.
     fn nextSegment(
         self: *BodyBuffer,
         arena: std.mem.Allocator,
@@ -205,29 +239,34 @@ const BodyBuffer = struct {
         needed: usize,
         preserve: usize,
     ) std.mem.Allocator.Error!void {
-        std.debug.assert(w.buffer.ptr == self.tail.ptr);
         const filled = w.buffer[0..w.end];
         // Asking to keep more than is buffered keeps all of it, as the
         // default rebase does.
         const kept = @min(preserve, filled.len);
-        const done = filled[0 .. filled.len - kept];
         const keep = filled[filled.len - kept ..];
 
         // Doubling, so a large body takes few segments, up to a size past
-        // which a bigger one saves nothing.
+        // which a bigger one saves nothing. Sized by `preserve` rather than
+        // what was kept of it: the caller asserts room for both, whatever
+        // was actually buffered.
         const next_len = if (w.buffer.len == 0) first_segment_len else @min(max_segment_len, w.buffer.len * 2);
-        // Sized by `preserve` rather than what was kept of it: the caller
-        // asserts room for both, whatever was actually buffered.
         const size = @max(next_len, std.math.add(usize, needed, preserve) catch return error.OutOfMemory);
-        const segment = try arena.alloc(u8, size);
-        if (done.len > 0) {
-            try self.sealed.append(arena, done);
-            self.sealed_len += done.len;
+        const next = try Segment.create(arena, size);
+
+        if (self.last()) |current| {
+            std.debug.assert(w.buffer.ptr == current.bytes().ptr);
+            current.len = filled.len - kept;
+            if (current.len == 0) {
+                // Nothing of it stays: drop it rather than send it empty.
+                self.segments.remove(&current.node);
+            } else {
+                self.sealed_len += current.len;
+            }
         }
-        @memcpy(segment[0..keep.len], keep);
-        self.tail = segment;
-        self.tail_len = keep.len;
-        w.buffer = segment;
+        @memcpy(next.bytes()[0..keep.len], keep);
+        next.len = keep.len;
+        self.segments.append(&next.node);
+        w.buffer = next.bytes();
         w.end = keep.len;
     }
 };
@@ -268,10 +307,14 @@ pub const BodyWriter = struct {
     };
 
     fn init(res: *Response) BodyWriter {
-        const body = &res.body_buffer;
+        const segment = res.body_buffer.last();
         return .{
             .res = res,
-            .interface = .{ .buffer = body.tail, .end = body.tail_len, .vtable = &vtable },
+            .interface = .{
+                .buffer = if (segment) |seg| seg.bytes() else &.{},
+                .end = if (segment) |seg| seg.len else 0,
+                .vtable = &vtable,
+            },
         };
     }
 
@@ -314,7 +357,7 @@ pub const BodyWriter = struct {
     /// tells the response how much of the current one is written.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
-        self.res.body_buffer.tail_len = w.end;
+        if (self.res.body_buffer.last()) |segment| segment.len = w.end;
     }
 
     fn fail(self: *BodyWriter, err: Error) std.Io.Writer.Error {
@@ -2300,7 +2343,7 @@ test "BodyWriter: a body over many segments goes out whole, with its length" {
         try body.interface.writeAll(expected[i..@min(i + 7, expected.len)]);
     }
     try body.end();
-    try std.testing.expect(response.body_buffer.sealed.items.len > 1);
+    try std.testing.expect(response.body_buffer.segments.len() > 1);
     try std.testing.expectEqual(expected.len, response.body_buffer.len());
     try response.write();
 
