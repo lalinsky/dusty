@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("root.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
@@ -2102,6 +2103,79 @@ test "Server: run serves every listener and tells the handler which one" {
 
     try std.testing.expectError(error.Canceled, server_future.cancel(io));
     try std.testing.expectEqual(0, server.addresses.len);
+}
+
+test "Server: socket_per_acceptor binds every socket to one port and serves them all" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listen = &.{.{ .address = loopback_addr, .acceptors = 4, .socket_per_acceptor = true }},
+    }, {});
+    defer server.deinit();
+
+    const Handler = struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "ok";
+        }
+    };
+    server.router.get("/", Handler.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+    try std.testing.expectEqual(1, server.addresses.len);
+    try std.testing.expect(server.address.ip.getPort() != 0);
+
+    // The kernel hashes each connection to one of the four sockets, so
+    // enough of them reach every one; a socket without a loop would leave
+    // some unanswered.
+    for (0..64) |_| {
+        const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+        defer stream.close(io);
+        defer stream.shutdown(io, .both) catch {};
+
+        var write_buf: [256]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        try writer.interface.flush();
+
+        var read_buf: [1024]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var status: [64]u8 = undefined;
+        var body: [16]u8 = undefined;
+        const resp = try readResponse(&reader.interface, &status, &body);
+        try std.testing.expectStringStartsWith(resp.status, "HTTP/1.1 200 ");
+        try std.testing.expectEqualStrings("ok", resp.body);
+    }
+
+    try std.testing.expectError(error.Canceled, server_future.cancel(io));
+}
+
+test "Server: socket_per_acceptor is refused without SO_REUSEPORT or on a unix socket" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    {
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{
+            .listen = &.{.{ .address = loopback_addr, .socket_per_acceptor = true, .reuse_address = false }},
+        }, {});
+        defer server.deinit();
+        try std.testing.expectError(error.SocketPerAcceptorUnsupported, server.run());
+    }
+    {
+        const unix = try std.Io.net.UnixAddress.init("/tmp/dusty-socket-per-acceptor.sock");
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{
+            .listen = &.{.{ .address = .{ .unix = unix }, .socket_per_acceptor = true }},
+        }, {});
+        defer server.deinit();
+        try std.testing.expectError(error.SocketPerAcceptorUnsupported, server.run());
+    }
 }
 
 test "Server: a listener that fails to open releases the ones opened before it" {

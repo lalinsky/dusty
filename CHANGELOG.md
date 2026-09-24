@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added `Listener.socket_per_acceptor`, which gives each accept loop its own SO_REUSEPORT socket on the listener's address so the kernel spreads new connections over separate accept queues. Off by default: it scales further when nearly every request opens a new connection, at the cost of tail latency. Linux only.
+
 ## [0.3.1] - 2026-09-21
 
 - Added whole-request HTTP client deadlines. `ClientConfig.timeout` defaults to 30 seconds, and `FetchOptions.timeout` can replace or disable it for an individual request. Buffered response bodies remain covered through completion; explicitly streamed responses are left to the caller.
