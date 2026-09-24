@@ -456,8 +456,18 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// Accepts on every listener in `config.listen` until canceled, then
-        /// drains the connections in flight.
+        /// drains the connections in flight. Returns `error.Canceled` whenever
+        /// it was canceled, even if it was failing for another reason by then.
         pub fn run(self: *Self) !void {
+            self.serve() catch |err| {
+                // A cancel that arrived while `serve` failed for another
+                // reason is still pending, and is what the caller asked about.
+                if (err != error.Canceled) try self.io.checkCancel();
+                return err;
+            };
+        }
+
+        fn serve(self: *Self) !void {
             const listeners = self.config.listen;
             if (listeners.len == 0) {
                 log.err("config.listen is empty, so no connection could ever be served", .{});
