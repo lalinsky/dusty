@@ -220,10 +220,6 @@ fn makeTestResponse(conn: *Connection) Response {
         .headers = .{},
         .content_type = null,
         .arena = undefined,
-        // Real storage rather than undefined: the 404 and 500 paths clear
-        // the buffer, and `init` allocates nothing until something is
-        // written, so a test that writes no body still leaks nothing.
-        .buffer = .init(std.testing.allocator),
         .conn = conn,
         .written = false,
         .headers_written = false,
@@ -622,6 +618,9 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
                 r.content_type = .json;
                 var body = r.writer();
                 try body.interface.writeAll("{\"half\":");
+                // Flushed, so the response holds the fragment the error
+                // path has to throw away.
+                try body.interface.flush();
                 return error.Boom;
             }
         }.handle,
@@ -643,6 +642,7 @@ const WritingMiddleware = struct {
         res.content_type = .json;
         var body = res.writer();
         try body.interface.writeAll("{\"half\":");
+        try body.interface.flush();
         return executor.next();
     }
 };

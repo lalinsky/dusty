@@ -153,6 +153,134 @@ pub const EventStream = struct {
     }
 };
 
+/// A buffered response body: segments of the request arena, each allocated
+/// when the last one fills and never moved. It is collected only so its
+/// length is known before the headers go out, so it is never gathered into
+/// one piece; it is sent a segment at a time.
+///
+/// The last segment belongs to whichever `BodyWriter` is open, and its
+/// `len` catches up with it when that writer is flushed or ended, or moves
+/// to the next segment.
+const BodyBuffer = struct {
+    segments: std.DoublyLinkedList = .{},
+    /// The bytes in every segment but the last.
+    sealed_len: usize = 0,
+
+    const first_segment_len = 512;
+    const max_segment_len = 64 * 1024;
+
+    /// A segment's header, with its bytes right behind it in the same
+    /// allocation.
+    const Segment = struct {
+        node: std.DoublyLinkedList.Node = .{},
+        len: usize = 0,
+        capacity: usize,
+
+        fn create(arena: std.mem.Allocator, capacity: usize) std.mem.Allocator.Error!*Segment {
+            const size = std.math.add(usize, @sizeOf(Segment), capacity) catch return error.OutOfMemory;
+            const memory = try arena.alignedAlloc(u8, .of(Segment), size);
+            const segment: *Segment = @ptrCast(memory.ptr);
+            segment.* = .{ .capacity = capacity };
+            return segment;
+        }
+
+        fn fromNode(node: *std.DoublyLinkedList.Node) *Segment {
+            return @fieldParentPtr("node", node);
+        }
+
+        fn bytes(self: *Segment) []u8 {
+            const base: [*]u8 = @ptrCast(self);
+            return base[@sizeOf(Segment)..][0..self.capacity];
+        }
+    };
+
+    /// With the first segment reserved up front: a short body then never
+    /// reaches a writer's vtable, and a writer is never unbuffered, which
+    /// `std.Io.Writer.sendFileAll` asserts against. The request arena keeps
+    /// its memory between a connection's requests, so this is a bump.
+    fn init(arena: std.mem.Allocator) std.mem.Allocator.Error!BodyBuffer {
+        var self: BodyBuffer = .{};
+        self.segments.append(&(try Segment.create(arena, first_segment_len)).node);
+        return self;
+    }
+
+    fn last(self: *const BodyBuffer) ?*Segment {
+        return if (self.segments.last) |node| Segment.fromNode(node) else null;
+    }
+
+    fn len(self: *const BodyBuffer) usize {
+        return self.sealed_len + if (self.last()) |segment| segment.len else 0;
+    }
+
+    /// Sends the segments in order, up to `max_vecs` in one vectored write.
+    fn writeTo(self: *const BodyBuffer, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        const max_vecs = 8;
+        var vecs: [max_vecs][]const u8 = undefined;
+        var n: usize = 0;
+        var it = self.segments.first;
+        while (it) |node| : (it = node.next) {
+            const segment = Segment.fromNode(node);
+            vecs[n] = segment.bytes()[0..segment.len];
+            n += 1;
+            if (n == max_vecs) {
+                try out.writeVecAll(vecs[0..n]);
+                n = 0;
+            }
+        }
+        if (n > 0) try out.writeVecAll(vecs[0..n]);
+    }
+
+    /// Forgets the body, keeping the last segment to write into again.
+    fn clear(self: *BodyBuffer) void {
+        const segment = self.last() orelse return;
+        segment.* = .{ .capacity = segment.capacity };
+        self.segments = .{};
+        self.segments.append(&segment.node);
+        self.sealed_len = 0;
+    }
+
+    /// Seals what `w` holds, except its last `preserve` bytes, which start
+    /// the next segment, and makes that next segment `w`'s buffer, with
+    /// room for `needed` more.
+    fn nextSegment(
+        self: *BodyBuffer,
+        arena: std.mem.Allocator,
+        w: *std.Io.Writer,
+        needed: usize,
+        preserve: usize,
+    ) std.mem.Allocator.Error!void {
+        const filled = w.buffer[0..w.end];
+        // Asking to keep more than is buffered keeps all of it, as the
+        // default rebase does.
+        const kept = @min(preserve, filled.len);
+        const keep = filled[filled.len - kept ..];
+
+        // Doubling, so a large body takes few segments, up to a size past
+        // which a bigger one saves nothing. Sized by `preserve` rather than
+        // what was kept of it: the caller asserts room for both, whatever
+        // was actually buffered.
+        const next_len = if (w.buffer.len == 0) first_segment_len else @min(max_segment_len, w.buffer.len * 2);
+        const size = @max(next_len, std.math.add(usize, needed, preserve) catch return error.OutOfMemory);
+        const next = try Segment.create(arena, size);
+
+        if (self.last()) |current| {
+            std.debug.assert(w.buffer.ptr == current.bytes().ptr);
+            current.len = filled.len - kept;
+            if (current.len == 0) {
+                // Nothing of it stays: drop it rather than send it empty.
+                self.segments.remove(&current.node);
+            } else {
+                self.sealed_len += current.len;
+            }
+        }
+        @memcpy(next.bytes()[0..keep.len], keep);
+        next.len = keep.len;
+        self.segments.append(&next.node);
+        w.buffer = next.bytes();
+        w.end = keep.len;
+    }
+};
+
 /// Collects a response body without touching the connection.
 ///
 /// The headers are not sent until the whole response is, so middleware
@@ -160,9 +288,14 @@ pub const EventStream = struct {
 /// with a `Content-Length`. Storage comes from the response's arena, so
 /// there is no size to pick and nothing for the caller to own.
 ///
-/// This exists as a wrapper rather than a bare `std.Io.Writer` so that a
-/// failure has somewhere to say what it was: the interface can only
-/// report `WriteFailed`.
+/// `interface` writes straight into the response's current body segment,
+/// so a short write is a copy and only a write that does not fit reaches
+/// the vtable. As with any buffered writer, what was written reaches the
+/// response when the writer is flushed, which `end` does. A failure is
+/// recorded in `err`, since the interface can only report `WriteFailed`.
+///
+/// Bytes in earlier segments are no longer in `interface.buffer`, so
+/// `std.Io.Writer.undo` can only take back what the current segment holds.
 ///
 /// Use `StreamingBodyWriter` when the body should go out as it is
 /// produced. Either way, `end` must be called before the handler returns.
@@ -170,41 +303,71 @@ pub const BodyWriter = struct {
     res: *Response,
     interface: std.Io.Writer,
     /// The real cause behind the generic `error.WriteFailed`. Nothing here
-    /// talks to the connection, so this is an allocation failure, or a
-    /// write after the headers went out with a length taken from the body
-    /// as it was then.
+    /// talks to the connection, so this is an allocation failure.
     err: ?Error = null,
 
-    pub const Error = std.mem.Allocator.Error || error{HeadersAlreadySent};
+    pub const Error = std.mem.Allocator.Error;
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drain,
+        .flush = flush,
+        .rebase = rebase,
+    };
 
     fn init(res: *Response) BodyWriter {
+        const segment = res.body_buffer.last();
         return .{
             .res = res,
-            // Unbuffered: the response's own storage is the buffer, so
-            // holding bytes here would only copy them twice.
-            .interface = .{ .buffer = &no_buf, .vtable = &.{ .drain = BodyWriter.drain } },
+            .interface = .{
+                .buffer = if (segment) |seg| seg.bytes() else &.{},
+                .end = if (segment) |seg| seg.len else 0,
+                .vtable = &vtable,
+            },
         };
     }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
-        // The headers carried the body's length as it was when they went
-        // out; anything more would be read by the peer as the next
-        // response.
-        if (self.res.headers_written) return self.fail(error.HeadersAlreadySent);
-        const out = &self.res.buffer.writer;
-        var total: usize = 0;
-        // Allocating's writer only fails by running out of memory.
-        for (data[0 .. data.len - 1]) |bytes| {
-            out.writeAll(bytes) catch return self.fail(error.OutOfMemory);
-            total += bytes.len;
-        }
         const pattern = data[data.len - 1];
-        for (0..splat) |_| {
-            out.writeAll(pattern) catch return self.fail(error.OutOfMemory);
-            total += pattern.len;
+        var needed: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            needed = std.math.add(usize, needed, bytes.len) catch return self.fail(error.OutOfMemory);
         }
-        return w.consume(total);
+        const splat_len = std.math.mul(usize, pattern.len, splat) catch return self.fail(error.OutOfMemory);
+        needed = std.math.add(usize, needed, splat_len) catch return self.fail(error.OutOfMemory);
+        // Called only when `data` does not fit in what is left, so move on
+        // to a segment it does fit in.
+        self.res.body_buffer.nextSegment(self.res.arena, w, needed, 0) catch |err| return self.fail(err);
+
+        const start = w.end;
+        for (data[0 .. data.len - 1]) |bytes| {
+            @memcpy(w.buffer[w.end..][0..bytes.len], bytes);
+            w.end += bytes.len;
+        }
+        switch (pattern.len) {
+            0 => {},
+            1 => {
+                @memset(w.buffer[w.end..][0..splat], pattern[0]);
+                w.end += splat;
+            },
+            else => for (0..splat) |_| {
+                @memcpy(w.buffer[w.end..][0..pattern.len], pattern);
+                w.end += pattern.len;
+            },
+        }
+        return w.end - start;
+    }
+
+    fn rebase(w: *std.Io.Writer, preserve: usize, minimum_len: usize) std.Io.Writer.Error!void {
+        const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        self.res.body_buffer.nextSegment(self.res.arena, w, minimum_len, preserve) catch |err| return self.fail(err);
+    }
+
+    /// The segments are the storage, so there is nothing to send: flushing
+    /// tells the response how much of the current one is written.
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *BodyWriter = @alignCast(@fieldParentPtr("interface", w));
+        if (self.res.body_buffer.last()) |segment| segment.len = w.end;
     }
 
     fn fail(self: *BodyWriter, err: Error) std.Io.Writer.Error {
@@ -219,9 +382,9 @@ pub const BodyWriter = struct {
         // `end` on the success path is harmless rather than a second body.
         if (!self.res.body_writer_open) return;
         self.res.body_writer_open = false;
-        self.interface.flush() catch |err| switch (err) {
-            error.WriteFailed => return self.err orelse error.OutOfMemory,
-        };
+        self.res.body_writer_buffering = false;
+        // Cannot fail: see `flush`.
+        self.interface.flush() catch unreachable;
         // A write that failed was reported then; the body is not complete
         // for having stopped.
         if (self.err) |err| return err;
@@ -375,7 +538,8 @@ pub const Response = struct {
     headers: http.Headers = .{},
     content_type: ?http.ContentType = null,
     arena: std.mem.Allocator,
-    buffer: std.Io.Writer.Allocating,
+    /// The body, when it is written rather than set with `body`.
+    body_buffer: BodyBuffer = .{},
     conn: *Connection,
     written: bool = false,
     headers_written: bool = false,
@@ -389,6 +553,9 @@ pub const Response = struct {
     head: bool = false,
     /// A body writer was handed out and has not been ended yet.
     body_writer_open: bool = false,
+    /// The open body writer is a `BodyWriter`, whose length the response
+    /// only learns when it ends.
+    body_writer_buffering: bool = false,
     /// The request was HTTP/1.0, so the peer does not understand chunked
     /// encoding. Set by the server.
     http10: bool = false,
@@ -424,7 +591,7 @@ pub const Response = struct {
     pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
         return .{
             .arena = arena,
-            .buffer = .init(arena),
+            .body_buffer = try .init(arena),
             .conn = conn,
             .headers = try http.Headers.init(arena, max_headers),
         };
@@ -446,6 +613,7 @@ pub const Response = struct {
     /// Call `end` on the result before returning from the handler.
     pub fn writer(self: *Response) BodyWriter {
         self.startBody();
+        self.body_writer_buffering = true;
         return .init(self);
     }
 
@@ -477,12 +645,15 @@ pub const Response = struct {
     fn startBody(self: *Response) void {
         std.debug.assert(!self.body_writer_open); // one body writer per response
         std.debug.assert(!self.headers_written); // body cannot start after the headers
-        std.debug.assert(self.body.len == 0 and self.buffer.writer.end == 0); // body already set
+        std.debug.assert(self.body.len == 0 and self.body_buffer.len() == 0); // body already set
         self.body_writer_open = true;
     }
 
+    /// Throws away the body written so far. Not while a body writer is
+    /// open: its unflushed bytes are its own, and it would put them back.
     pub fn clearWriter(self: *Response) void {
-        _ = self.buffer.writer.consumeAll();
+        std.debug.assert(!self.body_writer_buffering);
+        self.body_buffer.clear();
     }
 
     /// Throws away a body that was started but never finished, so a
@@ -495,9 +666,12 @@ pub const Response = struct {
     /// swapped.
     pub fn resetBody(self: *Response) void {
         std.debug.assert(!self.headers_written);
+        // An open writer is abandoned with the body: `end` on it does
+        // nothing once it is no longer the open one.
+        self.body_writer_open = false;
+        self.body_writer_buffering = false;
         self.clearWriter();
         self.body = "";
-        self.body_writer_open = false;
         // Everything that described the old body has to go with it.
         // `content_type` is the usual way to set one, but a handler can
         // write either header directly, and then a stale Content-Length
@@ -510,8 +684,13 @@ pub const Response = struct {
     }
 
     pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
+        // The open writer owns the segment being filled, and would write
+        // over this, or publish a length past the end of it.
+        if (self.body_writer_buffering) return error.BodyWriterOpen;
         const json_formatter = std.json.fmt(value, options);
-        try json_formatter.format(&self.buffer.writer);
+        var w: BodyWriter = .init(self);
+        defer w.interface.flush() catch unreachable;
+        try json_formatter.format(&w.interface);
         try self.header("Content-Type", "application/json; charset=UTF-8");
     }
 
@@ -655,7 +834,7 @@ pub const Response = struct {
                 // Write Content-Length if not manually set (skip for streaming responses like SSE)
                 const has_content_length = self.headers.get("Content-Length") != null;
                 if (!has_content_length) {
-                    try w.print("Content-Length: {d}\r\n", .{self.bufferedBody().len});
+                    try w.print("Content-Length: {d}\r\n", .{self.bodyLen()});
                 }
             }
         }
@@ -674,6 +853,9 @@ pub const Response = struct {
         // started body is still framed correctly.
         if (self.body_writer_open) {
             self.body_writer_open = false;
+            // A body writer that was never ended goes out as far as it was
+            // last flushed, framed to match.
+            self.body_writer_buffering = false;
             // Streaming under way with a declared length: whatever the
             // writer still held is gone with the handler's buffer, so the
             // body is short. Nothing can make it match the length we
@@ -701,7 +883,7 @@ pub const Response = struct {
         // A streamed body is the streaming writer's to account for.
         if (self.sendsBody() and !self.chunked and !self.streaming and self.content_length == null) {
             if (try self.declaredLength()) |declared| {
-                if (self.bufferedBody().len != declared) {
+                if (self.bodyLen() != declared) {
                     self.keepalive = false;
                     return error.ContentLengthMismatch;
                 }
@@ -716,11 +898,11 @@ pub const Response = struct {
         return std.fmt.parseInt(usize, value, 10) catch error.InvalidContentLength;
     }
 
-    /// The body as set so far: what the body writer collected, else the
-    /// `body` field.
-    fn bufferedBody(self: *const Response) []const u8 {
-        const buffered = self.buffer.writer.buffered();
-        return if (buffered.len > 0) buffered else self.body;
+    /// The length of the body as set so far: what the body writer
+    /// collected, else the `body` field.
+    fn bodyLen(self: *const Response) usize {
+        const written = self.body_buffer.len();
+        return if (written > 0) written else self.body.len;
     }
 
     /// Whatever this response still owes the peer, on the wire. Reports the
@@ -740,12 +922,23 @@ pub const Response = struct {
         // Write body (either from buffer or body field). A HEAD response
         // has already reported its length and must stop here.
         if (self.sendsBody()) {
-            try w.writeAll(self.bufferedBody());
+            if (self.body_buffer.len() > 0) {
+                try self.body_buffer.writeTo(w);
+            } else {
+                try w.writeAll(self.body);
+            }
         }
 
         return w.flush();
     }
 };
+
+/// The body a response has collected, in one piece, for comparing.
+fn testBody(response: *const Response, buf: []u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    try response.body_buffer.writeTo(&w);
+    return w.buffered();
+}
 
 test "Response: body used when buffer is empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -761,9 +954,7 @@ test "Response: body used when buffer is empty" {
     response.body = "body content";
 
     // Don't write to buffer
-    const buffered = response.buffer.writer.buffered();
-    try std.testing.expectEqualStrings("", buffered);
-    try std.testing.expect(buffered.len == 0);
+    try std.testing.expectEqual(0, response.body_buffer.len());
 
     // Body should be used
     try std.testing.expectEqualStrings("body content", response.body);
@@ -1332,7 +1523,7 @@ test "StreamingBodyWriter: end does not write a second terminator" {
     );
 }
 
-test "Response: an abandoned buffered body is still sent" {
+test "Response: an abandoned buffered body goes out as far as it was flushed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1346,12 +1537,14 @@ test "Response: an abandoned buffered body is still sent" {
 
     var body = response.writer();
     try body.interface.writeAll("hello");
-    // Handler returns without calling end.
+    try body.interface.flush();
+    try body.interface.writeAll(" world");
+    // Handler returns without calling end, or flushing again.
     try response.write();
 
     const written = conn_writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5") != null);
-    try std.testing.expect(std.mem.endsWith(u8, written, "hello"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhello"));
 }
 
 test "Response: an abandoned short body closes the connection" {
@@ -1467,7 +1660,8 @@ test "Response: json() with simple object" {
     var response = try Response.init(arena.allocator(), &connection, 32);
     try response.json(.{ .name = "Alice", .age = 30 }, .{});
 
-    const buffered = response.buffer.writer.buffered();
+    var body_buf: [256]u8 = undefined;
+    const buffered = try testBody(&response, &body_buf);
     try std.testing.expectEqualStrings("{\"name\":\"Alice\",\"age\":30}", buffered);
 
     // Check that Content-Type was set
@@ -1518,7 +1712,8 @@ test "Response: json() with array" {
     const items = [_]i32{ 1, 2, 3, 4, 5 };
     try response.json(items, .{});
 
-    const buffered = response.buffer.writer.buffered();
+    var body_buf: [256]u8 = undefined;
+    const buffered = try testBody(&response, &body_buf);
     try std.testing.expectEqualStrings("[1,2,3,4,5]", buffered);
 }
 
@@ -1541,7 +1736,8 @@ test "Response: json() with nested object" {
         .active = true,
     }, .{});
 
-    const buffered = response.buffer.writer.buffered();
+    var body_buf: [256]u8 = undefined;
+    const buffered = try testBody(&response, &body_buf);
     try std.testing.expectEqualStrings("{\"user\":{\"name\":\"Bob\",\"id\":42},\"active\":true}", buffered);
 }
 
@@ -2133,6 +2329,229 @@ test "Response: a HEAD streamed to an HTTP/1.0 peer keeps the connection" {
     try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
     try std.testing.expect(response.keepalive);
+}
+
+test "BodyWriter: a body over many segments goes out whole, with its length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [32 * 1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var expected: [10_000]u8 = undefined;
+    for (&expected, 0..) |*b, i| b.* = @intCast('a' + i % 26);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    // Short writes, as an encoder makes, crossing every segment boundary.
+    var i: usize = 0;
+    while (i < expected.len) : (i += 7) {
+        try body.interface.writeAll(expected[i..@min(i + 7, expected.len)]);
+    }
+    try body.end();
+    try std.testing.expect(response.body_buffer.segments.len() > 1);
+    try std.testing.expectEqual(expected.len, response.body_buffer.len());
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 10000\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ expected));
+}
+
+test "BodyWriter: a body of more segments than one vectored write takes goes out in order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const total = 600 * 1000;
+    const out_buf = try arena.allocator().alloc(u8, total + 1024);
+    var conn_writer: std.Io.Writer = .fixed(out_buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    var chunk: [1000]u8 = undefined;
+    for (0..total / chunk.len) |i| {
+        @memset(&chunk, @intCast('a' + i % 26));
+        try body.interface.writeAll(&chunk);
+    }
+    try body.end();
+    try std.testing.expect(response.body_buffer.segments.len() > 8);
+    try response.write();
+
+    const written = conn_writer.buffered();
+    const start = std.mem.indexOf(u8, written, "\r\n\r\n").? + 4;
+    try std.testing.expect(std.mem.indexOf(u8, written[0..start], "Content-Length: 600000\r\n") != null);
+    const sent = written[start..];
+    try std.testing.expectEqual(total, sent.len);
+    for (0..total / chunk.len) |i| {
+        try std.testing.expect(std.mem.allEqual(u8, sent[i * chunk.len ..][0..chunk.len], @intCast('a' + i % 26)));
+    }
+}
+
+test "BodyWriter: a write bigger than any segment, and a long splat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [256 * 1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    const big = [_]u8{'x'} ** (100 * 1024);
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    try body.interface.writeAll("<");
+    try body.interface.writeAll(&big);
+    try body.interface.splatByteAll('y', 70 * 1024);
+    try body.interface.writeAll(">");
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    const start = std.mem.indexOf(u8, written, "\r\n\r\n").? + 4;
+    try std.testing.expect(std.mem.indexOf(u8, written[0..start], "Content-Length: 174082\r\n") != null);
+    const sent = written[start..];
+    try std.testing.expectEqual(174082, sent.len);
+    try std.testing.expectEqualStrings("<", sent[0..1]);
+    try std.testing.expect(std.mem.allEqual(u8, sent[1..][0..big.len], 'x'));
+    try std.testing.expect(std.mem.allEqual(u8, sent[1 + big.len ..][0 .. 70 * 1024], 'y'));
+    try std.testing.expectEqualStrings(">", sent[sent.len - 1 ..]);
+}
+
+test "BodyWriter: rebase keeps the bytes it was asked to preserve" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [8 * 1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    const head = [_]u8{'h'} ** 500;
+    try body.interface.writeAll(&head);
+    // Asks for more room than the first segment has left, keeping the last
+    // four bytes contiguous with it.
+    const slice = try body.interface.writableSliceGreedyPreserve(4, 1000);
+    try std.testing.expect(slice.len >= 1000);
+    try std.testing.expectEqualStrings("hhhh", body.interface.buffer[body.interface.end - 4 .. body.interface.end]);
+    @memset(slice[0..1000], 't');
+    body.interface.advance(1000);
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    const start = std.mem.indexOf(u8, written, "\r\n\r\n").? + 4;
+    const sent = written[start..];
+    try std.testing.expectEqual(1500, sent.len);
+    try std.testing.expect(std.mem.allEqual(u8, sent[0..500], 'h'));
+    try std.testing.expect(std.mem.allEqual(u8, sent[500..], 't'));
+}
+
+test "BodyWriter: a file streamed into the body arrives whole" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var content: [3000]u8 = undefined;
+    for (&content, 0..) |*b, i| b.* = @intCast('0' + i % 10);
+    try tmp.dir.writeFile(io, .{ .sub_path = "body.txt", .data = &content });
+
+    var buf: [8 * 1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    const file = try tmp.dir.openFile(io, "body.txt", .{});
+    defer file.close(io);
+    var read_buf: [256]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
+    // Asserts a buffered writer, which a fresh body writer must be.
+    _ = try body.interface.sendFileAll(&file_reader, .unlimited);
+    try body.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 3000\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ content));
+}
+
+test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [4 * 1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    try body.interface.writeAll("abc");
+    const slice = try body.interface.writableSliceGreedyPreserve(100, 1000);
+    try std.testing.expect(slice.len >= 1000);
+    try std.testing.expectEqualStrings("abc", body.interface.buffered());
+    @memcpy(slice[0..3], "def");
+    body.interface.advance(3);
+    try body.end();
+    try response.write();
+
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Length: 6\r\n\r\nabcdef"));
+}
+
+test "Response: json is refused while a body writer is open" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    try body.interface.writeAll("[");
+    try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }, .{}));
+    try body.interface.writeAll("]");
+    try body.end();
+    try response.write();
+
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Length: 2\r\n\r\n[]"));
+}
+
+test "BodyWriter: resetBody after several segments leaves only the replacement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    try body.interface.splatByteAll('y', 300);
+    try body.interface.splatByteAll('z', 5000);
+    try body.interface.flush();
+    try std.testing.expect(response.body_buffer.segments.len() > 1);
+    try std.testing.expectEqual(5300, response.body_buffer.len());
+    response.resetBody();
+    var again = response.writer();
+    try again.interface.writeAll("fresh");
+    try again.end();
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nfresh"));
 }
 
 test "Response: a handler's own Content-Length must match the buffered body" {
