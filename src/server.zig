@@ -654,15 +654,27 @@ pub fn Server(comptime Ctx: type) type {
                     // accept, which says nothing about the listener. Routine
                     // on a public address, where clients reset and scanners
                     // probe, so it is not worth a log line or a pause.
-                    error.ConnectionAborted => continue,
+                    error.ConnectionAborted,
+                    // Linux reports an error already pending on the new
+                    // connection from accept itself (see accept(2)), so it
+                    // belongs to one client, not to the listener.
+                    error.ProtocolFailure,
+                    => continue,
                     // The machine is out of something, for now. Sleeping and
                     // trying again turns that into latency; returning would
                     // turn a condition that clears on its own into an outage
-                    // that needs a restart.
+                    // that needs a restart. `NetworkDown` is also a pending
+                    // connection error on Linux, and `Unexpected` is where the
+                    // rest of those (EHOSTUNREACH, ENETUNREACH, ...) end up.
+                    // `BlockedByFirewall` can also be a security policy
+                    // denying every accept, which would spin without a pause.
                     error.ProcessFdQuotaExceeded,
                     error.SystemFdQuotaExceeded,
                     error.SystemResources,
                     error.WouldBlock,
+                    error.NetworkDown,
+                    error.BlockedByFirewall,
+                    error.Unexpected,
                     => {
                         backoff_ms = if (backoff_ms == 0) min_accept_backoff_ms else @min(backoff_ms * 2, max_accept_backoff_ms);
                         log.warn("Accept failed: {}; retrying in {d}ms", .{ err, backoff_ms });
@@ -676,7 +688,10 @@ pub fn Server(comptime Ctx: type) type {
                         try self.io.sleep(.fromMilliseconds(@intCast(backoff_ms)), .awake);
                         continue;
                     },
-                    else => return err,
+                    // The socket itself is gone, and no retry brings it back.
+                    error.SocketNotListening,
+                    error.Canceled,
+                    => return err,
                 };
                 backoff_ms = 0;
 
