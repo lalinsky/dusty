@@ -19,7 +19,6 @@ const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
-const cgroup = @import("cgroup.zig");
 
 const log = std.log.scoped(.dusty);
 
@@ -488,12 +487,8 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
-            // Read once, and only when a listener sizes itself from it.
-            const cpu_count: usize = for (listeners) |cfg| {
-                if (cfg.acceptors == .auto) break cgroup.cpuCount(self.io);
-            } else 1;
             var acceptor_count: usize = 0;
-            for (listeners) |cfg| acceptor_count += cfg.acceptors.resolve(cpu_count);
+            for (listeners) |cfg| acceptor_count += @max(1, cfg.acceptors);
 
             const active = try self.allocator.alloc(ActiveListener, listeners.len);
             defer self.allocator.free(active);
@@ -511,7 +506,7 @@ pub fn Server(comptime Ctx: type) type {
             // Grouped by listener, in listener order.
             var next_acceptor: usize = 0;
             for (active) |*l| {
-                const n = l.config.acceptors.resolve(cpu_count);
+                const n = @max(1, l.config.acceptors);
                 for (acceptors[next_acceptor..][0..n]) |*a| a.* = .{ .listener = l };
                 next_acceptor += n;
             }
