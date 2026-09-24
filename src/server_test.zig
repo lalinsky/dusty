@@ -1490,6 +1490,96 @@ test "Server: a bad percent escape in the query is a 400, not a dropped connecti
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
 }
 
+/// Sends `head`, then `body_len` bytes of body the server will not read, and
+/// returns the status line of the answer. The rest of the answer must end
+/// with a FIN: a close with the body unread would be a reset, and the peer
+/// could lose the answer to it.
+fn statusLineWithUnreadBody(head: []const u8, body_len: usize, chunked: bool, timeouts: bool, out: []u8) ![]const u8 {
+    const io = std.testing.io;
+
+    var config: dusty.ServerConfig = .{ .listen = loopback, .request = .{ .max_body_size = 100 } };
+    if (!timeouts) config.timeout = .{ .request = null, .keepalive = null };
+    var server = dusty.Server(void).init(std.testing.allocator, io, config, {});
+    defer server.deinit();
+
+    const ignore = struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "OK";
+        }
+    }.handle;
+    server.router.get("/", ignore);
+    server.router.post("/", ignore);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, request_head: []const u8, len: usize, is_chunked: bool, status_out: []u8) ![]const u8 {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            // All of it in one send, so it is all queued at the server
+            // before the answer: a reset then shows up in the reads below
+            // rather than in a write.
+            var write_buf: [64 * 1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+
+            try writer.interface.writeAll(request_head);
+            if (is_chunked) try writer.interface.print("{x}\r\n", .{len});
+            try writer.interface.splatByteAll('x', len);
+            if (is_chunked) try writer.interface.writeAll("\r\n0\r\n\r\n");
+            try writer.interface.flush();
+
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            @memcpy(status_out[0..status_line.len], status_line);
+            _ = try reader.interface.discardRemaining();
+            return status_out[0..status_line.len];
+        }
+    }.run, .{ &server, io, head, body_len, chunked, out });
+
+    return client_future.await(io);
+}
+
+test "Server: a body too large to drain is not answered with a reset" {
+    var buf: [256]u8 = undefined;
+    for ([_]bool{ true, false }) |timeouts| {
+        const status = try statusLineWithUnreadBody("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", 32768, false, timeouts, &buf);
+        try std.testing.expectStringStartsWith(status, "HTTP/1.1 200 ");
+    }
+}
+
+test "Server: an unread chunked body is not answered with a reset" {
+    var buf: [256]u8 = undefined;
+    for ([_]bool{ true, false }) |timeouts| {
+        const status = try statusLineWithUnreadBody("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n", 32768, true, timeouts, &buf);
+        try std.testing.expectStringStartsWith(status, "HTTP/1.1 200 ");
+    }
+}
+
+test "Server: a 417 before an unread body is not answered with a reset" {
+    var buf: [256]u8 = undefined;
+    for ([_]bool{ true, false }) |timeouts| {
+        const status = try statusLineWithUnreadBody("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\nExpect: unknown-value\r\n\r\n", 32768, false, timeouts, &buf);
+        try std.testing.expectStringStartsWith(status, "HTTP/1.1 417 ");
+    }
+}
+
+test "Server: a 400 before an unread body is not answered with a reset" {
+    var buf: [256]u8 = undefined;
+    for ([_]bool{ true, false }) |timeouts| {
+        const status = try statusLineWithUnreadBody("POST /?q=100% HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", 32768, false, timeouts, &buf);
+        try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
+    }
+}
+
 test "Server: too many query parameters is a 400, not a dropped connection" {
     // One past the default limit of 32, each under its own name.
     const query = comptime blk: {
