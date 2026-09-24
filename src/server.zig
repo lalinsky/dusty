@@ -403,8 +403,10 @@ pub fn Server(comptime Ctx: type) type {
         const Acceptor = struct {
             listener: *ActiveListener,
             /// Why this loop gave up, once it has.
-            err: ?anyerror = null,
+            err: ?AcceptError = null,
         };
+
+        const AcceptError = @typeInfo(@typeInfo(@TypeOf(acceptConnections)).@"fn".return_type.?).error_union.error_set;
 
         const Busy = packed struct(u32) {
             count: u31 = 0,
