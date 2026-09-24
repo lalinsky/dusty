@@ -4,7 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- `Response.writer()` writes the body in place into segments of the request arena, instead of passing every write through the body writer's vtable into a growing buffer. Handlers that encode JSON bodies of a few KB are about twice as fast. `Response.writeHeader()` now returns `error.BodyWriterOpen` while a body writer is open.
+- `Response.writer()` writes the body in place into segments of the request arena, instead of passing every write through the body writer's vtable into a growing buffer. Handlers that encode JSON bodies of a few KB are about twice as fast.
+- `Response.writeHeader` is no longer public. Use `Response.stream` to send the headers before the body.
 - `Listener.acceptors` now defaults to null, which picks log2 of the CPUs the process may use (honoring cgroup CPU quotas), and at least two, instead of a fixed two.
 
 ## [0.3.1] - 2026-09-21
