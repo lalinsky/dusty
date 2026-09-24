@@ -85,10 +85,8 @@ const Origin = struct {
     /// Without this it would serialize as the `IpAddress` union rather
     /// than as the string it prints. Raw, because the quotes are the only
     /// escaping an address can need.
-    pub fn jsonStringify(self: Origin, jw: anytype) !void {
-        try jw.beginWriteRaw();
-        try jw.writer.print("\"{f}\"", .{self});
-        jw.endWriteRaw();
+    pub fn jsonWrite(self: Origin, encoder: anytype) !void {
+        try encoder.writer.print("\"{f}\"", .{self});
     }
 };
 
@@ -100,6 +98,19 @@ fn absoluteUrl(req: *Request, res: *Response) ![]const u8 {
         req.url,
     });
 }
+
+/// A request body that validated as JSON, written back exactly as it came.
+/// json.zig decodes into types rather than into a generic value, so an
+/// arbitrary document is echoed as its text.
+const RawJson = struct {
+    text: []const u8,
+
+    const null_value: RawJson = .{ .text = "null" };
+
+    pub fn jsonWrite(self: RawJson, encoder: anytype) !void {
+        try encoder.writer.writeAll(self.text);
+    }
+};
 
 /// The shape httpbin answers with. The optional fields are left out
 /// entirely when null, so `/get` carries no `data` and only `/anything`
@@ -113,11 +124,9 @@ const Description = struct {
     method: ?[]const u8 = null,
     data: ?[]const u8 = null,
     form: ?http.Params = null,
-    json: ?std.json.Value = null,
+    json: ?RawJson = null,
     files: ?struct {} = null,
     id: ?usize = null,
-
-    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
 };
 
 /// What varies between the endpoints that answer a description.
@@ -141,16 +150,16 @@ fn describe(req: *Request, res: *Response, opts: Describe) !Description {
         desc.form = if (req.content_type == .form) .{ .map = (try req.formData()).* } else .{};
         // Present but null when the body was not JSON, which is what a
         // client checks to see whether its POST round-tripped.
-        desc.json = parseJson(res.arena, req, data) orelse .null;
+        desc.json = parseJson(req, data) orelse .null_value;
         desc.files = .{};
     }
     return desc;
 }
 
-fn parseJson(arena: std.mem.Allocator, req: *Request, data: []const u8) ?std.json.Value {
+fn parseJson(req: *Request, data: []const u8) ?RawJson {
     if (req.content_type != .json) return null;
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, data, .{}) catch return null;
-    return parsed.value;
+    http.json.validateFromSlice(data) catch return null;
+    return .{ .text = data };
 }
 
 fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
@@ -180,7 +189,7 @@ fn handleIndex(_: *Ctx, _: *Request, res: *Response) !void {
 }
 
 fn handleGet(_: *Ctx, req: *Request, res: *Response) !void {
-    try res.json(try describe(req, res, .{}), Description.options);
+    try res.json(try describe(req, res, .{}), .{});
 }
 
 /// Shared by the methods that carry a body: post, put, patch, delete.
@@ -198,7 +207,7 @@ fn sendDescription(req: *Request, res: *Response, with_method: bool) !void {
         error.InvalidEscapeSequence, error.TooManyFormFields => return fail(res, .bad_request, "Invalid form body"),
         else => |e| return e,
     };
-    try res.json(desc, Description.options);
+    try res.json(desc, .{});
 }
 
 /// Answers whatever the request method was. Unlike the others this always
@@ -286,10 +295,8 @@ fn handleStream(_: *Ctx, req: *Request, res: *Response) !void {
     var buf: [4096]u8 = undefined;
     var body = try res.stream(&buf);
     for (0..n) |i| {
-        // A fresh serialiser per line: each line is its own JSON document,
-        // and Stringify refuses to start a second one.
-        var w: std.json.Stringify = .{ .writer = &body.interface, .options = Description.options };
-        try w.write(try describe(req, res, .{ .id = i }));
+        // Each line is its own JSON document.
+        try http.json.encode(try describe(req, res, .{ .id = i }), &body.interface);
         try body.interface.writeByte('\n');
         // Each line goes out as its own chunk, so the client sees the
         // response arrive in pieces.

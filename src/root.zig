@@ -28,6 +28,15 @@ pub const SessionData = @import("middleware/Session.zig").SessionData;
 pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
+
+/// json.zig, as `Request.json` and `Response.json` use it, for a type that
+/// shapes its encoding (`jsonFormat` returns a `json.StructOptions`) or for
+/// encoding JSON outside a response body. Present with the `use_json` build
+/// option.
+pub const json = if (@import("build_options").use_json) @import("json") else struct {};
+/// msgpack.zig, as `Request.msgpack` and `Response.msgpack` use it. Present
+/// with the `use_msgpack` build option.
+pub const msgpack = if (@import("build_options").use_msgpack) @import("msgpack") else struct {};
 pub const Executor = @import("middleware.zig").Executor;
 
 // Client

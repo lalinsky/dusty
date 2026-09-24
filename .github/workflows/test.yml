@@ -33,6 +33,11 @@ jobs:
       run: zig build test --summary all
       timeout-minutes: 5
 
+    - name: Run tests without JSON and MessagePack
+      if: runner.os == 'Linux'
+      run: zig build test --summary all -Duse_json=false -Duse_msgpack=false
+      timeout-minutes: 5
+
     - name: Build httpbin example
       run: zig build
       working-directory: examples/httpbin

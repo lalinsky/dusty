@@ -37,6 +37,16 @@
             .hash = "tls-0.1.0-ER2e0mepBgDBLqoGW16P4WLSO0NU7DrkvCshUIYAaliF",
             .lazy = true,
         },
+        .json = .{
+            .url = "git+https://github.com/lalinsky/json.zig#029d993bc2c0e9b644e95e5ced351793f9fd4c24",
+            .hash = "json-0.1.0-XOh3KkIQAgBBtfQYnKpI3WTEnrMh6x5spl2V7zj__o7N",
+            .lazy = true,
+        },
+        .msgpack = .{
+            .url = "git+https://github.com/lalinsky/msgpack.zig#451da35e104935d07fa46aa7a80499097929966f",
+            .hash = "msgpack-0.9.0-ZOu9PEGgAgDvbGsCCi8OPV-n25bHqJniaZYM45BMJT4a",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
