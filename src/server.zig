@@ -784,9 +784,13 @@ pub fn Server(comptime Ctx: type) type {
         /// enough: it may be a loop that goes back to blocking in `accept`
         /// on an idle listener, while another holds a connection it cannot
         /// serve until it is woken.
+        ///
+        /// Only a release from the cap can have anyone to wake: the count
+        /// never exceeds it, and every waiter sleeps on it being there.
         fn releaseConnectionSlot(self: *Self) void {
-            _ = self.active_connections.fetchSub(1, .acq_rel);
-            self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
+            const was = self.active_connections.fetchSub(1, .acq_rel);
+            const max = self.config.max_connections orelse return;
+            if (was >= max) self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
         }
 
         /// Wakes the drain when this was the last one: zero is the only
