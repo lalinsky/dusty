@@ -15,6 +15,8 @@ pub fn build(b: *std.Build) void {
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const use_json = b.option(bool, "use_json", "Build with JSON bodies via json.zig") orelse true;
+    const use_msgpack = b.option(bool, "use_msgpack", "Build with MessagePack bodies via msgpack.zig") orelse true;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -26,6 +28,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
     build_options.addOption(bool, "use_zlib", use_zlib);
+    build_options.addOption(bool, "use_json", use_json);
+    build_options.addOption(bool, "use_msgpack", use_msgpack);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -72,6 +76,26 @@ pub fn build(b: *std.Build) void {
         mod.addAnonymousImport("zlib", .{
             .root_source_file = b.path("src/zlib_stub.zig"),
         });
+    }
+
+    // JSON and MessagePack bodies are lazy dependencies too, and need no
+    // stub: without them, `Request.json`/`Response.json` and the msgpack
+    // pair fail to compile if they are used, and nothing else refers to them.
+    if (use_json) {
+        if (b.lazyDependency("json", .{
+            .target = target,
+            .optimize = optimize,
+        })) |json_dep| {
+            mod.addImport("json", json_dep.module("json"));
+        }
+    }
+    if (use_msgpack) {
+        if (b.lazyDependency("msgpack", .{
+            .target = target,
+            .optimize = optimize,
+        })) |msgpack_dep| {
+            mod.addImport("msgpack", msgpack_dep.module("msgpack"));
+        }
     }
 
     const translate_c = b.addTranslateC(.{
