@@ -212,12 +212,22 @@ const BodyBuffer = struct {
         return self.sealed_len + if (self.last()) |segment| segment.len else 0;
     }
 
+    /// Sends the segments in order, up to `max_vecs` in one vectored write.
     fn writeTo(self: *const BodyBuffer, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        const max_vecs = 8;
+        var vecs: [max_vecs][]const u8 = undefined;
+        var n: usize = 0;
         var it = self.segments.first;
         while (it) |node| : (it = node.next) {
             const segment = Segment.fromNode(node);
-            try out.writeAll(segment.bytes()[0..segment.len]);
+            vecs[n] = segment.bytes()[0..segment.len];
+            n += 1;
+            if (n == max_vecs) {
+                try out.writeVecAll(vecs[0..n]);
+                n = 0;
+            }
         }
+        if (n > 0) try out.writeVecAll(vecs[0..n]);
     }
 
     /// Forgets the body, keeping the last segment to write into again.
@@ -2350,6 +2360,37 @@ test "BodyWriter: a body over many segments goes out whole, with its length" {
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 10000\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ expected));
+}
+
+test "BodyWriter: a body of more segments than one vectored write takes goes out in order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const total = 600 * 1000;
+    const out_buf = try arena.allocator().alloc(u8, total + 1024);
+    var conn_writer: std.Io.Writer = .fixed(out_buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var body = response.writer();
+    var chunk: [1000]u8 = undefined;
+    for (0..total / chunk.len) |i| {
+        @memset(&chunk, @intCast('a' + i % 26));
+        try body.interface.writeAll(&chunk);
+    }
+    try body.end();
+    try std.testing.expect(response.body_buffer.segments.len() > 8);
+    try response.write();
+
+    const written = conn_writer.buffered();
+    const start = std.mem.indexOf(u8, written, "\r\n\r\n").? + 4;
+    try std.testing.expect(std.mem.indexOf(u8, written[0..start], "Content-Length: 600000\r\n") != null);
+    const sent = written[start..];
+    try std.testing.expectEqual(total, sent.len);
+    for (0..total / chunk.len) |i| {
+        try std.testing.expect(std.mem.allEqual(u8, sent[i * chunk.len ..][0..chunk.len], @intCast('a' + i % 26)));
+    }
 }
 
 test "BodyWriter: a write bigger than any segment, and a long splat" {
