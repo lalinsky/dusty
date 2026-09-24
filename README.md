@@ -4,8 +4,6 @@ The library was originally written for [zio](https://github.com/lalinsky/zio), a
 implementation of the `std.Io` interface, especially if you need to communicate with other services over the network in your HTTP request handlers,
 or if you are using WebSocket. However, it's usable with any implementation, like `std.Io.Threaded`, or even the simulated implementation from [Marionette](https://github.com/sb2bg/marionette).
 
-The server API is inspired by Karl Seguin's [http.zig](https://github.com/karlseguin/http.zig), and tries to be as compatible as possible.
-
 ## Features
 - Router with support for parameters and wildcards
 - Supports HTTP/1.0 and HTTP/1.1
