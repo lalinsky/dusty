@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- `Response.writer` collects the body in segments of the request arena instead of one growing buffer, and writes into the current segment directly, so short writes no longer go through a vtable call each. A body is never moved or gathered into one piece; only its length is needed before sending. Encoding JSON bodies of a few KB through it is about twice as fast.
+- `BodyWriter` is now buffered like any `std.Io.Writer`: what was written reaches the response when it is flushed, which `end` does. A body writer that is neither ended nor flushed goes out as far as it was last flushed.
+- `Response.writeHeader` returns `error.BodyWriterOpen` while a `BodyWriter` is open, since the response does not know the body's length until the writer is flushed or ended. `BodyWriter.Error` no longer includes `HeadersAlreadySent`.
 - `Listener.acceptors` now defaults to null, which picks log2 of the CPUs the process may use (honoring cgroup CPU quotas), and at least two, instead of a fixed two.
 
 ## [0.3.1] - 2026-09-21
