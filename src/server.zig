@@ -377,8 +377,6 @@ pub fn Server(comptime Ctx: type) type {
             tls_auth: ?tls.config.CertKeyPair = null,
             tls_client_ca: ?std.crypto.Certificate.Bundle = null,
             client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
-            /// Why its accept loop gave up, once it has.
-            err: ?anyerror = null,
 
             fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
                 if (build_options.use_tls) {
@@ -398,6 +396,17 @@ pub fn Server(comptime Ctx: type) type {
                 l.freeTls(allocator);
             }
         };
+
+        /// One accept loop. Several can share a listener's socket, so each
+        /// keeps its own error rather than racing the others to store one on
+        /// the listener.
+        const Acceptor = struct {
+            listener: *ActiveListener,
+            /// Why this loop gave up, once it has.
+            err: ?AcceptError = null,
+        };
+
+        const AcceptError = @typeInfo(@typeInfo(@TypeOf(acceptConnections)).@"fn".return_type.?).error_union.error_set;
 
         const Busy = packed struct(u32) {
             count: u31 = 0,
@@ -480,16 +489,28 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
+            var acceptor_count: usize = 0;
+            for (listeners) |cfg| acceptor_count += @max(1, cfg.acceptors);
+
             const active = try self.allocator.alloc(ActiveListener, listeners.len);
             defer self.allocator.free(active);
             const addresses = try self.allocator.alloc(Address, listeners.len);
             defer self.allocator.free(addresses);
+            const acceptors = try self.allocator.alloc(Acceptor, acceptor_count);
+            defer self.allocator.free(acceptors);
             var opened: usize = 0;
             defer for (active[0..opened]) |*l| l.close(self.io, self.allocator);
             for (listeners, active, addresses) |*cfg, *l, *address| {
                 l.* = try self.open(cfg);
                 opened += 1;
                 address.* = l.address;
+            }
+            // Grouped by listener, in listener order.
+            var next_acceptor: usize = 0;
+            for (active) |*l| {
+                const n = @max(1, l.config.acceptors);
+                for (acceptors[next_acceptor..][0..n]) |*a| a.* = .{ .listener = l };
+                next_acceptor += n;
             }
 
             self.addresses = addresses;
@@ -515,9 +536,18 @@ pub fn Server(comptime Ctx: type) type {
             var stopped: std.Io.Event = .unset;
             var accepting: std.Io.Group = .init;
             defer accepting.cancel(self.io);
-            for (active) |*l| {
-                accepting.concurrent(self.io, acceptLoop, .{ self, l, &connections, &stopped }) catch |err| {
-                    log.err("Failed to spawn the accept loop for {f}: {}", .{ l.address, err });
+            for (acceptors, 0..) |*a, i| {
+                accepting.concurrent(self.io, acceptLoop, .{ self, a, &connections, &stopped }) catch |err| {
+                    // A listener that already has a loop running is still
+                    // served, only with fewer accepts waiting. The loops for
+                    // a listener are spawned in a row, and a first one that
+                    // fails ends the run below, so a predecessor on the same
+                    // listener means one is running.
+                    if (i > 0 and acceptors[i - 1].listener == a.listener) {
+                        log.warn("Failed to spawn an extra accept loop for {f}: {}", .{ a.listener.address, err });
+                        continue;
+                    }
+                    log.err("Failed to spawn the accept loop for {f}: {}", .{ a.listener.address, err });
                     // The loops already running may have accepted by now.
                     accepting.cancel(self.io);
                     self.drainConnections();
@@ -535,8 +565,8 @@ pub fn Server(comptime Ctx: type) type {
 
             accepting.cancel(self.io);
             self.drainConnections();
-            for (active) |*l| {
-                if (l.err) |err| return err;
+            for (acceptors) |*a| {
+                if (a.err) |err| return err;
             }
             // Cannot happen: `stopped` is only set by an accept loop that
             // stored its error first, and every loop was joined above.
@@ -597,15 +627,15 @@ pub fn Server(comptime Ctx: type) type {
         /// else is the listener failing, and stops the whole run.
         fn acceptLoop(
             self: *Self,
-            l: *ActiveListener,
+            a: *Acceptor,
             connections: *std.Io.Group,
             stopped: *std.Io.Event,
         ) std.Io.Cancelable!void {
-            self.acceptConnections(l, connections) catch |err| switch (err) {
+            self.acceptConnections(a.listener, connections) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
                 else => {
-                    log.err("Listener {f} failed: {}", .{ l.address, err });
-                    l.err = err;
+                    log.err("Listener {f} failed: {}", .{ a.listener.address, err });
+                    a.err = err;
                     stopped.set(self.io);
                 },
             };
@@ -732,8 +762,8 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Takes the slot for a connection just accepted. The check above is
         /// what keeps a loop from accepting at the cap, but it is not one
-        /// step with this, and one accept loop per listener races for the
-        /// same slots. A loop that lost the race waits here, holding its
+        /// step with this, and every accept loop, on every listener, races
+        /// for the same slots. A loop that lost the race waits here, holding its
         /// connection the way the backlog would have, so the cap is exact.
         fn reserveConnectionSlot(self: *Self) std.Io.Cancelable!void {
             const max = self.config.max_connections orelse {
@@ -756,9 +786,13 @@ pub fn Server(comptime Ctx: type) type {
         /// enough: it may be a loop that goes back to blocking in `accept`
         /// on an idle listener, while another holds a connection it cannot
         /// serve until it is woken.
+        ///
+        /// Only a release from the cap can have anyone to wake: the count
+        /// never exceeds it, and every waiter sleeps on it being there.
         fn releaseConnectionSlot(self: *Self) void {
-            _ = self.active_connections.fetchSub(1, .acq_rel);
-            self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
+            const was = self.active_connections.fetchSub(1, .acq_rel);
+            const max = self.config.max_connections orelse return;
+            if (was >= max) self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
         }
 
         /// Wakes the drain when this was the last one: zero is the only

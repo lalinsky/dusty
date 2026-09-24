@@ -81,6 +81,14 @@ pub const Listener = struct {
     kernel_backlog: u31 = 1024,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
     reuse_address: bool = true,
+    /// How many accept loops share the socket. With io_uring, an accept
+    /// completes at most once per trip through the event loop, so a single
+    /// loop takes one connection per trip however many are queued, which
+    /// limits a server taking many short connections. Several accepts
+    /// waiting together let one trip take several. An idle one costs a
+    /// parked task, and on Windows a socket created ahead for the
+    /// connection it will get. Zero is taken as one.
+    acceptors: u16 = 2,
 };
 
 pub const ServerConfig = struct {
