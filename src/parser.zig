@@ -2,6 +2,8 @@ const std = @import("std");
 const Transport = @import("transport.zig").Transport;
 
 const c = @import("llhttp");
+const zlib = @import("zlib");
+const build_options = @import("build_options");
 
 const Method = @import("http.zig").Method;
 const Status = @import("http.zig").Status;
@@ -544,7 +546,7 @@ pub const ResponseParser = struct {
 ///
 /// Both transforms between wire bytes and the body a caller asked for are
 /// this type's job. It undoes the transfer framing itself; for a content
-/// coding it stacks, because `std.compress.flate.Decompress` reads from a
+/// coding it stacks, because `zlib.Decompress` reads from a
 /// `std.Io.Reader` and so needs one underneath it handing over raw framed
 /// bytes. That one is another `BodyReader` -- same type, lower role -- and
 /// `startDecoding` puts it and the decoder in one allocation.
@@ -581,18 +583,15 @@ pub fn BodyReader(comptime Parser: type) type {
         /// Switched on rather than compared so what it rewrites drops out of
         /// the inferred error set as well as out of the answer, the same way
         /// tls.zig's `ReadFailed` does in `Transport`.
-        fn decodeCause(e: std.compress.flate.Decompress.Error) !void {
+        fn decodeCause(e: zlib.Decompress.Error) !void {
             switch (e) {
-                // Records whatever the reader below it handed over, and on
-                // failure that is the sentinel: keep descending.
+                // The reader below it failed, and that reader knows why:
+                // keep descending.
                 error.ReadFailed => {},
                 // The compressed stream stopped early -- the same condition
                 // the framing half reports as `IncompleteBody`, and the same
-                // name is what it needs. `EndOfStream` is how a peer that
-                // hung up is spelled, which `Transport.isPeerGone` believes:
-                // it would tear the connection down instead of answering,
-                // for a peer that is still there and sent a whole message.
-                error.EndOfStream => return error.IncompleteBody,
+                // name is what it needs.
+                error.TruncatedInput => return error.IncompleteBody,
                 else => |cause| return cause,
             }
         }
@@ -624,17 +623,17 @@ pub fn BodyReader(comptime Parser: type) type {
 
         /// The decoder and the reader handing it raw framed bytes, in one
         /// allocation so the pointers between them stay put while the body
-        /// reader above is copied around by value.
+        /// reader above is copied around by value. zlib's own state is
+        /// allocated from the same allocator when decoding starts.
         pub const Decode = struct {
             source: Self,
             source_buffer: [source_buffer_len]u8,
-            decoder: std.compress.flate.Decompress,
-            window: [std.compress.flate.max_window_len]u8,
+            decoder: zlib.Decompress,
 
-            /// What the decoder pulls raw framed bytes in. It reads its
-            /// input a few bytes at a time, so this is about how often that
-            /// goes back through the parser, not about correctness.
-            const source_buffer_len = 1024;
+            /// What the decoder pulls raw framed bytes in. It takes all of
+            /// it at once, so this is about how often that goes back through
+            /// the parser, not about correctness.
+            const source_buffer_len = 4096;
         };
 
         pub const StartDecodingError = std.mem.Allocator.Error ||
@@ -649,18 +648,20 @@ pub fn BodyReader(comptime Parser: type) type {
         /// now is copied down to become the reader underneath, and its
         /// buffer position is copied with it.
         ///
-        /// Allocated rather than inline because it is 64K of sliding window
-        /// and a few more of Huffman tables, and a body reader is embedded
-        /// in `Request` and in `ClientResponse` -- neither can carry that
-        /// per message when most messages are not coded at all. It lives as
-        /// long as the reader does; both callers hand over a per-message
-        /// arena.
+        /// Allocated rather than inline because the decoder reads from the
+        /// reader underneath by pointer, and a body reader is embedded in
+        /// `Request` and in `ClientResponse` and copied around by value; zlib
+        /// allocates its window, sized to the stream, only once decoding
+        /// starts. It lives as long as the reader does; both callers hand
+        /// over a per-message arena, so nothing here is freed.
         pub fn startDecoding(
             self: *Self,
             allocator: std.mem.Allocator,
             encoding: ContentEncoding,
         ) StartDecodingError!void {
-            const container: std.compress.flate.Container = switch (encoding) {
+            // Built without zlib, nothing here can undo a coding.
+            if (!build_options.use_zlib and encoding != .identity) return error.UnsupportedContentEncoding;
+            const container: zlib.Container = switch (encoding) {
                 .identity => return,
                 .gzip => .gzip,
                 // HTTP's "deflate" is zlib-wrapped, whatever the name says.
@@ -677,7 +678,9 @@ pub fn BodyReader(comptime Parser: type) type {
             const decode = try allocator.create(Decode);
             decode.source = self.*;
             decode.source.interface.buffer = &decode.source_buffer;
-            decode.decoder = .init(&decode.source.interface, container, &decode.window);
+            // No buffer of its own: it is only ever read through `stream`,
+            // which writes into the caller's writer.
+            decode.decoder = try .init(allocator, &decode.source.interface, &.{}, container, .{});
             self.decode = decode;
         }
 

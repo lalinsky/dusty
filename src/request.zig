@@ -743,7 +743,31 @@ test "Request.body: basic POST" {
     try std.testing.expectEqualStrings("hello", body.?);
 }
 
+test "Request.body: built without zlib, a coded body is refused" {
+    if (@import("build_options").use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello";
+    var reader = try fixedMessageReader(arena.allocator(), raw_request);
+
+    var req: Request = .{
+        .arena = arena.allocator(),
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parser = undefined,
+    };
+
+    var parser: RequestParser = undefined;
+    try parser.init(&req);
+    defer parser.deinit();
+    req.parser = &parser;
+    try parseHeaders(&reader, &parser);
+
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
+}
+
 test "Request.body: a gzip request body is decoded" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -771,6 +795,7 @@ test "Request.body: a gzip request body is decoded" {
 }
 
 test "Request.body: a chunked gzip body is unwrapped by both layers" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -878,6 +903,7 @@ test "Request.body: a chunked trailer split across a buffer wrap is dropped, not
 }
 
 test "Request: decoding takes the headers that described the encoded body" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -970,6 +996,7 @@ test "Request.body: decoding off yields what the wire carried" {
 }
 
 test "Request.body: a compressed body cut short is a bad body, not a departed peer" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1055,6 +1082,7 @@ test "Request.body: a body read that failed before it started can be asked for a
 }
 
 test "Request: a streaming read resolves through the reader it hands out" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1079,9 +1107,10 @@ test "Request: a streaming read resolves through the reader it hands out" {
     // has to answer -- including for a failure in the layer it added.
     var read_buf: [64]u8 = undefined;
     var r = try req.reader(&read_buf);
-    var sink: std.Io.Writer = .fixed(&[_]u8{});
+    var sink_buf: [64]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
     try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink, .limited(64)));
-    try std.testing.expectEqual(error.BadGzipHeader, r.err.?);
+    try std.testing.expectEqual(error.CorruptInput, r.err.?);
 }
 
 test "Request.body: a body cut short is IncompleteBody, not a failed read" {

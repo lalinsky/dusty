@@ -37,6 +37,11 @@
             .hash = "tls-0.1.0-ER2e0mepBgDBLqoGW16P4WLSO0NU7DrkvCshUIYAaliF",
             .lazy = true,
         },
+        .zlib = .{
+            .url = "git+https://github.com/lalinsky/zlib.zig#537dbce25b1b29a0361845b019711dad35699aa6",
+            .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

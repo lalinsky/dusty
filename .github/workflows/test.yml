@@ -33,6 +33,11 @@ jobs:
       run: zig build test --summary all
       timeout-minutes: 5
 
+    - name: Run tests without zlib
+      if: runner.os == 'Linux'
+      run: zig build test --summary all -Duse_zlib=false
+      timeout-minutes: 5
+
     - name: Build httpbin example
       run: zig build
       working-directory: examples/httpbin

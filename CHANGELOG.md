@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Request and response bodies with `Content-Encoding: gzip` or `deflate` are decoded with zlib, through [zlib.zig](https://github.com/lalinsky/zlib.zig), instead of `std.compress.flate`. A corrupt body now fails with `error.CorruptInput` in place of the flate-specific errors, and a coded body no longer takes a 64K window from the arena up front. Build with `-Duse_zlib=false` to leave zlib out; coded bodies are then refused with `error.UnsupportedContentEncoding`.
 - `Response.writer()` writes the body in place into segments of the request arena, instead of passing every write through the body writer's vtable into a growing buffer. Handlers that encode JSON bodies of a few KB are about twice as fast.
 - `Response.writeHeader` is no longer public. Use `Response.stream` to send the headers before the body.
 - `Listener.acceptors` now defaults to null, which picks log2 of the CPUs the process may use (honoring cgroup CPU quotas), and at least two, instead of a fixed two.
