@@ -927,15 +927,18 @@ pub fn Server(comptime Ctx: type) type {
         /// which tells the peer there is nothing more to wait for, and what
         /// it sent is thrown away until it hangs up, or `linger_timeout`
         /// passes, or `linger_limit` bytes for a peer that keeps sending.
-        /// Without a deadline to arm, the wait could be held open, so the
-        /// FIN goes out and the close follows it at once.
+        ///
+        /// Without a deadline to arm, only the peer hanging up or the byte
+        /// limit ends the wait, as nothing bounds any other wait on such a
+        /// server either. Closing sooner resets a peer whose request had
+        /// not all arrived: on macOS, what is still in flight when the
+        /// socket closes is answered with a reset.
         fn lingeringClose(self: *Self, connection: *Connection, timer: *Timer) !void {
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
                 else => |e| return e,
             };
-            if (!timer.canBound()) return;
             timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
             defer timer.clear(self.io);
             _ = connection.reader.discardShort(linger_limit) catch {
