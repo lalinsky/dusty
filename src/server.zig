@@ -12,6 +12,8 @@ const Headers = @import("http.zig").Headers;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
 const body_read_reserve = @import("config.zig").body_read_reserve;
+const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
+const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
@@ -91,14 +93,23 @@ const ClientAuthRef = struct {
     mode: ServerConfig.Tls.ClientAuth.Mode,
 };
 
-/// Primed into a connection's request arena, so an ordinary request is
-/// served without growing it. A request that needs more grows it once, and
-/// the arena keeps what it grew to for the rest of the connection.
+/// Primed into each pooled request arena, so an ordinary request is served
+/// without growing it. A request that needs more grows it once, and the
+/// arena keeps what it grew to.
 const request_arena_reserve = 8 * 1024;
 
+/// What a connection reads into while it waits for a request, in place of
+/// the pooled read buffer it takes once one arrives. An ordinary head fits,
+/// so it moves across in one copy; a longer one is read the rest of the way
+/// into the pooled buffer.
+const idle_read_buffer_len = 1024;
+
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
-/// layer), their buffers and the request arena, for one accepted
-/// connection. Initialized in place: `tls_conn` stores pointers into
+/// layer) and their buffers for one accepted connection. The buffer a
+/// request is read into and its arena are not the connection's: they come
+/// from the server's pool while a request is being served.
+///
+/// Initialized in place: `tls_conn` stores pointers into
 /// `tcp_reader`/`tcp_writer`, and `tls_reader`/`tls_writer` store a pointer
 /// back into `tls_conn`, so a `Connection` must never be moved after
 /// `initPlain`/`initTls` runs.
@@ -107,15 +118,12 @@ pub const Connection = struct {
     stream: std.Io.net.Stream,
     allocator: std.mem.Allocator,
 
-    /// Per-request memory, reset between requests.
-    arena: std.heap.ArenaAllocator,
-    /// One allocation for what lives as long as the connection: the TLS
-    /// record buffers, under TLS, and `read_buffer` after them.
+    /// The TLS record buffers, under TLS; empty otherwise.
     buffers: []u8,
-    /// Where request heads are read. The parsed headers are slices into it,
-    /// and what a head does not use is what the body reader reads into, so
-    /// the reader's view of it shrinks as a request is parsed;
-    /// `rewindReader` restores it for the next one.
+    /// Where request heads are read, set with `useReadBuffer`. The parsed
+    /// headers are slices into it, and what a head does not use is what the
+    /// body reader reads into, so the reader's view of it shrinks as a
+    /// request is parsed; `rewindReader` restores it for the next one.
     read_buffer: []u8,
 
     tcp_reader: std.Io.net.Stream.Reader = undefined,
@@ -141,31 +149,22 @@ pub const Connection = struct {
     writer: *std.Io.Writer = undefined,
 
     /// Whole before anything can fail, so `deinit` is safe after a failed
-    /// init. `tls_buffers_len` is how much of `buffers` the TLS layer gets,
-    /// ahead of the read buffer.
+    /// init. `tls_buffers_len` is how much the TLS layer gets.
     fn init(
         self: *Connection,
         allocator: std.mem.Allocator,
         io: std.Io,
         stream: std.Io.net.Stream,
-        request_buffer_size: usize,
         tls_buffers_len: usize,
     ) !void {
         self.* = .{
             .io = io,
             .stream = stream,
             .allocator = allocator,
-            .arena = .init(allocator),
             .buffers = &.{},
             .read_buffer = &.{},
         };
-        self.buffers = try allocator.alloc(u8, tls_buffers_len + request_buffer_size + body_read_reserve);
-        self.read_buffer = self.buffers[tls_buffers_len..];
-
-        // Reset keeps the memory, as one node the requests are then carved
-        // from.
-        _ = try self.arena.allocator().alloc(u8, request_arena_reserve);
-        _ = self.arena.reset(.retain_capacity);
+        self.buffers = try allocator.alloc(u8, tls_buffers_len);
     }
 
     pub fn initPlain(
@@ -173,10 +172,9 @@ pub const Connection = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         stream: std.Io.net.Stream,
-        request_buffer_size: usize,
     ) !void {
-        try self.init(allocator, io, stream, request_buffer_size, 0);
-        self.tcp_reader = stream.reader(io, self.read_buffer);
+        try self.init(allocator, io, stream, 0);
+        self.tcp_reader = stream.reader(io, &.{});
         self.tcp_writer = stream.writer(io, &self.write_buffer);
         self.reader = &self.tcp_reader.interface;
         self.writer = &self.tcp_writer.interface;
@@ -187,11 +185,10 @@ pub const Connection = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         stream: std.Io.net.Stream,
-        request_buffer_size: usize,
         auth: *tls.config.CertKeyPair,
         client_auth: ?ClientAuthRef,
     ) !void {
-        try self.init(allocator, io, stream, request_buffer_size, tls.input_buffer_len + tls.output_buffer_len);
+        try self.init(allocator, io, stream, tls.input_buffer_len + tls.output_buffer_len);
 
         // The tls.Connection points into these for the whole connection.
         const tcp_read_buffer = self.buffers[0..tls.input_buffer_len];
@@ -214,10 +211,23 @@ pub const Connection = struct {
             .now = std.Io.Clock.real.now(io),
             .rng = self.tls_rng.interface(),
         });
-        self.tls_reader = self.tls_conn.?.reader(self.read_buffer);
+        self.tls_reader = self.tls_conn.?.reader(&.{});
         self.tls_writer = self.tls_conn.?.writer(&self.tls_cleartext_write_buffer);
         self.reader = &self.tls_reader.interface;
         self.writer = &self.tls_writer.interface;
+    }
+
+    /// Reads into `buffer` from now on, with what the reader holds moved
+    /// into it.
+    pub fn useReadBuffer(self: *Connection, buffer: []u8) void {
+        const r = self.reader;
+        const buffered = r.buffered();
+        std.debug.assert(buffered.len <= buffer.len);
+        @memcpy(buffer[0..buffered.len], buffered);
+        r.buffer = buffer;
+        r.seek = 0;
+        r.end = buffered.len;
+        self.read_buffer = buffer;
     }
 
     /// Gives the reader the whole read buffer back for the next request.
@@ -245,7 +255,6 @@ pub const Connection = struct {
             .io = undefined,
             .stream = undefined,
             .allocator = undefined,
-            .arena = undefined,
             .buffers = &.{},
             .read_buffer = &.{},
             .reader = undefined,
@@ -256,7 +265,6 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
-        self.arena.deinit();
         self.allocator.free(self.buffers);
     }
 
@@ -368,6 +376,7 @@ pub fn Server(comptime Ctx: type) type {
         addresses: []const Address = &.{},
         ready: std.Io.Event,
         _middleware_registry: std.SinglyLinkedList,
+        request_buffers: RequestBuffersPool,
 
         /// A listener while `run` serves it: the socket, and the TLS
         /// material every connection accepted on it shares.
@@ -426,6 +435,7 @@ pub fn Server(comptime Ctx: type) type {
                 .address = undefined,
                 .ready = .unset,
                 ._middleware_registry = .{},
+                .request_buffers = .init(allocator, config.request.buffer_size + body_read_reserve, request_arena_reserve),
             };
         }
 
@@ -438,6 +448,7 @@ pub fn Server(comptime Ctx: type) type {
                 item.middleware.deinit();
             }
             self.router.deinit();
+            self.request_buffers.deinit();
         }
 
         /// Creates a middleware instance managed by the server.
@@ -973,7 +984,7 @@ pub fn Server(comptime Ctx: type) type {
                             .mode = l.client_auth_mode,
                         } else null;
 
-                        connection.initTls(self.allocator, self.io, stream, self.config.request.buffer_size, auth, client_auth) catch |err| {
+                        connection.initTls(self.allocator, self.io, stream, auth, client_auth) catch |err| {
                             // tls.zig only saw the ciphertext reader or
                             // writer fail generically, so the cause is a
                             // layer down -- and when the handshake ran out
@@ -1000,7 +1011,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
             }
 
-            try connection.initPlain(self.allocator, self.io, stream, self.config.request.buffer_size);
+            try connection.initPlain(self.allocator, self.io, stream);
             return self.handleRequests(l, &connection, &timer, &busy);
         }
 
@@ -1031,8 +1042,14 @@ pub fn Server(comptime Ctx: type) type {
             timer: *Timer,
             busy: *bool,
         ) !void {
+            var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
+            connection.useReadBuffer(&idle_read_buffer);
+            var buffers: ?*RequestBuffers = null;
+            defer if (buffers) |b| self.request_buffers.release(b);
+
             var request: Request = .{
-                .arena = connection.arena.allocator(),
+                // The pooled arena, once a request has arrived.
+                .arena = undefined,
                 .io = self.io,
                 .transport = connection.transport(),
                 .parser = undefined,
@@ -1060,6 +1077,11 @@ pub fn Server(comptime Ctx: type) type {
                 // request pipelined behind the last one is already here.
                 const first = request_count == 0;
                 if (connection.reader.bufferedLen() == 0) {
+                    if (buffers) |b| {
+                        connection.useReadBuffer(&idle_read_buffer);
+                        self.request_buffers.release(b);
+                        buffers = null;
+                    }
                     self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
                     switch (try self.waitForRequest(connection, busy)) {
                         .arrived => {},
@@ -1070,6 +1092,13 @@ pub fn Server(comptime Ctx: type) type {
                 }
                 if (!first) self.armTimer(timer, self.config.timeout.request);
                 request_count += 1;
+
+                if (buffers == null) {
+                    const b = try self.request_buffers.acquire();
+                    buffers = b;
+                    connection.useReadBuffer(b.read_buffer);
+                    request.arena = b.arena.allocator();
+                }
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {
                     error.EndOfStream => return,
@@ -1207,7 +1236,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 parser.reset();
                 request.reset();
-                _ = connection.arena.reset(.retain_capacity);
+                _ = buffers.?.arena.reset(.retain_capacity);
                 connection.rewindReader();
             }
         }

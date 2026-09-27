@@ -40,7 +40,7 @@ pub const TlsCa = union(enum) {
     }
 };
 
-/// Kept free past the head in a connection's read buffer, which is sized
+/// Kept free past the head in a request's read buffer, which is sized
 /// `buffer_size + body_read_reserve`. `parseHeaders` gives the body reader
 /// whatever the head did not use, and a body reader with no buffer cannot
 /// read; refusing a head that would eat into this is what makes it a reserve
@@ -138,9 +138,13 @@ pub const ServerConfig = struct {
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
-    /// Costs about `request.buffer_size + 13K` per connection, 33K more
-    /// under TLS, and 70K more for a connection that receives a body with a
-    /// `Content-Encoding` while `request.decompress` is on.
+    /// An open connection costs about 10K, 33K more under TLS. A request
+    /// being served takes `request.buffer_size + 9K` more from a pool the
+    /// connections share, given back once the response is sent and nothing
+    /// else has arrived, and 70K more when it has a body with a
+    /// `Content-Encoding` while `request.decompress` is on. The pool is
+    /// never shrunk: it holds enough for the most requests ever served at
+    /// once, each with the most its arena was grown to.
     max_connections: ?u32 = 10_000,
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
@@ -195,10 +199,10 @@ pub const ServerConfig = struct {
         /// decoded rather than what arrived.
         ///
         /// Which is the limit worth enforcing, but note what it costs: a
-        /// connection can hold this much in its arena, and a compressed
-        /// request reaches it for a fraction of the bytes on the wire. Size
-        /// memory for `max_connections` of these, not for what a peer has
-        /// to send to get one.
+        /// request can grow its arena by this much, the pooled arena keeps
+        /// it, and a compressed request reaches it for a fraction of the
+        /// bytes on the wire. Size memory for `max_connections` of these,
+        /// not for what a peer has to send to get one.
         max_body_size: usize = 1_048_576, // 1MB default
         /// Undo `Content-Encoding` on request bodies. A coding we cannot
         /// undo fails the read with `error.UnsupportedContentEncoding`
@@ -207,9 +211,9 @@ pub const ServerConfig = struct {
         /// Turn off to read what the wire carried, whatever it is;
         /// `Request.content_encoding` says what that was.
         ///
-        /// Costs about 70K from the connection's arena -- a 64K sliding
-        /// window and the decoder -- on the connections that actually
-        /// receive a coded body, and only once each.
+        /// Costs about 70K from the request's arena -- a 64K sliding
+        /// window and the decoder -- on the requests that actually have a
+        /// coded body.
         decompress: bool = true,
         /// Buffer size (bytes) for reading the request head: the request
         /// line and all headers. This is also the limit on it -- the parsed

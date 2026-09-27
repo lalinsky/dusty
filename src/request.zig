@@ -587,7 +587,8 @@ const ParseHeadersError = std.Io.Reader.Error || ParseError ||
 /// Returns error.IncompleteRequest if connection closed mid-request.
 /// Returns error.HeadersTooLarge if the head does not fit.
 pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeadersError!void {
-    // Re-pre-allocate headers each call to handle keep-alive (arena was reset).
+    // The arena is reset between requests, and may be another pooled set's
+    // by the next one, so the headers are allocated for each.
     parser.request.headers = try http.Headers.init(parser.request.arena, parser.request.config.max_header_count);
     var parsed_len: usize = 0;
     while (!parser.state.headers_complete) {

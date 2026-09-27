@@ -98,7 +98,6 @@ pub const RequestParser = struct {
             .settings = undefined,
             .request = request,
         };
-        request.headers = try Headers.init(request.arena, request.config.max_header_count);
 
         self.settings = std.mem.zeroes(c.llhttp_settings_t);
         self.settings.on_method_complete = onMethod;
@@ -234,7 +233,7 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
-        // Headers point directly into arena-allocated read buffer, no copy needed
+        // Headers point directly into the read buffer, no copy needed
         self.request.headers.add(self.state.header_field, self.state.header_value) catch return -1;
 
         self.state.header_value = "";
@@ -898,6 +897,8 @@ test "RequestParser: basic" {
         .arena = arena.allocator(),
         .parser = undefined,
         .transport = undefined,
+        // Allocated by `parseHeaders`, which this test goes around.
+        .headers = try Headers.init(arena.allocator(), 32),
     };
 
     var parser: RequestParser = undefined;
