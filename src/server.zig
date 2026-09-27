@@ -230,6 +230,15 @@ pub const Connection = struct {
         self.read_buffer = buffer;
     }
 
+    /// Reads into `buffer` from now on, throwing away what the reader holds.
+    pub fn replaceReadBuffer(self: *Connection, buffer: []u8) void {
+        const r = self.reader;
+        r.buffer = buffer;
+        r.seek = 0;
+        r.end = 0;
+        self.read_buffer = buffer;
+    }
+
     /// Gives the reader the whole read buffer back for the next request.
     /// What the last request left unread is the start of the next one,
     /// pipelined behind it, and it moves to the front.
@@ -928,17 +937,30 @@ pub fn Server(comptime Ctx: type) type {
         /// it sent is thrown away until it hangs up, or `linger_timeout`
         /// passes, or `linger_limit` bytes for a peer that keeps sending.
         ///
-        /// Without a deadline to arm, only the peer hanging up or the byte
-        /// limit ends the wait, as nothing bounds any other wait on such a
-        /// server either. Closing sooner resets a peer whose request had
-        /// not all arrived: on macOS, what is still in flight when the
-        /// socket closes is answered with a reset.
-        fn lingeringClose(self: *Self, connection: *Connection, timer: *Timer) !void {
+        /// Without a deadline to bound the reads, it waits out
+        /// `linger_timeout` without reading instead, as Go's net/http does:
+        /// time for the peer to read the answer before a reset can arrive.
+        ///
+        /// Throwing input away needs no request buffers, so the set is given
+        /// back first and the reads go through `idle_read_buffer`.
+        fn lingeringClose(
+            self: *Self,
+            connection: *Connection,
+            timer: *Timer,
+            idle_read_buffer: []u8,
+            buffers: *?*RequestBuffers,
+        ) !void {
+            if (buffers.*) |b| {
+                connection.replaceReadBuffer(idle_read_buffer);
+                self.request_buffers.release(b);
+                buffers.* = null;
+            }
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
                 else => |e| return e,
             };
+            if (!timer.canBound()) return self.io.sleep(linger_timeout, .awake);
             timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
             defer timer.clear(self.io);
             _ = connection.reader.discardShort(linger_limit) catch {
@@ -1090,7 +1112,7 @@ pub fn Server(comptime Ctx: type) type {
                         .arrived => {},
                         .peer_gone => return,
                         // The request it refused was not read.
-                        .refused => return self.lingeringClose(connection, timer),
+                        .refused => return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers),
                     }
                 }
                 if (!first) self.armTimer(timer, self.config.timeout.request);
@@ -1110,13 +1132,13 @@ pub fn Server(comptime Ctx: type) type {
                         log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        return self.lingeringClose(connection, timer);
+                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     },
                     error.TooManyHeaders => {
                         log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
                         sendHeadersTooLarge(connection.writer) catch
                             return connection.getWriteError() orelse error.Unexpected;
-                        return self.lingeringClose(connection, timer);
+                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     },
                     else => |e| return e,
                 };
@@ -1148,7 +1170,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.status = .expectation_failed;
                         response.keepalive = false;
                         try response.write();
-                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer);
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                         return;
                     }
                 }
@@ -1171,7 +1193,7 @@ pub fn Server(comptime Ctx: type) type {
                         response.status = .bad_request;
                         response.keepalive = false;
                         try response.write();
-                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer);
+                        if (hasUnreadInput(connection, &parser)) try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                         return;
                     },
                     else => |e| return e,
@@ -1232,7 +1254,7 @@ pub fn Server(comptime Ctx: type) type {
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
                     if (response.status != .switching_protocols and hasUnreadInput(connection, &parser)) {
-                        try self.lingeringClose(connection, timer);
+                        try self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                     }
                     break;
                 }

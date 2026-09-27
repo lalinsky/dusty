@@ -112,6 +112,10 @@ pub const Timer = if (have_auto_cancel) struct {
     pub fn clear(self: *@This(), _: std.Io) void {
         self.inner.clear();
     }
+
+    pub fn canBound(_: *const @This()) bool {
+        return true;
+    }
 } else struct {
     /// Null when no deadline was configured.
     watch: ?*Watch = null,
@@ -128,6 +132,12 @@ pub const Timer = if (have_auto_cancel) struct {
     pub fn clear(self: *@This(), io: std.Io) void {
         const w = self.watch orelse return;
         w.disarm(io);
+    }
+
+    /// Whether `set` does anything: there is no watcher when no deadline
+    /// was configured for the connection.
+    pub fn canBound(self: *const @This()) bool {
+        return self.watch != null;
     }
 };
 
