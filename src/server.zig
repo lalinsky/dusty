@@ -444,7 +444,7 @@ pub fn Server(comptime Ctx: type) type {
                 .address = undefined,
                 .ready = .unset,
                 ._middleware_registry = .{},
-                .request_buffers = .init(allocator, config.request.buffer_size + body_read_reserve, request_arena_reserve),
+                .request_buffers = .init(allocator, io, config.request.buffer_size + body_read_reserve, request_arena_reserve),
             };
         }
 
