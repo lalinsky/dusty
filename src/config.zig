@@ -139,9 +139,11 @@ pub const ServerConfig = struct {
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
     /// An open connection costs about 10K, 33K more under TLS, and
-    /// `request.buffer_size + 9K` more once its first request arrives. A
-    /// request with a body with a `Content-Encoding` takes 70K more while
-    /// `request.decompress` is on.
+    /// `request.buffer_size + 9K` more once its first request arrives, or
+    /// only while a request is being served with
+    /// `request.keep_buffers_between_requests` off. A request with a body
+    /// with a `Content-Encoding` takes 70K more while `request.decompress`
+    /// is on.
     max_connections: ?u32 = 10_000,
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
@@ -218,6 +220,13 @@ pub const ServerConfig = struct {
         /// copies, so the head is held whole and cannot be read in pieces.
         /// A head that does not fit is answered with 431.
         buffer_size: usize = 16384,
+        /// Whether a keep-alive connection keeps the buffer its requests
+        /// are read into, and their arena, while it waits for the next one.
+        /// Off, it gives them back between requests and takes a set again
+        /// when the next one arrives: an idle connection then holds only
+        /// its own 10K, but every request on a busy one pays for the trip,
+        /// which costs throughput on a server with many cores.
+        keep_buffers_between_requests: bool = true,
         /// Maximum number of headers allowed in a request
         max_header_count: usize = 32,
         /// Maximum number of route parameters (e.g., /user/:id/:action)

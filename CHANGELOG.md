@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 - `Response.writer()` writes the body in place into segments of the request arena, instead of passing every write through the body writer's vtable into a growing buffer. Handlers that encode JSON bodies of a few KB are about twice as fast.
 - `Response.writeHeader` is no longer public. Use `Response.stream` to send the headers before the body.
 - `Listener.acceptors` now defaults to null, which picks log2 of the CPUs the process may use (honoring cgroup CPU quotas), and at least two, instead of a fixed two.
-- A connection's request read buffer and arena are reused by later connections instead of being allocated for each one, and a connection that never sends a request holds none.
+- A connection's request read buffer and arena are reused by later connections instead of being allocated for each one, and a connection that never sends a request holds none. Set `ServerConfig.request.keep_buffers_between_requests` to false to have keep-alive connections give them back between requests as well, for less memory per idle connection at some cost in throughput.
 
 ## [0.3.1] - 2026-09-21
 
