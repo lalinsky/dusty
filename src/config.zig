@@ -138,13 +138,10 @@ pub const ServerConfig = struct {
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
-    /// An open connection costs about 10K, 33K more under TLS. A request
-    /// being served takes `request.buffer_size + 9K` more from a pool the
-    /// connections share, given back once the response is sent and nothing
-    /// else has arrived, and 70K more when it has a body with a
-    /// `Content-Encoding` while `request.decompress` is on. The pool is
-    /// never shrunk: it holds enough for the most requests ever served at
-    /// once, each with the most its arena was grown to.
+    /// An open connection costs about 10K, 33K more under TLS, and
+    /// `request.buffer_size + 9K` more once its first request arrives. A
+    /// request with a body with a `Content-Encoding` takes 70K more while
+    /// `request.decompress` is on.
     max_connections: ?u32 = 10_000,
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {

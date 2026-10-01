@@ -98,16 +98,17 @@ const ClientAuthRef = struct {
 /// arena keeps what it grew to.
 const request_arena_reserve = 8 * 1024;
 
-/// What a connection reads into while it waits for a request, in place of
-/// the pooled read buffer it takes once one arrives. An ordinary head fits,
-/// so it moves across in one copy; a longer one is read the rest of the way
-/// into the pooled buffer.
+/// What a connection reads into while it waits for its first request, in
+/// place of the pooled read buffer it takes once one arrives. An ordinary
+/// head fits, so it moves across in one copy; a longer one is read the rest
+/// of the way into the pooled buffer.
 const idle_read_buffer_len = 1024;
 
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer) and their buffers for one accepted connection. The buffer a
 /// request is read into and its arena are not the connection's: they come
-/// from the server's pool while a request is being served.
+/// from the server's pool once its first request arrives, and go back when
+/// it closes.
 ///
 /// Initialized in place: `tls_conn` stores pointers into
 /// `tcp_reader`/`tcp_writer`, and `tls_reader`/`tls_writer` store a pointer
@@ -1102,11 +1103,9 @@ pub fn Server(comptime Ctx: type) type {
                 // request pipelined behind the last one is already here.
                 const first = request_count == 0;
                 if (connection.reader.bufferedLen() == 0) {
-                    if (buffers) |b| {
-                        connection.useReadBuffer(&idle_read_buffer);
-                        self.request_buffers.release(b);
-                        buffers = null;
-                    }
+                    // A later request is read straight into the set the
+                    // connection keeps: giving it back between requests
+                    // costs a shared lock and a cold set on every one.
                     self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
                     switch (try self.waitForRequest(connection, busy)) {
                         .arrived => {},
@@ -1119,7 +1118,7 @@ pub fn Server(comptime Ctx: type) type {
                 request_count += 1;
 
                 if (buffers == null) {
-                    const b = try self.request_buffers.acquire();
+                    const b = try self.request_buffers.acquire(@intFromPtr(connection));
                     buffers = b;
                     connection.useReadBuffer(b.read_buffer);
                     request.arena = b.arena.allocator();
