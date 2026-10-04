@@ -17,7 +17,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
-const BORDER = "=" ** 80;
+const BORDER: []const u8 = &@as([80]u8, @splat('='));
 
 // Log capture for suppressing logs in passing tests.
 // The Io is stashed at startup so the global log callback can perform mutex
@@ -186,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
         test_index += 1;
 
         current_test = friendly_name;
-        std.testing.allocator_instance = .{};
+        std.testing.allocator_instance = if (comptime @hasDecl(std.heap, "SafeAllocator")) .init(std.heap.page_allocator, .{}) else .{};
         std.testing.io_instance = .init(gpa, .{
             .argv0 = .init(init.minimal.args),
             .environ = init.minimal.environ,
@@ -214,7 +214,11 @@ pub fn main(init: std.process.Init) !void {
 
         const ns_taken = slowest.endTiming(io, gpa, friendly_name);
 
-        if (std.testing.allocator_instance.deinit() == .leak) {
+        const leaked = if (comptime @hasDecl(std.heap, "SafeAllocator"))
+            std.testing.allocator_instance.deinit() != 0
+        else
+            std.testing.allocator_instance.deinit() == .leak;
+        if (leaked) {
             leak += 1;
             Printer.status(.fail, "\n{s}\n\"{s}\" - Memory Leak\n{s}\n", .{ BORDER, friendly_name, BORDER });
         }

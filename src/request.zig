@@ -710,12 +710,12 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
         // functions that resolve for them.
         RequestBodyReader.Error,
     }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
             // Not a sentinel, but not a cause either: the body layer calls a
             // stream that stopped early `IncompleteBody`, and `EndOfStream`
             // here would be read as the peer having hung up.
-            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
+            try std.testing.expect(!std.mem.eql(u8, e_name, "EndOfStream"));
         }
     }
 }
@@ -879,7 +879,7 @@ test "Request.body: a chunked trailer split across a buffer wrap is dropped, not
     // the start of the buffer with the rest of the name.
     const head = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
     const region = 2048;
-    const data = "a" ** 2033;
+    const data = &@as([2033]u8, @splat('a'));
     const body = "7f1\r\n" ++ data ++ "\r\n0\r\n" ++ "X-Trailer: value\r\n\r\n";
     comptime std.debug.assert(("7f1\r\n" ++ data ++ "\r\n0\r\n" ++ "X-Tra").len == region);
 
@@ -1192,7 +1192,7 @@ test "Request.body: large body over 128 bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const body_content = "A" ** 256;
+    const body_content = &@as([256]u8, @splat('A'));
     const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 256\r\n\r\n" ++ body_content;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 

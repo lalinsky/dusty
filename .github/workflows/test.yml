@@ -12,8 +12,10 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        zig-version: ['0.16.0', '0.17.0']
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -23,7 +25,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: ${{ matrix.zig-version }}
 
     - name: Build
       run: zig build
@@ -41,11 +43,15 @@ jobs:
     - name: Build httpbin example
       run: zig build
       working-directory: examples/httpbin
+      # httpbin pins its own zio, which is still on Zig 0.16.
+      if: matrix.zig-version == '0.16.0'
       timeout-minutes: 5
 
     - name: Test httpbin example
       run: python3 test_httpbin.py
       working-directory: examples/httpbin
+      # httpbin pins its own zio, which is still on Zig 0.16.
+      if: matrix.zig-version == '0.16.0'
       timeout-minutes: 5
 
     - name: Build examples

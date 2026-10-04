@@ -212,8 +212,9 @@ test "Status: fromCode" {
 }
 
 test "Status: fromCode round-trips every named status" {
-    inline for (@typeInfo(Status).@"enum".fields) |f| {
-        try std.testing.expectEqual(@field(Status, f.name), try Status.fromCode(f.value));
+    inline for (comptime std.meta.fieldNames(Status)) |name| {
+        const status = @field(Status, name);
+        try std.testing.expectEqual(status, try Status.fromCode(comptime @intFromEnum(status)));
     }
 }
 
@@ -535,7 +536,7 @@ const allowed_header_name_bytes = "!#$%&'*+-.^_`|~" ++
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 const tchar_table: [256]bool = blk: {
-    var table = [_]bool{false} ** 256;
+    var table: [256]bool = @splat(false);
     for (allowed_header_name_bytes) |byte| table[byte] = true;
     break :blk table;
 };

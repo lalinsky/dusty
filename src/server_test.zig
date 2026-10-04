@@ -822,7 +822,7 @@ test "Server: keepalive with request buffers given back between requests" {
 
     // A head longer than what a connection waits for a request in, so it
     // is read the rest of the way into the set taken again.
-    const long_value = "abcdefgh" ++ "x" ** 2000;
+    const long_value = "abcdefgh" ++ &@as([2000]u8, @splat('x'));
     try w.writeAll("GET /header HTTP/1.1\r\nHost: localhost\r\nX-Long: " ++ long_value ++ "\r\n\r\n");
     try w.flush();
     const resp2 = try readResponse(r, &status, &body);
@@ -1438,7 +1438,7 @@ test "Server: closes connection when unread body exceeds max_body_size" {
     var reader = stream.reader(io, &read_buf);
     const r = &reader.interface;
 
-    const body = "x" ** 200;
+    const body = &@as([200]u8, @splat('x'));
     try w.print("POST /ignore HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
     try w.flush();
 

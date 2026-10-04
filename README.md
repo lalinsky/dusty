@@ -18,6 +18,8 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 
 ## Installation
 
+Requires Zig 0.16 or 0.17.
+
 ```sh
 zig fetch --save "git+https://github.com/lalinsky/dusty#v0.3.1"
 ```

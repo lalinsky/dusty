@@ -239,8 +239,8 @@ fn unbracketed(host: []const u8) []const u8 {
 
 /// Get host string from URI.
 fn uriHost(uri: Uri, buffer: *[255]u8) ![]const u8 {
-    const hostname = uri.getHost(buffer) catch return error.InvalidUrl;
-    return hostname.bytes;
+    const component = uri.host orelse return error.InvalidUrl;
+    return component.toRaw(buffer) catch return error.InvalidUrl;
 }
 
 /// Get path for HTTP request line.
@@ -1802,6 +1802,9 @@ test "ClientResponse: neither it nor its reader carries a buffer or a decoder" {
 }
 
 test "Client: no std.Io sentinel escapes its public API" {
+    // Listing the names of these error sets takes more than the default
+    // quota on Zig 0.16.
+    @setEvalBranchQuota(10_000);
     // `ReadFailed`/`WriteFailed` say only that a read or write failed, which
     // the caller knew when it called. The client stacks more layers than the
     // server does -- socket, TLS, request and response framing,
@@ -1822,9 +1825,9 @@ test "Client: no std.Io sentinel escapes its public API" {
         ClientResponse.ReadError,
         ResponseBodyReader.Error,
     }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
-            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
         }
     }
 
@@ -1833,8 +1836,8 @@ test "Client: no std.Io sentinel escapes its public API" {
     // read as the peer having hung up. `fetch` is excluded because a
     // connection-close-delimited response can end that way for real.
     inline for (.{ ClientResponse.ReadError, ResponseBodyReader.Error }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "EndOfStream"));
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "EndOfStream"));
         }
     }
 }
@@ -1843,7 +1846,7 @@ test "ClientResponse.body: large body over 128 bytes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const body_content = "A" ** 256;
+    const body_content = &@as([256]u8, @splat('A'));
     const raw_response = "HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n" ++ body_content;
     var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
@@ -1925,7 +1928,7 @@ test "parseResponseHeaders: an endless run of interim responses is refused" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_response = "HTTP/1.1 100 Continue\r\n\r\n" ** (max_interim_responses + 1) ++
+    const raw_response = repeat("HTTP/1.1 100 Continue\r\n\r\n", max_interim_responses + 1) ++
         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
@@ -2560,4 +2563,14 @@ test "Connection.release: the Keep-Alive timeout is in seconds" {
     try std.testing.expect(left > 4 * std.time.ns_per_s);
     try std.testing.expect(left <= 5 * std.time.ns_per_s);
     peer_future.cancel(io);
+}
+
+/// `s` repeated `n` times, for test fixtures. Zig 0.17 removed `**`.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        break :blk &final;
+    };
 }

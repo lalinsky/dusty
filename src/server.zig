@@ -469,7 +469,10 @@ pub fn Server(comptime Ctx: type) type {
         pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(Ctx) {
             const arena = self.router.arena.allocator();
             const m = try arena.create(M);
-            m.* = switch (@typeInfo(@TypeOf(M.init)).@"fn".params.len) {
+            const init_info = @typeInfo(@TypeOf(M.init)).@"fn";
+            // Zig 0.17 replaced `params` with `param_types`.
+            const init_param_count = if (@hasField(@TypeOf(init_info), "params")) init_info.params.len else init_info.param_types.len;
+            m.* = switch (init_param_count) {
                 1 => try M.init(config),
                 2 => try M.init(config, MiddlewareConfig{
                     .arena = arena,
@@ -1358,11 +1361,11 @@ test "Connection: the placeholders it descends past stay out of its error sets" 
     // `ReadFailed`/`WriteFailed` mean only "the layer below failed", which
     // is what the accessors exist to look past. They must not survive into
     // what a caller can be handed.
-    inline for (@typeInfo(Connection.ReadError).error_set.?) |e| {
-        try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+    inline for (comptime std.meta.fieldNames(Connection.ReadError)) |e_name| {
+        try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
     }
-    inline for (@typeInfo(Connection.WriteError).error_set.?) |e| {
-        try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+    inline for (comptime std.meta.fieldNames(Connection.WriteError)) |e_name| {
+        try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
     }
 }
 

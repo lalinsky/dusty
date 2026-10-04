@@ -1510,16 +1510,26 @@ test "Server: res.compress gzips buffered and streamed bodies for a client that 
             var client = dusty.Client.init(std.testing.allocator, _io, .{});
             defer client.deinit();
 
-            const long = Handlers.line ** 100;
+            const long = repeat(Handlers.line, 100);
             try fetch(&client, port, "/buffered", false, .gzip, long);
             try fetch(&client, port, "/streamed", false, .gzip, long);
             try fetch(&client, port, "/short", false, .identity, Handlers.line);
             const event = "event: fox\ndata: the quick brown fox jumps over the lazy dog\ndata: \n\n";
-            try fetch(&client, port, "/events", false, .gzip, event ** 3);
+            try fetch(&client, port, "/events", false, .gzip, repeat(event, 3));
             try fetch(&client, port, "/buffered", true, .identity, long);
             try fetch(&client, port, "/streamed", true, .identity, long);
         }
     }.run, .{ &server, io });
 
     try client_future.await(io);
+}
+
+/// `s` repeated `n` times, for test fixtures. Zig 0.17 removed `**`.
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime blk: {
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        break :blk &final;
+    };
 }

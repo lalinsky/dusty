@@ -407,7 +407,7 @@ test "WebSocket: writeFrame binary with medium length" {
     var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
 
-    const payload = "x" ** 200;
+    const payload = &@as([200]u8, @splat('x'));
     try ws.writeFrame(.binary, payload, true);
 
     const written = conn_writer.buffered();
@@ -658,7 +658,7 @@ test "WebSocket: readFrame rejects large control frame" {
         0x89, // FIN + ping
         126, // extended length indicator
         0x00, 0x7E, // 126 bytes
-    } ++ [_]u8{0} ** 126;
+    } ++ @as([126]u8, @splat(0));
     var reader: std.Io.Reader = .fixed(&frame_data);
 
     var buf: [1024]u8 = undefined;
@@ -747,8 +747,8 @@ test "WebSocket: concurrent sends do not interleave within a frame" {
     var ws = WebSocket.init(io, .{ .writer = &probe.interface, .reader = &reader }, gpa, 0);
     defer ws.deinit();
 
-    const a = "a" ** 300;
-    const b = "b" ** 300;
+    const a = &@as([300]u8, @splat('a'));
+    const b = &@as([300]u8, @splat('b'));
 
     var fa = try io.concurrent(struct {
         fn run(s: *WebSocket, payload: []const u8) !void {
@@ -794,7 +794,7 @@ test "WebSocket: send reports the real error, not error.WriteFailed" {
     }, std.testing.allocator, 0);
     defer ws.deinit();
 
-    try std.testing.expectError(error.ConnectionResetByPeer, ws.send(.text, "x" ** 64));
+    try std.testing.expectError(error.ConnectionResetByPeer, ws.send(.text, &@as([64]u8, @splat('x'))));
 }
 
 test "WebSocket: no std.Io sentinel escapes its public API" {
@@ -811,9 +811,9 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
         ErrorSetOf(WebSocket.close),
         ErrorSetOf(WebSocket.receive),
     }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
-            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
         }
     }
 }
