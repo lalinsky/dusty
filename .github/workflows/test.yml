@@ -29,7 +29,9 @@ jobs:
 
     - name: Build
       run: zig build
-      timeout-minutes: 5
+      # A cold build on 0.17 takes several times longer than on 0.16, and
+      # Windows is the slowest runner.
+      timeout-minutes: 15
 
     - name: Run tests
       run: zig build test --summary all
