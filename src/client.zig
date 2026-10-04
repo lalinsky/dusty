@@ -240,7 +240,11 @@ fn unbracketed(host: []const u8) []const u8 {
 /// Get host string from URI.
 fn uriHost(uri: Uri, buffer: *[255]u8) ![]const u8 {
     const component = uri.host orelse return error.InvalidUrl;
-    return component.toRaw(buffer) catch return error.InvalidUrl;
+    const hostname = component.toRaw(buffer) catch return error.InvalidUrl;
+    // A host with nothing to decode is returned as is, not copied into
+    // `buffer`, so its length is not bounded by it.
+    if (hostname.len == 0 or hostname.len > buffer.len) return error.InvalidUrl;
+    return hostname;
 }
 
 /// Get path for HTTP request line.
@@ -1576,6 +1580,21 @@ test "parseUrl: IPv6 literal keeps its brackets" {
     try std.testing.expectEqualStrings("[::1]", host);
     const info = try uriPortAndProtocol(uri);
     try std.testing.expectEqual(8080, info.port);
+}
+
+test "uriHost: decodes escaped host and rejects a missing or oversized host" {
+    var host_buf: [255]u8 = undefined;
+    try std.testing.expectEqualStrings("example.com", try uriHost(try parseUrl("http://exam%70le.com/"), &host_buf));
+    try std.testing.expectError(error.InvalidUrl, uriHost(try parseUrl("http:/path"), &host_buf));
+    try std.testing.expectError(error.InvalidUrl, parseUrl("http://"));
+    // Zig 0.17's Uri.parse already refuses a host this long; on 0.16 it is
+    // uriHost that runs out of room for it.
+    const long_host = "http://" ++ @as([256]u8, @splat('a'));
+    if (parseUrl(long_host)) |uri| {
+        try std.testing.expectError(error.InvalidUrl, uriHost(uri, &host_buf));
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidUrl, err);
+    }
 }
 
 test "parseUrl: basic URL" {

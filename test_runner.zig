@@ -296,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const total_tests = pass + fail;
-    const status = if (fail == 0) Status.pass else Status.fail;
+    const status = if (fail == 0 and leak == 0) Status.pass else Status.fail;
     Printer.status(status, "\n{d} of {d} test{s} passed\n", .{ pass, total_tests, if (total_tests != 1) "s" else "" });
     if (skip > 0) {
         Printer.status(.skip, "{d} test{s} skipped\n", .{ skip, if (skip != 1) "s" else "" });
@@ -314,7 +314,7 @@ pub fn main(init: std.process.Init) !void {
     Printer.fmt("\n", .{});
     try slowest.display();
     Printer.fmt("\n", .{});
-    std.process.exit(if (fail == 0) 0 else 1);
+    std.process.exit(if (fail == 0 and leak == 0) 0 else 1);
 }
 
 const Printer = struct {
