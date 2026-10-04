@@ -230,6 +230,7 @@ const zio = b.dependency("zio", .{
     .optimize = optimize,
 });
 exe.root_module.addImport("zio", zio.module("zio"));
+dusty.module("dusty").addImport("zio", zio.module("zio"));
 ```
 
 Then initialize zio's runtime and pass it to dusty:
