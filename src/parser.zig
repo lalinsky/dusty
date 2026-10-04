@@ -811,10 +811,10 @@ pub fn BodyReader(comptime Parser: type) type {
 /// Fails to compile unless every error `Fn` can return is in `Allowed`.
 fn assertFailsWithin(comptime Fn: type, comptime Allowed: type) void {
     const returned = @typeInfo(@typeInfo(Fn).@"fn".return_type.?).error_union.error_set;
-    for (@typeInfo(returned).error_set.?) |e| {
+    for (std.meta.fieldNames(returned)) |name| {
         // A member of `Allowed` coerces; anything else is a compile error
         // naming the offending parser and error.
-        const member: Allowed = @field(Allowed, e.name);
+        const member: Allowed = @field(Allowed, name);
         _ = &member;
     }
 }

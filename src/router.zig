@@ -64,7 +64,7 @@ pub fn Router(comptime Ctx: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .arena = std.heap.ArenaAllocator.init(allocator),
-                .trees = [_]?*Node{null} ** 256,
+                .trees = @splat(null),
             };
         }
 

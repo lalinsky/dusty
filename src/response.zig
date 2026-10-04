@@ -825,7 +825,7 @@ pub const Response = struct {
         if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
 
         const connection = req.headers.get("Connection") orelse return null;
-        if (std.ascii.indexOfIgnoreCase(connection, "upgrade") == null) return null;
+        if (std.ascii.findIgnoreCase(connection, "upgrade") == null) return null;
 
         const version = req.headers.get("Sec-WebSocket-Version") orelse return null;
         if (!std.mem.eql(u8, version, "13")) return null;
@@ -1711,8 +1711,8 @@ test "Response: no std.Io.Writer sentinel escapes the public write API" {
         EventStream.Error,
         EventWriter.Error,
     }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
         }
     }
 }
@@ -2643,7 +2643,7 @@ test "BodyWriter: a write bigger than any segment, and a long splat" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const big = [_]u8{'x'} ** (100 * 1024);
+    const big: [100 * 1024]u8 = @splat('x');
     var response = try Response.init(arena.allocator(), &connection, 32);
     var body = response.writer();
     try body.interface.writeAll("<");
@@ -2675,7 +2675,7 @@ test "BodyWriter: rebase keeps the bytes it was asked to preserve" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     var body = response.writer();
-    const head = [_]u8{'h'} ** 500;
+    const head: [500]u8 = @splat('h');
     try body.interface.writeAll(&head);
     // Asks for more room than the first segment has left, keeping the last
     // four bytes contiguous with it.
@@ -3077,13 +3077,13 @@ test "Response: compress without room for its headers sends the body as it is" {
     var response = try Response.init(arena.allocator(), &connection, 1);
     response.request = &request;
     response.compress = true;
-    response.body = "a" ** 300;
+    response.body = &@as([300]u8, @splat('a'));
     try response.write();
 
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary") == null);
-    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ "a" ** 300));
+    try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n" ++ &@as([300]u8, @splat('a'))));
 }
 
 test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
@@ -3102,7 +3102,7 @@ test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
     response.compress = true;
     try response.header("ETag", "\"v1\"");
     try response.header("Accept-Ranges", "bytes");
-    response.body = "a" ** 300;
+    response.body = &@as([300]u8, @splat('a'));
     try response.write();
 
     const written = conn_writer.buffered();

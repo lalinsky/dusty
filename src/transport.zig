@@ -174,9 +174,9 @@ test "Transport: no std.Io sentinel escapes a resolved error set" {
     // transport resolves through these two, so a sentinel surviving here
     // would survive everywhere.
     inline for (.{ Transport.ReadError, Transport.WriteError }) |Set| {
-        inline for (@typeInfo(Set).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, "ReadFailed"));
-            try std.testing.expect(!std.mem.eql(u8, e.name, "WriteFailed"));
+        inline for (comptime std.meta.fieldNames(Set)) |e_name| {
+            try std.testing.expect(!std.mem.eql(u8, e_name, "ReadFailed"));
+            try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
         }
     }
 }
