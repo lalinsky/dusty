@@ -413,7 +413,7 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx: Ctx = .{};
     var server = http.Server(Ctx).init(init.gpa, rt.io(), .{
-        .listen = &.{.{ .address = .{ .ip = opts.listen } }},
+        .listeners = &.{.{ .address = .{ .ip = opts.listen } }},
         .trusted_proxy_hops = opts.trusted_proxy_hops,
         .timeout = .{
             .request = request_timeout,

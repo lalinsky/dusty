@@ -11,6 +11,7 @@ const parseHeaders = @import("request.zig").parseHeaders;
 const Headers = @import("http.zig").Headers;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
+const default_listeners = @import("config.zig").default_listeners;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
@@ -382,7 +383,7 @@ pub fn Server(comptime Ctx: type) type {
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
-        /// Every listener's bound address, in `config.listen` order. Filled
+        /// Every listener's bound address, in `config.listeners` order. Filled
         /// in before `ready` is set, and empty again once `run` has
         /// returned.
         addresses: []const Address = &.{},
@@ -491,7 +492,7 @@ pub fn Server(comptime Ctx: type) type {
             return mw;
         }
 
-        /// Accepts on every listener in `config.listen` until canceled, then
+        /// Accepts on every listener in `config.listeners` until canceled, then
         /// drains the connections in flight. Returns `error.Canceled` whenever
         /// it was canceled, even if it was failing for another reason by then.
         pub fn run(self: *Self) !void {
@@ -504,11 +505,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         fn serve(self: *Self) !void {
-            const listeners = self.config.listen;
-            if (listeners.len == 0) {
-                log.err("config.listen is empty, so no connection could ever be served", .{});
-                return error.NoListeners;
-            }
+            const listeners = self.configuredListeners();
             if (self.config.max_connections) |max| {
                 if (max == 0) {
                     log.err("config.max_connections is 0, so no connection could ever be served", .{});
@@ -602,6 +599,10 @@ pub fn Server(comptime Ctx: type) type {
             // Cannot happen: `stopped` is only set by an accept loop that
             // stored its error first, and every loop was joined above.
             unreachable;
+        }
+
+        fn configuredListeners(self: *const Self) []const Listener {
+            return if (self.config.listeners.len == 0) &default_listeners else self.config.listeners;
         }
 
         /// Loads the listener's TLS material and binds its socket.
@@ -1279,6 +1280,18 @@ pub fn Server(comptime Ctx: type) type {
 
 test {
     _ = RequestParser;
+}
+
+test "Server: an empty listener list resolves to the default" {
+    var server = Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = &.{} }, {});
+    defer server.deinit();
+
+    const listeners = server.configuredListeners();
+    try std.testing.expectEqual(@as(usize, 1), listeners.len);
+    const ip = listeners[0].address.ip;
+    try std.testing.expect(ip == .ip4);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, ip.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 8080), ip.ip4.port);
 }
 
 test "trusted proxy hops select X-Forwarded-For from the right" {

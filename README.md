@@ -51,7 +51,7 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
 pub fn main(init: std.process.Init) !void {
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
     var server = http.Server(void).init(init.gpa, init.io, .{
-        .listen = &.{.{ .address = addr }},
+        .listeners = &.{.{ .address = addr }},
     }, {});
     defer server.deinit();
 
@@ -61,15 +61,17 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`listen` takes any number of listeners, each with its own TLS, so one server
+`listeners` takes any number of listeners, each with its own TLS, so one server
 can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 
 ```zig
-.listen = &.{
+.listeners = &.{
     .{ .address = addr443, .tls = .{ .cert_path = "server.pem", .key_path = "server.key" } },
     .{ .address = addr80 },
 },
 ```
+
+When `listeners` is omitted or empty, the server listens on `127.0.0.1:8080`.
 
 A handler can tell them apart through `req.listener` and `req.secure`, and
 `server.addresses` has each listener's bound address once `server.ready` is set.
@@ -120,7 +122,7 @@ The server side is symmetric. TLS is configured per listener, and `client_auth`
 makes it ask connecting clients for a certificate:
 
 ```zig
-.listen = &.{.{
+.listeners = &.{.{
     .address = addr,
     .tls = .{
         .cert_path = "server.pem",
@@ -245,7 +247,7 @@ pub fn main(init: std.process.Init) !void {
     defer rt.deinit();
 
     var server = http.Server(void).init(init.gpa, rt.io(), .{
-        .listen = &.{.{ .address = addr }},
+        .listeners = &.{.{ .address = addr }},
     }, {});
     defer server.deinit();
 

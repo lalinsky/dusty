@@ -66,7 +66,7 @@ pub const Address = union(enum) {
     }
 };
 
-/// One socket a server accepts on. `ServerConfig.listen` holds any number,
+/// One socket a server accepts on. `ServerConfig.listeners` holds any number,
 /// each with its own TLS, so one server can serve HTTPS on 443 and plain
 /// HTTP on 80.
 pub const Listener = struct {
@@ -103,6 +103,11 @@ pub const Listener = struct {
     }
 };
 
+/// Used when `ServerConfig.listeners` is empty.
+pub const default_listeners = [_]Listener{.{
+    .address = .{ .ip = .{ .ip4 = .loopback(8080) } },
+}};
+
 test "Listener.acceptorCount: log2 of the CPUs, at least two, unless given" {
     const auto: Listener = .{ .address = undefined };
     try std.testing.expectEqual(2, auto.acceptorCount(1));
@@ -121,9 +126,10 @@ pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
     /// Where the server accepts connections. `Server.run` serves all of
-    /// them and refuses an empty list. Borrowed for the server's life, and
-    /// requests point back into it through `Request.listener`.
-    listen: []const Listener = &.{},
+    /// them. An empty list uses the default, 127.0.0.1:8080. Borrowed for
+    /// the server's life, and requests point back into it through
+    /// `Request.listener`.
+    listeners: []const Listener = &default_listeners,
     /// Number of reverse-proxy hops between the server and the client. Zero
     /// reports the socket peer and ignores `X-Forwarded-For`. A positive
     /// value selects that address from the right of the forwarding chain:
@@ -245,4 +251,13 @@ test "ServerConfig: connection timeouts are finite by default" {
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(30), cfg.timeout.request.?);
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(60), cfg.timeout.keepalive.?);
     try std.testing.expectEqual(@as(usize, 0), cfg.trusted_proxy_hops);
+}
+
+test "ServerConfig: the default listener is 127.0.0.1:8080" {
+    const cfg: ServerConfig = .{};
+    try std.testing.expectEqual(@as(usize, 1), cfg.listeners.len);
+    const ip = cfg.listeners[0].address.ip;
+    try std.testing.expect(ip == .ip4);
+    try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, ip.ip4.bytes);
+    try std.testing.expectEqual(@as(u16, 8080), ip.ip4.port);
 }
