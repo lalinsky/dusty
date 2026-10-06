@@ -4,12 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- Builds with Zig 0.17 as well as 0.16. TLS now comes from [a fork of tls.zig](https://github.com/lalinsky/tls.zig) that supports both versions.
-- Request and response bodies with `Content-Encoding: gzip` or `deflate` are decoded with zlib, through [zlib.zig](https://github.com/lalinsky/zlib.zig), instead of `std.compress.flate`. A corrupt body now fails with `error.CorruptInput` in place of the flate-specific errors, and a coded body no longer takes a 64K window from the arena up front. Build with `-Duse_zlib=false` to leave zlib out; coded bodies are then refused with `error.UnsupportedContentEncoding`.
-- `Response.writer()` writes the body in place into segments of the request arena, instead of passing every write through the body writer's vtable into a growing buffer. Handlers that encode JSON bodies of a few KB are about twice as fast.
-- `Response.writeHeader` is no longer public. Use `Response.stream` to send the headers before the body.
-- `Listener.acceptors` now defaults to null, which picks log2 of the CPUs the process may use (honoring cgroup CPU quotas), and at least two, instead of a fixed two.
-- A connection's request read buffer and arena are reused by later connections instead of being allocated for each one, and a connection that never sends a request holds none. Set `ServerConfig.request.keep_buffers_between_requests` to false to have keep-alive connections give them back between requests as well, for less memory per idle connection at some cost in throughput.
+This release expands how servers listen and send responses, while improving throughput and reducing per-connection memory use.
+
+### Highlights
+
+- A server can now serve any number of listeners with one router and context, including plain HTTP, HTTPS with per-listener TLS settings, and Unix sockets. Handlers can distinguish them through `Request.listener` and `Request.secure`, and `Server.addresses` exposes every bound address once the server is ready.
+- Added opt-in gzip response compression. Set `res.compress = true` to negotiate gzip from `Accept-Encoding` for buffered bodies, streamed bodies, and event streams. Dusty manages `Vary`, weakens strong `ETag` values, and removes `Accept-Ranges` when the representation is compressed; small or non-shrinking buffered bodies remain uncompressed.
+- The server now processes pipelined HTTP/1.1 requests in order instead of closing a connection when the next request has already arrived.
+
+### Performance and reliability
+
+- `Response.writer()` now writes directly into arena-backed segments and sends them with vectored writes instead of repeatedly growing and copying one buffer. Handlers that encode JSON bodies of a few KB are about twice as fast.
+- Each listener runs multiple accept loops to improve throughput when many connections arrive at once. `Listener.acceptors` defaults to the base-2 logarithm of the CPUs available to the process, honoring cgroup CPU quotas and using at least two loops; set it explicitly to override the automatic value.
+- Request read buffers and arenas are pooled across connections and the pool is sharded to reduce contention. Connections allocate them only after receiving a request and normally retain them across keep-alive requests. Set `ServerConfig.request.keep_buffers_between_requests` to `false` to reduce memory held by idle connections at some cost in throughput.
+- Accept loops now continue through client-specific failures and back off on persistent resource or network errors instead of spinning or stopping the server. Connections with unread input are closed gracefully so clients can still receive the response.
+
+### Compatibility and build options
+
+- Dusty now builds with Zig 0.17 as well as 0.16. TLS uses [a fork of tls.zig](https://github.com/lalinsky/tls.zig) that supports both versions, and CI covers both Zig releases on Linux, macOS, and Windows.
+- Request and client response bodies with `Content-Encoding: gzip` or `deflate` are now decoded with zlib through [zlib.zig](https://github.com/lalinsky/zlib.zig), replacing `std.compress.flate`. Corrupt encoded bodies report `error.CorruptInput`, and decoder memory is allocated according to the stream's window instead of reserving 64K up front. Build with `-Duse_zlib=false` to omit zlib; encoded bodies then fail with `error.UnsupportedContentEncoding`, and the client does not advertise gzip or deflate.
+- The HTTP client now rejects URLs with a missing, empty, or overlong host instead of allowing an invalid host through request setup.
+
+### Upgrade notes
+
+- Listener configuration has moved to `ServerConfig.listeners`, which defaults to `127.0.0.1:8080` when omitted or empty, and servers now start with `Server.run()`. `Server.listen()` and `ServerConfig.tls` have been removed; move TLS, backlog, address-reuse, and accept-loop settings into each `Listener`.
+- `Response.writeHeader` is no longer public. Use `Response.stream()` when headers must be sent before the body.
 
 ## [0.3.1] - 2026-09-21
 

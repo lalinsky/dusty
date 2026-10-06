@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     // TLS is a property of the listener, so one server can serve HTTPS on
     // 8443 and plain HTTP on 8080 at the same time.
     var server = http.Server(void).init(init.gpa, io, .{
-        .listen = &.{
+        .listeners = &.{
             .{
                 .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8443) },
                 .tls = .{ .cert_path = cert_path, .key_path = key_path },

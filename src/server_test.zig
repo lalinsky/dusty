@@ -7,7 +7,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     const io = std.testing.io;
     const TestServer = dusty.Server(Ctx);
 
-    var server = TestServer.init(std.testing.allocator, io, .{ .listen = loopback }, ctx);
+    var server = TestServer.init(std.testing.allocator, io, .{ .listeners = loopback }, ctx);
     defer server.deinit();
 
     try ctx.setup(&server);
@@ -272,7 +272,7 @@ test "Server: HTTP/1.0 GET request" {
 test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/stream", struct {
@@ -359,7 +359,7 @@ test "Server: WebSocket echo" {
 
     var ctx: TestContext = .{};
 
-    var server = dusty.Server(TestContext).init(std.testing.allocator, io, .{ .listen = loopback }, &ctx);
+    var server = dusty.Server(TestContext).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
     defer server.deinit();
 
     try ctx.setup(&server);
@@ -484,7 +484,7 @@ test "Server: WebSocket echo" {
 test "Server: void context handlers" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -547,7 +547,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
     // Short enough to expire long before the 2s handler finishes, so the
     // drain has to give up rather than wait it out.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = loopback,
+        .listeners = loopback,
         .timeout = .{ .shutdown = .fromMilliseconds(100) },
     }, {});
     defer server.deinit();
@@ -626,7 +626,7 @@ test "Server: graceful shutdown drain still blocks after an earlier connection c
 test "Server: 100-continue" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.post("/upload", struct {
@@ -713,7 +713,7 @@ fn readResponse(r: *std.Io.Reader, status_buf: []u8, body_buf: []u8) !struct { s
 test "Server: keepalive after handler ignores request body" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.post("/ignore", struct {
@@ -775,7 +775,7 @@ test "Server: keepalive with request buffers given back between requests" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = loopback,
+        .listeners = loopback,
         .request = .{ .keep_buffers_between_requests = false },
     }, {});
     defer server.deinit();
@@ -898,7 +898,7 @@ fn expectPipelinedResponses(
 }
 
 test "Server: pipelined requests are answered in order on one connection" {
-    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
     defer server.deinit();
     PipelineCtx.setup(&server);
 
@@ -912,7 +912,7 @@ test "Server: pipelined requests are answered in order on one connection" {
 }
 
 test "Server: a pipelined request behind a body is served after it" {
-    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
     defer server.deinit();
     PipelineCtx.setup(&server);
 
@@ -925,7 +925,7 @@ test "Server: a pipelined request behind a body is served after it" {
 }
 
 test "Server: a pipelined request behind an unread body is served after it is drained" {
-    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
     defer server.deinit();
     PipelineCtx.setup(&server);
 
@@ -945,7 +945,7 @@ test "Server: a pipelined head that needs the whole read buffer is served" {
     // first has been moved out of its way: what it left the reader would
     // be too small for the reserve the body reader is owed.
     var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{
-        .listen = loopback,
+        .listeners = loopback,
         .request = .{ .buffer_size = 1024 },
     }, {});
     defer server.deinit();
@@ -967,7 +967,7 @@ test "Server: a pipelined head that needs the whole read buffer is served" {
 test "Server: a pipelined head that arrives in two parts is served" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
     PipelineCtx.setup(&server);
 
@@ -1014,7 +1014,7 @@ test "Server: a pipelined head that arrives in two parts is served" {
 test "Server: Connection: close on a pipelined request ends the connection after it" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
     PipelineCtx.setup(&server);
 
@@ -1054,7 +1054,7 @@ test "Server: Connection: close on a pipelined request ends the connection after
 test "Server: a handler's own EndOfStream is a 500, not a vanished peer" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/eof", struct {
@@ -1116,7 +1116,7 @@ test "Server: a handler's own EndOfStream is a 500, not a vanished peer" {
 test "Server: handler error yields 500 and keeps the connection alive" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/boom", struct {
@@ -1179,7 +1179,7 @@ test "Server: handler error yields 500 and keeps the connection alive" {
 test "Server: an event stream is chunked and leaves the connection reusable" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/events", struct {
@@ -1262,7 +1262,7 @@ test "Server: an event stream is chunked and leaves the connection reusable" {
 test "Server: handler error after streaming started aborts the connection" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/bad-stream", struct {
@@ -1334,7 +1334,7 @@ test "Server: handler error after streaming started aborts the connection" {
 test "Server: keepalive after handler ignores a compressed request body" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.post("/ignore", struct {
@@ -1405,7 +1405,7 @@ test "Server: closes connection when unread body exceeds max_body_size" {
     var server = dusty.Server(void).init(
         std.testing.allocator,
         io,
-        .{ .listen = loopback, .request = .{ .max_body_size = 100 } },
+        .{ .listeners = loopback, .request = .{ .max_body_size = 100 } },
         {},
     );
     defer server.deinit();
@@ -1460,7 +1460,7 @@ test "Server: closes connection when unread body exceeds max_body_size" {
 test "Server: 417 Expectation Failed for unknown Expect value" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.post("/upload", struct {
@@ -1506,7 +1506,7 @@ test "Server: 417 Expectation Failed for unknown Expect value" {
 fn statusLineFor(raw: []const u8, out: []u8) ![]const u8 {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -1561,7 +1561,7 @@ test "Server: a bad percent escape in the query is a 400, not a dropped connecti
 fn statusLineWithUnreadBody(head: []const u8, body_len: usize, chunked: bool, timeouts: bool, out: []u8) ![]const u8 {
     const io = std.testing.io;
 
-    var config: dusty.ServerConfig = .{ .listen = loopback, .request = .{ .max_body_size = 100 } };
+    var config: dusty.ServerConfig = .{ .listeners = loopback, .request = .{ .max_body_size = 100 } };
     if (!timeouts) config.timeout = .{ .request = null, .keepalive = null };
     var server = dusty.Server(void).init(std.testing.allocator, io, config, {});
     defer server.deinit();
@@ -1679,7 +1679,7 @@ test "Server: a response written without reading the body does not wait for one 
 test "Server: a body sent without waiting for 100 Continue is drained and the connection kept" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.post("/ignore", struct {
@@ -1741,7 +1741,7 @@ test "Server: a body sent without waiting for 100 Continue is drained and the co
 test "Server: HEAD is answered by the GET route with no body" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/thing", struct {
@@ -1803,7 +1803,7 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
     // Comfortably longer than the handler, so the drain has no reason to
     // give up on it.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = loopback,
+        .listeners = loopback,
         .timeout = .{ .shutdown = .fromMilliseconds(5000) },
     }, {});
     defer server.deinit();
@@ -1853,7 +1853,7 @@ test "Server: graceful shutdown waits for a connection that finishes in time" {
 fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !void {
     const io = std.testing.io;
 
-    var config: dusty.ServerConfig = .{ .listen = loopback, .timeout = timeout };
+    var config: dusty.ServerConfig = .{ .listeners = loopback, .timeout = timeout };
     config.timeout.shutdown = .fromMilliseconds(5000);
     var server = dusty.Server(void).init(std.testing.allocator, io, config, {});
     defer server.deinit();
@@ -1915,7 +1915,7 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     sync.release = .unset;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = loopback,
+        .listeners = loopback,
         .timeout = .{ .shutdown = .fromMilliseconds(5000) },
     }, {});
     defer server.deinit();
@@ -2002,7 +2002,7 @@ test "Server: request resolves the client through a trusted proxy" {
     };
     var ctx: Ctx = .{};
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listen = loopback, .trusted_proxy_hops = 1 }, &ctx);
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, &ctx);
     defer server.deinit();
 
     server.router.get("/whoami", struct {
@@ -2082,7 +2082,7 @@ test "Server: client_auth with ca .none is rejected by run" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{
+        .listeners = &.{.{
             .address = loopback_addr,
             .tls = .{
                 .cert_path = "examples/certs/cert.pem",
@@ -2096,15 +2096,6 @@ test "Server: client_auth with ca .none is rejected by run" {
     try std.testing.expectError(error.NoCertificateAuthority, server.run());
 }
 
-test "Server: an empty listen list is refused by run" {
-    const io = std.testing.io;
-
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = &.{} }, {});
-    defer server.deinit();
-
-    try std.testing.expectError(error.NoListeners, server.run());
-}
-
 test "Server: run serves every listener and tells the handler which one" {
     const io = std.testing.io;
 
@@ -2112,7 +2103,7 @@ test "Server: run serves every listener and tells the handler which one" {
         .{ .address = loopback_addr },
         .{ .address = loopback_addr },
     };
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = &listeners }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = &listeners }, {});
     defer server.deinit();
 
     const Handler = struct {
@@ -2179,7 +2170,7 @@ test "Server: a listener that fails to open releases the ones opened before it" 
     probe.deinit(io);
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{
+        .listeners = &.{
             .{ .address = addr },
             .{
                 .address = loopback_addr,
@@ -2200,7 +2191,7 @@ test "Server: a listener with tls set is refused when TLS is compiled out" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{
+        .listeners = &.{.{
             .address = loopback_addr,
             .tls = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" },
         }},
@@ -2221,7 +2212,7 @@ test "Server: graceful shutdown waits for a request in flight on a later listene
     sync.finished = false;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{ .{ .address = loopback_addr }, .{ .address = loopback_addr } },
+        .listeners = &.{ .{ .address = loopback_addr }, .{ .address = loopback_addr } },
         .timeout = .{ .shutdown = .fromMilliseconds(5000) },
     }, {});
     defer server.deinit();
@@ -2269,7 +2260,7 @@ test "Server: graceful shutdown waits for a request in flight on a later listene
 test "Server: a request head too large for the buffer gets 431, not a panic" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -2327,7 +2318,7 @@ test "Server: a peer that will not hang up after a 431 is hung up on anyway" {
     const io = std.testing.io;
 
     // No request deadline, so the drain's own is what ends it.
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback, .timeout = .{ .request = null } }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .timeout = .{ .request = null } }, {});
     defer server.deinit();
 
     var server_future = try io.concurrent(struct {
@@ -2383,7 +2374,7 @@ test "Server: a head that just fits is still served" {
 
     // 8 KB of header against the 16 KB default: comfortably under, so the
     // guard must not fire early.
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/", struct {
@@ -2455,7 +2446,7 @@ fn expectStatusForHeadOfLength(
     const S = dusty.Server(HeadBoundaryCtx);
 
     var ctx: HeadBoundaryCtx = .{};
-    var server = S.init(std.testing.allocator, io, .{ .listen = loopback }, &ctx);
+    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
     defer server.deinit();
     server.router.post("/", HeadBoundaryCtx.handle);
 
@@ -2549,7 +2540,7 @@ test "Server: max_connections caps overlap without dropping anyone" {
     const cap = 2;
 
     var ctx: ConcurrencyCtx = .{};
-    var server = S.init(std.testing.allocator, io, .{ .listen = loopback, .max_connections = cap }, &ctx);
+    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback, .max_connections = cap }, &ctx);
     defer server.deinit();
     server.router.get("/", ConcurrencyCtx.handle);
 
@@ -2602,7 +2593,7 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
         .{ .address = loopback_addr },
         .{ .address = loopback_addr },
     };
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = &listeners, .max_connections = 1 }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = &listeners, .max_connections = 1 }, {});
     defer server.deinit();
     server.router.get("/", struct {
         fn handle(_: *dusty.Request, res: *dusty.Response) !void {
@@ -2669,7 +2660,7 @@ test "Server: a slot freed on one listener reaches a connection waiting on anoth
 
 test "Server: a max_connections of zero is refused by run" {
     const io = std.testing.io;
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback, .max_connections = 0 }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback, .max_connections = 0 }, {});
     defer server.deinit();
     try std.testing.expectError(error.NoConnectionsAllowed, server.run());
 }
@@ -2679,7 +2670,7 @@ test "Server: a max_connections of zero is refused by run" {
 /// instead of hanging up.
 fn millisUntilServerHangsUp(config: dusty.ServerConfig, head: []const u8) !?i64 {
     var cfg = config;
-    cfg.listen = loopback;
+    cfg.listeners = loopback;
     const io = std.testing.io;
     const S = dusty.Server(void);
 
@@ -2739,7 +2730,7 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
     const S = dusty.Server(void);
 
     var server = S.init(std.testing.allocator, io, .{
-        .listen = loopback,
+        .listeners = loopback,
         .timeout = .{ .keepalive = .fromMilliseconds(150) },
     }, {});
     defer server.deinit();

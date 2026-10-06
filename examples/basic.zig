@@ -149,7 +149,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
     var server = AppServer.init(allocator, io, .{
-        .listen = &.{.{ .address = addr }},
+        .listeners = &.{.{ .address = addr }},
     }, &ctx);
     defer server.deinit();
 

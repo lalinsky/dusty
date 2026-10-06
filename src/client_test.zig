@@ -6,7 +6,7 @@ const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
 test "Client: simple GET request" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -54,7 +54,7 @@ test "Client: simple GET request" {
 test "Client: fetch GET request" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/api", struct {
@@ -105,7 +105,7 @@ test "Client: fetch GET request" {
 test "Client: connection pooling" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -169,7 +169,7 @@ test "Client: connection pooling" {
 test "Client: pool evicts dead connection after server goes away" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -246,7 +246,7 @@ test "Client: redirect failing after connection release does not double-release"
         .location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.1:{d}/", .{dead_port}),
     };
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listen = loopback }, &ctx);
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
     defer server.deinit();
 
     server.router.get("/redirect", struct {
@@ -310,7 +310,7 @@ test "Client: redirect failing after connection release does not double-release"
 test "Client: connection with unread response body is not pooled" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -361,7 +361,7 @@ test "Client: connection with unread response body is not pooled" {
 test "Client: pool survives concurrent fetches on a shared client" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/test", struct {
@@ -438,7 +438,7 @@ test "Client: pool survives concurrent fetches on a shared client" {
 test "Client: WebSocket upgrade" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     server.router.get("/ws", struct {
@@ -586,7 +586,7 @@ test "Client: one server serves a plain listener and a TLS listener" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{
+        .listeners = &.{
             .{ .address = loopback_addr },
             .{
                 .address = loopback_addr,
@@ -641,7 +641,7 @@ test "Client: HTTPS with a custom CA file" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
     }, {});
     defer server.deinit();
 
@@ -690,7 +690,7 @@ test "Client: presents a client certificate for mutual TLS" {
     // as the server certificate, the client certificate, and the CA that
     // validates both.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{ .address = loopback_addr, .tls = .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
             .cert_path = test_cert_path,
             .key_path = test_key_path,
             .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
@@ -741,7 +741,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{ .address = loopback_addr, .tls = .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
             .cert_path = test_cert_path,
             .key_path = test_key_path,
             .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
@@ -790,7 +790,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{ .address = loopback_addr, .tls = .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
             .cert_path = test_cert_path,
             .key_path = test_key_path,
             .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
@@ -838,7 +838,7 @@ test "Client: rejects a server certificate the configured CA does not cover" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listen = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
     }, {});
     defer server.deinit();
 
@@ -1333,7 +1333,7 @@ test "Client: FetchOptions.timeout replaces the client default" {
         }));
     }
     { // a default, lifted for this request
-        var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+        var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
         defer server.deinit();
         server.router.get("/slow", struct {
             fn handle(req: *dusty.Request, res: *dusty.Response) !void {
@@ -1398,7 +1398,7 @@ test "Client: the request deadline covers the body, unless it is streamed" {
 test "Client: redirects share the request's budget" {
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
     const Hops = struct {
         fn first(req: *dusty.Request, res: *dusty.Response) !void {
@@ -1440,7 +1440,7 @@ test "Server: res.compress gzips buffered and streamed bodies for a client that 
     if (!@import("build_options").use_zlib) return error.SkipZigTest;
     const io = std.testing.io;
 
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listen = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
     defer server.deinit();
 
     const Handlers = struct {
