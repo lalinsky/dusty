@@ -11,6 +11,11 @@
             .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
             .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
         },
+        .custom_tls = .{
+            .url = "git+https://github.com/lalinsky/tls.zig#533d7247768fe18f7690a3acdb22931f0ee34726",
+            .hash = "tls-0.1.0-ER2e0kGsBgDgqxy4MhTi4cju7fwbFJKoW1pMt_autjZq",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

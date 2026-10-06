@@ -34,6 +34,33 @@ const dusty = b.dependency("dusty", .{
 exe.root_module.addImport("dusty", dusty.module("dusty"));
 ```
 
+### Using a custom tls.zig
+
+TLS is enabled with Dusty's pinned tls.zig dependency by default. To inject a
+different compatible version without fetching or compiling the bundled one,
+disable only the bundled provider and replace the `tls` import:
+
+```zig
+const dusty = b.dependency("dusty", .{
+    .target = target,
+    .optimize = optimize,
+    .use_tls = true,
+    .use_bundled_tls = false,
+});
+const custom_tls = b.dependency("custom_tls", .{
+    .target = target,
+    .optimize = optimize,
+});
+
+const dusty_mod = dusty.module("dusty");
+dusty_mod.addImport("tls", custom_tls.module("tls"));
+exe.root_module.addImport("dusty", dusty_mod);
+```
+
+The application declares `custom_tls` in its own `build.zig.zon`, so it can
+point to another commit, fork, or local path. Omitting the injected module is a
+compile error. Use `.use_tls = false` instead when TLS should be compiled out.
+
 ## Usage
 
 ### Server Example

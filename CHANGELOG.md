@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added the `use_bundled_tls` build option. Applications can keep TLS enabled
+  while replacing Dusty's pinned tls.zig dependency with a compatible module.
+
 ## [0.4.0] - 2026-10-06
 
 This release expands how servers listen and send responses, while improving throughput and reducing per-connection memory use.
