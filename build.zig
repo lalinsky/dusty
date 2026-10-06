@@ -5,6 +5,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const use_tls = b.option(bool, "use_tls", "Build with TLS/HTTPS support via tls.zig") orelse true;
+    const use_bundled_tls = b.option(
+        bool,
+        "use_bundled_tls",
+        "Use Dusty's pinned tls.zig dependency; disable to inject a compatible 'tls' module",
+    ) orelse true;
     // HTTP/2 support is gated behind this option (like use_tls) because it links
     // the nghttp2 C library. Defaults off until the implementation lands. Requires
     // use_tls, since h2 is negotiated via TLS ALPN.
@@ -31,10 +36,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zio_stub.zig"),
     });
 
-    // TLS support is a lazy dependency: only fetched when `use_tls` is set (the
-    // default). When disabled, a stub is imported so the client still builds but
-    // HTTPS requests fail with error.TlsNotConfigured.
-    if (use_tls) {
+    // TLS support is a lazy dependency: only fetched when both TLS and the
+    // bundled provider are enabled (the defaults). Applications can keep TLS
+    // active while injecting a compatible module with:
+    //   dusty_mod.addImport("tls", custom_tls_mod);
+    if (!use_tls) {
+        mod.addAnonymousImport("tls", .{
+            .root_source_file = b.path("src/tls_stub.zig"),
+        });
+    } else if (use_bundled_tls) {
         if (b.lazyDependency("tls", .{
             .target = target,
             .optimize = optimize,
@@ -43,7 +53,7 @@ pub fn build(b: *std.Build) void {
         }
     } else {
         mod.addAnonymousImport("tls", .{
-            .root_source_file = b.path("src/tls_stub.zig"),
+            .root_source_file = b.path("src/tls_injection_required.zig"),
         });
     }
 
