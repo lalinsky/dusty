@@ -102,14 +102,6 @@ pub const Transport = struct {
                 if (tls_reader.err) |e| switch (e) {
                     // Keep descending: the cause is on the TCP layer below.
                     error.ReadFailed => {},
-                    // Unreachable: tls.zig's read error set is built on
-                    // `std.Io.Reader.Error`, so it carries `EndOfStream`
-                    // along with the `ReadFailed` it wanted, but the read
-                    // itself turns a clean end into zero bytes and never
-                    // returns it. Named anyway so it stays out of the
-                    // resolved set, where it would read as the peer having
-                    // hung up on a caller that asked why a read failed.
-                    error.EndOfStream => return error.Unexpected,
                     else => |cause| return cause,
                 };
             }
