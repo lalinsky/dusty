@@ -3,6 +3,7 @@ const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
+const Static = @import("server/static.zig").Static;
 
 const log = std.log.scoped(.dusty);
 
@@ -71,6 +72,8 @@ pub fn Executor(comptime Ctx: type) type {
         ctx: if (Ctx == void) void else *Ctx,
         action: ?Action(Ctx),
         middlewares: []const Middleware(Ctx),
+        /// Set for a route that serves files, in place of `action`.
+        static: ?*const Static = null,
 
         pub fn run(self: *Self) !void {
             self.next() catch |err| switch (err) {
@@ -113,6 +116,10 @@ pub fn Executor(comptime Ctx: type) type {
             }
 
             // All middlewares executed, call dispatcher or handler
+            if (self.static) |files| {
+                if (!try files.serve(self.req, self.res)) try self.handleNotFound();
+                return;
+            }
             if (self.action) |action| {
                 if (comptime Ctx != void and @hasDecl(Ctx, "dispatch")) {
                     return self.ctx.dispatch(action, self.req, self.res);

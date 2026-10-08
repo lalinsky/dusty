@@ -30,6 +30,8 @@ pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
+pub const StaticOptions = @import("server/static.zig").StaticOptions;
+pub const Precompressed = @import("server/static.zig").Precompressed;
 
 // Client
 pub const Client = @import("client.zig").Client;
@@ -56,4 +58,6 @@ comptime {
     _ = @import("config.zig");
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
+    _ = @import("server/static.zig");
+    _ = @import("server/static_test.zig");
 }

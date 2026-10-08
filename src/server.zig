@@ -289,6 +289,7 @@ pub const Connection = struct {
         };
         self.tcp_reader.err = null;
         self.tcp_writer.err = null;
+        self.tcp_writer.write_file_err = null;
     }
 
     pub fn deinit(self: *Connection) void {
@@ -525,6 +526,10 @@ pub fn Server(comptime Ctx: type) type {
                     log.err("config.max_connections is 0, so no connection could ever be served", .{});
                     return error.NoConnectionsAllowed;
                 }
+            }
+            if (self.config.response.write_buffer_size == 0) {
+                log.err("config.response.write_buffer_size is 0, which leaves no room to send a file through", .{});
+                return error.NoWriteBuffer;
             }
 
             // Read once, and only when a listener sizes itself from it.
@@ -1186,6 +1191,7 @@ pub fn Server(comptime Ctx: type) type {
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
                 var response = try Response.init(request.arena, connection, self.config.request.max_header_count);
+                defer response.deinit();
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
                 response.request = &request;
@@ -1233,6 +1239,7 @@ pub fn Server(comptime Ctx: type) type {
                     .res = &response,
                     .ctx = self.ctx,
                     .action = if (found) |r| r.action else null,
+                    .static = if (found) |r| r.static else null,
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
                 executor.run() catch |err| switch (err) {

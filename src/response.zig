@@ -637,6 +637,16 @@ pub const Response = struct {
     /// to go out as it was kept its `ETag` strong, which still matches the
     /// weak one under the weak comparison `If-None-Match` uses.
     compress: bool = false,
+    /// The body, when it is a file: opened by `sendFile`, sent and closed
+    /// by `write`.
+    file: ?BodyFile = null,
+
+    pub const BodyFile = struct {
+        handle: std.Io.File,
+        /// Where in the file the body starts, and how much of it there is.
+        offset: u64 = 0,
+        size: usize,
+    };
 
     /// What shaping a header can fail with. Nothing here touches the
     /// connection: a header set after the headers went out, a name or value
@@ -667,6 +677,51 @@ pub const Response = struct {
             .conn = conn,
             .headers = try http.Headers.init(arena, max_headers),
         };
+    }
+
+    /// Closes a file body that `write` never got to send.
+    pub fn deinit(self: *Response) void {
+        self.closeFile();
+    }
+
+    pub const SendFileOptions = struct {
+        /// See `std.Io.Dir.OpenFileOptions.resolve_beneath`.
+        resolve_beneath: bool = false,
+    };
+
+    pub const SendFileError = std.Io.File.OpenError || std.Io.File.StatError || error{ FileTooBig, NotFile };
+
+    /// Makes the file at `sub_path` in `dir` the body. The file is opened
+    /// and checked now, so a missing one is reported here, where it can
+    /// still become a 404; it goes out after the handler returns, with
+    /// whatever headers the handler and middleware have set by then, and
+    /// is closed once sent.
+    ///
+    /// A directory is `error.IsDir`, and anything else that is not a
+    /// regular file, such as a device, is `error.NotFile`. Never compressed.
+    pub fn sendFile(self: *Response, dir: std.Io.Dir, sub_path: []const u8, options: SendFileOptions) SendFileError!std.Io.File.Stat {
+        std.debug.assert(!self.body_writer_open); // body writer already open
+        std.debug.assert(!self.headers_written); // body cannot start after the headers
+        std.debug.assert(self.body.len == 0 and self.body_buffer.len() == 0); // body already set
+        const io = self.conn.io;
+        const handle = try dir.openFile(io, sub_path, .{ .resolve_beneath = options.resolve_beneath });
+        errdefer handle.close(io);
+        const stat = try handle.stat(io);
+        switch (stat.kind) {
+            .file => {},
+            .directory => return error.IsDir,
+            else => return error.NotFile,
+        }
+        const size = std.math.cast(usize, stat.size) orelse return error.FileTooBig;
+        self.closeFile();
+        self.file = .{ .handle = handle, .size = size };
+        return stat;
+    }
+
+    fn closeFile(self: *Response) void {
+        const body = self.file orelse return;
+        body.handle.close(self.conn.io);
+        self.file = null;
     }
 
     pub fn header(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
@@ -767,6 +822,7 @@ pub const Response = struct {
         self.body_writer_buffering = false;
         self.clearWriter();
         self.body = "";
+        self.closeFile();
         // Everything that described the old body has to go with it.
         // `content_type` is the usual way to set one, but a handler can
         // write any of these directly, and then a stale Content-Length
@@ -970,6 +1026,7 @@ pub const Response = struct {
     /// nothing fails after a response has started claiming a coding.
     fn negotiateCompression(self: *const Response) Compression {
         if (!build_options.use_zlib or !self.compress) return .off;
+        if (self.file != null) return .off;
         const not_modified = self.status == .not_modified;
         if (!not_modified and !statusHasBody(self.status)) return .off;
         if (self.status == .partial_content) return .off;
@@ -1173,6 +1230,7 @@ pub const Response = struct {
             // built a replacement has already cleared it.
         }
         self.written = true;
+        defer self.closeFile();
 
         // Already false for a chunked response: the streaming writer
         // settled the headers when it sent them.
@@ -1199,7 +1257,37 @@ pub const Response = struct {
                 }
             }
         }
+        if (self.file) |body| {
+            if (send_header) try self.resolve(self.sendHeader(self.conn.writer));
+            if (self.sendsBody()) try self.sendFileBody(body);
+            return self.resolve(self.conn.writer.flush());
+        }
         return self.resolve(self.sendBody(self.conn.writer, send_header));
+    }
+
+    fn sendFileBody(self: *Response, body: BodyFile) WriteError!void {
+        if (body.size == 0) return;
+        // Unbuffered: without a sendfile of its own, the `Io` reads the
+        // file straight into the connection's write buffer.
+        var reader = body.handle.reader(self.conn.io, &.{});
+        reader.seekTo(body.offset) catch unreachable; // a new reader is positional
+        const sent = self.conn.writer.sendFileAll(&reader, .limited(body.size)) catch |err| switch (err) {
+            error.WriteFailed => {
+                self.keepalive = false;
+                return self.conn.getWriteError() orelse error.Unexpected;
+            },
+            error.ReadFailed => {
+                self.keepalive = false;
+                if (reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                return error.ContentLengthMismatch;
+            },
+        };
+        // The file shrank since it was opened, and the length already went
+        // out with the headers.
+        if (sent != body.size) {
+            self.keepalive = false;
+            return error.ContentLengthMismatch;
+        }
     }
 
     /// The Content-Length the handler set, if it did.
@@ -1211,6 +1299,7 @@ pub const Response = struct {
     /// The length of the body as set so far: what the body writer
     /// collected, else the `body` field.
     fn bodyLen(self: *const Response) usize {
+        if (self.file) |body| return body.size;
         const written = self.body_buffer.len();
         return if (written > 0) written else self.body.len;
     }
