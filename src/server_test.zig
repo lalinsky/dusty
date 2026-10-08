@@ -233,6 +233,40 @@ test "Server: GET with no body" {
     try std.testing.expectEqual(0, ctx.read_len);
 }
 
+test "Server: a handler rolls its scratch work back with the request arena" {
+    const TestContext = struct {
+        const Self = @This();
+
+        rolled_back: bool = false,
+
+        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
+            _ = ctx;
+            server.router.get("/test", handleGet);
+        }
+
+        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
+            _ = ctx;
+            try writer.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            try writer.flush();
+        }
+
+        fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            const s = try req.arena_impl.snapshot();
+            defer req.arena_impl.release(s);
+            const scratch = try req.arena.alloc(u8, 100);
+            req.arena_impl.restore(s);
+            // The same memory, handed out again.
+            ctx.rolled_back = (try req.arena.alloc(u8, 100)).ptr == scratch.ptr;
+            res.body = "OK\n";
+        }
+    };
+
+    var ctx: TestContext = .{};
+    try testClientServer(TestContext, &ctx);
+
+    try std.testing.expect(ctx.rolled_back);
+}
+
 test "Server: HTTP/1.0 GET request" {
     const TestContext = struct {
         const Self = @This();

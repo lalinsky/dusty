@@ -1132,6 +1132,7 @@ pub fn Server(comptime Ctx: type) type {
                     buffers = b;
                     connection.useReadBuffer(b.read_buffer);
                     request.arena = b.arena.allocator();
+                    request.arena_impl = &b.arena;
                 }
 
                 parseHeaders(connection.reader, &parser) catch |err| switch (err) {

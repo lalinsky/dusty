@@ -9,6 +9,7 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const Listener = @import("config.zig").Listener;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
+const Arena = @import("Arena.zig");
 pub const Cookie = @import("cookie.zig").Cookie;
 pub const SessionData = @import("middleware/Session.zig").SessionData;
 
@@ -50,6 +51,12 @@ pub const Request = struct {
     secure: bool = false,
 
     arena: std.mem.Allocator,
+    /// What `arena` allocates from, for what only it can do: a snapshot to
+    /// roll scratch work back to, say. Everything allocated after a snapshot
+    /// is gone once it is restored, so it is for work whose results do not
+    /// outlive it. Set by the server; a request built by hand has to set it
+    /// to use it.
+    arena_impl: *Arena = undefined,
     io: std.Io = undefined,
 
     // Installed by the server for real requests. Kept as a callback so this
@@ -79,6 +86,7 @@ pub const Request = struct {
 
     pub fn reset(self: *Request) void {
         const arena = self.arena;
+        const arena_impl = self.arena_impl;
         const io = self.io;
         const parser = self.parser;
         const transport = self.transport;
@@ -93,6 +101,7 @@ pub const Request = struct {
         const secure = self.secure;
         self.* = .{
             .arena = arena,
+            .arena_impl = arena_impl,
             .io = io,
             .parser = parser,
             .transport = transport,

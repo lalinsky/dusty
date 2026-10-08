@@ -30,6 +30,7 @@ pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
+pub const Arena = @import("Arena.zig");
 
 // Client
 pub const Client = @import("client.zig").Client;
