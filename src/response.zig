@@ -835,6 +835,8 @@ pub const Response = struct {
         _ = self.headers.remove("Content-Encoding");
     }
 
+    /// Writes `value` as the body with `std.json`. `encode` with json.zig's
+    /// `json.encode` is considerably faster for types known at compile time.
     pub fn json(self: *Response, value: anytype, options: std.json.Stringify.Options) !void {
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
@@ -861,6 +863,81 @@ pub const Response = struct {
             template.render(args, &w.interface)
         else
             @call(.auto, template, args ++ .{&w.interface});
+        return self.endBody(&w, content_type, result);
+    }
+
+    /// Encodes `value` as the body, sent as `content_type`, or as whatever
+    /// the response already has when it is null. `encodeFn` is a
+    /// serializer's write-to-writer function, its parameters told apart by
+    /// type: the `*std.Io.Writer` gets the body, a `std.mem.Allocator` the
+    /// response's arena, and the one parameter left gets `value`. That takes
+    /// json.zig's `json.encode`, msgpack.zig's `msgpack.encode` and
+    /// serde.zig's `toWriter` as they are.
+    ///
+    /// If the encoding fails, what it wrote is discarded, so the handler can
+    /// still send something else.
+    pub fn encode(self: *Response, content_type: ?http.ContentType, comptime encodeFn: anytype, value: anytype) !void {
+        const params = comptime encodeParams(@TypeOf(encodeFn));
+        var w = self.writer();
+        // Built in place rather than field by field, so a value known only
+        // at compile time, such as a struct literal, can be passed.
+        const result = switch (params.len) {
+            2 => @call(.auto, encodeFn, .{
+                encodeArg(params[0], &w.interface, self.arena, value),
+                encodeArg(params[1], &w.interface, self.arena, value),
+            }),
+            3 => @call(.auto, encodeFn, .{
+                encodeArg(params[0], &w.interface, self.arena, value),
+                encodeArg(params[1], &w.interface, self.arena, value),
+                encodeArg(params[2], &w.interface, self.arena, value),
+            }),
+            else => unreachable,
+        };
+        return self.endBody(&w, content_type, result);
+    }
+
+    const EncodeParam = enum { writer, allocator, value };
+
+    inline fn encodeArg(
+        comptime param: EncodeParam,
+        out: *std.Io.Writer,
+        arena: std.mem.Allocator,
+        value: anytype,
+    ) switch (param) {
+        .writer => *std.Io.Writer,
+        .allocator => std.mem.Allocator,
+        .value => @TypeOf(value),
+    } {
+        return switch (param) {
+            .writer => out,
+            .allocator => arena,
+            .value => value,
+        };
+    }
+
+    fn encodeParams(comptime F: type) []const EncodeParam {
+        const types = paramTypes(F);
+        var params: [types.len]EncodeParam = undefined;
+        var writers = 0;
+        var values = 0;
+        for (types, &params) |T, *param| {
+            param.* = if (T == *std.Io.Writer) .writer else if (T == std.mem.Allocator) .allocator else .value;
+            switch (param.*) {
+                .writer => writers += 1,
+                .allocator => {},
+                .value => values += 1,
+            }
+        }
+        if (writers != 1 or values != 1 or types.len > 3) {
+            @compileError("encode: expected a *std.Io.Writer parameter and one for the value, besides an optional std.mem.Allocator");
+        }
+        const final = params;
+        return &final;
+    }
+
+    /// Ends a body a template or an encoder wrote, throwing it away if it
+    /// failed.
+    fn endBody(self: *Response, w: *BodyWriter, content_type: ?http.ContentType, result: anytype) !void {
         result catch |err| {
             const ended = w.end();
             self.clearWriter();
@@ -3375,6 +3452,39 @@ test "Response: render calls a function or a template type" {
     try page.render(null, test_templates.Page, .{"Title"});
     try std.testing.expectEqualStrings("<h1>Title</h1>", try testBody(&page, &body_buf));
     try std.testing.expectEqual(.xml, page.content_type);
+}
+
+const test_encoders = struct {
+    /// The value first, as json.zig's `json.encode`.
+    fn valueFirst(value: anytype, w: *std.Io.Writer) !void {
+        try w.print("[{d}]", .{value});
+    }
+
+    /// An allocator and the writer first, as serde.zig's `msgpack.toWriter`.
+    fn writerFirst(allocator: std.mem.Allocator, w: *std.Io.Writer, value: anytype) !void {
+        try w.writeAll(try std.fmt.allocPrint(allocator, "<{d}>", .{value}));
+    }
+};
+
+test "Response: encode finds the writer, the allocator and the value by type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var body_buf: [256]u8 = undefined;
+
+    var first = try Response.init(arena.allocator(), &connection, 32);
+    try first.encode(.json, test_encoders.valueFirst, 42);
+    try std.testing.expectEqualStrings("[42]", try testBody(&first, &body_buf));
+    try std.testing.expectEqual(.json, first.content_type);
+
+    var second = try Response.init(arena.allocator(), &connection, 32);
+    try second.encode(.msgpack, test_encoders.writerFirst, @as(u32, 7));
+    try std.testing.expectEqualStrings("<7>", try testBody(&second, &body_buf));
+    try std.testing.expectEqual(.msgpack, second.content_type);
 }
 
 test "Response: a failed render can be replaced" {

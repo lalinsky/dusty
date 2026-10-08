@@ -199,7 +199,8 @@ pub const Request = struct {
         return result;
     }
 
-    /// Parse body as JSON into type T
+    /// Parse body as JSON into type T, with `std.json`. json.zig is
+    /// considerably faster for types known at compile time.
     pub fn json(self: *Request, comptime T: type) !?T {
         const b = try self.body() orelse return null;
         return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});

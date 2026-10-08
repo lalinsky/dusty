@@ -73,7 +73,7 @@ const http = @import("dusty");
 fn handleUser(req: *http.Request, res: *http.Response) !void {
     const user_id = req.params.get("id") orelse "guest";
     try req.io.sleep(.fromMilliseconds(10), .real);
-    try res.json(.{ .id = user_id, .name = "John Doe" }, .{});
+    try res.print(.text, "Hello, user {s}!\n", .{user_id});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -135,6 +135,36 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
 
 `res.render` also takes a plain function whose last parameter is the `*std.Io.Writer`.
 For something small, `res.print(.html, "<p>Hello, {s}</p>", .{name})` formats the body directly.
+
+### Serialization
+
+`res.encode` writes a value with a serializer's write-to-writer function, telling its parameters
+apart by type, so libraries plug in as they are. We recommend
+[json.zig](https://github.com/lalinsky/json.zig) for JSON and
+[msgpack.zig](https://github.com/lalinsky/msgpack.zig) for MessagePack, both specialized to your
+types at compile time.
+
+```zig
+const json = @import("json");
+const msgpack = @import("msgpack");
+
+fn handleUser(req: *http.Request, res: *http.Response) !void {
+    const input = try json.decodeFromSliceLeaky(UserInput, req.arena, try req.body() orelse "", .{});
+    const user = try updateUser(input);
+    try res.encode(.json, json.encode, user);
+}
+
+fn handleUserMsgpack(req: *http.Request, res: *http.Response) !void {
+    const user = try loadUser(req.params.get("id").?);
+    try res.encode(.msgpack, msgpack.encode, user);
+}
+```
+
+Other serializers fit the same way, [serde.zig](https://github.com/OrlovEvgeny/serde.zig)'s `toWriter` for one. Unlike `std.json`, json.zig
+leaves out optional fields that are null, unless the type says otherwise.
+
+`res.json` and `req.json` are there for convenience. They use `std.json`, so they take any type,
+`std.json.Value` included, but json.zig is considerably faster at both encoding and decoding.
 
 ### Static Files
 
