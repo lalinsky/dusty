@@ -131,7 +131,17 @@ pub const Transport = struct {
         }
         if (self.tcp_writer) |tcp_writer| {
             if (tcp_writer.err) |e| return e;
+            // A failed sendfile is kept apart from a failed write. The errors
+            // its caller gets back instead are never recorded, and Zig 0.16
+            // has no such errors in the set.
+            if (tcp_writer.write_file_err) |e| switch (e) {
+                inline else => |cause| if (comptime !isReturnedBySendFile(cause)) return cause,
+            };
         }
+    }
+
+    fn isReturnedBySendFile(comptime err: anyerror) bool {
+        return err == error.Unimplemented or err == error.EndOfStream or err == error.ReadFailed;
     }
 
     /// The error type `getWriteError` yields.

@@ -11,6 +11,7 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 - Transparent gzip/deflate decoding of request and response bodies
 - gzip compression of response bodies, opt-in per response with `res.compress = true`
 - Server-Sent Events (SSE) for streaming responses
+- Static file serving with conditional and range requests, and precompressed files
 - WebSocket support (RFC 6455)
 - HTTP/HTTPS client with connection pooling
 - Unix domain socket support for client connections
@@ -134,6 +135,25 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
 
 `res.render` also takes a plain function whose last parameter is the `*std.Io.Writer`.
 For something small, `res.print(.html, "<p>Hello, {s}</p>", .{name})` formats the body directly.
+
+### Static Files
+
+`router.static` serves a directory under a prefix:
+
+```zig
+var public = try std.Io.Dir.cwd().openDir(io, "public", .{});
+defer public.close(io);
+
+server.router.static("/assets", public, .{
+    // Serve style.css.br or style.css.gz in place of style.css when the client accepts them.
+    .precompressed = &.{ .br, .gzip },
+});
+```
+
+Responses carry `ETag` and `Last-Modified`, and the conditional and `Range` headers that use
+them are honored. A directory serves its `index.html`; paths with `..` are 404s, and so are
+dotfiles unless `.hide_dotfiles = false`. Symlinks are followed unless `.resolve_beneath = true`,
+which depends on the platform.
 
 ### Client Example
 

@@ -8,6 +8,7 @@ pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsPath = @import("config.zig").TlsPath;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
+pub const RouteInfo = @import("router.zig").RouteInfo;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 pub const BodyWriter = @import("response.zig").BodyWriter;
@@ -30,6 +31,8 @@ pub const middleware = @import("middleware/middleware.zig");
 pub const Middleware = @import("middleware.zig").Middleware;
 pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
+pub const StaticOptions = @import("server/static.zig").StaticOptions;
+pub const Precompressed = @import("server/static.zig").Precompressed;
 
 // Client
 pub const Client = @import("client.zig").Client;
@@ -56,4 +59,6 @@ comptime {
     _ = @import("config.zig");
     _ = @import("middleware.zig");
     _ = @import("middleware/middleware.zig");
+    _ = @import("server/static.zig");
+    _ = @import("server/static_test.zig");
 }

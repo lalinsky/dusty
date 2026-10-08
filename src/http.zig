@@ -583,6 +583,8 @@ pub const ContentType = enum(u32) {
     jpeg,
     webp,
     gif,
+    svg,
+    ico,
     mp4,
     webm,
     mp3,
@@ -591,6 +593,8 @@ pub const ContentType = enum(u32) {
     woff,
     woff2,
     ttf,
+    wasm,
+    pdf,
     event_stream,
     form,
     multipart_form,
@@ -636,6 +640,8 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/jpeg")) and std.mem.eql(u8, main, "image/jpeg")) return .jpeg;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/webp")) and std.mem.eql(u8, main, "image/webp")) return .webp;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/gif")) and std.mem.eql(u8, main, "image/gif")) return .gif;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("image/svg+xml")) and std.mem.eql(u8, main, "image/svg+xml")) return .svg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("image/x-icon")) and std.mem.eql(u8, main, "image/x-icon")) return .ico;
         if ((hash == comptime std.hash.Fnv1a_32.hash("video/mp4")) and std.mem.eql(u8, main, "video/mp4")) return .mp4;
         if ((hash == comptime std.hash.Fnv1a_32.hash("video/webm")) and std.mem.eql(u8, main, "video/webm")) return .webm;
         if ((hash == comptime std.hash.Fnv1a_32.hash("audio/mpeg")) and std.mem.eql(u8, main, "audio/mpeg")) return .mp3;
@@ -647,6 +653,8 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/x-www-form-urlencoded")) and std.mem.eql(u8, main, "application/x-www-form-urlencoded")) return .form;
         if ((hash == comptime std.hash.Fnv1a_32.hash("multipart/form-data")) and std.mem.eql(u8, main, "multipart/form-data")) return .multipart_form;
         if ((hash == comptime std.hash.Fnv1a_32.hash("font/ttf")) and std.mem.eql(u8, main, "font/ttf")) return .ttf;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/wasm")) and std.mem.eql(u8, main, "application/wasm")) return .wasm;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/pdf")) and std.mem.eql(u8, main, "application/pdf")) return .pdf;
 
         return .unknown;
     }
@@ -665,8 +673,10 @@ pub const ContentType = enum(u32) {
 
         if ((hash == comptime std.hash.Fnv1a_32.hash("txt")) and std.mem.eql(u8, name, "txt")) return .text;
         if ((hash == comptime std.hash.Fnv1a_32.hash("html")) and std.mem.eql(u8, name, "html")) return .html;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("htm")) and std.mem.eql(u8, name, "htm")) return .html;
         if ((hash == comptime std.hash.Fnv1a_32.hash("css")) and std.mem.eql(u8, name, "css")) return .css;
         if ((hash == comptime std.hash.Fnv1a_32.hash("js")) and std.mem.eql(u8, name, "js")) return .js;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("mjs")) and std.mem.eql(u8, name, "mjs")) return .js;
         if ((hash == comptime std.hash.Fnv1a_32.hash("xml")) and std.mem.eql(u8, name, "xml")) return .xml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("json")) and std.mem.eql(u8, name, "json")) return .json;
         if ((hash == comptime std.hash.Fnv1a_32.hash("yaml")) and std.mem.eql(u8, name, "yaml")) return .yaml;
@@ -675,6 +685,8 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("jpeg")) and std.mem.eql(u8, name, "jpeg")) return .jpeg;
         if ((hash == comptime std.hash.Fnv1a_32.hash("webp")) and std.mem.eql(u8, name, "webp")) return .webp;
         if ((hash == comptime std.hash.Fnv1a_32.hash("gif")) and std.mem.eql(u8, name, "gif")) return .gif;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("svg")) and std.mem.eql(u8, name, "svg")) return .svg;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("ico")) and std.mem.eql(u8, name, "ico")) return .ico;
         if ((hash == comptime std.hash.Fnv1a_32.hash("mp4")) and std.mem.eql(u8, name, "mp4")) return .mp4;
         if ((hash == comptime std.hash.Fnv1a_32.hash("webm")) and std.mem.eql(u8, name, "webm")) return .webm;
         if ((hash == comptime std.hash.Fnv1a_32.hash("mp3")) and std.mem.eql(u8, name, "mp3")) return .mp3;
@@ -683,6 +695,8 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("woff")) and std.mem.eql(u8, name, "woff")) return .woff;
         if ((hash == comptime std.hash.Fnv1a_32.hash("woff2")) and std.mem.eql(u8, name, "woff2")) return .woff2;
         if ((hash == comptime std.hash.Fnv1a_32.hash("ttf")) and std.mem.eql(u8, name, "ttf")) return .ttf;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("wasm")) and std.mem.eql(u8, name, "wasm")) return .wasm;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("pdf")) and std.mem.eql(u8, name, "pdf")) return .pdf;
 
         return .unknown;
     }
@@ -701,6 +715,8 @@ pub const ContentType = enum(u32) {
             .jpeg => "image/jpeg",
             .webp => "image/webp",
             .gif => "image/gif",
+            .svg => "image/svg+xml",
+            .ico => "image/x-icon",
             .mp4 => "video/mp4",
             .webm => "video/webm",
             .mp3 => "audio/mpeg",
@@ -709,6 +725,8 @@ pub const ContentType = enum(u32) {
             .woff => "font/woff",
             .woff2 => "font/woff2",
             .ttf => "font/ttf",
+            .wasm => "application/wasm",
+            .pdf => "application/pdf",
             .event_stream => "text/event-stream",
             .form => "application/x-www-form-urlencoded",
             .multipart_form => "multipart/form-data",
@@ -753,6 +771,12 @@ pub const ContentEncoding = enum {
 /// response be sent gzipped: gzip, or failing that `*`, listed without
 /// `q=0`. A field sent on several lines is one list.
 pub fn acceptsGzip(headers: *const Headers) bool {
+    return acceptsEncoding(headers, "gzip");
+}
+
+/// `acceptsGzip` for any content coding, by its registered name. `x-gzip`
+/// counts as gzip.
+pub fn acceptsEncoding(headers: *const Headers, name: []const u8) bool {
     var wildcard = false;
     var fields = headers.iterator();
     while (fields.next()) |field| {
@@ -768,7 +792,8 @@ pub fn acceptsGzip(headers: *const Headers) bool {
                     accepted = !isZeroQuality(std.mem.trim(u8, param[2..], " \t"));
                 }
             }
-            if (ContentEncoding.fromString(coding) == .gzip) return accepted;
+            if (std.ascii.eqlIgnoreCase(coding, name)) return accepted;
+            if (std.ascii.eqlIgnoreCase(name, "gzip") and std.ascii.eqlIgnoreCase(coding, "x-gzip")) return accepted;
             if (std.mem.eql(u8, coding, "*")) wildcard = accepted;
         }
     }

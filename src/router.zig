@@ -3,6 +3,19 @@ const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Method = @import("http.zig").Method;
 const Middleware = @import("middleware.zig").Middleware;
+const Static = @import("server/static.zig").Static;
+const StaticOptions = @import("server/static.zig").StaticOptions;
+const Precompressed = @import("server/static.zig").Precompressed;
+
+/// What a request learns of the route it matched, as `Request.route`.
+pub const RouteInfo = struct {
+    /// The pattern the route was registered under, group prefix included:
+    /// `/users/:id`, not the path that matched it.
+    path: []const u8,
+    /// Whatever the route was registered with, for its handler to cast
+    /// back. Null for the routes `get`, `post` and the like register.
+    data: ?*const anyopaque = null,
+};
 
 const NodeKind = enum {
     static,
@@ -49,6 +62,7 @@ pub fn Router(comptime Ctx: type) type {
             fn (*Ctx, *Request, *Response) anyerror!void;
 
         pub const Route = struct {
+            info: RouteInfo,
             action: *const Handler,
             middlewares: []const Middleware(Ctx),
         };
@@ -91,7 +105,14 @@ pub fn Router(comptime Ctx: type) type {
             }
         }
 
-        fn insertRoute(self: *Self, path: []const u8, method: Method, handler: *const Handler, middlewares: []const Middleware(Ctx)) !void {
+        fn insertRoute(
+            self: *Self,
+            path: []const u8,
+            method: Method,
+            handler: *const Handler,
+            middlewares: []const Middleware(Ctx),
+            data: ?*const anyopaque,
+        ) !void {
             const method_idx = @intFromEnum(method);
             std.debug.assert(method_idx < 256);
 
@@ -131,6 +152,13 @@ pub fn Router(comptime Ctx: type) type {
 
                 // Find or create child
                 var child = findChild(current, segment, kind);
+                if (child) |existing| {
+                    // One wildcard node captures under one name, and a route
+                    // reading another would never find its value.
+                    if (kind == .wildcard and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
+                        @panic("wildcard registered under two names");
+                    }
+                }
                 if (child == null) {
                     const new_node = try self.arena.allocator().create(Node);
                     new_node.* = Node{
@@ -165,6 +193,7 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const route = try alloc.create(Route);
             route.* = .{
+                .info = .{ .path = try alloc.dupe(u8, path), .data = data },
                 .action = handler,
                 .middlewares = middlewares,
             };
@@ -219,6 +248,7 @@ pub fn Router(comptime Ctx: type) type {
         }
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
+            req.route = null;
             // Strip query parameters from URL and parse them
             req.query.map.clearRetainingCapacity();
             const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
@@ -248,14 +278,14 @@ pub fn Router(comptime Ctx: type) type {
                 offset += segment.len + 1; // +1 for the '/'
             }
 
-            if (try self.matchIn(req.method, req, path, segments.items, offsets.items)) |route| {
-                return route;
-            }
-            // A HEAD response is the GET response without the body, so a
-            // HEAD with no route of its own is answered by the GET one.
-            // Second, so a route registered with `head` still wins.
-            if (req.method == .head) {
-                return self.matchIn(.get, req, path, segments.items, offsets.items);
+            const route = try self.matchIn(req.method, req, path, segments.items, offsets.items) orelse
+                // A HEAD response is the GET response without the body, so a
+                // HEAD with no route of its own is answered by the GET one.
+                // Second, so a route registered with `head` still wins.
+                if (req.method == .head) try self.matchIn(.get, req, path, segments.items, offsets.items) else null;
+            if (route) |r| {
+                req.route = &r.info;
+                return r.*;
             }
             return null;
         }
@@ -267,47 +297,74 @@ pub fn Router(comptime Ctx: type) type {
             path: []const u8,
             segments: []const []const u8,
             offsets: []const usize,
-        ) !?Route {
+        ) !?*const Route {
             const root = self.trees[@intFromEnum(method)] orelse return null;
             const node = try matchRecursive(root, req, path, segments, offsets, 0) orelse return null;
             const opaque_route = node.route orelse return null;
-            const route: *const Route = @ptrCast(@alignCast(opaque_route));
-            return route.*;
+            return @ptrCast(@alignCast(opaque_route));
         }
 
         pub fn get(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .get, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .get, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn head(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .head, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .head, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn post(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .post, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .post, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn put(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .put, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .put, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn delete(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .delete, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .delete, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn patch(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .patch, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .patch, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn options(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .options, handler, self.middlewares) catch @panic("OOM");
+            self.insertRoute(path, .options, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         pub fn any(self: *Self, path: []const u8, handler: Handler) void {
             inline for (all_methods) |method| {
-                self.insertRoute(path, method, handler, self.middlewares) catch @panic("OOM");
+                self.insertRoute(path, method, handler, self.middlewares, null) catch @panic("OOM");
             }
         }
+
+        /// Serves the files under `dir` at `prefix`: `GET prefix/a/b.css` is
+        /// `a/b.css` in `dir`, and a HEAD is answered the same way without
+        /// the body. A path that leaves `dir` with `..` is a 404, and so is
+        /// one naming nothing to serve. `dir` must stay open while the
+        /// router is in use.
+        pub fn static(self: *Self, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
+            self.addStatic(prefix, dir, opts, self.middlewares);
+        }
+
+        fn addStatic(self: *Self, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions, middlewares: []const Middleware(Ctx)) void {
+            const alloc = self.arena.allocator();
+            const files = alloc.create(Static) catch @panic("OOM");
+            files.* = .{ .dir = dir, .options = opts };
+            if (opts.index) |index| files.options.index = alloc.dupe(u8, index) catch @panic("OOM");
+            files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
+            const base = std.mem.trimEnd(u8, prefix, "/");
+            // The directory itself, for its index.
+            self.insertRoute(if (base.len == 0) "/" else base, .get, staticAction, middlewares, files) catch @panic("OOM");
+            const files_path = std.fmt.allocPrint(alloc, "{s}/*" ++ Static.param, .{base}) catch @panic("OOM");
+            self.insertRoute(files_path, .get, staticAction, middlewares, files) catch @panic("OOM");
+        }
+
+        const staticAction: Handler = if (Ctx == void) Static.handle else struct {
+            fn handle(_: *Ctx, req: *Request, res: *Response) anyerror!void {
+                return Static.handle(req, res);
+            }
+        }.handle;
 
         pub fn group(self: *Self, prefix: []const u8, middlewares: []const Middleware(Ctx)) Group {
             return .{ .router = self, .prefix = prefix, .middlewares = middlewares };
@@ -332,7 +389,7 @@ pub fn Router(comptime Ctx: type) type {
             }
 
             fn register(g: Group, method: Method, path: []const u8, handler: Handler) void {
-                g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares()) catch @panic("OOM");
+                g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), null) catch @panic("OOM");
             }
 
             pub fn get(g: Group, path: []const u8, handler: Handler) void {
@@ -367,6 +424,10 @@ pub fn Router(comptime Ctx: type) type {
                 inline for (all_methods) |method| {
                     g.register(method, path, handler);
                 }
+            }
+
+            pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
+                g.router.addStatic(g.concatPath(prefix), dir, opts, g.mergeMiddlewares());
             }
         };
 
@@ -623,6 +684,31 @@ test "Router: extract single parameter" {
     const id = req.params.get("id");
     try std.testing.expect(id != null);
     try std.testing.expectEqualStrings("123", id.?);
+}
+
+test "Router: the matched route is on the request, by its pattern" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    const api = router.group("/api", &.{});
+    api.get("/users/:id", testHandler);
+
+    var req = Request{
+        .method = .get,
+        .url = "/api/users/123",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    _ = try router.findHandler(&req);
+    try std.testing.expectEqualStrings("/api/users/:id", req.route.?.path);
+
+    req.url = "/nowhere";
+    _ = try router.findHandler(&req);
+    try std.testing.expectEqual(null, req.route);
 }
 
 test "Router: extract multiple parameters" {
