@@ -581,7 +581,7 @@ const StreamCompressor = struct {
 /// 204 and a 304 do not, so a peer reads whatever follows their head as
 /// the next response.
 fn statusHasBody(status: http.Status) bool {
-    const code = @intFromEnum(status);
+    const code = @backingInt(status);
     return code >= 200 and status != .no_content and status != .not_modified;
 }
 
@@ -816,19 +816,29 @@ pub const Response = struct {
 
     fn RenderArgs(comptime template: anytype) type {
         if (@TypeOf(template) == type) {
-            const params = @typeInfo(@TypeOf(template.render)).@"fn".params;
+            const params = paramTypes(@TypeOf(template.render));
             if (params.len != 2) @compileError("render: expected " ++ @typeName(template) ++ ".render(args, writer)");
-            return params[0].type orelse @compileError("render: " ++ @typeName(template) ++ ".render takes anytype args");
+            return params[0] orelse @compileError("render: " ++ @typeName(template) ++ ".render takes anytype args");
         }
-        const params = @typeInfo(@TypeOf(template)).@"fn".params;
-        if (params.len == 0 or params[params.len - 1].type != *std.Io.Writer) {
+        const params = paramTypes(@TypeOf(template));
+        if (params.len == 0 or params[params.len - 1] != *std.Io.Writer) {
             @compileError("render: the last parameter must be *std.Io.Writer");
         }
         var types: [params.len - 1]type = undefined;
         for (params[0 .. params.len - 1], &types) |param, *T| {
-            T.* = param.type orelse @compileError("render: template parameters must not be anytype");
+            T.* = param orelse @compileError("render: template parameters must not be anytype");
         }
         return @Tuple(&types);
+    }
+
+    /// Zig 0.17 replaced `params` with `param_types`.
+    fn paramTypes(comptime F: type) []const ?type {
+        const info = @typeInfo(F).@"fn";
+        if (@hasField(@TypeOf(info), "param_types")) return info.param_types;
+        var types: [info.params.len]?type = undefined;
+        for (info.params, &types) |param, *T| T.* = param.type;
+        const final = types;
+        return &final;
     }
 
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
@@ -1084,7 +1094,7 @@ pub const Response = struct {
     /// writing to a `std.Io.Writer` does; the public entry point resolves it.
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
-        try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
+        try w.print("HTTP/1.1 {d} {f}\r\n", .{ @backingInt(self.status), self.status });
 
         // Write headers
         var iter = self.headers.iterator();
