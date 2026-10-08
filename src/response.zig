@@ -801,7 +801,7 @@ pub const Response = struct {
     /// so the handler can still send something else.
     pub fn render(self: *Response, comptime template: anytype, args: RenderArgs(template)) !void {
         if (self.content_type == null and self.headers.get("Content-Type") == null) {
-            try self.header("Content-Type", http.ContentType.html.toContentType());
+            self.content_type = .html;
         }
         var w = self.writer();
         const result = if (@TypeOf(template) == type)
@@ -3266,13 +3266,13 @@ test "Response: render calls a function or a template type" {
     try response.render(test_templates.greeting, .{ "hi", 3 });
     var body_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("<p>hi x3</p>", try testBody(&response, &body_buf));
-    try std.testing.expectEqualStrings("text/html; charset=UTF-8", response.headers.get("Content-Type").?);
+    try std.testing.expectEqual(.html, response.content_type);
 
     var page = try Response.init(arena.allocator(), &connection, 32);
     page.content_type = .xml;
     try page.render(test_templates.Page, .{"Title"});
     try std.testing.expectEqualStrings("<h1>Title</h1>", try testBody(&page, &body_buf));
-    try std.testing.expectEqual(null, page.headers.get("Content-Type"));
+    try std.testing.expectEqual(.xml, page.content_type);
 }
 
 test "Response: a failed render can be replaced" {
