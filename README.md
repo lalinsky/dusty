@@ -160,7 +160,7 @@ fn handleUserMsgpack(req: *http.Request, res: *http.Response) !void {
 }
 ```
 
-Other serializers fit the same way, serde.zig's `toWriter` for one. Unlike `std.json`, json.zig
+Other serializers fit the same way, [serde.zig](https://github.com/OrlovEvgeny/serde.zig)'s `toWriter` for one. Unlike `std.json`, json.zig
 leaves out optional fields that are null, unless the type says otherwise.
 
 `res.json` and `req.json` are there for convenience. They use `std.json`, so they take any type,
