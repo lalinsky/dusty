@@ -790,19 +790,16 @@ pub const Response = struct {
         try self.header("Content-Type", "application/json; charset=UTF-8");
     }
 
-    /// Renders an HTML template into the body. `template` is either a
-    /// function whose last parameter is the `*std.Io.Writer`, called with
-    /// `args` followed by the writer, or a type with
-    /// `render(args, writer: *std.Io.Writer)`, called with `args` as its
+    /// Renders a template into the body, sent as `content_type`, or as
+    /// whatever the response already has when it is null.
+    /// `template` is either a function whose last parameter is the
+    /// `*std.Io.Writer`, called with `args` followed by the writer, or a type
+    /// with `render(args, writer: *std.Io.Writer)`, called with `args` as its
     /// first parameter.
     ///
-    /// Sets Content-Type to `text/html; charset=UTF-8` unless the response
-    /// already has one. If the template fails, what it wrote is discarded,
-    /// so the handler can still send something else.
-    pub fn render(self: *Response, comptime template: anytype, args: RenderArgs(template)) !void {
-        if (self.content_type == null and self.headers.get("Content-Type") == null) {
-            self.content_type = .html;
-        }
+    /// If the template fails, what it wrote is discarded, so the handler can
+    /// still send something else.
+    pub fn render(self: *Response, content_type: ?http.ContentType, comptime template: anytype, args: RenderArgs(template)) !void {
         var w = self.writer();
         const result = if (@TypeOf(template) == type)
             template.render(args, &w.interface)
@@ -815,6 +812,22 @@ pub const Response = struct {
             return err;
         };
         try w.end();
+        if (content_type) |value| self.content_type = value;
+    }
+
+    /// Formats the body, sent as `content_type`, or as whatever the
+    /// response already has when it is null.
+    pub fn print(self: *Response, content_type: ?http.ContentType, comptime fmt: []const u8, args: anytype) BodyWriter.Error!void {
+        var w = self.writer();
+        w.interface.print(fmt, args) catch {
+            w.end() catch |err| {
+                self.clearWriter();
+                return err;
+            };
+            unreachable; // the body writer records every failure
+        };
+        try w.end();
+        if (content_type) |value| self.content_type = value;
     }
 
     fn RenderArgs(comptime template: anytype) type {
@@ -3263,14 +3276,14 @@ test "Response: render calls a function or a template type" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    try response.render(test_templates.greeting, .{ "hi", 3 });
+    try response.render(.html, test_templates.greeting, .{ "hi", 3 });
     var body_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("<p>hi x3</p>", try testBody(&response, &body_buf));
     try std.testing.expectEqual(.html, response.content_type);
 
     var page = try Response.init(arena.allocator(), &connection, 32);
     page.content_type = .xml;
-    try page.render(test_templates.Page, .{"Title"});
+    try page.render(null, test_templates.Page, .{"Title"});
     try std.testing.expectEqualStrings("<h1>Title</h1>", try testBody(&page, &body_buf));
     try std.testing.expectEqual(.xml, page.content_type);
 }
@@ -3285,8 +3298,24 @@ test "Response: a failed render can be replaced" {
     connection.initWriterForTesting(&conn_writer);
 
     var response = try Response.init(arena.allocator(), &connection, 32);
-    try std.testing.expectError(error.Broken, response.render(test_templates.failing, .{}));
-    try response.render(test_templates.Page, .{"Fallback"});
+    try std.testing.expectError(error.Broken, response.render(.html, test_templates.failing, .{}));
+    try response.render(.html, test_templates.Page, .{"Fallback"});
     var body_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("<h1>Fallback</h1>", try testBody(&response, &body_buf));
+}
+
+test "Response: print formats the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.print(.text, "{s} x{d}", .{ "hi", 3 });
+    try response.write();
+
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhi x3"));
 }

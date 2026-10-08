@@ -121,18 +121,19 @@ pub templ UserPage(name: []const u8, admin: bool) {
 }
 ```
 
-`res.render` writes it into the response as `text/html`:
+`res.render` writes it into the response with the given content type:
 
 ```zig
 const pages = @import("templates/pages.zig");
 
 fn handleUser(req: *http.Request, res: *http.Response) !void {
     const name = req.params.get("name") orelse "guest";
-    try res.render(pages.UserPage, .{ name, false });
+    try res.render(.html, pages.UserPage, .{ name, false });
 }
 ```
 
 `res.render` also takes a plain function whose last parameter is the `*std.Io.Writer`.
+For something small, `res.print(.html, "<p>Hello, {s}</p>", .{name})` formats the body directly.
 
 ### Client Example
 
