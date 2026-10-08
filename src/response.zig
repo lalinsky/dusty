@@ -797,21 +797,24 @@ pub const Response = struct {
     /// first parameter.
     ///
     /// Sets Content-Type to `text/html; charset=UTF-8` unless the response
-    /// already has one.
+    /// already has one. If the template fails, what it wrote is discarded,
+    /// so the handler can still send something else.
     pub fn render(self: *Response, comptime template: anytype, args: RenderArgs(template)) !void {
+        if (self.content_type == null and self.headers.get("Content-Type") == null) {
+            try self.header("Content-Type", http.ContentType.html.toContentType());
+        }
         var w = self.writer();
         const result = if (@TypeOf(template) == type)
             template.render(args, &w.interface)
         else
             @call(.auto, template, args ++ .{&w.interface});
         result catch |err| {
-            if (w.err) |e| return e;
+            const ended = w.end();
+            self.clearWriter();
+            if (err == error.WriteFailed) try ended;
             return err;
         };
         try w.end();
-        if (self.content_type == null and self.headers.get("Content-Type") == null) {
-            try self.header("Content-Type", http.ContentType.html.toContentType());
-        }
     }
 
     fn RenderArgs(comptime template: anytype) type {
@@ -3272,7 +3275,7 @@ test "Response: render calls a function or a template type" {
     try std.testing.expectEqual(null, page.headers.get("Content-Type"));
 }
 
-test "Response: render returns the template's error" {
+test "Response: a failed render can be replaced" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3283,4 +3286,7 @@ test "Response: render returns the template's error" {
 
     var response = try Response.init(arena.allocator(), &connection, 32);
     try std.testing.expectError(error.Broken, response.render(test_templates.failing, .{}));
+    try response.render(test_templates.Page, .{"Fallback"});
+    var body_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("<h1>Fallback</h1>", try testBody(&response, &body_buf));
 }
