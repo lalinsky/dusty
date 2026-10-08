@@ -125,6 +125,7 @@ test "Listener.acceptorCount: log2 of the CPUs, at least two, unless given" {
 pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
+    response: Response = .{},
     /// Where the server accepts connections. `Server.run` serves all of
     /// them. An empty list uses the default, 127.0.0.1:8080. Borrowed for
     /// the server's life, and requests point back into it through
@@ -144,10 +145,10 @@ pub const ServerConfig = struct {
     /// accepting; what arrives meanwhile waits in the kernel's accept queue,
     /// `Listener.kernel_backlog` deep. Null lifts the cap.
     ///
-    /// An open connection costs about 10K, 33K more under TLS, and
-    /// `request.buffer_size + 9K` more once its first request arrives, or
-    /// only while a request is being served with
-    /// `request.keep_buffers_between_requests` off. A request with a body
+    /// An open connection costs about 2K, 33K more under TLS, and
+    /// `request.buffer_size + response.write_buffer_size + 9K` more once
+    /// its first request arrives, or only while a request is being served
+    /// with `request.keep_buffers_between_requests` off. A request with a body
     /// with a `Content-Encoding` takes 70K more while `request.decompress`
     /// is on.
     max_connections: ?u32 = 10_000,
@@ -230,7 +231,7 @@ pub const ServerConfig = struct {
         /// are read into, and their arena, while it waits for the next one.
         /// Off, it gives them back between requests and takes a set again
         /// when the next one arrives: an idle connection then holds only
-        /// its own 10K, but every request on a busy one pays for the trip,
+        /// its own 2K, but every request on a busy one pays for the trip,
         /// which costs throughput on a server with many cores.
         keep_buffers_between_requests: bool = true,
         /// Maximum number of headers allowed in a request
@@ -243,6 +244,15 @@ pub const ServerConfig = struct {
         max_form_count: usize = 32,
         /// Maximum number of multipart form fields
         max_multiform_count: usize = 32,
+    };
+
+    pub const Response = struct {
+        /// Buffer size (bytes) for writing to the connection while a request
+        /// is served. A response head and a body that fits behind it go out
+        /// in one write; a streamed chunk, an event or a WebSocket frame is
+        /// assembled in it and sent as it is finished. Taken with the
+        /// request's read buffer, and given back with it.
+        write_buffer_size: usize = 8192,
     };
 };
 
