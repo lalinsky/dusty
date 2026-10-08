@@ -5,10 +5,12 @@
 
 const std = @import("std");
 
-/// A request's read buffer and arena, in one allocation with this header.
+/// A request's read and write buffers and arena, in one allocation with
+/// this header.
 pub const RequestBuffers = struct {
     arena: std.heap.ArenaAllocator,
     read_buffer: []u8,
+    write_buffer: []u8,
     node: std.SinglyLinkedList.Node = .{},
     /// The shard it was taken from, and goes back to.
     shard: u8 = 0,
@@ -18,6 +20,7 @@ pub const RequestBuffersPool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     read_buffer_len: usize,
+    write_buffer_len: usize,
     /// Primed into each arena, so an ordinary request is served without
     /// growing it.
     arena_reserve: usize,
@@ -32,11 +35,12 @@ pub const RequestBuffersPool = struct {
         _: void align(std.atomic.cache_line) = {},
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, read_buffer_len: usize, arena_reserve: usize) RequestBuffersPool {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, read_buffer_len: usize, write_buffer_len: usize, arena_reserve: usize) RequestBuffersPool {
         return .{
             .allocator = allocator,
             .io = io,
             .read_buffer_len = read_buffer_len,
+            .write_buffer_len = write_buffer_len,
             .arena_reserve = arena_reserve,
         };
     }
@@ -75,12 +79,14 @@ pub const RequestBuffersPool = struct {
     }
 
     fn create(self: *RequestBuffersPool) std.mem.Allocator.Error!*RequestBuffers {
-        const size = std.math.add(usize, @sizeOf(RequestBuffers), self.read_buffer_len) catch return error.OutOfMemory;
+        const size = std.math.add(usize, @sizeOf(RequestBuffers), self.buffersLen()) catch return error.OutOfMemory;
         const memory = try self.allocator.alignedAlloc(u8, .of(RequestBuffers), size);
         const buffers: *RequestBuffers = @ptrCast(memory.ptr);
+        const read_buffer = memory[@sizeOf(RequestBuffers)..][0..self.read_buffer_len];
         buffers.* = .{
             .arena = .init(self.allocator),
-            .read_buffer = memory[@sizeOf(RequestBuffers)..],
+            .read_buffer = read_buffer,
+            .write_buffer = memory[@sizeOf(RequestBuffers) + read_buffer.len ..],
         };
         errdefer self.destroy(buffers);
         // Reset keeps the memory, as one node the requests are then carved
@@ -93,18 +99,23 @@ pub const RequestBuffersPool = struct {
     fn destroy(self: *RequestBuffersPool, buffers: *RequestBuffers) void {
         buffers.arena.deinit();
         const base: [*]align(@alignOf(RequestBuffers)) u8 = @ptrCast(buffers);
-        self.allocator.free(base[0 .. @sizeOf(RequestBuffers) + self.read_buffer_len]);
+        self.allocator.free(base[0 .. @sizeOf(RequestBuffers) + self.buffersLen()]);
+    }
+
+    fn buffersLen(self: *const RequestBuffersPool) usize {
+        return self.read_buffer_len +| self.write_buffer_len;
     }
 };
 
 test "RequestBuffersPool: a set given back is the next one taken with the same key" {
-    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 256);
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256);
     defer pool.deinit();
 
     const a = try pool.acquire(1);
     const b = try pool.acquire(1);
     try std.testing.expect(a != b);
     try std.testing.expectEqual(128, a.read_buffer.len);
+    try std.testing.expectEqual(64, a.write_buffer.len);
 
     pool.release(a);
     pool.release(b);
@@ -119,7 +130,7 @@ test "RequestBuffersPool: a set given back is the next one taken with the same k
 }
 
 test "RequestBuffersPool: a set goes back to the shard it came from" {
-    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 256);
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256);
     defer pool.deinit();
 
     // Two keys that land on different shards.

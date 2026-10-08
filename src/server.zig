@@ -132,14 +132,12 @@ pub const Connection = struct {
 
     tcp_reader: std.Io.net.Stream.Reader = undefined,
     tcp_writer: std.Io.net.Stream.Writer = undefined,
-    write_buffer: [4096]u8 = undefined,
 
     // TLS layer: tcp_reader/tcp_writer above carry ciphertext; tls_conn wraps
     // them, and tls_reader/tls_writer expose the cleartext Reader/Writer used
     // for HTTP I/O.
     tls_conn: ?tls.Connection = null,
     tls_rng: std.Random.IoSource = undefined,
-    tls_cleartext_write_buffer: [4096]u8 = undefined,
     tls_reader: tls.Connection.Reader = undefined,
     tls_writer: tls.Connection.Writer = undefined,
 
@@ -179,7 +177,7 @@ pub const Connection = struct {
     ) !void {
         try self.init(allocator, io, stream, 0);
         self.tcp_reader = stream.reader(io, &.{});
-        self.tcp_writer = stream.writer(io, &self.write_buffer);
+        self.tcp_writer = stream.writer(io, &.{});
         self.reader = &self.tcp_reader.interface;
         self.writer = &self.tcp_writer.interface;
     }
@@ -216,7 +214,7 @@ pub const Connection = struct {
             .rng = self.tls_rng.interface(),
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
-        self.tls_writer = self.tls_conn.?.writer(&self.tls_cleartext_write_buffer);
+        self.tls_writer = self.tls_conn.?.writer(&.{});
         self.reader = &self.tls_reader.interface;
         self.writer = &self.tls_writer.interface;
     }
@@ -232,6 +230,22 @@ pub const Connection = struct {
         r.seek = 0;
         r.end = buffered.len;
         self.read_buffer = buffer;
+    }
+
+    /// Writes through `buffer` from now on, until `releaseWriteBuffer`.
+    /// Without one, each write goes out as it is made, which is all that
+    /// is written between requests: responses that are one constant string.
+    pub fn useWriteBuffer(self: *Connection, buffer: []u8) void {
+        std.debug.assert(self.writer.end == 0);
+        self.writer.buffer = buffer;
+    }
+
+    /// Takes the write buffer back, throwing away what it holds. Every
+    /// response is flushed as it ends, so only a failed write leaves
+    /// anything, on a connection that is closing.
+    pub fn releaseWriteBuffer(self: *Connection) void {
+        self.writer.buffer = &.{};
+        self.writer.end = 0;
     }
 
     /// Reads into `buffer` from now on, throwing away what the reader holds.
@@ -448,7 +462,7 @@ pub fn Server(comptime Ctx: type) type {
                 .address = undefined,
                 .ready = .unset,
                 ._middleware_registry = .{},
-                .request_buffers = .init(allocator, io, config.request.buffer_size + body_read_reserve, request_arena_reserve),
+                .request_buffers = .init(allocator, io, config.request.buffer_size + body_read_reserve, config.response.write_buffer_size, request_arena_reserve),
             };
         }
 
@@ -959,6 +973,7 @@ pub fn Server(comptime Ctx: type) type {
         ) !void {
             if (buffers.*) |b| {
                 connection.replaceReadBuffer(idle_read_buffer);
+                connection.releaseWriteBuffer();
                 self.request_buffers.release(b);
                 buffers.* = null;
             }
@@ -1077,7 +1092,10 @@ pub fn Server(comptime Ctx: type) type {
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
             var buffers: ?*RequestBuffers = null;
-            defer if (buffers) |b| self.request_buffers.release(b);
+            defer if (buffers) |b| {
+                connection.releaseWriteBuffer();
+                self.request_buffers.release(b);
+            };
 
             var request: Request = .{
                 // The pooled arena, once a request has arrived.
@@ -1112,6 +1130,7 @@ pub fn Server(comptime Ctx: type) type {
                     if (!self.config.request.keep_buffers_between_requests) {
                         if (buffers) |b| {
                             connection.useReadBuffer(&idle_read_buffer);
+                            connection.releaseWriteBuffer();
                             self.request_buffers.release(b);
                             buffers = null;
                         }
@@ -1131,6 +1150,7 @@ pub fn Server(comptime Ctx: type) type {
                     const b = try self.request_buffers.acquire(@intFromPtr(connection));
                     buffers = b;
                     connection.useReadBuffer(b.read_buffer);
+                    connection.useWriteBuffer(b.write_buffer);
                     request.arena = b.arena.allocator();
                 }
 
