@@ -3,7 +3,6 @@ const Request = @import("request.zig").Request;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
-const Static = @import("server/static.zig").Static;
 
 const log = std.log.scoped(.dusty);
 
@@ -72,8 +71,6 @@ pub fn Executor(comptime Ctx: type) type {
         ctx: if (Ctx == void) void else *Ctx,
         action: ?Action(Ctx),
         middlewares: []const Middleware(Ctx),
-        /// Set for a route that serves files, in place of `action`.
-        static: ?*const Static = null,
 
         pub fn run(self: *Self) !void {
             self.next() catch |err| switch (err) {
@@ -116,21 +113,19 @@ pub fn Executor(comptime Ctx: type) type {
             }
 
             // All middlewares executed, call dispatcher or handler
-            if (self.static) |files| {
-                if (!try files.serve(self.req, self.res)) try self.handleNotFound();
-                return;
-            }
-            if (self.action) |action| {
-                if (comptime Ctx != void and @hasDecl(Ctx, "dispatch")) {
-                    return self.ctx.dispatch(action, self.req, self.res);
-                } else if (comptime Ctx == void) {
-                    return action(self.req, self.res);
-                } else {
-                    return action(self.ctx, self.req, self.res);
-                }
-            } else {
-                try self.handleNotFound();
-            }
+            const action = self.action orelse return self.handleNotFound();
+            const result = if (comptime Ctx != void and @hasDecl(Ctx, "dispatch"))
+                self.ctx.dispatch(action, self.req, self.res)
+            else if (comptime Ctx == void)
+                action(self.req, self.res)
+            else
+                action(self.ctx, self.req, self.res);
+            // A handler that finds nothing to answer with answers as if no
+            // route had matched.
+            result catch |err| switch (err) {
+                error.NotFound => return self.handleNotFound(),
+                else => return err,
+            };
         }
 
         fn handleNotFound(self: *Self) !void {
@@ -348,6 +343,31 @@ test "Middleware: no middlewares calls handler directly" {
     try executor.next();
 
     try std.testing.expectEqualStrings("handler called", res.body);
+}
+
+test "Executor: a handler returning NotFound gets the 404" {
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .ctx = {},
+        .action = struct {
+            fn handle(_: *Request, r: *Response) !void {
+                r.body = "partial";
+                return error.NotFound;
+            }
+        }.handle,
+        .middlewares = &.{},
+    };
+
+    try executor.run();
+
+    try std.testing.expectEqual(.not_found, res.status);
+    try std.testing.expectEqualStrings("404 Not Found\n", res.body);
 }
 
 test "Middleware: no action returns 404" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const http = @import("http.zig");
+const RouteInfo = @import("router.zig").RouteInfo;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Transport = @import("transport.zig").Transport;
@@ -33,6 +34,8 @@ pub const Request = struct {
     /// from the headers alongside the coding for the same reason, and kept
     /// here for the same one.
     content_length: ?usize = null,
+    /// The route the request matched, null when none did.
+    route: ?*const RouteInfo = null,
     params: http.Params = .{},
     query: http.Params = .{},
     /// The client address. This is the socket peer unless

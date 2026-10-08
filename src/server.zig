@@ -1239,7 +1239,6 @@ pub fn Server(comptime Ctx: type) type {
                     .res = &response,
                     .ctx = self.ctx,
                     .action = if (found) |r| r.action else null,
-                    .static = if (found) |r| r.static else null,
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
                 executor.run() catch |err| switch (err) {

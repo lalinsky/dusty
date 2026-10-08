@@ -8,6 +8,7 @@ pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsPath = @import("config.zig").TlsPath;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
+pub const RouteInfo = @import("router.zig").RouteInfo;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
 pub const BodyWriter = @import("response.zig").BodyWriter;

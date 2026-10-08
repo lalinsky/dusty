@@ -55,6 +55,13 @@ pub const Static = struct {
     /// The wildcard the routes capture the path under.
     pub const param = "path";
 
+    /// The action of the routes `Router.static` registers, with the
+    /// `Static` as their data.
+    pub fn handle(req: *Request, res: *Response) !void {
+        const self: *const Static = @ptrCast(@alignCast(req.route.?.data.?));
+        if (!try self.serve(req, res)) return error.NotFound;
+    }
+
     /// False when there is no file to serve, which the caller answers with
     /// its 404.
     pub fn serve(self: *const Static, req: *Request, res: *Response) !bool {
