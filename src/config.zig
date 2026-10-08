@@ -252,7 +252,11 @@ pub const ServerConfig = struct {
         /// in one write; a streamed chunk, an event or a WebSocket frame is
         /// assembled in it and sent as it is finished. Taken with the
         /// request's read buffer, and given back with it.
-        write_buffer_size: usize = 8192,
+        ///
+        /// 16K is the most a TLS record carries, so under TLS a smaller
+        /// buffer sends what passes through it, a file or a body written in
+        /// pieces, in more, smaller records.
+        write_buffer_size: usize = 16384,
     };
 };
 
