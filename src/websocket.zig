@@ -21,10 +21,11 @@ pub const WebSocket = struct {
     fragmented_type: ?MessageType = null,
     fragmented_data: std.ArrayListUnmanaged(u8) = .empty,
     write_mutex: std.Io.Mutex = .init,
-    /// When false, `send` and `ping` leave their frames in the write buffer
-    /// until `flush`, including frames sent from other tasks. Pongs sent by
-    /// `receive` and close frames are always flushed, taking any buffered
-    /// frames with them.
+    /// When false, `send` and `ping` skip the flush after writing their
+    /// frame, including when sent from other tasks, so frames collect in the
+    /// write buffer until `flush`. Bytes still reach the transport whenever
+    /// the buffer fills. Pongs sent by `receive` and close frames are always
+    /// flushed, taking any buffered frames with them.
     autoflush: bool = true,
 
     pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
@@ -217,7 +218,7 @@ pub const WebSocket = struct {
         try self.writeFrame(.ping, data, true, self.autoflush);
     }
 
-    /// Write out frames buffered while `autoflush` is off. Safe to call from
+    /// Write out whatever is left in the write buffer. Safe to call from
     /// any task. A failure means the connection is unusable, not that a
     /// particular message was lost.
     pub fn flush(self: *WebSocket) !void {
@@ -822,7 +823,7 @@ const SocketProbe = struct {
     }
 };
 
-test "WebSocket: autoflush off holds frames until flush, but not past a pong" {
+test "WebSocket: autoflush off leaves frames in the buffer until flush or a pong" {
     const gpa = std.testing.allocator;
     var wbuf: [256]u8 = undefined;
     var probe = SocketProbe.init(gpa, &wbuf);
