@@ -790,6 +790,73 @@ pub const Response = struct {
         try self.header("Content-Type", "application/json; charset=UTF-8");
     }
 
+    /// Renders a template into the body, sent as `content_type`, or as
+    /// whatever the response already has when it is null.
+    /// `template` is either a function whose last parameter is the
+    /// `*std.Io.Writer`, called with `args` followed by the writer, or a type
+    /// with `render(args, writer: *std.Io.Writer)`, called with `args` as its
+    /// first parameter.
+    ///
+    /// If the template fails, what it wrote is discarded, so the handler can
+    /// still send something else.
+    pub fn render(self: *Response, content_type: ?http.ContentType, comptime template: anytype, args: RenderArgs(template)) !void {
+        var w = self.writer();
+        const result = if (@TypeOf(template) == type)
+            template.render(args, &w.interface)
+        else
+            @call(.auto, template, args ++ .{&w.interface});
+        result catch |err| {
+            const ended = w.end();
+            self.clearWriter();
+            if (err == error.WriteFailed) try ended;
+            return err;
+        };
+        try w.end();
+        if (content_type) |value| self.content_type = value;
+    }
+
+    /// Formats the body, sent as `content_type`, or as whatever the
+    /// response already has when it is null.
+    pub fn print(self: *Response, content_type: ?http.ContentType, comptime fmt: []const u8, args: anytype) BodyWriter.Error!void {
+        var w = self.writer();
+        w.interface.print(fmt, args) catch {
+            w.end() catch |err| {
+                self.clearWriter();
+                return err;
+            };
+            unreachable; // the body writer records every failure
+        };
+        try w.end();
+        if (content_type) |value| self.content_type = value;
+    }
+
+    fn RenderArgs(comptime template: anytype) type {
+        if (@TypeOf(template) == type) {
+            const params = paramTypes(@TypeOf(template.render));
+            if (params.len != 2) @compileError("render: expected " ++ @typeName(template) ++ ".render(args, writer)");
+            return params[0] orelse @compileError("render: " ++ @typeName(template) ++ ".render takes anytype args");
+        }
+        const params = paramTypes(@TypeOf(template));
+        if (params.len == 0 or params[params.len - 1] != *std.Io.Writer) {
+            @compileError("render: the last parameter must be *std.Io.Writer");
+        }
+        var types: [params.len - 1]type = undefined;
+        for (params[0 .. params.len - 1], &types) |param, *T| {
+            T.* = param orelse @compileError("render: template parameters must not be anytype");
+        }
+        return @Tuple(&types);
+    }
+
+    /// Zig 0.17 replaced `params` with `param_types`.
+    fn paramTypes(comptime F: type) []const ?type {
+        const info = @typeInfo(F).@"fn";
+        if (@hasField(@TypeOf(info), "param_types")) return info.param_types;
+        var types: [info.params.len]?type = undefined;
+        for (info.params, &types) |param, *T| T.* = param.type;
+        const final = types;
+        return &final;
+    }
+
     pub fn setCookie(self: *Response, name: []const u8, value: []const u8, opts: CookieOpts) !void {
         if (self.headers_written) return error.HeadersAlreadySent;
         const serialized = try serializeCookie(self.arena, name, value, opts);
@@ -3178,4 +3245,77 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     try std.testing.expect(std.mem.indexOf(u8, written, "Vary: Accept-Encoding\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Content-Encoding") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+}
+
+const test_templates = struct {
+    fn greeting(name: []const u8, count: u32, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("<p>{s} x{d}</p>", .{ name, count });
+    }
+
+    const Page = struct {
+        const Args = struct { []const u8 };
+
+        fn render(args: Args, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            try w.print("<h1>{s}</h1>", .{args[0]});
+        }
+    };
+
+    fn failing(w: *std.Io.Writer) (std.Io.Writer.Error || error{Broken})!void {
+        try w.writeAll("partial");
+        return error.Broken;
+    }
+};
+
+test "Response: render calls a function or a template type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.render(.html, test_templates.greeting, .{ "hi", 3 });
+    var body_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("<p>hi x3</p>", try testBody(&response, &body_buf));
+    try std.testing.expectEqual(.html, response.content_type);
+
+    var page = try Response.init(arena.allocator(), &connection, 32);
+    page.content_type = .xml;
+    try page.render(null, test_templates.Page, .{"Title"});
+    try std.testing.expectEqualStrings("<h1>Title</h1>", try testBody(&page, &body_buf));
+    try std.testing.expectEqual(.xml, page.content_type);
+}
+
+test "Response: a failed render can be replaced" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try std.testing.expectError(error.Broken, response.render(.html, test_templates.failing, .{}));
+    try response.render(.html, test_templates.Page, .{"Fallback"});
+    var body_buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("<h1>Fallback</h1>", try testBody(&response, &body_buf));
+}
+
+test "Response: print formats the body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.print(.text, "{s} x{d}", .{ "hi", 3 });
+    try response.write();
+
+    try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhi x3"));
 }

@@ -103,6 +103,38 @@ When `listeners` is omitted or empty, the server listens on `127.0.0.1:8080`.
 A handler can tell them apart through `req.listener` and `req.secure`, and
 `server.addresses` has each listener's bound address once `server.ready` is set.
 
+### Templating
+
+Dusty has no templating system of its own. We recommend [zt](https://github.com/lalinsky/zt),
+which compiles templates to Zig at build time. A template in `src/templates/pages.zt`:
+
+```zig
+pub templ UserPage(name: []const u8, admin: bool) {
+    <html>
+        <body>
+            <h1>Hello, {name}</h1>
+            if (admin) {
+                <p>You are an admin.</p>
+            }
+        </body>
+    </html>
+}
+```
+
+`res.render` writes it into the response with the given content type:
+
+```zig
+const pages = @import("templates/pages.zig");
+
+fn handleUser(req: *http.Request, res: *http.Response) !void {
+    const name = req.params.get("name") orelse "guest";
+    try res.render(.html, pages.UserPage, .{ name, false });
+}
+```
+
+`res.render` also takes a plain function whose last parameter is the `*std.Io.Writer`.
+For something small, `res.print(.html, "<p>Hello, {s}</p>", .{name})` formats the body directly.
+
 ### Client Example
 
 ```zig
