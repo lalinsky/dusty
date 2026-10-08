@@ -48,6 +48,7 @@ test {
 comptime {
     _ = @import("server_test.zig");
     _ = @import("server/request_buffers.zig");
+    _ = @import("Arena.zig");
     _ = @import("websocket.zig");
     _ = @import("client.zig");
     _ = @import("client_test.zig");

@@ -1271,7 +1271,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 parser.reset();
                 request.reset();
-                _ = buffers.?.arena.reset(.retain_capacity);
+                buffers.?.arena.reset(.retain_capacity);
                 connection.rewindReader();
             }
         }

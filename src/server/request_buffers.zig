@@ -4,10 +4,11 @@
 //! connections opening and closing at once mostly take different locks.
 
 const std = @import("std");
+const Arena = @import("../Arena.zig");
 
 /// A request's read buffer and arena, in one allocation with this header.
 pub const RequestBuffers = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: Arena,
     read_buffer: []u8,
     node: std.SinglyLinkedList.Node = .{},
     /// The shard it was taken from, and goes back to.
@@ -67,7 +68,7 @@ pub const RequestBuffersPool = struct {
 
     /// Gives a set back to the shard it was taken from, its arena reset.
     pub fn release(self: *RequestBuffersPool, buffers: *RequestBuffers) void {
-        _ = buffers.arena.reset(.retain_capacity);
+        buffers.arena.reset(.retain_capacity);
         const shard = &self.shards[buffers.shard];
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
@@ -79,14 +80,11 @@ pub const RequestBuffersPool = struct {
         const memory = try self.allocator.alignedAlloc(u8, .of(RequestBuffers), size);
         const buffers: *RequestBuffers = @ptrCast(memory.ptr);
         buffers.* = .{
-            .arena = .init(self.allocator),
+            .arena = .init(self.allocator, .{}),
             .read_buffer = memory[@sizeOf(RequestBuffers)..],
         };
         errdefer self.destroy(buffers);
-        // Reset keeps the memory, as one node the requests are then carved
-        // from.
-        _ = try buffers.arena.allocator().alloc(u8, self.arena_reserve);
-        _ = buffers.arena.reset(.retain_capacity);
+        try buffers.arena.preheat(self.arena_reserve);
         return buffers;
     }
 
