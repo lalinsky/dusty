@@ -193,6 +193,10 @@ pub const WebSocketClient = struct {
         return self.ws.receive();
     }
 
+    pub fn receiveMany(self: *WebSocketClient) ![]const WebSocket.Message {
+        return self.ws.receiveMany();
+    }
+
     pub fn ping(self: *WebSocketClient, data: []const u8) !void {
         return self.ws.ping(data);
     }
@@ -1843,6 +1847,7 @@ test "Client: no std.Io sentinel escapes its public API" {
         ErrorSetOf(Client.connectWebSocket),
         ErrorSetOf(WebSocketClient.send),
         ErrorSetOf(WebSocketClient.receive),
+        ErrorSetOf(WebSocketClient.receiveMany),
         // The wrapper a streaming caller resolves through, not just the
         // functions that resolve for them.
         ClientResponse.ReadError,
