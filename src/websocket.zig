@@ -21,6 +21,11 @@ pub const WebSocket = struct {
     fragmented_type: ?MessageType = null,
     fragmented_data: std.ArrayListUnmanaged(u8) = .empty,
     write_mutex: std.Io.Mutex = .init,
+    /// When false, `send` and `ping` leave their frames in the write buffer
+    /// until `flush`, including frames sent from other tasks. Pongs sent by
+    /// `receive` and close frames are always flushed, taking any buffered
+    /// frames with them.
+    autoflush: bool = true,
 
     pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
 
@@ -118,7 +123,7 @@ pub const WebSocket = struct {
             switch (frame.opcode) {
                 .ping => {
                     // Auto-respond with pong
-                    try self.writeFrame(.pong, frame.payload, true);
+                    try self.writeFrame(.pong, frame.payload, true, true);
                     self.auto_responded = true;
                     continue;
                 },
@@ -203,13 +208,24 @@ pub const WebSocket = struct {
     /// Send a text or binary message
     pub fn send(self: *WebSocket, msg_type: MessageType, data: []const u8) !void {
         if (msg_type != .text and msg_type != .binary) return Error.InvalidOpcode;
-        try self.writeFrame(msg_type, data, true);
+        try self.writeFrame(msg_type, data, true, self.autoflush);
     }
 
     /// Send a ping frame
     pub fn ping(self: *WebSocket, data: []const u8) !void {
         if (data.len > 125) return Error.LargeControlFrame;
-        try self.writeFrame(.ping, data, true);
+        try self.writeFrame(.ping, data, true, self.autoflush);
+    }
+
+    /// Write out frames buffered while `autoflush` is off. Safe to call from
+    /// any task. A failure means the connection is unusable, not that a
+    /// particular message was lost.
+    pub fn flush(self: *WebSocket) !void {
+        try self.write_mutex.lock(self.io);
+        defer self.write_mutex.unlock(self.io);
+        if (self.closed) return error.EndOfStream;
+        errdefer self.closed = true;
+        return self.resolveWrite(self.transport.writer.flush());
     }
 
     /// Send close frame and mark connection as closed. Does nothing if a close
@@ -302,14 +318,14 @@ pub const WebSocket = struct {
         };
     }
 
-    fn writeFrame(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) !void {
+    fn writeFrame(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool) !void {
         try self.write_mutex.lock(self.io);
         defer self.write_mutex.unlock(self.io);
         if (self.closed) return error.EndOfStream;
-        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin));
+        return self.resolveWrite(self.writeFrameLocked(opcode, data, fin, flush_now));
     }
 
-    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool) std.Io.Writer.Error!void {
+    fn writeFrameLocked(self: *WebSocket, opcode: MessageType, data: []const u8, fin: bool, flush_now: bool) std.Io.Writer.Error!void {
         // A half-written frame leaves the peer unable to find the next frame
         // boundary.
         errdefer self.closed = true;
@@ -347,7 +363,7 @@ pub const WebSocket = struct {
         } else {
             try self.transport.writer.writeAll(data);
         }
-        try self.transport.writer.flush();
+        if (flush_now) try self.transport.writer.flush();
     }
 
     fn writeClose(self: *WebSocket, code: CloseCode, reason: []const u8) !void {
@@ -360,7 +376,7 @@ pub const WebSocket = struct {
         std.mem.writeInt(u16, buf[0..2], @intFromEnum(code), .big);
         const reason_len = @min(reason.len, 123);
         @memcpy(buf[2..][0..reason_len], reason[0..reason_len]);
-        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true));
+        try self.resolveWrite(self.writeFrameLocked(.close, buf[0 .. 2 + reason_len], true, true));
     }
 
     /// Compute Sec-WebSocket-Accept value from client key
@@ -388,7 +404,7 @@ test "WebSocket: writeFrame text" {
 
     var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
-    try ws.writeFrame(.text, "Hello", true);
+    try ws.writeFrame(.text, "Hello", true, true);
 
     const written = conn_writer.buffered();
     // FIN + text opcode
@@ -408,7 +424,7 @@ test "WebSocket: writeFrame binary with medium length" {
     defer ws.deinit();
 
     const payload = &@as([200]u8, @splat('x'));
-    try ws.writeFrame(.binary, payload, true);
+    try ws.writeFrame(.binary, payload, true, true);
 
     const written = conn_writer.buffered();
     // FIN + binary opcode
@@ -678,7 +694,7 @@ test "WebSocket: writeFrame masked (client mode)" {
     var ws = WebSocket.init(std.testing.io, .{ .writer = &conn_writer, .reader = &reader }, std.testing.allocator, 0);
     defer ws.deinit();
     ws.is_client = true;
-    try ws.writeFrame(.text, "Hello", true);
+    try ws.writeFrame(.text, "Hello", true, true);
 
     const written = conn_writer.buffered();
     // FIN + text opcode
@@ -776,6 +792,64 @@ test "WebSocket: concurrent sends do not interleave within a frame" {
     }
 }
 
+/// A buffered writer whose drained bytes, what reached the socket, land in `out`.
+const SocketProbe = struct {
+    interface: std.Io.Writer,
+    out: std.ArrayListUnmanaged(u8) = .empty,
+    gpa: std.mem.Allocator,
+
+    fn init(gpa: std.mem.Allocator, buffer: []u8) SocketProbe {
+        return .{
+            .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer },
+            .gpa = gpa,
+        };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *SocketProbe = @alignCast(@fieldParentPtr("interface", w));
+        self.out.appendSlice(self.gpa, w.buffered()) catch return error.WriteFailed;
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.out.appendSlice(self.gpa, bytes) catch return error.WriteFailed;
+            n += bytes.len;
+        }
+        for (0..splat) |_| {
+            self.out.appendSlice(self.gpa, data[data.len - 1]) catch return error.WriteFailed;
+            n += data[data.len - 1].len;
+        }
+        return n;
+    }
+};
+
+test "WebSocket: autoflush off holds frames until flush, but not past a pong" {
+    const gpa = std.testing.allocator;
+    var wbuf: [256]u8 = undefined;
+    var probe = SocketProbe.init(gpa, &wbuf);
+    defer probe.out.deinit(gpa);
+
+    // Masked ping, then masked text; zero mask keys leave the payloads readable.
+    const frames = [_]u8{
+        0x89, 0x84, 0, 0, 0, 0, 'p', 'i', 'n', 'g',
+        0x81, 0x82, 0, 0, 0, 0, 'h', 'i',
+    };
+    var reader: std.Io.Reader = undefined;
+    var ws = serverSocketOver(&frames, &reader, &probe.interface);
+    defer ws.deinit();
+    ws.autoflush = false;
+
+    try ws.send(.text, "a");
+    try ws.send(.text, "b");
+    try std.testing.expectEqual(0, probe.out.items.len);
+    try ws.flush();
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'a', 0x81, 1, 'b' }, probe.out.items);
+
+    probe.out.clearRetainingCapacity();
+    try ws.send(.text, "c");
+    _ = try ws.receive();
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'c', 0x8A, 4, 'p', 'i', 'n', 'g' }, probe.out.items);
+}
+
 test "WebSocket: send reports the real error, not error.WriteFailed" {
     // Too small to hold the frame, so the payload has nowhere to go.
     var buf: [4]u8 = undefined;
@@ -808,6 +882,7 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
     inline for (.{
         ErrorSetOf(WebSocket.send),
         ErrorSetOf(WebSocket.ping),
+        ErrorSetOf(WebSocket.flush),
         ErrorSetOf(WebSocket.close),
         ErrorSetOf(WebSocket.receive),
     }) |Set| {
