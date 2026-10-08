@@ -581,7 +581,7 @@ const StreamCompressor = struct {
 /// 204 and a 304 do not, so a peer reads whatever follows their head as
 /// the next response.
 fn statusHasBody(status: http.Status) bool {
-    const code = @backingInt(status);
+    const code = @intFromEnum(status);
     return code >= 200 and status != .no_content and status != .not_modified;
 }
 
@@ -1094,7 +1094,7 @@ pub const Response = struct {
     /// writing to a `std.Io.Writer` does; the public entry point resolves it.
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
-        try w.print("HTTP/1.1 {d} {f}\r\n", .{ @backingInt(self.status), self.status });
+        try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
 
         // Write headers
         var iter = self.headers.iterator();
