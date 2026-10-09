@@ -27,6 +27,7 @@ its table on startup, which needs Postgres 14 or newer.
 - Adding or renaming a todo answers with the whole list, filtered and searched like the page.
   Toggling answers with just that item, deleting with nothing, and both update the item counter
   out of band.
-- `router.embedded` for the stylesheet, compiled into the binary with `@embedFile`.
+- `addAssets` for the stylesheet and favicon: embedded in the binary and linked from the layout
+  with `assets.url`, under URLs that change with their content.
 - `res.startEventStream` waiting on a change counter that the `LISTEN` task bumps.
 - `res.encode` with json.zig for `GET /api/todos`.
