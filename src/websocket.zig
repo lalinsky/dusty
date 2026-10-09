@@ -112,8 +112,9 @@ pub const WebSocket = struct {
 
     /// Like `receive`, but also returns every further message already
     /// complete in the read buffer, without blocking for more. A close
-    /// message ends the batch. The messages are valid until the next call
-    /// to receive(), receiveMany() or tryReceive().
+    /// message comes in a batch of its own, so the messages before it can
+    /// still be answered. The messages are valid until the next call to
+    /// receive(), receiveMany() or tryReceive().
     pub fn receiveMany(self: *WebSocket) ![]const Message {
         self.resetMessages();
         const arena = self.msg_arena.allocator();
@@ -130,13 +131,15 @@ pub const WebSocket = struct {
     /// message is in the read buffer. A null leaves the previously returned
     /// message valid.
     pub fn tryReceive(self: *WebSocket) !?Message {
-        if (!messageBuffered(self.transport.reader.buffered())) return null;
+        if (bufferedMessage(self.transport.reader.buffered()) == null) return null;
         self.resetMessages();
         return try self.nextMessage();
     }
 
+    /// Reading a close answers it, which ends sending, so a close is left
+    /// for the next batch.
     fn nextBufferedMessage(self: *WebSocket) !?Message {
-        if (!messageBuffered(self.transport.reader.buffered())) return null;
+        if (bufferedMessage(self.transport.reader.buffered()) != .data) return null;
         return try self.nextMessage();
     }
 
@@ -155,31 +158,31 @@ pub const WebSocket = struct {
     }
 
     /// Whether `bytes` starts with a whole message, along with any control
-    /// frames before or inside it.
-    fn messageBuffered(bytes: []const u8) bool {
+    /// frames before or inside it, and which kind.
+    fn bufferedMessage(bytes: []const u8) ?enum { data, close } {
         var rest = bytes;
         while (true) {
-            if (rest.len < 2) return false;
+            if (rest.len < 2) return null;
             const fin = rest[0] & 0x80 != 0;
             const opcode = rest[0] & 0x0F;
             var header_len: usize = 2;
             var payload_len: u64 = rest[1] & 0x7F;
             if (payload_len == 126) {
-                if (rest.len < 4) return false;
+                if (rest.len < 4) return null;
                 payload_len = std.mem.readInt(u16, rest[2..4], .big);
                 header_len = 4;
             } else if (payload_len == 127) {
-                if (rest.len < 10) return false;
+                if (rest.len < 10) return null;
                 payload_len = std.mem.readInt(u64, rest[2..10], .big);
                 header_len = 10;
             }
             if (rest[1] & 0x80 != 0) header_len += 4;
-            if (rest.len < header_len or rest.len - header_len < payload_len) return false;
+            if (rest.len < header_len or rest.len - header_len < payload_len) return null;
             rest = rest[header_len + @as(usize, @intCast(payload_len)) ..];
             if (opcode & 0x8 == 0) {
-                if (fin) return true;
+                if (fin) return .data;
             } else if (opcode == @intFromEnum(MessageType.close)) {
-                return true;
+                return .close;
             }
         }
     }
@@ -941,6 +944,26 @@ test "WebSocket: receiveMany returns the buffered messages and stops at a partia
     try std.testing.expectEqualSlices(u8, &.{ 0x8A, 0 }, out.buffered());
 
     try std.testing.expectError(error.EndOfStream, ws.receiveMany());
+}
+
+test "WebSocket: receiveMany leaves a close for the next batch" {
+    // Masked frames with zero mask keys: "a", then a close with code 1000.
+    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+        [_]u8{ 0x88, 0x82, 0, 0, 0, 0, 0x03, 0xE8 };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const msgs = try ws.receiveMany();
+    try std.testing.expectEqual(1, msgs.len);
+    try ws.send(.text, msgs[0].data);
+
+    const close = try ws.receiveMany();
+    try std.testing.expectEqual(1, close.len);
+    try std.testing.expectEqual(.close, close[0].type);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'a', 0x88, 2, 0x03, 0xE8 }, out.buffered());
 }
 
 test "WebSocket: tryReceive returns null at a partial message and keeps the last one" {
