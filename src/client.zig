@@ -182,8 +182,8 @@ pub const WebSocketClient = struct {
     ws: WebSocket,
     conn: *Connection,
 
-    // No flushing here: `WebSocket` flushes each frame while holding its write
-    // mutex, and a flush from out here would touch the same writer unguarded.
+    // Flushing only through `WebSocket`, which holds its write mutex; a flush
+    // of the writer from out here would touch it unguarded.
 
     pub fn send(self: *WebSocketClient, msg_type: WebSocket.MessageType, data: []const u8) !void {
         return self.ws.send(msg_type, data);
@@ -195,6 +195,10 @@ pub const WebSocketClient = struct {
 
     pub fn ping(self: *WebSocketClient, data: []const u8) !void {
         return self.ws.ping(data);
+    }
+
+    pub fn flush(self: *WebSocketClient) !void {
+        return self.ws.flush();
     }
 
     pub fn close(self: *WebSocketClient, code: WebSocket.CloseCode, reason: []const u8) !void {
