@@ -250,11 +250,9 @@ pub fn build(b: *std.Build) void {
 }
 
 pub const AssetsOptions = struct {
-    /// Every file under it is bundled, except dotfiles. A compressed copy
-    /// next to a file, `app.css.br` for `app.css`, is served in its place
-    /// to clients that accept it. The directory is listed when the build is
-    /// configured, so it has to be in the source tree, and `--watch` sees
-    /// changes to the files but not files added or removed.
+    /// Every file under it is bundled, except dotfiles; symlinks are not
+    /// followed. A compressed copy next to a file, `app.css.br` for
+    /// `app.css`, is served in its place to clients that accept it.
     dir: std.Build.LazyPath,
     /// Where the files are served.
     prefix: []const u8 = "/assets",
@@ -276,39 +274,17 @@ pub fn addAssets(b: *std.Build, dusty_dep: *std.Build.Dependency, opts: AssetsOp
 }
 
 fn bundle(b: *std.Build, gen: *std.Build.Step.Compile, root: std.Build.LazyPath, opts: AssetsOptions) *std.Build.Module {
-    const io = b.graph.io;
-
-    // Copied first, so the tool can be given one directory, whose path
-    // changes with its contents, rather than every file on its command line.
-    const files = b.addWriteFiles();
-    var dir = std.Io.Dir.cwd().openDir(io, opts.dir.getPath(b), .{ .iterate = true }) catch |err| {
-        std.debug.panic("unable to open asset directory '{s}': {t}", .{ opts.dir.getPath(b), err });
-    };
-    defer dir.close(io);
-    var walker = dir.walk(b.allocator) catch @panic("OOM");
-    defer walker.deinit();
-    while (walker.next(io) catch |err| std.debug.panic("unable to list asset directory: {t}", .{err})) |entry| {
-        if (entry.basename[0] == '.') {
-            if (entry.kind == .directory) walker.leave(io);
-            continue;
-        }
-        const kind = switch (entry.kind) {
-            .sym_link => (entry.dir.statFile(io, entry.basename, .{}) catch continue).kind,
-            else => entry.kind,
-        };
-        if (kind != .file) continue;
-        const name = b.dupe(entry.path);
-        std.mem.replaceScalar(u8, name, std.fs.path.sep, '/');
-        _ = files.addCopyFile(opts.dir.path(b, name), name);
-    }
+    // Copied first, so the tool gets a directory whose path changes with
+    // its contents.
+    const copy = b.addWriteFiles().addCopyDirectory(opts.dir, "", .{});
 
     const run = b.addRunArtifact(gen);
     const table = run.addOutputFileArg("files.zig");
     run.addArg(opts.prefix);
-    run.addDirectoryArg(files.getDirectory());
+    run.addDirectoryArg(copy);
 
     const module = b.addWriteFiles();
-    _ = module.addCopyDirectory(files.getDirectory(), "files", .{});
+    _ = module.addCopyDirectory(copy, "files", .{});
     _ = module.addCopyFile(table, "files.zig");
     _ = module.addCopyFile(root, "root.zig");
     return b.createModule(.{ .root_source_file = module.getDirectory().path(b, "root.zig") });

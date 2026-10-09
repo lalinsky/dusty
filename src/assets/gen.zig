@@ -30,6 +30,10 @@ pub fn main(init: std.process.Init) !void {
     var walker = try dir.walk(arena);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
+        if (entry.basename[0] == '.') {
+            if (entry.kind == .directory) walker.leave(io);
+            continue;
+        }
         if (entry.kind != .file) continue;
         const name = try arena.dupe(u8, entry.path);
         std.mem.replaceScalar(u8, name, std.fs.path.sep, '/');
