@@ -5,17 +5,28 @@ const loopback: []const dusty.Listener = &.{.{ .address = .{ .ip = .{ .ip4 = .lo
 /// Serves `dir` at `prefix`, sends `request` on one connection and returns
 /// everything the server sent back before closing it.
 fn exchange(dir: std.Io.Dir, prefix: []const u8, opts: dusty.StaticOptions, request: []const u8, out: []u8) ![]const u8 {
-    const io = std.testing.io;
-
-    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
     defer server.deinit();
     server.router.static(prefix, dir, opts);
+    return send(&server, request, out);
+}
+
+/// Serves `data` at `/style.css` and sends `request`, as `exchange` does.
+fn exchangeEmbedded(opts: dusty.EmbeddedOptions, request: []const u8, out: []u8) ![]const u8 {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.embedded("/style.css", "body { color: red }", opts);
+    return send(&server, request, out);
+}
+
+fn send(server: *dusty.Server(void), request: []const u8, out: []u8) ![]const u8 {
+    const io = std.testing.io;
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
             try s.run();
         }
-    }.run, .{&server});
+    }.run, .{server});
     defer server_future.cancel(io) catch {};
 
     try server.ready.wait(io);
@@ -240,4 +251,52 @@ test "static: something other than a regular file is a 404" {
     var out: [4096]u8 = undefined;
     const got = try exchange(tmp.dir, "/", .{}, "GET /null HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
     try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 404"));
+}
+
+test "embedded: serves the content, with a 304 for its ETag" {
+    var out: [4096]u8 = undefined;
+    const got = try exchangeEmbedded(.{}, "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try std.testing.expectEqualStrings("text/css; charset=UTF-8", header(got, "Content-Type").?);
+    try std.testing.expectEqual(null, header(got, "Last-Modified"));
+    try std.testing.expectEqualStrings("body { color: red }", body(got));
+    var etag_buf: [64]u8 = undefined;
+    const etag = etag_buf[0..header(got, "ETag").?.len];
+    @memcpy(etag, header(got, "ETag").?);
+
+    var request_buf: [256]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buf, "GET /style.css HTTP/1.1\r\nHost: x\r\nIf-None-Match: {s}\r\nConnection: close\r\n\r\n", .{etag});
+    const not_modified = try exchangeEmbedded(.{}, request, &out);
+    try std.testing.expect(std.mem.startsWith(u8, not_modified, "HTTP/1.1 304"));
+    try std.testing.expectEqualStrings("", body(not_modified));
+
+    // Without an mtime, a date says nothing either way.
+    const dated = try exchangeEmbedded(.{}, "GET /style.css HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Thu, 01 Jan 2099 00:00:00 GMT\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, dated, "HTTP/1.1 200"));
+
+    const ranged = try exchangeEmbedded(.{}, "GET /style.css HTTP/1.1\r\nHost: x\r\nRange: bytes=5-9\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, ranged, "HTTP/1.1 206"));
+    try std.testing.expectEqualStrings("bytes 5-9/19", header(ranged, "Content-Range").?);
+    try std.testing.expectEqualStrings("{ col", body(ranged));
+}
+
+test "embedded: a compressed copy is served to a client that accepts it" {
+    const opts: dusty.EmbeddedOptions = .{ .br = "brotli", .gzip = "gzipped" };
+
+    var out: [4096]u8 = undefined;
+    const gzipped = try exchangeEmbedded(opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqualStrings("gzip", header(gzipped, "Content-Encoding").?);
+    try std.testing.expectEqualStrings("text/css; charset=UTF-8", header(gzipped, "Content-Type").?);
+    try std.testing.expectEqualStrings("Accept-Encoding", header(gzipped, "Vary").?);
+    try std.testing.expect(std.mem.endsWith(u8, header(gzipped, "ETag").?, "-gzip\""));
+    try std.testing.expectEqualStrings("gzipped", body(gzipped));
+
+    const brotli = try exchangeEmbedded(opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip, br\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqualStrings("br", header(brotli, "Content-Encoding").?);
+    try std.testing.expectEqualStrings("brotli", body(brotli));
+
+    const plain = try exchangeEmbedded(opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expectEqual(null, header(plain, "Content-Encoding"));
+    try std.testing.expectEqualStrings("Accept-Encoding", header(plain, "Vary").?);
+    try std.testing.expectEqualStrings("body { color: red }", body(plain));
 }

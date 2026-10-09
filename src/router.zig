@@ -6,6 +6,8 @@ const Middleware = @import("middleware.zig").Middleware;
 const Static = @import("server/static.zig").Static;
 const StaticOptions = @import("server/static.zig").StaticOptions;
 const Precompressed = @import("server/static.zig").Precompressed;
+const Embedded = @import("server/static.zig").Embedded;
+const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
 /// What a request learns of the route it matched, as `Request.route`.
 pub const RouteInfo = struct {
@@ -360,11 +362,30 @@ pub fn Router(comptime Ctx: type) type {
             self.insertRoute(files_path, .get, staticAction, middlewares, files) catch @panic("OOM");
         }
 
-        const staticAction: Handler = if (Ctx == void) Static.handle else struct {
-            fn handle(_: *Ctx, req: *Request, res: *Response) anyerror!void {
-                return Static.handle(req, res);
-            }
-        }.handle;
+        /// Serves `data` at `path`, usually a file embedded with
+        /// `@embedFile`, with the same conditional and `Range` handling as
+        /// `static`. There is no `Last-Modified`; the `ETag` is a hash of
+        /// the content. `data` must outlive the router.
+        pub fn embedded(self: *Self, path: []const u8, data: []const u8, opts: EmbeddedOptions) void {
+            self.addEmbedded(path, data, opts, self.middlewares);
+        }
+
+        fn addEmbedded(self: *Self, path: []const u8, data: []const u8, opts: EmbeddedOptions, middlewares: []const Middleware(Ctx)) void {
+            const alloc = self.arena.allocator();
+            const file = alloc.create(Embedded) catch @panic("OOM");
+            file.* = Embedded.init(alloc, path, data, opts) catch @panic("OOM");
+            self.insertRoute(path, .get, plainAction(Embedded.handle), middlewares, file) catch @panic("OOM");
+        }
+
+        const staticAction = plainAction(Static.handle);
+
+        fn plainAction(comptime handler: fn (*Request, *Response) anyerror!void) Handler {
+            return if (Ctx == void) handler else struct {
+                fn handle(_: *Ctx, req: *Request, res: *Response) anyerror!void {
+                    return handler(req, res);
+                }
+            }.handle;
+        }
 
         pub fn group(self: *Self, prefix: []const u8, middlewares: []const Middleware(Ctx)) Group {
             return .{ .router = self, .prefix = prefix, .middlewares = middlewares };
@@ -428,6 +449,10 @@ pub fn Router(comptime Ctx: type) type {
 
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
                 g.router.addStatic(g.concatPath(prefix), dir, opts, g.mergeMiddlewares());
+            }
+
+            pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: EmbeddedOptions) void {
+                g.router.addEmbedded(g.concatPath(path), data, opts, g.mergeMiddlewares());
             }
         };
 

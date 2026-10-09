@@ -265,9 +265,6 @@ pub fn main(init: std.process.Init) !void {
 
     var app: App = .{ .pool = pool, .changes = .init(io) };
 
-    var public = try std.Io.Dir.cwd().openDir(io, "public", .{});
-    defer public.close(io);
-
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
     var server = http.Server(App).init(init.gpa, io, .{
         .listeners = &.{.{ .address = addr }},
@@ -282,7 +279,8 @@ pub fn main(init: std.process.Init) !void {
     server.router.delete("/todos/:id", delete);
     server.router.get("/events", events);
     server.router.get("/api/todos", api);
-    server.router.static("/assets", public, .{});
+    server.router.embedded("/assets/app.css", @embedFile("assets/app.css"), .{});
+    server.router.embedded("/assets/favicon.svg", @embedFile("assets/favicon.svg"), .{});
 
     var listen_task = try io.concurrent(listen, .{ &app, io });
     defer listen_task.cancel(io) catch {};

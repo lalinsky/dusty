@@ -33,6 +33,7 @@ pub const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 pub const Executor = @import("middleware.zig").Executor;
 pub const StaticOptions = @import("server/static.zig").StaticOptions;
 pub const Precompressed = @import("server/static.zig").Precompressed;
+pub const EmbeddedOptions = @import("server/static.zig").EmbeddedOptions;
 
 // Client
 pub const Client = @import("client.zig").Client;
