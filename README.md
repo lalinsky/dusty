@@ -136,6 +136,9 @@ fn handleUser(req: *http.Request, res: *http.Response) !void {
 `res.render` also takes a plain function whose last parameter is the `*std.Io.Writer`.
 For something small, `res.print(.html, "<p>Hello, {s}</p>", .{name})` formats the body directly.
 
+[examples/todo](examples/todo) is a complete app built with zt, [pg.zig](https://github.com/lalinsky/pg.zig)
+and [htmx](https://htmx.org), with live updates across browser tabs over Server-Sent Events.
+
 ### Serialization
 
 `res.encode` writes a value with a serializer's write-to-writer function, telling its parameters

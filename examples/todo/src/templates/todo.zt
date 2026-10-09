@@ -1,0 +1,97 @@
+pub const Todo = struct {
+    id: i32,
+    title: []const u8,
+    done: bool,
+};
+
+pub const Filter = enum { all, active, completed };
+
+// htmx 4 swaps error responses too; a 5xx would replace the list with its text.
+const htmx_config =
+    \\{"noSwap": [204, 304, "5xx"]}
+;
+
+pub templ Layout(title: []const u8) {
+    <!DOCTYPE html>
+    <html lang="en">
+        <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <meta name="htmx-config" content={htmx_config} />
+            <title>{title}</title>
+            <link rel="stylesheet" href="/assets/app.css" />
+            <script src="https://unpkg.com/htmx.org@4.0.0/dist/htmx.min.js" integrity="sha384-BvJpBiO8Kh31EqtJe5DRIeWrHWnCGkwytKs9NKFi86Hhw96dEqdEMzZDeK9iEGTc" crossorigin="anonymous"></script>
+            <script src="https://unpkg.com/htmx.org@4.0.0/dist/ext/hx-sse.min.js" integrity="sha384-VZD0TLKqhJ26ayBUgQg3ud6DsOLMJvtcz0ANpNc9WSbgIuQTnlXI2IfsF5jhBjT6" crossorigin="anonymous"></script>
+        </head>
+        <body hx-boost:inherited="true">
+            @children
+        </body>
+    </html>
+}
+
+pub templ Page(filter: Filter, q: []const u8, todos: []const Todo, left: i64, version: u32) {
+    @Layout("Todos") {
+        <main id="app" hx-sse:connect="/events?since={version}">
+            <h1>todos</h1>
+            <form hx-post="/todos" hx-include="#view" hx-target="#todo-list" hx-on::after:request="if (event.detail.ctx.response.status < 400) this.reset()">
+                <input class="new-todo" name="title" placeholder="What needs to be done?" autocomplete="off" autofocus required />
+            </form>
+            <div id="view">
+                <input type="hidden" name="filter" value={@tagName(filter)} />
+                <input class="search" type="search" name="q" placeholder="Search" value={q} hx-get="/" hx-include="#view" hx-trigger="input changed delay:300ms, search" hx-target="#todo-list" hx-replace-url="true" />
+            </div>
+            <ul id="todo-list" hx-get="/" hx-include="#view" hx-trigger="changed[!document.querySelector('#todo-list .editing')] from:#app">
+                @TodoItems(todos)
+            </ul>
+            <footer>
+                @Count(left, false)
+                <nav>
+                    @FilterLink(filter, .all, "All")
+                    @FilterLink(filter, .active, "Active")
+                    @FilterLink(filter, .completed, "Completed")
+                </nav>
+            </footer>
+        </main>
+    }
+}
+
+pub templ FilterLink(current: Filter, filter: Filter, label: []const u8) {
+    <a href="/?filter={@tagName(filter)}" class={if (current == filter) "selected" else null}>{label}</a>
+}
+
+pub templ TodoList(todos: []const Todo, left: i64) {
+    @TodoItems(todos)
+    @Count(left, true)
+}
+
+pub templ TodoItems(todos: []const Todo) {
+    for (todos) |todo| {
+        @TodoItem(todo)
+    }
+}
+
+pub templ TodoItem(todo: Todo) {
+    <li id="todo-{todo.id}" class={if (todo.done) "done" else null}>
+        <input type="checkbox" checked={if (todo.done) "checked" else null} hx-patch="/todos/{todo.id}/toggle" hx-target="closest li" hx-swap="outerHTML" />
+        <label hx-get="/todos/{todo.id}/edit" hx-trigger="dblclick" hx-target="closest li" hx-swap="outerHTML">{todo.title}</label>
+        <button class="destroy" hx-delete="/todos/{todo.id}" hx-target="closest li" hx-swap="delete" aria-label="Delete">×</button>
+    </li>
+}
+
+pub templ TodoItemWithCount(todo: Todo, left: i64) {
+    @TodoItem(todo)
+    @Count(left, true)
+}
+
+pub templ TodoEdit(todo: Todo) {
+    <li id="todo-{todo.id}" class="editing">
+        <input class="edit" name="title" value={todo.title} autofocus hx-put="/todos/{todo.id}" hx-include="#view" hx-trigger="blur, keyup[key=='Enter']" hx-target="#todo-list" />
+    </li>
+}
+
+pub templ Count(left: i64, oob: bool) {
+    <span id="todo-count" hx-swap-oob={if (oob) "true" else null}>
+        <strong>{left}</strong>
+        {if (left == 1) " item left" else " items left"}
+    </span>
+}

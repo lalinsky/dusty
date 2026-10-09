@@ -49,6 +49,13 @@ jobs:
       if: matrix.zig-version == '0.16.0'
       timeout-minutes: 5
 
+    - name: Build todo example
+      run: zig build
+      working-directory: examples/todo
+      # Its zt and json.zig pins are still on Zig 0.16.
+      if: matrix.zig-version == '0.16.0'
+      timeout-minutes: 5
+
     - name: Build httpbin example with injected TLS
       run: zig build -Duse_bundled_tls=false
       working-directory: examples/httpbin
