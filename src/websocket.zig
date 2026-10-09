@@ -103,9 +103,45 @@ pub const WebSocket = struct {
     /// Receive next message. Blocks until message arrives.
     /// Ping frames are handled automatically (pong sent).
     /// Pong frames are ignored.
-    /// The returned message data is valid until the next call to receive().
+    /// The returned message data is valid until the next call to receive(),
+    /// receiveMany() or tryReceive().
     pub fn receive(self: *WebSocket) !Message {
-        return self.receiveFrame() catch |err| switch (err) {
+        self.resetMessages();
+        return self.nextMessage();
+    }
+
+    /// Like `receive`, but also returns every further message already
+    /// complete in the read buffer, without blocking for more. A close
+    /// message ends the batch. The messages are valid until the next call
+    /// to receive(), receiveMany() or tryReceive().
+    pub fn receiveMany(self: *WebSocket) ![]const Message {
+        self.resetMessages();
+        const arena = self.msg_arena.allocator();
+        var msgs: std.ArrayListUnmanaged(Message) = .empty;
+        try msgs.append(arena, try self.nextMessage());
+        while (msgs.getLast().type != .close) {
+            const msg = try self.nextBufferedMessage() orelse break;
+            try msgs.append(arena, msg);
+        }
+        return msgs.items;
+    }
+
+    /// Like `receive`, but returns null instead of blocking when no whole
+    /// message is in the read buffer. A null leaves the previously returned
+    /// message valid.
+    pub fn tryReceive(self: *WebSocket) !?Message {
+        if (!messageBuffered(self.transport.reader.buffered())) return null;
+        self.resetMessages();
+        return try self.nextMessage();
+    }
+
+    fn nextBufferedMessage(self: *WebSocket) !?Message {
+        if (!messageBuffered(self.transport.reader.buffered())) return null;
+        return try self.nextMessage();
+    }
+
+    fn nextMessage(self: *WebSocket) !Message {
+        return self.readMessage() catch |err| switch (err) {
             // The reads inside can only report the sentinel; the transport
             // knows what actually happened.
             error.ReadFailed => self.transport.getReadError() orelse error.Unexpected,
@@ -113,10 +149,43 @@ pub const WebSocket = struct {
         };
     }
 
-    fn receiveFrame(self: *WebSocket) !Message {
+    fn resetMessages(self: *WebSocket) void {
         _ = self.msg_arena.reset(.retain_capacity);
-        self.fragmented_data = .empty;
         self.auto_responded = false;
+    }
+
+    /// Whether `bytes` starts with a whole message, along with any control
+    /// frames before or inside it.
+    fn messageBuffered(bytes: []const u8) bool {
+        var rest = bytes;
+        while (true) {
+            if (rest.len < 2) return false;
+            const fin = rest[0] & 0x80 != 0;
+            const opcode = rest[0] & 0x0F;
+            var header_len: usize = 2;
+            var payload_len: u64 = rest[1] & 0x7F;
+            if (payload_len == 126) {
+                if (rest.len < 4) return false;
+                payload_len = std.mem.readInt(u16, rest[2..4], .big);
+                header_len = 4;
+            } else if (payload_len == 127) {
+                if (rest.len < 10) return false;
+                payload_len = std.mem.readInt(u64, rest[2..10], .big);
+                header_len = 10;
+            }
+            if (rest[1] & 0x80 != 0) header_len += 4;
+            if (rest.len < header_len or rest.len - header_len < payload_len) return false;
+            rest = rest[header_len + @as(usize, @intCast(payload_len)) ..];
+            if (opcode & 0x8 == 0) {
+                if (fin) return true;
+            } else if (opcode == @intFromEnum(MessageType.close)) {
+                return true;
+            }
+        }
+    }
+
+    fn readMessage(self: *WebSocket) !Message {
+        self.fragmented_data = .empty;
         self.fragmented_type = null;
         while (true) {
             const frame = try self.readFrame();
@@ -851,6 +920,46 @@ test "WebSocket: autoflush off leaves frames in the buffer until flush or a pong
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 'c', 0x8A, 4, 'p', 'i', 'n', 'g' }, probe.out.items);
 }
 
+test "WebSocket: receiveMany returns the buffered messages and stops at a partial one" {
+    // Masked frames with zero mask keys: "a", a ping, "b" + "c" in two
+    // fragments, then the start of a frame whose payload has not arrived.
+    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+        [_]u8{ 0x89, 0x80, 0, 0, 0, 0 } ++
+        [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'b' } ++
+        [_]u8{ 0x80, 0x81, 0, 0, 0, 0, 'c' } ++
+        [_]u8{ 0x81, 0x85, 0, 0 };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const msgs = try ws.receiveMany();
+    try std.testing.expectEqual(2, msgs.len);
+    try std.testing.expectEqualStrings("a", msgs[0].data);
+    try std.testing.expectEqualStrings("bc", msgs[1].data);
+    try std.testing.expectEqualSlices(u8, &.{ 0x8A, 0 }, out.buffered());
+
+    try std.testing.expectError(error.EndOfStream, ws.receiveMany());
+}
+
+test "WebSocket: tryReceive returns null at a partial message and keeps the last one" {
+    // Masked frames with zero mask keys: "a", then the first fragment of a
+    // message whose last fragment has not arrived.
+    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+        [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'b' };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const msg = (try ws.tryReceive()).?;
+    try std.testing.expectEqualStrings("a", msg.data);
+    try std.testing.expectEqual(null, try ws.tryReceive());
+    try std.testing.expectEqualStrings("a", msg.data);
+}
+
 test "WebSocket: send reports the real error, not error.WriteFailed" {
     // Too small to hold the frame, so the payload has nowhere to go.
     var buf: [4]u8 = undefined;
@@ -886,6 +995,8 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
         ErrorSetOf(WebSocket.flush),
         ErrorSetOf(WebSocket.close),
         ErrorSetOf(WebSocket.receive),
+        ErrorSetOf(WebSocket.receiveMany),
+        ErrorSetOf(WebSocket.tryReceive),
     }) |Set| {
         inline for (comptime std.meta.fieldNames(Set)) |e_name| {
             try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
