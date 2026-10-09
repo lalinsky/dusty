@@ -103,8 +103,8 @@ pub const WebSocket = struct {
     /// Receive next message. Blocks until message arrives.
     /// Ping frames are handled automatically (pong sent).
     /// Pong frames are ignored.
-    /// The returned message data is valid until the next call to receive()
-    /// or receiveMany().
+    /// The returned message data is valid until the next call to receive(),
+    /// receiveMany() or tryReceive().
     pub fn receive(self: *WebSocket) !Message {
         self.resetMessages();
         return self.nextMessage();
@@ -113,16 +113,31 @@ pub const WebSocket = struct {
     /// Like `receive`, but also returns every further message already
     /// complete in the read buffer, without blocking for more. A close
     /// message ends the batch. The messages are valid until the next call
-    /// to receive() or receiveMany().
+    /// to receive(), receiveMany() or tryReceive().
     pub fn receiveMany(self: *WebSocket) ![]const Message {
         self.resetMessages();
+        const arena = self.msg_arena.allocator();
         var msgs: std.ArrayListUnmanaged(Message) = .empty;
-        while (true) {
-            const msg = try self.nextMessage();
-            try msgs.append(self.msg_arena.allocator(), msg);
-            if (msg.type == .close or !messageBuffered(self.transport.reader.buffered())) break;
+        try msgs.append(arena, try self.nextMessage());
+        while (msgs.getLast().type != .close) {
+            const msg = try self.nextBufferedMessage() orelse break;
+            try msgs.append(arena, msg);
         }
         return msgs.items;
+    }
+
+    /// Like `receive`, but returns null instead of blocking when no whole
+    /// message is in the read buffer. A null leaves the previously returned
+    /// message valid.
+    pub fn tryReceive(self: *WebSocket) !?Message {
+        if (!messageBuffered(self.transport.reader.buffered())) return null;
+        self.resetMessages();
+        return try self.nextMessage();
+    }
+
+    fn nextBufferedMessage(self: *WebSocket) !?Message {
+        if (!messageBuffered(self.transport.reader.buffered())) return null;
+        return try self.nextMessage();
     }
 
     fn nextMessage(self: *WebSocket) !Message {
@@ -928,6 +943,23 @@ test "WebSocket: receiveMany returns the buffered messages and stops at a partia
     try std.testing.expectError(error.EndOfStream, ws.receiveMany());
 }
 
+test "WebSocket: tryReceive returns null at a partial message and keeps the last one" {
+    // Masked frames with zero mask keys: "a", then the first fragment of a
+    // message whose last fragment has not arrived.
+    const frames = [_]u8{ 0x81, 0x81, 0, 0, 0, 0, 'a' } ++
+        [_]u8{ 0x01, 0x81, 0, 0, 0, 0, 'b' };
+    var reader: std.Io.Reader = undefined;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var ws = serverSocketOver(&frames, &reader, &out);
+    defer ws.deinit();
+
+    const msg = (try ws.tryReceive()).?;
+    try std.testing.expectEqualStrings("a", msg.data);
+    try std.testing.expectEqual(null, try ws.tryReceive());
+    try std.testing.expectEqualStrings("a", msg.data);
+}
+
 test "WebSocket: send reports the real error, not error.WriteFailed" {
     // Too small to hold the frame, so the payload has nowhere to go.
     var buf: [4]u8 = undefined;
@@ -964,6 +996,7 @@ test "WebSocket: no std.Io sentinel escapes its public API" {
         ErrorSetOf(WebSocket.close),
         ErrorSetOf(WebSocket.receive),
         ErrorSetOf(WebSocket.receiveMany),
+        ErrorSetOf(WebSocket.tryReceive),
     }) |Set| {
         inline for (comptime std.meta.fieldNames(Set)) |e_name| {
             try std.testing.expect(!std.mem.eql(u8, e_name, "WriteFailed"));
