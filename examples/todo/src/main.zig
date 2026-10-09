@@ -279,8 +279,10 @@ pub fn main(init: std.process.Init) !void {
     server.router.delete("/todos/:id", delete);
     server.router.get("/events", events);
     server.router.get("/api/todos", api);
-    server.router.embedded("/assets/app.css", @embedFile("assets/app.css"), .{});
-    server.router.embedded("/assets/favicon.svg", @embedFile("assets/favicon.svg"), .{});
+
+    const assets = server.router.group("/assets", &.{});
+    assets.embedded("/app.css", @embedFile("assets/app.css"), .{});
+    assets.embedded("/favicon.svg", @embedFile("assets/favicon.svg"), .{});
 
     var listen_task = try io.concurrent(listen, .{ &app, io });
     defer listen_task.cancel(io) catch {};
