@@ -188,6 +188,18 @@ them are honored. A directory serves its `index.html`; paths with `..` are 404s,
 dotfiles unless `.hide_dotfiles = false`. Symlinks are followed unless `.resolve_beneath = true`,
 which depends on the platform.
 
+`router.embedded` serves a single file compiled into the binary:
+
+```zig
+server.router.embedded("/assets/app.css", @embedFile("assets/app.css"), .{
+    // Optional compressed copies, served to clients that accept them.
+    .br = @embedFile("assets/app.css.br"),
+});
+```
+
+The content type comes from the path's extension unless `.content_type` is set. The `ETag` is
+a hash of the content, and there is no `Last-Modified`.
+
 ### Client Example
 
 ```zig

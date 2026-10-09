@@ -19,6 +19,7 @@ pub templ Layout(title: []const u8) {
             <meta name="viewport" content="width=device-width, initial-scale=1" />
             <meta name="htmx-config" content={htmx_config} />
             <title>{title}</title>
+            <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
             <link rel="stylesheet" href="/assets/app.css" />
             <script src="https://unpkg.com/htmx.org@4.0.0/dist/htmx.min.js" integrity="sha384-BvJpBiO8Kh31EqtJe5DRIeWrHWnCGkwytKs9NKFi86Hhw96dEqdEMzZDeK9iEGTc" crossorigin="anonymous"></script>
             <script src="https://unpkg.com/htmx.org@4.0.0/dist/ext/hx-sse.min.js" integrity="sha384-VZD0TLKqhJ26ayBUgQg3ud6DsOLMJvtcz0ANpNc9WSbgIuQTnlXI2IfsF5jhBjT6" crossorigin="anonymous"></script>

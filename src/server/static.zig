@@ -123,68 +123,157 @@ pub const Static = struct {
             }
         }
         if (encoding) |e| try res.header("Content-Encoding", e.name());
-
-        const etag = try formatEtag(req.arena, stat, encoding);
-        const mtime = mtimeSeconds(stat);
-        try res.header("ETag", etag);
-        try res.header("Last-Modified", try formatHttpDate(req.arena, mtime));
-        try res.header("Accept-Ranges", "bytes");
-
-        switch (checkPreconditions(req, etag, mtime)) {
-            .proceed => {},
-            .not_modified => {
-                res.status = .not_modified;
-                return true;
-            },
-            .failed => {
-                res.resetBody();
-                res.status = .precondition_failed;
-                return true;
-            },
-        }
-
-        // RFC 9110 defines ranges for GET only; a HEAD gets the whole length.
-        if (req.method != .get) return true;
-        const range = req.headers.get("Range") orelse return true;
-        if (req.headers.get("If-Range")) |value| {
-            if (!ifRangeMatches(value, etag, mtime)) return true;
-        }
-        const size = res.file.?.size;
-        switch (parseRange(range, size)) {
-            .ignore => {},
-            .unsatisfiable => {
-                res.resetBody();
-                res.status = .range_not_satisfiable;
-                try res.header("Content-Range", try std.fmt.allocPrint(req.arena, "bytes */{d}", .{size}));
-            },
-            .satisfiable => |r| {
-                res.status = .partial_content;
-                try res.header("Content-Range", try std.fmt.allocPrint(req.arena, "bytes {d}-{d}/{d}", .{ r.start, r.start + r.len - 1, size }));
-                res.file.?.offset = r.start;
-                res.file.?.size = r.len;
-            },
-        }
+        try finish(req, res, try formatEtag(req.arena, stat, encoding), mtimeSeconds(stat));
         return true;
     }
 };
 
+pub const EmbeddedOptions = struct {
+    /// Defaults to the type the extension of the route's path gives.
+    content_type: ?http.ContentType = null,
+    /// Compressed copies of the content, served to a client that accepts
+    /// them, in this order of preference.
+    br: ?[]const u8 = null,
+    zstd: ?[]const u8 = null,
+    gzip: ?[]const u8 = null,
+};
+
+/// Content served from memory by the route `Router.embedded` registers,
+/// with it as the route's data.
+pub const Embedded = struct {
+    content_type: http.ContentType,
+    plain: Variant,
+    /// Indexed by `Precompressed`.
+    compressed: [std.enums.values(Precompressed).len]?Variant,
+    any_compressed: bool,
+
+    const Variant = struct {
+        data: []const u8,
+        etag: []const u8,
+
+        /// From a hash of the content, since there is no file to take an
+        /// mtime from. Computed once, rather than per request.
+        fn init(allocator: std.mem.Allocator, data: []const u8, encoding: ?Precompressed) !Variant {
+            const hash = std.hash.Wyhash.hash(0, data);
+            const etag = if (encoding) |e|
+                try std.fmt.allocPrint(allocator, "\"{x}-{x}-{s}\"", .{ hash, data.len, e.name() })
+            else
+                try std.fmt.allocPrint(allocator, "\"{x}-{x}\"", .{ hash, data.len });
+            return .{ .data = data, .etag = etag };
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, data: []const u8, opts: EmbeddedOptions) !Embedded {
+        var self: Embedded = .{
+            .content_type = opts.content_type orelse .fromExtension(extension(path)),
+            .plain = try .init(allocator, data, null),
+            .compressed = undefined,
+            .any_compressed = false,
+        };
+        for (std.enums.values(Precompressed)) |encoding| {
+            const copy = switch (encoding) {
+                .br => opts.br,
+                .zstd => opts.zstd,
+                .gzip => opts.gzip,
+            };
+            self.compressed[@intFromEnum(encoding)] = if (copy) |c| try .init(allocator, c, encoding) else null;
+            if (copy != null) self.any_compressed = true;
+        }
+        return self;
+    }
+
+    /// The action of the route `Router.embedded` registers.
+    pub fn handle(req: *Request, res: *Response) !void {
+        const self: *const Embedded = @ptrCast(@alignCast(req.route.?.data.?));
+        var variant = self.plain;
+        if (self.any_compressed) {
+            // Which copy is served depends on Accept-Encoding, whichever it
+            // turns out to be.
+            try addVary(req, res);
+            for (std.enums.values(Precompressed)) |candidate| {
+                const copy = self.compressed[@intFromEnum(candidate)] orelse continue;
+                if (!http.acceptsEncoding(&req.headers, candidate.name())) continue;
+                variant = copy;
+                try res.header("Content-Encoding", candidate.name());
+                break;
+            }
+        }
+        res.content_type = self.content_type;
+        res.body = variant.data;
+        try finish(req, res, variant.etag, null);
+    }
+};
+
+/// The validators, then the conditional and `Range` headers, for a body
+/// already set, from a file or from memory. `mtime` is null when there is
+/// no `Last-Modified` to give.
+fn finish(req: *Request, res: *Response, etag: []const u8, mtime: ?i64) !void {
+    try res.header("ETag", etag);
+    if (mtime) |m| try res.header("Last-Modified", try formatHttpDate(req.arena, m));
+    try res.header("Accept-Ranges", "bytes");
+
+    switch (checkPreconditions(req, etag, mtime)) {
+        .proceed => {},
+        .not_modified => {
+            res.status = .not_modified;
+            return;
+        },
+        .failed => {
+            res.resetBody();
+            res.status = .precondition_failed;
+            return;
+        },
+    }
+
+    // RFC 9110 defines ranges for GET only; a HEAD gets the whole length.
+    if (req.method != .get) return;
+    const range = req.headers.get("Range") orelse return;
+    if (req.headers.get("If-Range")) |value| {
+        if (!ifRangeMatches(value, etag, mtime)) return;
+    }
+    const size = if (res.file) |file| file.size else res.body.len;
+    switch (parseRange(range, size)) {
+        .ignore => {},
+        .unsatisfiable => {
+            res.resetBody();
+            res.status = .range_not_satisfiable;
+            try res.header("Content-Range", try std.fmt.allocPrint(req.arena, "bytes */{d}", .{size}));
+        },
+        .satisfiable => |r| {
+            res.status = .partial_content;
+            try res.header("Content-Range", try std.fmt.allocPrint(req.arena, "bytes {d}-{d}/{d}", .{ r.start, r.start + r.len - 1, size }));
+            if (res.file) |*file| {
+                file.offset = r.start;
+                file.size = r.len;
+            } else {
+                res.body = res.body[@intCast(r.start)..][0..r.len];
+            }
+        },
+    }
+}
+
 const Precondition = enum { proceed, not_modified, failed };
 
 /// The conditional headers, in the order RFC 9110 §13.2.2 evaluates them. A
-/// date that does not parse is ignored, as is the header carrying it.
-fn checkPreconditions(req: *const Request, etag: []const u8, mtime: i64) Precondition {
+/// date that does not parse is ignored, as is the header carrying it, and
+/// so is any date when there is no `mtime` to compare it with.
+fn checkPreconditions(req: *const Request, etag: []const u8, mtime: ?i64) Precondition {
     if (req.headers.get("If-Match")) |value| {
         if (!etagListMatches(value, etag, .strong)) return .failed;
     } else if (req.headers.get("If-Unmodified-Since")) |value| {
-        if (parseHttpDate(value)) |date| {
-            if (mtime > date) return .failed;
+        if (mtime) |m| {
+            if (parseHttpDate(value)) |date| {
+                if (m > date) return .failed;
+            }
         }
     }
     if (req.headers.get("If-None-Match")) |value| {
         if (etagListMatches(value, etag, .weak)) return .not_modified;
     } else if (req.headers.get("If-Modified-Since")) |value| {
-        if (parseHttpDate(value)) |date| {
-            if (mtime <= date) return .not_modified;
+        if (mtime) |m| {
+            if (parseHttpDate(value)) |date| {
+                if (m <= date) return .not_modified;
+            }
         }
     }
     return .proceed;
@@ -192,13 +281,13 @@ fn checkPreconditions(req: *const Request, etag: []const u8, mtime: i64) Precond
 
 /// An `If-Range` is one validator, an entity tag compared strongly or a date
 /// that has to be the `Last-Modified` exactly.
-fn ifRangeMatches(value: []const u8, etag: []const u8, mtime: i64) bool {
+fn ifRangeMatches(value: []const u8, etag: []const u8, mtime: ?i64) bool {
     const trimmed = std.mem.trim(u8, value, " \t");
     if (std.mem.startsWith(u8, trimmed, "\"") or std.mem.startsWith(u8, trimmed, "W/")) {
         return std.mem.eql(u8, trimmed, etag);
     }
     const date = parseHttpDate(trimmed) orelse return false;
-    return date == mtime;
+    return mtime != null and date == mtime.?;
 }
 
 const RangeResult = union(enum) {
