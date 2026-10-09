@@ -136,7 +136,18 @@ pub const EmbeddedOptions = struct {
     br: ?[]const u8 = null,
     zstd: ?[]const u8 = null,
     gzip: ?[]const u8 = null,
+    /// A request with `?v=` set to this is answered as cacheable for good:
+    /// a link with it changes when the content does. Any other request,
+    /// such as one for a version from before a deploy, still gets the
+    /// current content, with `cache_control`.
+    version: ?[]const u8 = null,
+    /// Sent as `Cache-Control` with a 200, 206 or 304, unless `version`
+    /// matches.
+    cache_control: ?[]const u8 = null,
 };
+
+/// The `Cache-Control` of a request with a matching `EmbeddedOptions.version`.
+pub const immutable = "public, max-age=31536000, immutable";
 
 /// Content served from memory by the route `Router.embedded` registers,
 /// with it as the route's data.
@@ -146,6 +157,8 @@ pub const Embedded = struct {
     /// Indexed by `Precompressed`.
     compressed: [std.enums.values(Precompressed).len]?Variant,
     any_compressed: bool,
+    version: ?[]const u8,
+    cache_control: ?[]const u8,
 
     const Variant = struct {
         data: []const u8,
@@ -169,6 +182,8 @@ pub const Embedded = struct {
             .plain = try .init(allocator, data, null),
             .compressed = undefined,
             .any_compressed = false,
+            .version = if (opts.version) |v| try allocator.dupe(u8, v) else null,
+            .cache_control = if (opts.cache_control) |c| try allocator.dupe(u8, c) else null,
         };
         for (std.enums.values(Precompressed)) |encoding| {
             const copy = switch (encoding) {
@@ -201,6 +216,17 @@ pub const Embedded = struct {
         res.content_type = self.content_type;
         res.body = variant.data;
         try finish(req, res, variant.etag, null);
+        // Not on a 412 or 416, which a cache could otherwise keep for good.
+        switch (res.status) {
+            .ok, .partial_content, .not_modified => if (self.cacheControl(req)) |c| try res.header("Cache-Control", c),
+            else => {},
+        }
+    }
+
+    fn cacheControl(self: *const Embedded, req: *const Request) ?[]const u8 {
+        const version = self.version orelse return self.cache_control;
+        const requested = req.query.get("v") orelse return self.cache_control;
+        return if (std.mem.eql(u8, requested, version)) immutable else self.cache_control;
     }
 };
 

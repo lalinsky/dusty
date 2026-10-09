@@ -12,6 +12,7 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 - gzip compression of response bodies, opt-in per response with `res.compress = true`
 - Server-Sent Events (SSE) for streaming responses
 - Static file serving with conditional and range requests, and precompressed files
+- Assets embedded in the binary at build time, with cache-busting URLs
 - WebSocket support (RFC 6455)
 - HTTP/HTTPS client with connection pooling
 - Unix domain socket support for client connections
@@ -28,11 +29,11 @@ zig fetch --save "git+https://github.com/lalinsky/dusty#v0.4.0"
 Then in your `build.zig`, add the module as a dependency:
 
 ```zig
-const dusty = b.dependency("dusty", .{
+const dusty_dep = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("dusty", dusty.module("dusty"));
+exe.root_module.addImport("dusty", dusty_dep.module("dusty"));
 ```
 
 ### Using a custom tls.zig
@@ -42,7 +43,7 @@ different compatible version without fetching or compiling the bundled one,
 disable only the bundled provider and replace the `tls` import:
 
 ```zig
-const dusty = b.dependency("dusty", .{
+const dusty_dep = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
     .use_tls = true,
@@ -53,7 +54,7 @@ const custom_tls = b.dependency("custom_tls", .{
     .optimize = optimize,
 });
 
-const dusty_mod = dusty.module("dusty");
+const dusty_mod = dusty_dep.module("dusty");
 dusty_mod.addImport("tls", custom_tls.module("tls"));
 exe.root_module.addImport("dusty", dusty_mod);
 ```
@@ -199,6 +200,42 @@ server.router.embedded("/assets/app.css", @embedFile("assets/app.css"), .{
 
 The content type comes from the path's extension unless `.content_type` is set. The `ETag` is
 a hash of the content, and there is no `Last-Modified`.
+
+#### Embedded Assets
+
+`addAssets` in `build.zig` embeds a whole directory into the binary, as a module:
+
+```zig
+const dusty = @import("dusty");
+
+exe.root_module.addImport("assets", dusty.addAssets(b, dusty_dep, .{
+    .dir = b.path("assets"),
+    .prefix = "/assets", // the default
+}));
+```
+
+Templates link to the files with `assets.url`, which adds a hash of the content, such as
+`/assets/app.css?v=6ec8ea7d`. An unknown name is a compile error.
+
+```zig
+const assets = @import("assets");
+
+pub templ Layout(title: []const u8) {
+    <link rel="stylesheet" href={assets.url("app.css")} />
+    ...
+}
+```
+
+`assets.register` serves them:
+
+```zig
+assets.register(&server.router);
+```
+
+A request with the current hash is cached for good (`immutable`); anything else is answered with
+the current file and `no-cache`, so a page still open from before a deploy gets the new file
+rather than a 404. A compressed copy next to a file, `app.css.br`, is served to clients that
+accept it, and dotfiles are left out.
 
 ### Client Example
 
@@ -356,7 +393,7 @@ const zio = b.dependency("zio", .{
     .optimize = optimize,
 });
 exe.root_module.addImport("zio", zio.module("zio"));
-dusty.module("dusty").addImport("zio", zio.module("zio"));
+dusty_dep.module("dusty").addImport("zio", zio.module("zio"));
 ```
 
 Then initialize zio's runtime and pass it to dusty:

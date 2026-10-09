@@ -160,6 +160,17 @@ pub fn build(b: *std.Build) void {
         mod.addIncludePath(b.path("src/nghttp2/lib/includes"));
     }
 
+    // Hashes the files of an asset bundle for `addAssets`; run on the host
+    // whatever the target.
+    const assets_gen = b.addExecutable(.{
+        .name = "dusty-assets",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/assets/gen.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    b.installArtifact(assets_gen);
+
     // Examples
     const examples_step = b.step("examples", "Build all examples");
 
@@ -205,6 +216,26 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    const assets_gen_tests = b.addTest(.{
+        .root_module = assets_gen.root_module,
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
+    });
+    test_step.dependOn(&b.addRunArtifact(assets_gen_tests).step);
+
+    const assets_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/assets/test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
+    });
+    assets_tests.root_module.addImport("dusty", mod);
+    assets_tests.root_module.addImport("assets", bundle(b, assets_gen, b.path("src/assets/root.zig"), .{
+        .dir = b.path("src/assets/testdata"),
+    }));
+    test_step.dependOn(&b.addRunArtifact(assets_tests).step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means
@@ -216,4 +247,69 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+pub const AssetsOptions = struct {
+    /// Every file under it is bundled, except dotfiles. A compressed copy
+    /// next to a file, `app.css.br` for `app.css`, is served in its place
+    /// to clients that accept it. The directory is listed when the build is
+    /// configured, so it has to be in the source tree, and `--watch` sees
+    /// changes to the files but not files added or removed.
+    dir: std.Build.LazyPath,
+    /// Where the files are served.
+    prefix: []const u8 = "/assets",
+};
+
+/// Bundles a directory of assets into a module, to import into the app:
+///
+/// ```zig
+/// const dusty = @import("dusty");
+/// const assets = dusty.addAssets(b, dusty_dep, .{ .dir = b.path("assets") });
+/// exe.root_module.addImport("assets", assets);
+/// ```
+///
+/// The module embeds the files. Its `url("app.css")` gives the URL to link
+/// to, with a hash of the content in it, and `register(router)` serves them
+/// all.
+pub fn addAssets(b: *std.Build, dusty_dep: *std.Build.Dependency, opts: AssetsOptions) *std.Build.Module {
+    return bundle(b, dusty_dep.artifact("dusty-assets"), dusty_dep.path("src/assets/root.zig"), opts);
+}
+
+fn bundle(b: *std.Build, gen: *std.Build.Step.Compile, root: std.Build.LazyPath, opts: AssetsOptions) *std.Build.Module {
+    const io = b.graph.io;
+
+    // Copied first, so the tool can be given one directory, whose path
+    // changes with its contents, rather than every file on its command line.
+    const files = b.addWriteFiles();
+    var dir = std.Io.Dir.cwd().openDir(io, opts.dir.getPath(b), .{ .iterate = true }) catch |err| {
+        std.debug.panic("unable to open asset directory '{s}': {t}", .{ opts.dir.getPath(b), err });
+    };
+    defer dir.close(io);
+    var walker = dir.walk(b.allocator) catch @panic("OOM");
+    defer walker.deinit();
+    while (walker.next(io) catch |err| std.debug.panic("unable to list asset directory: {t}", .{err})) |entry| {
+        if (entry.basename[0] == '.') {
+            if (entry.kind == .directory) walker.leave(io);
+            continue;
+        }
+        const kind = switch (entry.kind) {
+            .sym_link => (entry.dir.statFile(io, entry.basename, .{}) catch continue).kind,
+            else => entry.kind,
+        };
+        if (kind != .file) continue;
+        const name = b.dupe(entry.path);
+        std.mem.replaceScalar(u8, name, std.fs.path.sep, '/');
+        _ = files.addCopyFile(opts.dir.path(b, name), name);
+    }
+
+    const run = b.addRunArtifact(gen);
+    const table = run.addOutputFileArg("files.zig");
+    run.addArg(opts.prefix);
+    run.addDirectoryArg(files.getDirectory());
+
+    const module = b.addWriteFiles();
+    _ = module.addCopyDirectory(files.getDirectory(), "files", .{});
+    _ = module.addCopyFile(table, "files.zig");
+    _ = module.addCopyFile(root, "root.zig");
+    return b.createModule(.{ .root_source_file = module.getDirectory().path(b, "root.zig") });
 }

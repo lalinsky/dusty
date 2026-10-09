@@ -1,11 +1,12 @@
 const std = @import("std");
 const zt = @import("zt");
+const dusty = @import("dusty");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const dusty = b.dependency("dusty", .{
+    const dusty_dep = b.dependency("dusty", .{
         .target = target,
         .optimize = optimize,
     });
@@ -28,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     // Override dusty's default `zio` stub with the real module so that
     // request/keepalive timeouts use zio.AutoCancel.
-    const dusty_mod = dusty.module("dusty");
+    const dusty_mod = dusty_dep.module("dusty");
     dusty_mod.addImport("zio", zio.module("zio"));
 
     const templates = zt.addTemplates(b, zt_dep, &.{
@@ -48,6 +49,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("json", json.module("json"));
     exe.root_module.addImport("pg", pg.module("pg"));
     exe.root_module.addImport("zt", zt_dep.module("zt"));
+    exe.root_module.addImport("assets", dusty.addAssets(b, dusty_dep, .{ .dir = b.path("assets") }));
     exe.step.dependOn(templates);
 
     b.installArtifact(exe);
