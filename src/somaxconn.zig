@@ -9,8 +9,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// What `listen` gets when the file is missing or says nothing usable.
-const fallback: u31 = if (@TypeOf(std.c.SOMAXCONN) == type) 128 else std.c.SOMAXCONN;
+/// What `listen` gets when the file is missing or says nothing usable: the
+/// platform's `SOMAXCONN`, as Go's `syscall.SOMAXCONN` has it. Spelled out
+/// rather than taken from `std.c`, whose Windows value does not compile.
+const fallback: u31 = switch (builtin.os.tag) {
+    // winsock2.h; the provider picks "a reasonable maximum" for it.
+    .windows => 0x7fffffff,
+    else => 128,
+};
 
 /// The largest backlog the kernel will honor. At least 1.
 pub fn somaxconn(io: std.Io) std.Io.Cancelable!u31 {
