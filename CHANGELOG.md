@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
+- `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
+  on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
+  which then wait a second or more to retry.
 
 ## [0.4.0] - 2026-10-06
 
