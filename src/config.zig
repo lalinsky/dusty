@@ -76,9 +76,15 @@ pub const Listener = struct {
     /// setting this fails `Server.run`.
     tls: ?ServerConfig.Tls = null,
     /// How many connections the kernel accepts on the server's behalf
-    /// while it is not accepting itself. Past this, clients see the
-    /// connection refused.
-    kernel_backlog: u31 = 1024,
+    /// while it is not accepting itself. Past this, Linux drops the
+    /// client's SYN, and the client waits a second or more before it
+    /// tries again.
+    ///
+    /// Null asks for the most the system allows: `net.core.somaxconn` on
+    /// Linux, read from /proc/sys/net/core/somaxconn, and the platform's
+    /// `SOMAXCONN` elsewhere, as Go does. The kernel caps a larger value
+    /// to that silently.
+    kernel_backlog: ?u31 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
     reuse_address: bool = true,
     /// How many accept loops share the socket. With io_uring, an accept

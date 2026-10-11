@@ -23,6 +23,7 @@ const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
+const somaxconn = @import("somaxconn.zig").somaxconn;
 
 const log = std.log.scoped(.dusty);
 
@@ -538,6 +539,9 @@ pub fn Server(comptime Ctx: type) type {
             } else 1;
             var acceptor_count: usize = 0;
             for (listeners) |cfg| acceptor_count += cfg.acceptorCount(cpu_count);
+            const default_backlog: u31 = for (listeners) |cfg| {
+                if (cfg.kernel_backlog == null) break try somaxconn(self.io);
+            } else 0;
 
             const active = try self.allocator.alloc(ActiveListener, listeners.len);
             defer self.allocator.free(active);
@@ -548,7 +552,7 @@ pub fn Server(comptime Ctx: type) type {
             var opened: usize = 0;
             defer for (active[0..opened]) |*l| l.close(self.io, self.allocator);
             for (listeners, active, addresses) |*cfg, *l, *address| {
-                l.* = try self.open(cfg);
+                l.* = try self.open(cfg, cfg.kernel_backlog orelse default_backlog);
                 opened += 1;
                 address.* = l.address;
             }
@@ -625,7 +629,7 @@ pub fn Server(comptime Ctx: type) type {
         }
 
         /// Loads the listener's TLS material and binds its socket.
-        fn open(self: *Self, cfg: *const Listener) !ActiveListener {
+        fn open(self: *Self, cfg: *const Listener, kernel_backlog: u31) !ActiveListener {
             var l: ActiveListener = .{ .config = cfg, .address = cfg.address, .server = undefined };
             errdefer l.freeTls(self.allocator);
 
@@ -664,10 +668,10 @@ pub fn Server(comptime Ctx: type) type {
 
             l.server = switch (cfg.address) {
                 .ip => |ip| try ip.listen(self.io, .{
-                    .kernel_backlog = cfg.kernel_backlog,
+                    .kernel_backlog = kernel_backlog,
                     .reuse_address = cfg.reuse_address,
                 }),
-                .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = cfg.kernel_backlog }),
+                .unix => |unix| try unix.listen(self.io, .{ .kernel_backlog = kernel_backlog }),
             };
             if (cfg.address == .ip) l.address = .{ .ip = l.server.socket.address };
             return l;
