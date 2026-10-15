@@ -1051,6 +1051,47 @@ test "Server: Connection: close on a pipelined request ends the connection after
     try std.testing.expectError(error.EndOfStream, readResponse(r, &status2, &body2));
 }
 
+test "Server: a CONNECT ends the connection, its body unserved" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    PipelineCtx.setup(&server);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    // llhttp ends a CONNECT at its head, so the "body" is what follows it.
+    const smuggled = "GET /c HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.print("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nContent-Length: {d}\r\n\r\n{s}", .{ smuggled.len, smuggled });
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const r = &reader.interface;
+
+    var status1: [64]u8 = undefined;
+    var body1: [32]u8 = undefined;
+    const resp1 = try readResponse(r, &status1, &body1);
+    try std.testing.expect(std.mem.indexOf(u8, resp1.status, "404") != null);
+
+    var status2: [64]u8 = undefined;
+    var body2: [32]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, readResponse(r, &status2, &body2));
+}
+
 test "Server: a handler's own EndOfStream is a 500, not a vanished peer" {
     const io = std.testing.io;
 
