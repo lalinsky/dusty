@@ -1461,6 +1461,37 @@ test "Client: redirects share the request's budget" {
     try std.testing.expectEqualStrings("done", (try response.body()).?);
 }
 
+fn expectRedirectFollowedWithoutDrain(comptime redirect_head: []const u8, config: dusty.ClientConfig) !void {
+    const io = std.testing.io;
+    var target: StallingServer = undefined;
+    try target.start(io, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone");
+    defer target.stop(io);
+
+    var head_buf: [256]u8 = undefined;
+    const head = try std.fmt.bufPrint(&head_buf, redirect_head, .{try target.url()});
+    var redirector: StallingServer = undefined;
+    try redirector.start(io, head);
+    defer redirector.stop(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, config);
+    defer client.deinit();
+    var response = try client.fetch(try redirector.url(), .{});
+    defer response.deinit();
+    try std.testing.expectEqualStrings("done", (try response.body()).?);
+}
+
+test "Client: a redirect body is not drained from a connection that won't be reused" {
+    // The redirect bodies never finish, so draining one runs into the timeout.
+    try expectRedirectFollowedWithoutDrain(
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nConnection: close\r\n\r\npartial",
+        .{ .timeout = .fromMilliseconds(2000) },
+    );
+    try expectRedirectFollowedWithoutDrain(
+        "HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nContent-Length: 100\r\n\r\npartial",
+        .{ .timeout = .fromMilliseconds(2000), .max_idle_connections = 0 },
+    );
+}
+
 test "Server: res.compress gzips buffered and streamed bodies for a client that accepts it" {
     if (!@import("build_options").use_zlib) return error.SkipZigTest;
     const io = std.testing.io;
