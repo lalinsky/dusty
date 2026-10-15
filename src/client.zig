@@ -1216,10 +1216,14 @@ pub const Client = struct {
                 conn_released = true;
 
                 // 301/302/303 with a non-GET/HEAD method: switch to GET and drop body.
+                // QUERY keeps its method and body on 301/302 (RFC 10008, Section 2.5).
                 // 307/308 preserve the original method and body.
                 var redirect_options = state.options;
                 if (status_code == 301 or status_code == 302 or status_code == 303) {
-                    if (redirect_options.method != .get and redirect_options.method != .head) {
+                    const method = redirect_options.method;
+                    const keeps_method = method == .get or method == .head or
+                        (method == .query and status_code != 303);
+                    if (!keeps_method) {
                         redirect_options.method = .get;
                         redirect_options.body = null;
                     } else if (status_code == 303) {
