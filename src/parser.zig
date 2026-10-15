@@ -326,6 +326,8 @@ pub const ResponseParser = struct {
         // Set by a failed `feed` or `finish`. llhttp keeps no record of an
         // end-of-stream the message was not ready for.
         failed: bool = false,
+        // An interim response was read and dropped on the way to this one.
+        saw_interim: bool = false,
 
         // Body reading state
         body_dest_buf: []u8 = &.{}, // Where onBody should copy to
@@ -370,6 +372,7 @@ pub const ResponseParser = struct {
         self.response.* = .{ .arena = self.response.arena };
         self.response.headers = try Headers.init(self.response.arena, self.max_headers);
         self.reset();
+        self.state.saw_interim = true;
     }
 
     pub fn feed(self: *ResponseParser, data: []const u8) !void {

@@ -1050,36 +1050,44 @@ pub const Client = struct {
         // (e.g. the WebSocket upgrade path) must pass false.
         advertise_http2: bool,
     ) !*Connection {
-        // Try to get a connection from the pool
-        const conn = self.pool.acquire(host, port, protocol, unix_socket_path) orelse blk: {
-            // No pooled connection, create a new one
-            const stream = if (unix_socket_path) |path| unix: {
-                const unix_addr = try std.Io.net.UnixAddress.init(path);
-                break :unix try unix_addr.connect(self.io);
-            } else if (std.Io.net.IpAddress.parse(unbracketed(host), port)) |addr| tcp: {
-                break :tcp try addr.connect(self.io, .{ .mode = .stream });
-            } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
-            errdefer stream.close(self.io);
+        return self.pool.acquire(host, port, protocol, unix_socket_path) orelse
+            self.dialConnection(host, port, protocol, tls_config, unix_socket_path, advertise_http2);
+    }
 
-            const new_conn = try self.allocator.create(Connection);
-            errdefer self.allocator.destroy(new_conn);
-            try new_conn.init(
-                self.allocator,
-                self.io,
-                &self.pool,
-                stream,
-                host,
-                port,
-                self.config.buffer_size,
-                self.config.max_response_header_count,
-                protocol,
-                tls_config,
-                unix_socket_path,
-                advertise_http2,
-            );
+    /// Open a new connection, bypassing the pool.
+    fn dialConnection(
+        self: *Client,
+        host: []const u8,
+        port: u16,
+        protocol: Protocol,
+        tls_config: ?TlsRef,
+        unix_socket_path: ?[]const u8,
+        advertise_http2: bool,
+    ) !*Connection {
+        const stream = if (unix_socket_path) |path| unix: {
+            const unix_addr = try std.Io.net.UnixAddress.init(path);
+            break :unix try unix_addr.connect(self.io);
+        } else if (std.Io.net.IpAddress.parse(unbracketed(host), port)) |addr| tcp: {
+            break :tcp try addr.connect(self.io, .{ .mode = .stream });
+        } else |_| try (try std.Io.net.HostName.init(host)).connect(self.io, port, .{ .mode = .stream });
+        errdefer stream.close(self.io);
 
-            break :blk new_conn;
-        };
+        const conn = try self.allocator.create(Connection);
+        errdefer self.allocator.destroy(conn);
+        try conn.init(
+            self.allocator,
+            self.io,
+            &self.pool,
+            stream,
+            host,
+            port,
+            self.config.buffer_size,
+            self.config.max_response_header_count,
+            protocol,
+            tls_config,
+            unix_socket_path,
+            advertise_http2,
+        );
         return conn;
     }
 
@@ -1176,73 +1184,27 @@ pub const Client = struct {
         // Acquire or create a connection. The redirect path releases it early
         // and continues with fallible work, so the errdefer must be disarmed
         // after that release to avoid releasing the connection twice.
-        const conn = try self.acquireConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, build_options.use_http2 and self.config.http2 and state.protocol == .https);
+        const advertise_http2 = build_options.use_http2 and self.config.http2 and state.protocol == .https;
+        var reused = true;
+        var conn = self.pool.acquire(host, state.port, state.protocol, state.options.unix_socket_path) orelse blk: {
+            reused = false;
+            break :blk try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
+        };
         var conn_released = false;
         errdefer if (!conn_released) self.pool.release(conn);
 
-        // HTTP/2 was negotiated via ALPN but the h2 path isn't implemented yet.
-        // The TLS connection is already committed to h2 (we can't speak HTTP/1.1
-        // over it), so don't pool it — mark closing so release() tears it down.
-        if (conn.http_version == .http_2) {
-            conn.closing = true;
-            return error.Http2NotImplemented;
-        }
-
-        // Whatever the proxy answers, what follows a CONNECT on the wire
-        // cannot be relied on to be the next response.
-        if (state.options.method == .connect) conn.closing = true;
-
-        conn.parser.head_request = state.options.method == .head;
-        conn.parser.connect_request = state.options.method == .connect;
-
-        // Send request. On write/flush failure the connection is dead or has
-        // a partially written request, so mark it closing before the errdefer
-        // releases it — otherwise it gets pooled again and poisons the pool.
-        var write_err: ?Connection.WriteError = null;
-        writeRequest(conn.writer, .{
-            .method = state.options.method,
-            .uri = state.uri,
-            .host = host,
-            .port = state.port,
-            .protocol = state.protocol,
-            .headers = state.options.headers,
-            .body = state.options.body,
-            .decompress = state.options.decompress,
-            .strip_sensitive_headers = state.strip_sensitive_headers,
-            .strip_body_headers = state.strip_body_headers,
-            .referer = state.referer,
-            .user_agent = self.config.user_agent,
-        }) catch |err| {
-            conn.closing = true;
-            switch (err) {
-                error.WriteFailed => write_err = conn.getWriteError() orelse error.Unexpected,
-                else => |e| return e,
-            }
+        var lost = false;
+        self.sendRequest(conn, state, host, &lost) catch |err| {
+            // The server may have closed the idle connection just as it was
+            // picked up. Retried on a new one under the same conditions as
+            // Go's net/http.
+            if (!lost or !reused or !isReplayable(state.options)) return err;
+            self.pool.release(conn);
+            conn_released = true;
+            conn = try self.dialConnection(host, state.port, state.protocol, tls_config, state.options.unix_socket_path, advertise_http2);
+            conn_released = false;
+            try self.sendRequest(conn, state, host, &lost);
         };
-
-        if (write_err == null) conn.flush() catch |err| {
-            conn.closing = true;
-            write_err = err;
-        };
-
-        if (write_err) |err| {
-            if (err == error.Canceled) return err;
-            // A server that rejects the request (413, 401, ...) may answer
-            // and close before reading all of it. The fetch's own deadline
-            // still applies on top of this one.
-            const early: Deadline = .init(self.io, .{ .duration = .{ .raw = early_response_wait, .clock = .awake } });
-            early.run(Connection.parseHead, .{conn}) catch |read_err| switch (read_err) {
-                error.Canceled => return error.Canceled,
-                else => return err,
-            };
-        } else {
-            // Any failure leaves the connection at an unknown stream
-            // position, so it must not be pooled.
-            conn.parseHead() catch |err| {
-                conn.closing = true;
-                return err;
-            };
-        }
 
         // From here on an error leaves the body where it is, and the
         // errdefer above pools the connection. A body still on the wire
@@ -1370,7 +1332,93 @@ pub const Client = struct {
         if (!state.options.stream) _ = try response.body();
         return response;
     }
+
+    /// Writes the request on `conn` and reads the response head. `lost` is
+    /// set when the connection failed before any of the response arrived.
+    fn sendRequest(self: *Client, conn: *Connection, state: FetchState, host: []const u8, lost: *bool) !void {
+        // HTTP/2 was negotiated via ALPN but the h2 path isn't implemented yet.
+        // The TLS connection is already committed to h2 (we can't speak HTTP/1.1
+        // over it), so don't pool it — mark closing so release() tears it down.
+        if (conn.http_version == .http_2) {
+            conn.closing = true;
+            return error.Http2NotImplemented;
+        }
+
+        // Whatever the proxy answers, what follows a CONNECT on the wire
+        // cannot be relied on to be the next response.
+        if (state.options.method == .connect) conn.closing = true;
+
+        conn.parser.head_request = state.options.method == .head;
+        conn.parser.connect_request = state.options.method == .connect;
+
+        // Send request. On write/flush failure the connection is dead or has
+        // a partially written request, so mark it closing before the errdefer
+        // releases it — otherwise it gets pooled again and poisons the pool.
+        var write_err: ?Connection.WriteError = null;
+        writeRequest(conn.writer, .{
+            .method = state.options.method,
+            .uri = state.uri,
+            .host = host,
+            .port = state.port,
+            .protocol = state.protocol,
+            .headers = state.options.headers,
+            .body = state.options.body,
+            .decompress = state.options.decompress,
+            .strip_sensitive_headers = state.strip_sensitive_headers,
+            .strip_body_headers = state.strip_body_headers,
+            .referer = state.referer,
+            .user_agent = self.config.user_agent,
+        }) catch |err| {
+            conn.closing = true;
+            switch (err) {
+                error.WriteFailed => write_err = conn.getWriteError() orelse error.Unexpected,
+                else => |e| return e,
+            }
+        };
+
+        if (write_err == null) conn.flush() catch |err| {
+            conn.closing = true;
+            write_err = err;
+        };
+
+        // A failed head read leaves whatever it got in the buffer, so an
+        // empty one means none of the response arrived, unless an interim
+        // response was read and dropped from it.
+        if (write_err) |err| {
+            if (err == error.Canceled) return err;
+            // A server that rejects the request (413, 401, ...) may answer
+            // and close before reading all of it. The fetch's own deadline
+            // still applies on top of this one.
+            const early: Deadline = .init(self.io, .{ .duration = .{ .raw = early_response_wait, .clock = .awake } });
+            early.run(Connection.parseHead, .{conn}) catch |read_err| switch (read_err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    lost.* = conn.reader.end == 0 and !conn.parser.state.saw_interim;
+                    return err;
+                },
+            };
+        } else {
+            // Any failure leaves the connection at an unknown stream
+            // position, so it must not be pooled.
+            conn.parseHead() catch |err| {
+                conn.closing = true;
+                lost.* = err != error.Canceled and conn.reader.end == 0 and !conn.parser.state.saw_interim;
+                return err;
+            };
+        }
+    }
 };
+
+/// Whether a request may be sent again after a connection failure, by the
+/// same rules as Go's net/http. A body is a slice, so it can always be resent.
+fn isReplayable(options: FetchOptions) bool {
+    switch (options.method) {
+        .get, .head, .options, .trace, .query => return true,
+        else => {},
+    }
+    const headers = options.headers orelse return false;
+    return headers.get("Idempotency-Key") != null or headers.get("X-Idempotency-Key") != null;
+}
 
 const FetchState = struct {
     uri: Uri,
