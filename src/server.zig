@@ -101,11 +101,10 @@ const ClientAuthRef = struct {
 const request_arena_reserve = 8 * 1024;
 
 /// What a connection reads into while it waits for a request without a set
-/// of request buffers -- its first, or any with
-/// `request.keep_buffers_between_requests` off -- in place of the pooled
-/// read buffer it takes once one arrives. An ordinary
-/// head fits, so it moves across in one copy; a longer one is read the rest
-/// of the way into the pooled buffer.
+/// of request buffers -- its first, or a later one once they are given
+/// back -- in place of the pooled read buffer it takes once one arrives. An
+/// ordinary head fits, so it moves across in one copy; a longer one is read
+/// the rest of the way into the pooled buffer.
 const idle_read_buffer_len = 1024;
 
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
@@ -249,6 +248,12 @@ pub const Connection = struct {
         self.writer.end = 0;
     }
 
+    /// Forgets the cause of a failed read that is being retried.
+    pub fn clearReadError(self: *Connection) void {
+        self.tcp_reader.err = null;
+        if (build_options.use_tls and self.tls_conn != null) self.tls_reader.err = null;
+    }
+
     /// Reads into `buffer` from now on, throwing away what the reader holds.
     pub fn replaceReadBuffer(self: *Connection, buffer: []u8) void {
         const r = self.reader;
@@ -355,6 +360,12 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// within a round trip, and the request deadline may be off.
 const linger_limit: usize = 64 * 1024;
 const linger_timeout: std.Io.Duration = .fromSeconds(1);
+
+/// How long a keep-alive connection waits for its next request with its
+/// request buffers before giving them back, as Go's net/http does. Only zio
+/// can end a read early without ending the connection; elsewhere the buffers
+/// go back as soon as the wait starts.
+const buffer_release_delay: std.Io.Duration = .fromMilliseconds(50);
 
 fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
@@ -880,23 +891,50 @@ pub fn Server(comptime Ctx: type) type {
             refused,
         };
 
+        /// Request buffers a wait gives back once `buffer_release_delay`
+        /// has passed, and how long it then goes on waiting.
+        const DelayedRelease = struct {
+            idle_read_buffer: []u8,
+            buffers: *?*RequestBuffers,
+            rest: ?std.Io.Duration,
+        };
+
         /// Waits for the first byte of a request, with nothing in flight:
         /// the drain does not wait for a connection here, and the cancel
         /// that follows it closes the socket cleanly.
-        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool) !RequestWait {
+        fn waitForRequest(
+            self: *Self,
+            connection: *Connection,
+            timer: *Timer,
+            busy: *bool,
+            delayed_release: ?DelayedRelease,
+        ) !RequestWait {
             busy.* = false;
             self.finishRequest();
 
-            connection.reader.fillMore() catch |err| switch (err) {
-                error.EndOfStream => return .peer_gone,
-                error.ReadFailed => {
-                    const e = connection.getReadError() orelse error.Unexpected;
-                    // Nothing is in flight between requests, so a peer that
-                    // went away here has cost us nothing.
-                    if (Connection.isPeerGone(e)) return .peer_gone;
-                    return e;
-                },
-            };
+            var release = delayed_release;
+            while (true) {
+                connection.reader.fillMore() catch |err| switch (err) {
+                    error.EndOfStream => return .peer_gone,
+                    error.ReadFailed => {
+                        const e = connection.getReadError() orelse error.Unexpected;
+                        // Nothing is in flight between requests, so a peer that
+                        // went away here has cost us nothing.
+                        if (Connection.isPeerGone(e)) return .peer_gone;
+                        if (comptime have_auto_cancel) if (release) |r| if (e == error.Canceled and timer.fired()) {
+                            release = null;
+                            connection.clearReadError();
+                            // A TLS record cut short by the timer is held by
+                            // the TLS layer, not in these buffers.
+                            if (connection.reader.bufferedLen() == 0) self.releaseBuffers(connection, r.idle_read_buffer, r.buffers);
+                            self.armTimer(timer, r.rest);
+                            continue;
+                        };
+                        return e;
+                    },
+                };
+                break;
+            }
 
             const was = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
             busy.* = true;
@@ -980,12 +1018,7 @@ pub fn Server(comptime Ctx: type) type {
             idle_read_buffer: []u8,
             buffers: *?*RequestBuffers,
         ) !void {
-            if (buffers.*) |b| {
-                connection.replaceReadBuffer(idle_read_buffer);
-                connection.releaseWriteBuffer();
-                self.request_buffers.release(b);
-                buffers.* = null;
-            }
+            self.releaseBuffers(connection, idle_read_buffer, buffers);
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
@@ -1001,6 +1034,15 @@ pub fn Server(comptime Ctx: type) type {
                 if (Connection.isPeerGone(cause)) return;
                 return cause;
             };
+        }
+
+        /// Throws away what the reader holds.
+        fn releaseBuffers(self: *Self, connection: *Connection, idle_read_buffer: []u8, buffers: *?*RequestBuffers) void {
+            const b = buffers.* orelse return;
+            connection.replaceReadBuffer(idle_read_buffer);
+            connection.releaseWriteBuffer();
+            self.request_buffers.release(b);
+            buffers.* = null;
         }
 
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
@@ -1136,16 +1178,26 @@ pub fn Server(comptime Ctx: type) type {
                 // request pipelined behind the last one is already here.
                 const first = request_count == 0;
                 if (connection.reader.bufferedLen() == 0) {
-                    if (!self.config.request.keep_buffers_between_requests) {
-                        if (buffers) |b| {
-                            connection.useReadBuffer(&idle_read_buffer);
-                            connection.releaseWriteBuffer();
-                            self.request_buffers.release(b);
-                            buffers = null;
+                    const keepalive = self.config.timeout.keepalive;
+                    var delayed_release: ?DelayedRelease = null;
+                    if (buffers != null and !self.config.request.keep_buffers_between_requests) {
+                        if (!have_auto_cancel) {
+                            self.releaseBuffers(connection, &idle_read_buffer, &buffers);
+                        } else if (keepalive == null or keepalive.?.nanoseconds > buffer_release_delay.nanoseconds) {
+                            delayed_release = .{
+                                .idle_read_buffer = &idle_read_buffer,
+                                .buffers = &buffers,
+                                .rest = if (keepalive) |k| .{ .nanoseconds = k.nanoseconds - buffer_release_delay.nanoseconds } else null,
+                            };
                         }
                     }
-                    self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
-                    switch (try self.waitForRequest(connection, busy)) {
+                    self.armTimer(timer, if (first)
+                        self.config.timeout.request
+                    else if (delayed_release != null)
+                        buffer_release_delay
+                    else
+                        keepalive);
+                    switch (try self.waitForRequest(connection, timer, busy, delayed_release)) {
                         .arrived => {},
                         .peer_gone => return,
                         // The request it refused was not read.

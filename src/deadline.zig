@@ -113,6 +113,12 @@ pub const Timer = if (have_auto_cancel) struct {
         self.inner.clear();
     }
 
+    /// Whether the cancel a call just failed with was this timer's, which
+    /// is then consumed rather than left pending.
+    pub fn fired(self: *@This()) bool {
+        return self.inner.check(error.Canceled);
+    }
+
     pub fn canBound(_: *const @This()) bool {
         return true;
     }
