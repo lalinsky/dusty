@@ -1194,9 +1194,11 @@ pub const Client = struct {
                 const redirect_uri = Uri.resolveInPlace(state.uri, location.len, &aux_buf) catch return error.InvalidUrl;
                 const redirect_info = try uriPortAndProtocol(redirect_uri);
 
+                if (!conn.parser.shouldKeepAlive() or self.pool.max_idle == 0) conn.closing = true;
+
                 // Drain small redirect bodies (up to 2KB) so the connection can
                 // be returned to the pool rather than closed.
-                if (!conn.parser.isBodyComplete()) {
+                if (!conn.closing and !conn.parser.isBodyComplete()) {
                     const max_drain = 2048;
                     var drain_buf: [1024]u8 = undefined;
                     // No decoding: this is throwing the body away to keep the
@@ -1210,7 +1212,6 @@ pub const Client = struct {
                     };
                     if (!conn.parser.isBodyComplete()) conn.closing = true;
                 }
-                if (!conn.parser.shouldKeepAlive()) conn.closing = true;
                 self.pool.release(conn);
                 conn_released = true;
 
