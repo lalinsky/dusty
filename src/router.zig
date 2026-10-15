@@ -69,11 +69,11 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
         };
 
-        pub const all_methods = [_]Method{ .get, .post, .put, .delete, .head, .patch, .options, .query };
-
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree
         trees: [256]?*Node,
+        // Routes registered with `any`, tried after the method's own tree
+        any_tree: ?*Node = null,
         // Global middlewares applied to all routes
         middlewares: []const Middleware(Ctx) = &.{},
 
@@ -107,19 +107,59 @@ pub fn Router(comptime Ctx: type) type {
             }
         }
 
+        const Conflict = struct {
+            method: Method,
+            method_path: []const u8,
+            any_path: []const u8,
+        };
+
+        /// The first route that registering `path` for `method`, or for
+        /// `any` when null, would conflict with.
+        fn findConflict(self: *const Self, path: []const u8, method: ?Method) ?Conflict {
+            if (method) |m| {
+                const root = self.any_tree orelse return null;
+                const other = findConflictIn(root, path, false) orelse return null;
+                return .{ .method = m, .method_path = path, .any_path = other };
+            }
+            for (self.trees, 0..) |tree, i| {
+                const root = tree orelse continue;
+                const other = findConflictIn(root, path, true) orelse continue;
+                return .{ .method = @enumFromInt(i), .method_path = other, .any_path = path };
+            }
+            return null;
+        }
+
+        fn findConflictIn(node: *const Node, path: []const u8, path_is_any: bool) ?[]const u8 {
+            if (node.route) |opaque_route| {
+                const route: *const Route = @ptrCast(@alignCast(opaque_route));
+                const other = route.info.path;
+                if (if (path_is_any) conflicts(other, path) else conflicts(path, other)) return other;
+            }
+            var child = node.static_children;
+            while (child) |c| : (child = c.next_sibling) {
+                if (findConflictIn(c, path, path_is_any)) |other| return other;
+            }
+            if (node.param_child) |c| if (findConflictIn(c, path, path_is_any)) |other| return other;
+            if (node.wildcard_child) |c| if (findConflictIn(c, path, path_is_any)) |other| return other;
+            return null;
+        }
+
         fn insertRoute(
             self: *Self,
             path: []const u8,
-            method: Method,
+            method: ?Method,
             handler: *const Handler,
             middlewares: []const Middleware(Ctx),
             data: ?*const anyopaque,
         ) !void {
-            const method_idx = @intFromEnum(method);
-            std.debug.assert(method_idx < 256);
+            if (self.findConflict(path, method)) |c| {
+                std.debug.panic("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
+            }
+
+            const slot = if (method) |m| &self.trees[@intFromEnum(m)] else &self.any_tree;
 
             // Get or create root for this method
-            if (self.trees[method_idx] == null) {
+            if (slot.* == null) {
                 const root = try self.arena.allocator().create(Node);
                 root.* = Node{
                     .segment = "",
@@ -131,10 +171,10 @@ pub fn Router(comptime Ctx: type) type {
                     .next_sibling = null,
                     .route = null,
                 };
-                self.trees[method_idx] = root;
+                slot.* = root;
             }
 
-            var current = self.trees[method_idx].?;
+            var current = slot.*.?;
 
             var iter = std.mem.splitScalar(u8, path, '/');
             while (iter.next()) |segment| {
@@ -284,7 +324,8 @@ pub fn Router(comptime Ctx: type) type {
                 // A HEAD response is the GET response without the body, so a
                 // HEAD with no route of its own is answered by the GET one.
                 // Second, so a route registered with `head` still wins.
-                if (req.method == .head) try self.matchIn(.get, req, path, segments.items, offsets.items) else null;
+                (if (req.method == .head) try self.matchIn(.get, req, path, segments.items, offsets.items) else null) orelse
+                try self.matchIn(null, req, path, segments.items, offsets.items);
             if (route) |r| {
                 req.route = &r.info;
                 return r.*;
@@ -294,13 +335,13 @@ pub fn Router(comptime Ctx: type) type {
 
         fn matchIn(
             self: *const Self,
-            method: Method,
+            method: ?Method,
             req: *Request,
             path: []const u8,
             segments: []const []const u8,
             offsets: []const usize,
         ) !?*const Route {
-            const root = self.trees[@intFromEnum(method)] orelse return null;
+            const root = (if (method) |m| self.trees[@intFromEnum(m)] else self.any_tree) orelse return null;
             const node = try matchRecursive(root, req, path, segments, offsets, 0) orelse return null;
             const opaque_route = node.route orelse return null;
             return @ptrCast(@alignCast(opaque_route));
@@ -338,10 +379,13 @@ pub fn Router(comptime Ctx: type) type {
             self.insertRoute(path, .query, handler, self.middlewares, null) catch @panic("OOM");
         }
 
+        /// Matches every method, for requests that no route of their own
+        /// method matches (or, for HEAD, of GET). A route of one method
+        /// conflicts with an `any` route when both match some path and its
+        /// own path is not more specific, and registering the second of the
+        /// two panics.
         pub fn any(self: *Self, path: []const u8, handler: Handler) void {
-            inline for (all_methods) |method| {
-                self.insertRoute(path, method, handler, self.middlewares, null) catch @panic("OOM");
-            }
+            self.insertRoute(path, null, handler, self.middlewares, null) catch @panic("OOM");
         }
 
         /// Serves the files under `dir` at `prefix`: `GET prefix/a/b.css` is
@@ -413,7 +457,7 @@ pub fn Router(comptime Ctx: type) type {
                 return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}", .{ g.prefix, path }) catch @panic("OOM");
             }
 
-            fn register(g: Group, method: Method, path: []const u8, handler: Handler) void {
+            fn register(g: Group, method: ?Method, path: []const u8, handler: Handler) void {
                 g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), null) catch @panic("OOM");
             }
 
@@ -450,9 +494,7 @@ pub fn Router(comptime Ctx: type) type {
             }
 
             pub fn any(g: Group, path: []const u8, handler: Handler) void {
-                inline for (all_methods) |method| {
-                    g.register(method, path, handler);
-                }
+                g.register(null, path, handler);
             }
 
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
@@ -495,6 +537,26 @@ pub fn Router(comptime Ctx: type) type {
             }
         }
     };
+}
+
+/// Whether some request path matches both, and `method_path` matches some
+/// path `any_path` doesn't. Segments are literals, `:param` matching one
+/// segment, and `*wildcard` matching one or more.
+fn conflicts(method_path: []const u8, any_path: []const u8) bool {
+    var it1 = std.mem.tokenizeScalar(u8, method_path, '/');
+    var it2 = std.mem.tokenizeScalar(u8, any_path, '/');
+    var more_general = false;
+    while (true) {
+        const s1 = it1.next() orelse return more_general and it2.next() == null;
+        const s2 = it2.next() orelse return false;
+        if (s1[0] == '*') return s2[0] != '*' or more_general;
+        if (s2[0] == '*') return more_general;
+        if (s1[0] == ':') {
+            if (s2[0] != ':') more_general = true;
+        } else if (s2[0] != ':' and !std.mem.eql(u8, s1, s2)) {
+            return false;
+        }
+    }
 }
 
 // Tests
@@ -681,7 +743,7 @@ test "Router: all HTTP methods" {
 
     router.any("/resource", testHandler);
 
-    for (TestRouter.all_methods) |method| {
+    for ([_]Method{ .get, .head, .post, .query, .trace, .propfind }) |method| {
         var req = Request{
             .method = method,
             .url = "/resource",
@@ -1402,7 +1464,7 @@ test "Group: any method registers all methods" {
     const api = router.group("/api", &.{});
     api.any("/resource", testHandler);
 
-    for (TestRouter.all_methods) |method| {
+    for ([_]Method{ .get, .head, .post, .query, .trace, .propfind }) |method| {
         var req = Request{
             .method = method,
             .url = "/api/resource",
@@ -1438,6 +1500,71 @@ test "Router: QUERY route" {
 
     req.method = .get;
     try std.testing.expect(try router.findHandler(&req) == null);
+}
+
+test "Router: any() comes after the method's own routes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/x", testHandler);
+    router.any("/x", testHandler2);
+    router.any("/users/:id", testHandler2);
+    router.get("/users/me", testHandler);
+
+    const cases = [_]struct { Method, []const u8, *const TestRouter.Handler }{
+        .{ .get, "/x", testHandler },
+        .{ .head, "/x", testHandler },
+        .{ .post, "/x", testHandler2 },
+        .{ .get, "/users/me", testHandler },
+        .{ .get, "/users/1", testHandler2 },
+        .{ .post, "/users/me", testHandler2 },
+    };
+    for (cases) |case| {
+        var req = Request{
+            .method = case[0],
+            .url = case[1],
+            .arena = arena.allocator(),
+            .parser = undefined,
+            .transport = undefined,
+        };
+        try std.testing.expectEqual(case[2], (try router.findHandler(&req)).?.action);
+    }
+}
+
+test "Router: a method route conflicts with a more specific any() route" {
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/users/:id", testHandler);
+    router.get("/a/:x", testHandler);
+    router.any("/b/:y", testHandler2);
+    const c1 = router.findConflict("/users/me", null).?;
+    try std.testing.expectEqualStrings("/users/:id", c1.method_path);
+
+    var router2 = TestRouter.init(std.testing.allocator);
+    defer router2.deinit();
+    router2.any("/users/me", testHandler2);
+    const c2 = router2.findConflict("/users/:id", .get).?;
+    try std.testing.expectEqualStrings("/users/me", c2.any_path);
+
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ "/x", "/x", false },
+        .{ "/users/me", "/users/:id", false },
+        .{ "/users/:id", "/users/me", true },
+        .{ "/a/:x", "/b/:y", false },
+        .{ "/:x/b", "/a/:y", true },
+        .{ "/files/*p", "/files/a", true },
+        .{ "/files/a/b", "/files/*p", false },
+        .{ "/files/*p", "/files/*q", false },
+        .{ "/files", "/files/*p", false },
+        .{ "/*", "/a/*p", true },
+        .{ "/a/*p", "/*", false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case[2], conflicts(case[0], case[1]));
+    }
 }
 
 test "Router: a GET route answers HEAD" {
