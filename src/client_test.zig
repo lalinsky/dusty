@@ -1277,6 +1277,25 @@ test "Client: a 305 with a Location is not a redirect" {
     try expectLocationNotFollowed("HTTP/1.1 305 Use Proxy", .use_proxy);
 }
 
+/// Buffers one request, headers and Content-Length body, and returns it.
+fn readWholeRequest(r: *std.Io.Reader) ![]const u8 {
+    while (true) {
+        const buf = r.buffered();
+        if (std.mem.indexOf(u8, buf, "\r\n\r\n")) |end| {
+            var len: usize = 0;
+            var lines = std.mem.splitSequence(u8, buf[0..end], "\r\n");
+            while (lines.next()) |line| {
+                const prefix = "content-length:";
+                if (line.len > prefix.len and std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) {
+                    len = try std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " "), 10);
+                }
+            }
+            if (buf.len >= end + 4 + len) return buf[0 .. end + 4 + len];
+        }
+        try r.fillMore();
+    }
+}
+
 /// A QUERY answered with `status_line` and a Location; the peer echoes the
 /// redirected request back as the body.
 fn expectQueryRedirect(comptime status_line: []const u8, expected_start: []const u8, expected_end: []const u8) !void {
@@ -1294,12 +1313,11 @@ fn expectQueryRedirect(comptime status_line: []const u8, expected_start: []const
             var rd = s.reader(_io, &rbuf);
             var wbuf: [4096]u8 = undefined;
             var w = s.writer(_io, &wbuf);
-            rd.interface.fillMore() catch return;
-            rd.interface.tossBuffered();
+            const first = readWholeRequest(&rd.interface) catch return;
+            rd.interface.toss(first.len);
             w.interface.writeAll(status_line ++ "\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n") catch return;
             w.interface.flush() catch return;
-            rd.interface.fillMore() catch return;
-            const request = rd.interface.buffered();
+            const request = readWholeRequest(&rd.interface) catch return;
             w.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ request.len, request }) catch return;
             w.interface.flush() catch return;
             rd.interface.fillMore() catch {};
