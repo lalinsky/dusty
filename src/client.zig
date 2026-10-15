@@ -1125,6 +1125,10 @@ pub const Client = struct {
             return error.Http2NotImplemented;
         }
 
+        // Whatever the proxy answers, what follows a CONNECT on the wire
+        // cannot be relied on to be the next response.
+        if (state.options.method == .connect) conn.closing = true;
+
         // Send request. On write/flush failure the connection is dead or has
         // a partially written request, so mark it closing before the errdefer
         // releases it — otherwise it gets pooled again and poisons the pool.
@@ -1157,6 +1161,7 @@ pub const Client = struct {
         // Parse response headers. Any failure leaves the connection at an
         // unknown stream position, so it must not be pooled.
         conn.parser.head_request = state.options.method == .head;
+        conn.parser.connect_request = state.options.method == .connect;
         parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
             conn.closing = true;
             switch (err) {

@@ -308,6 +308,9 @@ pub const ResponseParser = struct {
     /// The request was HEAD, so the response has no body whatever its
     /// headers say. llhttp cannot tell from the response alone.
     head_request: bool = false,
+    /// The request was CONNECT, so a 2xx response has no body: the
+    /// connection is a tunnel from the end of the head.
+    connect_request: bool = false,
 
     const State = struct {
         has_status: bool = false,
@@ -496,7 +499,8 @@ pub const ResponseParser = struct {
         // Returning 1 is how a callback normally asks llhttp to skip the
         // body, but this one has to return HPE_PAUSED, so set the flag it
         // would have set.
-        if (self.head_request) self.parser.flags |= @intCast(c.F_SKIPBODY);
+        const tunnel = self.connect_request and @intFromEnum(self.response.status) / 100 == 2;
+        if (self.head_request or tunnel) self.parser.flags |= @intCast(c.F_SKIPBODY);
 
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
