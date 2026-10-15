@@ -1277,6 +1277,54 @@ test "Client: a 305 with a Location is not a redirect" {
     try expectLocationNotFollowed("HTTP/1.1 305 Use Proxy", .use_proxy);
 }
 
+/// A QUERY answered with `status_line` and a Location; the peer echoes the
+/// redirected request back as the body.
+fn expectQueryRedirect(comptime status_line: []const u8, expected_start: []const u8, expected_end: []const u8) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(struct {
+        fn run(l: *std.Io.net.Server, _io: std.Io) void {
+            const s = l.accept(_io) catch return;
+            defer s.close(_io);
+            var rbuf: [4096]u8 = undefined;
+            var rd = s.reader(_io, &rbuf);
+            var wbuf: [4096]u8 = undefined;
+            var w = s.writer(_io, &wbuf);
+            rd.interface.fillMore() catch return;
+            rd.interface.tossBuffered();
+            w.interface.writeAll(status_line ++ "\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n") catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch return;
+            const request = rd.interface.buffered();
+            w.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ request.len, request }) catch return;
+            w.interface.flush() catch return;
+            rd.interface.fillMore() catch {};
+        }
+    }.run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    var resp = try client.fetch(url, .{ .method = .query, .body = "q=1" });
+    defer resp.deinit();
+    const echoed = (try resp.body()).?;
+    try std.testing.expectStringStartsWith(echoed, expected_start);
+    try std.testing.expectStringEndsWith(echoed, expected_end);
+    peer_future.cancel(io);
+}
+
+test "Client: QUERY keeps its method and body on 302, and becomes GET on 303" {
+    try expectQueryRedirect("HTTP/1.1 302 Found", "QUERY /next ", "\r\n\r\nq=1");
+    try expectQueryRedirect("HTTP/1.1 303 See Other", "GET /next ", "\r\n\r\n");
+}
+
 /// A peer that accepts one connection, sends `head` once the request has
 /// arrived, and then holds the connection open without another byte until
 /// canceled.
