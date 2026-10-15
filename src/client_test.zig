@@ -1524,6 +1524,83 @@ test "Server: res.compress gzips buffered and streamed bodies for a client that 
     try client_future.await(io);
 }
 
+test "Server: res.compress sends zstd to a client that prefers it" {
+    if (!build_options.use_zstd) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    const Handlers = struct {
+        const line = "the quick brown fox jumps over the lazy dog\n";
+
+        fn buffered(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var w = res.writer();
+            for (0..100) |_| try w.interface.writeAll(line);
+            try w.end();
+        }
+
+        fn streamed(_: *dusty.Request, res: *dusty.Response) !void {
+            res.compress = true;
+            var buf: [256]u8 = undefined;
+            var w = try res.stream(&buf);
+            for (0..50) |_| try w.interface.writeAll(line);
+            try w.interface.flush();
+            for (0..50) |_| try w.interface.writeAll(line);
+            try w.end();
+        }
+    };
+    server.router.get("/buffered", Handlers.buffered);
+    server.router.get("/streamed", Handlers.streamed);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn fetch(client: *dusty.Client, port: u16, path: []const u8, expected: []const u8) !void {
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path });
+            var headers = try dusty.Headers.init(std.testing.allocator, 4);
+            defer headers.deinit(std.testing.allocator);
+            try headers.put("Accept-Encoding", "gzip, deflate, br, zstd");
+
+            // The client does not decode zstd: read what came, and decode it here.
+            var response = try client.fetch(url, .{ .headers = &headers, .decompress = false });
+            defer response.deinit();
+            try std.testing.expectEqualStrings("zstd", response.headers().get("Content-Encoding").?);
+            try std.testing.expectEqualStrings("Accept-Encoding", response.headers().get("Vary").?);
+
+            var in: std.Io.Reader = .fixed((try response.body()).?);
+            const window = try std.testing.allocator.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+            defer std.testing.allocator.free(window);
+            var decompress: std.compress.zstd.Decompress = .init(&in, window, .{});
+            var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            _ = try decompress.reader.streamRemaining(&out.writer);
+            try std.testing.expectEqualStrings(expected, out.written());
+        }
+
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const port = s.address.ip.getPort();
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{});
+            defer client.deinit();
+
+            const long = repeat(Handlers.line, 100);
+            try fetch(&client, port, "/buffered", long);
+            try fetch(&client, port, "/streamed", long);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
 /// `s` repeated `n` times, for test fixtures. Zig 0.17 removed `**`.
 fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
     return comptime blk: {

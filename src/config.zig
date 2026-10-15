@@ -257,6 +257,13 @@ pub const ServerConfig = struct {
         /// buffer sends what passes through it, a file or a body written in
         /// pieces, in more, smaller records.
         write_buffer_size: usize = 16384,
+        /// How many zstd compressors the server keeps for `res.compress`,
+        /// in a build with `use_zstd`. A response to a client that prefers
+        /// zstd borrows one while it is compressed, and falls back to gzip
+        /// when they are all lent out. Each takes about 380K from the
+        /// server's allocator once it is first needed, and is kept until
+        /// the server is deinitialized. 0 sends no zstd.
+        zstd_compressors: usize = 16,
     };
 };
 

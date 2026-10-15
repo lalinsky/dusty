@@ -777,7 +777,16 @@ pub fn acceptsGzip(headers: *const Headers) bool {
 /// `acceptsGzip` for any content coding, by its registered name. `x-gzip`
 /// counts as gzip.
 pub fn acceptsEncoding(headers: *const Headers, name: []const u8) bool {
-    var wildcard = false;
+    return encodingQuality(headers, name) > 0;
+}
+
+/// How much the request's `Accept-Encoding` wants a content coding, by its
+/// registered name, in thousandths: its `q`, or that of `*` when it is not
+/// listed, and 0 when neither is. Listed without a `q` is 1000, and so is a
+/// `q` that is not a number, as the coding was still listed. `x-gzip`
+/// counts as gzip.
+pub fn encodingQuality(headers: *const Headers, name: []const u8) u16 {
+    var wildcard: u16 = 0;
     var fields = headers.iterator();
     while (fields.next()) |field| {
         if (!std.ascii.eqlIgnoreCase(field.key, "Accept-Encoding")) continue;
@@ -785,28 +794,39 @@ pub fn acceptsEncoding(headers: *const Headers, name: []const u8) bool {
         while (it.next()) |item| {
             var parts = std.mem.splitScalar(u8, item, ';');
             const coding = std.mem.trim(u8, parts.first(), " \t");
-            var accepted = true;
+            var quality: u16 = 1000;
             while (parts.next()) |part| {
                 const param = std.mem.trim(u8, part, " \t");
                 if (param.len >= 2 and (param[0] == 'q' or param[0] == 'Q') and param[1] == '=') {
-                    accepted = !isZeroQuality(std.mem.trim(u8, param[2..], " \t"));
+                    quality = parseQuality(std.mem.trim(u8, param[2..], " \t"));
                 }
             }
-            if (std.ascii.eqlIgnoreCase(coding, name)) return accepted;
-            if (std.ascii.eqlIgnoreCase(name, "gzip") and std.ascii.eqlIgnoreCase(coding, "x-gzip")) return accepted;
-            if (std.mem.eql(u8, coding, "*")) wildcard = accepted;
+            if (std.ascii.eqlIgnoreCase(coding, name)) return quality;
+            if (std.ascii.eqlIgnoreCase(name, "gzip") and std.ascii.eqlIgnoreCase(coding, "x-gzip")) return quality;
+            if (std.mem.eql(u8, coding, "*")) wildcard = quality;
         }
     }
     return wildcard;
 }
 
-/// "0", "0.", "0.0" up to "0.000".
-fn isZeroQuality(value: []const u8) bool {
-    if (value.len == 0 or value[0] != '0') return false;
-    if (value.len == 1) return true;
-    if (value[1] != '.') return false;
-    for (value[2..]) |ch| if (ch != '0') return false;
-    return true;
+/// A `qvalue` (RFC 9110 §12.4.2), "0" to "1.000", in thousandths.
+fn parseQuality(value: []const u8) u16 {
+    if (value.len == 0 or value.len > 5) return 1000;
+    const whole: u16 = switch (value[0]) {
+        '0' => 0,
+        '1' => 1000,
+        else => return 1000,
+    };
+    if (value.len == 1) return whole;
+    if (value[1] != '.') return 1000;
+    var quality = whole;
+    var scale: u16 = 100;
+    for (value[2..]) |ch| {
+        if (ch < '0' or ch > '9') return 1000;
+        quality += (ch - '0') * scale;
+        scale /= 10;
+    }
+    return @min(quality, 1000);
 }
 
 fn testAcceptsGzip(values: []const []const u8) !bool {
@@ -835,6 +855,19 @@ test "acceptsGzip" {
     try std.testing.expect(try testAcceptsGzip(&.{ "br", "gzip" }));
     try std.testing.expect(!try testAcceptsGzip(&.{ "*", "gzip;q=0" }));
     try std.testing.expect(!try testAcceptsGzip(&.{}));
+}
+
+test "encodingQuality" {
+    var headers = try Headers.init(std.testing.allocator, 4);
+    defer headers.deinit(std.testing.allocator);
+    try headers.add("Accept-Encoding", "gzip;q=0.8, zstd, br;q=0.25");
+    try headers.add("Accept-Encoding", "*;q=0.1, deflate;q=1.000, identity;q=0.");
+    try std.testing.expectEqual(800, encodingQuality(&headers, "gzip"));
+    try std.testing.expectEqual(1000, encodingQuality(&headers, "zstd"));
+    try std.testing.expectEqual(250, encodingQuality(&headers, "br"));
+    try std.testing.expectEqual(1000, encodingQuality(&headers, "deflate"));
+    try std.testing.expectEqual(0, encodingQuality(&headers, "identity"));
+    try std.testing.expectEqual(100, encodingQuality(&headers, "compress"));
 }
 
 test "ContentEncoding: fromString" {

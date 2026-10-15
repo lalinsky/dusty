@@ -9,7 +9,7 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 - Supports HTTP/1.0 and HTTP/1.1
 - Supports chunked transfer encoding in both request/response bodies
 - Transparent gzip/deflate decoding of request and response bodies
-- gzip compression of response bodies, opt-in per response with `res.compress = true`
+- gzip compression of response bodies, opt-in per response with `res.compress = true`, and zstd for clients that prefer it in a build with `-Duse_zstd=true`
 - Server-Sent Events (SSE) for streaming responses
 - Static file serving with conditional and range requests, and precompressed files
 - Assets embedded in the binary at build time, with cache-busting URLs

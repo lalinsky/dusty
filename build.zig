@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const use_zstd = b.option(bool, "use_zstd", "Build with zstd response compression via zstd.zig") orelse false;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -26,6 +27,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
     build_options.addOption(bool, "use_zlib", use_zlib);
+    build_options.addOption(bool, "use_zstd", use_zstd);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -71,6 +73,21 @@ pub fn build(b: *std.Build) void {
     } else {
         mod.addAnonymousImport("zlib", .{
             .root_source_file = b.path("src/zlib_stub.zig"),
+        });
+    }
+
+    // zstd response compression, the same way: a lazy dependency, and a
+    // stub when `use_zstd` is off, which it is by default.
+    if (use_zstd) {
+        if (b.lazyDependency("zstd", .{
+            .target = target,
+            .optimize = optimize,
+        })) |zstd_dep| {
+            mod.addImport("zstd", zstd_dep.module("zstd"));
+        }
+    } else {
+        mod.addAnonymousImport("zstd", .{
+            .root_source_file = b.path("src/zstd_stub.zig"),
         });
     }
 

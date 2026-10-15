@@ -14,6 +14,7 @@ const ServerConfig = @import("config.zig").ServerConfig;
 const default_listeners = @import("config.zig").default_listeners;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
+const ZstdPool = @import("server/zstd_pool.zig").ZstdPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
@@ -405,6 +406,7 @@ pub fn Server(comptime Ctx: type) type {
         ready: std.Io.Event,
         _middleware_registry: std.SinglyLinkedList,
         request_buffers: RequestBuffersPool,
+        zstd_compressors: ZstdPool,
 
         /// A listener while `run` serves it: the socket, and the TLS
         /// material every connection accepted on it shares.
@@ -464,6 +466,7 @@ pub fn Server(comptime Ctx: type) type {
                 .ready = .unset,
                 ._middleware_registry = .{},
                 .request_buffers = .init(allocator, io, config.request.buffer_size + body_read_reserve, config.response.write_buffer_size, request_arena_reserve),
+                .zstd_compressors = .init(allocator, io, config.response.zstd_compressors),
             };
         }
 
@@ -477,6 +480,7 @@ pub fn Server(comptime Ctx: type) type {
             }
             self.router.deinit();
             self.request_buffers.deinit();
+            self.zstd_compressors.deinit();
         }
 
         /// Creates a middleware instance managed by the server.
@@ -1195,6 +1199,7 @@ pub fn Server(comptime Ctx: type) type {
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
                 response.request = &request;
+                if (build_options.use_zstd and self.zstd_compressors.limit > 0) response.zstd_compressors = &self.zstd_compressors;
                 request.response = &response;
 
                 // Handle Expect header (100-continue)

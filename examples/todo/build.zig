@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     const run_step = b.step("run", "Run the server");
     run_step.dependOn(&run.step);
 }

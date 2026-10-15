@@ -42,6 +42,10 @@
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
             .lazy = true,
         },
+        .zstd = .{
+            .path = "../zstd.zig",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
