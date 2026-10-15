@@ -1343,6 +1343,65 @@ test "Client: QUERY keeps its method and body on 302, and becomes GET on 303" {
     try expectQueryRedirect("HTTP/1.1 303 See Other", "GET /next ", "\r\n\r\n");
 }
 
+/// Reads the request head, answers with `response` unless it is empty, and
+/// closes with the body unread, which resets the connection under the
+/// client's write.
+fn rejectingPeer(listener: *std.Io.net.Server, io: std.Io, response: []const u8) void {
+    const s = listener.accept(io) catch return;
+    defer s.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rd = s.reader(io, &rbuf);
+    var w = s.writer(io, &.{});
+    while (std.mem.indexOf(u8, rd.interface.buffered(), "\r\n\r\n") == null) {
+        rd.interface.fillMore() catch return;
+    }
+    w.interface.writeAll(response) catch return;
+}
+
+fn fetchRejected(client: *dusty.Client, response: []const u8) !dusty.ClientResponse {
+    const io = client.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    var peer_future = try io.concurrent(rejectingPeer, .{ &listener, io, response });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+
+    // Well past what the socket buffers on both ends can take in.
+    const body = try std.testing.allocator.alloc(u8, 16 << 20);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'x');
+
+    return client.fetch(url, .{ .method = .post, .body = body });
+}
+
+test "Client: a response sent while the request body is still going out is returned" {
+    // Windows drops what was received once the connection is reset.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var client = dusty.Client.init(std.testing.allocator, std.testing.io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try fetchRejected(&client, "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntoo much");
+        defer resp.deinit();
+        try std.testing.expectEqual(.payload_too_large, resp.status());
+        try std.testing.expectEqualStrings("too much", (try resp.body()).?);
+    }
+    try std.testing.expectEqual(0, client.pool.idle_len);
+
+    // No answer: the write error, not the read that found nothing.
+    if (fetchRejected(&client, "")) |r| {
+        var unexpected = r;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.ConnectionResetByPeer, error.SocketUnconnected => {},
+        else => return err,
+    }
+}
+
 /// A peer that accepts one connection, sends `head` once the request has
 /// arrived, and then holds the connection open without another byte until
 /// canceled.
