@@ -1215,8 +1215,9 @@ pub fn Server(comptime Ctx: type) type {
                     }
                 }
 
-                // Check if the connection allows keepalive
-                if (!parser.shouldKeepAlive()) {
+                // llhttp ends a CONNECT at its head, Content-Length or not,
+                // so whatever follows is not a request.
+                if (!parser.shouldKeepAlive() or request.method == .connect) {
                     response.keepalive = false;
                 }
 
