@@ -1105,6 +1105,61 @@ test "Client: HEAD response with Content-Encoding has no body to decode" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
 }
 
+/// Answers the first connection keep-alive and closes it without reading
+/// another request, then answers "fresh" on the next connection.
+fn closeIdlePeer(l: *std.Io.net.Server, io: std.Io) void {
+    const responses = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfresh",
+    };
+    for (responses) |response| {
+        const s = l.accept(io) catch return;
+        defer s.close(io);
+        var rbuf: [4096]u8 = undefined;
+        var rd = s.reader(io, &rbuf);
+        var wbuf: [256]u8 = undefined;
+        var w = s.writer(io, &wbuf);
+        rd.interface.fillMore() catch return;
+        w.interface.writeAll(response) catch return;
+        w.interface.flush() catch return;
+    }
+}
+
+test "Client: a stale pooled connection is retried for GET, not for POST" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    for ([_]dusty.Method{ .get, .post }) |method| {
+        var peer_future = try io.concurrent(closeIdlePeer, .{ &listener, io });
+        defer peer_future.cancel(io);
+        // On the second pass this is retried too: the peer closed "fresh".
+        {
+            var resp = try client.fetch(url, .{});
+            defer resp.deinit();
+            try std.testing.expectEqualStrings("first", (try resp.body()).?);
+        }
+        try std.testing.expectEqual(1, client.pool.idle_len);
+
+        if (client.fetch(url, .{ .method = method, .body = "x" })) |r| {
+            var resp = r;
+            defer resp.deinit();
+            try std.testing.expectEqual(.get, method);
+            try std.testing.expectEqualStrings("fresh", (try resp.body()).?);
+        } else |err| {
+            try std.testing.expectEqual(.post, method);
+            if (err == error.Canceled or err == error.Timeout) return err;
+        }
+    }
+}
+
 test "Client: a 2xx CONNECT response has no body and its connection is not pooled" {
     const io = std.testing.io;
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
