@@ -69,7 +69,7 @@ pub fn Router(comptime Ctx: type) type {
             middlewares: []const Middleware(Ctx),
         };
 
-        pub const all_methods = [_]Method{ .get, .post, .put, .delete, .head, .patch, .options };
+        pub const all_methods = [_]Method{ .get, .post, .put, .delete, .head, .patch, .options, .query };
 
         arena: std.heap.ArenaAllocator,
         // Each HTTP method has its own radix tree
@@ -334,6 +334,10 @@ pub fn Router(comptime Ctx: type) type {
             self.insertRoute(path, .options, handler, self.middlewares, null) catch @panic("OOM");
         }
 
+        pub fn query(self: *Self, path: []const u8, handler: Handler) void {
+            self.insertRoute(path, .query, handler, self.middlewares, null) catch @panic("OOM");
+        }
+
         pub fn any(self: *Self, path: []const u8, handler: Handler) void {
             inline for (all_methods) |method| {
                 self.insertRoute(path, method, handler, self.middlewares, null) catch @panic("OOM");
@@ -439,6 +443,10 @@ pub fn Router(comptime Ctx: type) type {
 
             pub fn options(g: Group, path: []const u8, handler: Handler) void {
                 g.register(.options, path, handler);
+            }
+
+            pub fn query(g: Group, path: []const u8, handler: Handler) void {
+                g.register(.query, path, handler);
             }
 
             pub fn any(g: Group, path: []const u8, handler: Handler) void {
@@ -1405,6 +1413,31 @@ test "Group: any method registers all methods" {
         const route = try router.findHandler(&req);
         try std.testing.expect(route != null);
     }
+}
+
+test "Router: QUERY route" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.query("/search", testHandler);
+    router.group("/api", &.{}).query("/search", testHandler2);
+
+    var req = Request{
+        .method = .query,
+        .url = "/search",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+    req.url = "/api/search";
+    try std.testing.expectEqual(&testHandler2, (try router.findHandler(&req)).?.action);
+
+    req.method = .get;
+    try std.testing.expect(try router.findHandler(&req) == null);
 }
 
 test "Router: a GET route answers HEAD" {
