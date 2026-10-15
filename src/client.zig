@@ -5,6 +5,10 @@ const build_options = @import("build_options");
 
 const unix_path_max = 108;
 
+/// How long a request that failed to go out waits for the server's answer
+/// anyway.
+const early_response_wait: std.Io.Duration = .fromMilliseconds(50);
+
 const config_mod = @import("config.zig");
 const body_read_reserve = config_mod.body_read_reserve;
 
@@ -651,6 +655,13 @@ pub const Connection = struct {
         };
     }
 
+    fn parseHead(self: *Connection) !void {
+        parseResponseHeaders(self.reader, &self.parser) catch |err| switch (err) {
+            error.ReadFailed => return self.getReadError() orelse error.Unexpected,
+            else => |e| return e,
+        };
+    }
+
     pub fn host(self: *const Connection) []const u8 {
         return self.host_buffer[0..self.host_len];
     }
@@ -1129,9 +1140,13 @@ pub const Client = struct {
         // cannot be relied on to be the next response.
         if (state.options.method == .connect) conn.closing = true;
 
+        conn.parser.head_request = state.options.method == .head;
+        conn.parser.connect_request = state.options.method == .connect;
+
         // Send request. On write/flush failure the connection is dead or has
         // a partially written request, so mark it closing before the errdefer
         // releases it — otherwise it gets pooled again and poisons the pool.
+        var write_err: ?Connection.WriteError = null;
         writeRequest(conn.writer, .{
             .method = state.options.method,
             .uri = state.uri,
@@ -1148,27 +1163,34 @@ pub const Client = struct {
         }) catch |err| {
             conn.closing = true;
             switch (err) {
-                error.WriteFailed => return conn.getWriteError() orelse error.Unexpected,
+                error.WriteFailed => write_err = conn.getWriteError() orelse error.Unexpected,
                 else => |e| return e,
             }
         };
 
-        conn.flush() catch |err| {
+        if (write_err == null) conn.flush() catch |err| {
             conn.closing = true;
-            return err;
+            write_err = err;
         };
 
-        // Parse response headers. Any failure leaves the connection at an
-        // unknown stream position, so it must not be pooled.
-        conn.parser.head_request = state.options.method == .head;
-        conn.parser.connect_request = state.options.method == .connect;
-        parseResponseHeaders(conn.reader, &conn.parser) catch |err| {
-            conn.closing = true;
-            switch (err) {
-                error.ReadFailed => return conn.getReadError() orelse error.Unexpected,
-                else => |e| return e,
-            }
-        };
+        if (write_err) |err| {
+            if (err == error.Canceled) return err;
+            // A server that rejects the request (413, 401, ...) may answer
+            // and close before reading all of it. The fetch's own deadline
+            // still applies on top of this one.
+            const early: Deadline = .init(self.io, .{ .duration = .{ .raw = early_response_wait, .clock = .awake } });
+            early.run(Connection.parseHead, .{conn}) catch |read_err| switch (read_err) {
+                error.Canceled => return error.Canceled,
+                else => return err,
+            };
+        } else {
+            // Any failure leaves the connection at an unknown stream
+            // position, so it must not be pooled.
+            conn.parseHead() catch |err| {
+                conn.closing = true;
+                return err;
+            };
+        }
 
         // From here on an error leaves the body where it is, and the
         // errdefer above pools the connection. A body still on the wire
