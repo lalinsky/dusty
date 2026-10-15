@@ -323,6 +323,9 @@ pub const ResponseParser = struct {
 
         headers_complete: bool = false,
         message_complete: bool = false,
+        // Set by a failed `feed` or `finish`. llhttp keeps no record of an
+        // end-of-stream the message was not ready for.
+        failed: bool = false,
 
         // Body reading state
         body_dest_buf: []u8 = &.{}, // Where onBody should copy to
@@ -380,11 +383,17 @@ pub const ResponseParser = struct {
             return error.Paused;
         }
 
+        self.state.failed = true;
         return mapError(err);
     }
 
     pub fn finish(self: *ResponseParser) FinishError!void {
+        errdefer self.state.failed = true;
         return finishParser(&self.parser);
+    }
+
+    pub fn hasFailed(self: *const ResponseParser) bool {
+        return self.state.failed;
     }
 
     pub fn shouldKeepAlive(self: *ResponseParser) bool {
