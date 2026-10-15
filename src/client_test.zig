@@ -307,7 +307,7 @@ test "Client: redirect failing after connection release does not double-release"
     try std.testing.expectEqual(1, client.pool.idle_len);
 }
 
-test "Client: connection with unread response body is not pooled" {
+test "Client: a connection with an unread response body is drained and reused" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
@@ -336,26 +336,60 @@ test "Client: connection with unread response body is not pooled" {
     var client = dusty.Client.init(std.testing.allocator, io, .{});
     defer client.deinit();
 
-    // Deinit the response without reading the body: the connection sits at
-    // an unknown stream position and must be closed, not pooled, or the
-    // next request on it would read leftover body bytes as its response.
     {
         var response = try client.fetch(url, .{ .stream = true });
         defer response.deinit();
 
         try std.testing.expectEqual(.ok, response.status());
     }
-    try std.testing.expectEqual(0, client.pool.idle_len);
+    try client.pool.drains.await(io);
+    try std.testing.expectEqual(1, client.pool.idle_len);
 
-    // A fully read response is still pooled as usual.
+    // Reused rather than joined by a second connection.
     {
         var response = try client.fetch(url, .{});
         defer response.deinit();
 
-        try std.testing.expectEqual(.ok, response.status());
-        _ = try response.body();
+        try std.testing.expectEqualStrings("some response body", (try response.body()).?);
     }
     try std.testing.expectEqual(1, client.pool.idle_len);
+}
+
+test "Client: an unread body that is too long or stalls is not drained into the pool" {
+    const io = std.testing.io;
+    const long_head = "HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n";
+    const long = try std.testing.allocator.alloc(u8, long_head.len + 300000);
+    defer std.testing.allocator.free(long);
+    @memcpy(long[0..long_head.len], long_head);
+    @memset(long[long_head.len..], 'x');
+
+    const heads = [_][]const u8{ long, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial" };
+    for (heads) |head| {
+        var peer: StallingServer = undefined;
+        try peer.start(io, head);
+        defer peer.stop(io);
+
+        var client = dusty.Client.init(std.testing.allocator, io, .{});
+        defer client.deinit();
+        {
+            var response = try client.fetch(try peer.url(), .{ .stream = true });
+            defer response.deinit();
+        }
+        try client.pool.drains.await(io);
+        try std.testing.expectEqual(0, client.pool.idle_len);
+    }
+}
+
+test "Client: deinit cancels a drain still in progress" {
+    const io = std.testing.io;
+    var peer: StallingServer = undefined;
+    try peer.start(io, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial");
+    defer peer.stop(io);
+
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+    var response = try client.fetch(try peer.url(), .{ .stream = true });
+    response.deinit();
 }
 
 test "Client: pool survives concurrent fetches on a shared client" {

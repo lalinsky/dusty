@@ -278,6 +278,10 @@ fn uriPath(uri: Uri) []const u8 {
 /// connection does suspend, so that always happens after the lock has been
 /// dropped. `init`/`deinit` are not part of that contract — they must not run
 /// concurrently with `acquire`/`release`.
+///
+/// A connection released with its response body unread is handed to a task
+/// in `drains`, which discards the rest of the body and then releases it.
+/// `deinit` cancels those tasks, so they close their connections instead.
 pub const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -285,6 +289,12 @@ pub const ConnectionPool = struct {
     idle: std.DoublyLinkedList,
     idle_len: usize,
     max_idle: u8,
+    drains: std.Io.Group = .init,
+
+    /// Bounds on the unread body a background drain discards to keep a
+    /// connection, the same as Go's net/http.
+    const drain_max_bytes = 256 << 10;
+    const drain_timeout: std.Io.Duration = .fromMilliseconds(50);
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, max_idle: u8) ConnectionPool {
         return .{
@@ -298,6 +308,10 @@ pub const ConnectionPool = struct {
     }
 
     pub fn deinit(self: *ConnectionPool) void {
+        // A drain that completes during the cancel releases its connection
+        // into `idle`; a canceled one closes its own.
+        self.drains.cancel(self.io);
+
         // Close and free all idle connections
         while (self.idle.popFirst()) |node| {
             const conn: *Connection = @alignCast(@fieldParentPtr("pool_node", node));
@@ -391,6 +405,36 @@ pub const ConnectionPool = struct {
             old.deinit();
             self.allocator.destroy(old);
         }
+    }
+
+    /// Hands `conn` to a background drain, or returns false if no task
+    /// could be had for it, in which case the caller still owns it.
+    fn startDrain(self: *ConnectionPool, conn: *Connection) bool {
+        self.drains.concurrent(self.io, drain, .{ self, conn }) catch return false;
+        return true;
+    }
+
+    fn drain(self: *ConnectionPool, conn: *Connection) std.Io.Cancelable!void {
+        defer self.release(conn);
+        const deadline: Deadline = .init(self.io, .{ .duration = .{ .raw = drain_timeout, .clock = .awake } });
+        const complete = deadline.run(discardBody, .{conn}) catch |err| switch (err) {
+            error.Canceled => {
+                conn.closing = true;
+                return error.Canceled;
+            },
+            else => false,
+        };
+        if (!complete) conn.closing = true;
+    }
+
+    /// No decoding: the body is being thrown away to keep the connection.
+    fn discardBody(conn: *Connection) ResponseBodyReader.Error!bool {
+        var buf: [1024]u8 = undefined;
+        var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &buf);
+        _ = body_reader.interface.discardShort(drain_max_bytes + 1) catch |err| switch (err) {
+            error.ReadFailed => return body_reader.err orelse error.Unexpected,
+        };
+        return conn.parser.isBodyComplete();
     }
 };
 
@@ -681,13 +725,9 @@ pub const Connection = struct {
     }
 
     /// Release this connection back to its pool, handling keep-alive logic.
+    /// A response body that wasn't fully read is drained in the background
+    /// when it is small enough, and the connection closed otherwise.
     pub fn release(self: *Connection) void {
-        // A response body that wasn't fully read leaves the connection at an
-        // unknown stream position, so it must not be reused.
-        if (!self.parser.isBodyComplete()) {
-            self.closing = true;
-        }
-
         // Increment request count
         self.request_count +|= 1;
 
@@ -713,6 +753,17 @@ pub const Connection = struct {
                     self.closing = true;
                 }
             }
+        }
+
+        // The parser is always at the body's position on the wire, whatever
+        // was read through a decoder: what the decoder holds was already
+        // counted. A failed read leaves no such guarantee.
+        if (!self.parser.isBodyComplete()) {
+            const drainable = !self.closing and self.pool.max_idle != 0 and
+                !self.parser.hasFailed() and self.getReadError() == null and
+                (self.parsed_response.content_length orelse 0) <= ConnectionPool.drain_max_bytes;
+            if (drainable and self.pool.startDrain(self)) return;
+            self.closing = true;
         }
 
         self.pool.release(self);
@@ -883,8 +934,9 @@ pub const ClientResponse = struct {
 /// `init`/`deinit` are not part of that contract — they must not run
 /// concurrently with requests.
 ///
-/// Parallel requests allocate and free concurrently, so `allocator` must be
-/// thread-safe when the client is shared that way.
+/// Connections are freed and reset from background tasks as well as from
+/// requests, so `allocator` must be thread-safe whenever `io` runs tasks in
+/// parallel.
 pub const Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
