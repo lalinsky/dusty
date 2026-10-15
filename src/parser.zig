@@ -720,12 +720,17 @@ pub fn BodyReader(comptime Parser: type) type {
             // Send 100 Continue on first body read if client expects it
             if (self.request) |req| {
                 if (req.expects_continue) {
-                    req.expects_continue = false;
                     if (req.response) |res| {
-                        // A write, on a read: the caller asked for the body
-                        // and this is what unblocks the peer from sending it.
-                        sendContinue(res.conn.writer) catch
-                            return self.fail(self.transport.getWriteError() orelse error.Unexpected);
+                        // A final response has started, and 100 can no
+                        // longer precede it. The peer may still be holding
+                        // the body, so the flag stays.
+                        if (!res.headers_written) {
+                            req.expects_continue = false;
+                            // A write, on a read: the caller asked for the body
+                            // and this is what unblocks the peer from sending it.
+                            sendContinue(res.conn.writer) catch
+                                return self.fail(self.transport.getWriteError() orelse error.Unexpected);
+                        }
                     }
                 }
             }

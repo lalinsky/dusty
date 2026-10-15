@@ -678,6 +678,53 @@ test "Server: 100-continue" {
     try client_future.await(io);
 }
 
+test "Server: no 100 Continue once the response has started" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.post("/upload", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [64]u8 = undefined;
+            var body = try res.stream(&buf);
+            try body.interface.writeAll("first;");
+            try body.interface.flush();
+            try body.interface.writeAll((try req.body()) orelse "");
+            try body.end();
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("POST /upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\nhello");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var out: [1024]u8 = undefined;
+    var out_writer = std.Io.Writer.fixed(&out);
+    _ = try reader.interface.streamRemaining(&out_writer);
+    const response = out_writer.buffered();
+
+    try std.testing.expectStringStartsWith(response, "HTTP/1.1 200 ");
+    try std.testing.expect(std.mem.indexOf(u8, response, "100 Continue") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "first;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "hello") != null);
+}
+
 fn readResponse(r: *std.Io.Reader, status_buf: []u8, body_buf: []u8) !struct { status: []const u8, body: []const u8 } {
     const status_line = try r.takeDelimiterExclusive('\n');
     const status_len = @min(status_line.len, status_buf.len);

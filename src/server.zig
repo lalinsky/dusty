@@ -1204,7 +1204,8 @@ pub fn Server(comptime Ctx: type) type {
                 // Handle Expect header (100-continue)
                 if (request.headers.get("Expect")) |expect| {
                     if (std.ascii.eqlIgnoreCase(expect, "100-continue")) {
-                        request.expects_continue = true;
+                        // RFC 9110 10.1.1: ignored in an HTTP/1.0 request.
+                        request.expects_continue = !response.http10;
                     } else {
                         // Unknown Expect value - return 417
                         response.status = .expectation_failed;
@@ -1256,8 +1257,8 @@ pub fn Server(comptime Ctx: type) type {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {
                         // The peer is holding the body until it hears 100
-                        // Continue, and nothing asked for it. There is
-                        // nothing to drain, and a read would wait for it. A
+                        // Continue, which was never sent. There is nothing
+                        // to drain, and a read would wait for it. A
                         // peer that sent the body anyway is not waiting, and
                         // its body is drained like any other.
                         if (request.expects_continue and connection.reader.bufferedLen() == 0) break :blk false;
