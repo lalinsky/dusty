@@ -1071,6 +1071,31 @@ test "Client: HEAD response with Content-Encoding has no body to decode" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
 }
 
+test "Client: a 2xx CONNECT response has no body and its connection is not pooled" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer("HTTP/1.1 200 OK\r\n\r\n", "").run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{ .method = .connect });
+        defer resp.deinit();
+        try std.testing.expectEqual(.ok, resp.status());
+        try std.testing.expectEqual(null, try resp.body());
+    }
+    try std.testing.expectEqual(0, client.pool.idle_len);
+    peer_future.cancel(io);
+}
+
 // The exchange in #159: a server that sends Early Hints ahead of the real
 // response, and then answers a second request on the same connection.
 // That second answer is what shows the first one left nothing behind.
