@@ -89,7 +89,7 @@ pub fn Executor(comptime Ctx: type) type {
                     // fault, so it is neither a 500 nor worth an error log.
                     // The connection is asked, not the error: a handler
                     // can return an `EndOfStream` of its own.
-                    if (self.res.conn.peerGone()) return err;
+                    if (self.res.peerGone()) return err;
                     if (self.res.headers_written) {
                         // The response already started (e.g. streaming/chunked
                         // body or a WebSocket upgrade), so headers were sent

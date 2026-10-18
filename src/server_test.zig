@@ -2861,3 +2861,75 @@ test "Server: an idle keepalive connection is cut off by timeout.keepalive" {
     try std.testing.expect(elapsed >= 100);
     try std.testing.expect(elapsed < 3000);
 }
+
+test "Server.dispatch: a request over a sink is routed through the middleware to its handler" {
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{}, {});
+    defer server.deinit();
+    server.router.get("/users/:id", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.print(.text, "user {s}", .{req.params.get("id").?});
+            try res.trailer("x-done", "yes");
+        }
+    }.handle);
+
+    const Capture = struct {
+        status: ?dusty.Status = null,
+        ended: bool = false,
+        trailer: []const u8 = "",
+        buf: [64]u8 = undefined,
+        w: std.Io.Writer = undefined,
+        fn sink(self: *@This()) dusty.Sink {
+            return .{ .ptr = self, .vtable = &.{
+                .head = head,
+                .interim = interim,
+                .body = body,
+                .end = end,
+                .writeError = writeError,
+                .peerGone = peerGone,
+            } };
+        }
+        fn head(ptr: *anyopaque, status: dusty.Status, _: *const dusty.Headers, _: ?usize) std.Io.Writer.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.status = status;
+        }
+        fn interim(_: *anyopaque, _: dusty.Status) std.Io.Writer.Error!void {}
+        fn body(ptr: *anyopaque) *std.Io.Writer {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return &self.w;
+        }
+        fn end(ptr: *anyopaque, trailers: ?*const dusty.Headers) std.Io.Writer.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ended = true;
+            if (trailers) |t| self.trailer = t.get("x-done") orelse "";
+        }
+        fn writeError(_: *anyopaque) ?dusty.Response.SendError {
+            return null;
+        }
+        fn peerGone(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var cap: Capture = .{};
+    cap.w = .fixed(&cap.buf);
+
+    var req: dusty.Request = .{ .arena = arena, .io = io, .parser = undefined, .transport = undefined };
+    req.headers = try dusty.Headers.init(arena, 8);
+    req.method = .get;
+    req.url = "/users/42";
+    var res = try dusty.Response.initSink(arena, io, cap.sink(), 16);
+    req.response = &res;
+    res.request = &req;
+
+    try server.dispatch(&req, &res);
+    try res.write();
+
+    try std.testing.expectEqual(dusty.Status.ok, cap.status.?);
+    try std.testing.expectEqualStrings("user 42", cap.w.buffered());
+    try std.testing.expect(cap.ended);
+    try std.testing.expectEqualStrings("yes", cap.trailer);
+}
