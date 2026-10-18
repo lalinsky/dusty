@@ -190,6 +190,7 @@ pub const Connection = struct {
         stream: std.Io.net.Stream,
         auth: *tls.config.CertKeyPair,
         client_auth: ?ClientAuthRef,
+        alpn_protocols: []const []const u8,
     ) !void {
         try self.init(allocator, io, stream, tls.input_buffer_len + tls.output_buffer_len);
 
@@ -213,6 +214,7 @@ pub const Connection = struct {
             } else null,
             .now = std.Io.Clock.real.now(io),
             .rng = self.tls_rng.interface(),
+            .alpn_protocols = alpn_protocols,
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
         self.tls_writer = self.tls_conn.?.writer(&.{});
@@ -295,6 +297,14 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         self.allocator.free(self.buffers);
+    }
+
+    /// The protocol the client and server agreed on through ALPN, or null
+    /// for a plain connection or a TLS one that negotiated none. Points into
+    /// `ServerConfig.Tls.alpn_protocols`.
+    pub fn negotiatedProtocol(self: *const Connection) ?[]const u8 {
+        if (!build_options.use_tls) return null;
+        return if (self.tls_conn) |c| c.alpn_protocol else null;
     }
 
     /// A borrowed view of the layers above, for the parts of the library
@@ -1040,7 +1050,7 @@ pub fn Server(comptime Ctx: type) type {
                             .mode = l.client_auth_mode,
                         } else null;
 
-                        connection.initTls(self.allocator, self.io, stream, auth, client_auth) catch |err| {
+                        connection.initTls(self.allocator, self.io, stream, auth, client_auth, l.config.tls.?.alpn_protocols) catch |err| {
                             // tls.zig only saw the ciphertext reader or
                             // writer fail generically, so the cause is a
                             // layer down -- and when the handshake ran out

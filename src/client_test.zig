@@ -716,6 +716,57 @@ test "Client: HTTPS with a custom CA file" {
     try client_future.await(io);
 }
 
+test "Server: tls.alpn_protocols is offered to the client through ALPN" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const tls = @import("tls");
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{
+            .cert_path = test_cert_path,
+            .key_path = test_key_path,
+            .alpn_protocols = &.{"http/1.1"},
+        } }},
+    }, {});
+    defer server.deinit();
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+            const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
+            var bundle = try ca.load(std.testing.allocator, _io);
+            defer bundle.deinit(std.testing.allocator);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+            var read_buf: [tls.input_buffer_len]u8 = undefined;
+            var write_buf: [tls.output_buffer_len]u8 = undefined;
+            var tcp_reader = stream.reader(_io, &read_buf);
+            var tcp_writer = stream.writer(_io, &write_buf);
+            var rng: std.Random.IoSource = .{ .io = _io };
+
+            // The client prefers h2; the server only lists http/1.1.
+            const conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+                .host = "localhost",
+                .root_ca = bundle,
+                .now = std.Io.Clock.real.now(_io),
+                .rng = rng.interface(),
+                .alpn_protocols = &.{ "h2", "http/1.1" },
+            });
+            try std.testing.expectEqualStrings("http/1.1", conn.alpn_protocol orelse return error.NoAlpn);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
 test "Client: presents a client certificate for mutual TLS" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;

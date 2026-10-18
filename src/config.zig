@@ -170,6 +170,11 @@ pub const ServerConfig = struct {
         /// Ask connecting clients to authenticate with a certificate (mutual
         /// TLS). Null means client certificates are never requested.
         client_auth: ?ClientAuth = null,
+        /// Protocols offered through ALPN, in server preference order, for
+        /// example `&.{ "h2", "http/1.1" }`. Empty means no ALPN; a client
+        /// whose offer shares nothing with a non-empty list is handled by the
+        /// TLS module (tls.zig refuses it).
+        alpn_protocols: []const []const u8 = &.{},
 
         pub const ClientAuth = struct {
             /// Certificate authorities used to verify client certificates.
