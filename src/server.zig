@@ -1056,8 +1056,16 @@ pub fn Server(comptime Ctx: type) type {
                             }
                             if (Connection.isPeerGone(cause)) {
                                 log.debug("TLS handshake abandoned by peer: {}", .{cause});
-                            } else {
+                            } else if (cause == error.OutOfMemory) {
                                 log.err("TLS handshake failed: {}", .{cause});
+                            } else {
+                                // Anyone who can reach the port can fail a
+                                // handshake at will (a scanner, a client that
+                                // rejects the certificate or sends none), so
+                                // this is not the server's error and must not
+                                // flood the error log (nginx logs these at
+                                // info too).
+                                log.info("TLS handshake failed: {}", .{cause});
                             }
                             return;
                         };
