@@ -100,6 +100,9 @@ can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 },
 ```
 
+A TLS listener offers protocols through ALPN when given a list in preference
+order, for example `.tls = .{ ..., .alpn_protocols = &.{"http/1.1"} }`.
+
 When `listeners` is omitted or empty, the server listens on `127.0.0.1:8080`.
 
 A handler can tell them apart through `req.listener` and `req.secure`, and

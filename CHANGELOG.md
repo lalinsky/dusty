@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
+- Added `ServerConfig.Tls.alpn_protocols`, the protocols a TLS listener
+  offers through ALPN in preference order, and the server
+  `Connection.negotiatedProtocol()` that reports the agreed one.
 - A failed TLS handshake is now logged at info instead of err (only
   `OutOfMemory` stays at err). Any peer that reaches the port can fail one at
   will, so err-level logging let anyone flood the error log.
