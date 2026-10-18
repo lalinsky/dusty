@@ -6,6 +6,11 @@ All notable changes to this project will be documented in this file.
 
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
+- Added `ServerConfig.Tls.pem` to give a listener its certificate and key as
+  PEM text in memory instead of file paths, so a key from a secret store or
+  generated at startup never touches disk. `cert_path` and `key_path` now
+  default to empty, and `listen()` fails with `error.MissingTlsCertificate`
+  when neither form is given.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.

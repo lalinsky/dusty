@@ -40,6 +40,19 @@ pub const config = struct {
             return error.TlsNotConfigured;
         }
 
+        pub fn fromSlice(
+            allocator: std.mem.Allocator,
+            io: std.Io,
+            cert_pem: []const u8,
+            key_pem: []const u8,
+        ) !CertKeyPair {
+            _ = allocator;
+            _ = io;
+            _ = cert_pem;
+            _ = key_pem;
+            return error.TlsNotConfigured;
+        }
+
         pub fn deinit(self: *CertKeyPair, allocator: std.mem.Allocator) void {
             _ = self;
             _ = allocator;

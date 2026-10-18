@@ -647,13 +647,19 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
-                l.tls_auth = tls.config.CertKeyPair.fromFilePath(
+                const loaded = if (tls_cfg.pem) |pem|
+                    tls.config.CertKeyPair.fromSlice(self.allocator, self.io, pem.cert, pem.key)
+                else if (tls_cfg.cert_path.len == 0 or tls_cfg.key_path.len == 0) {
+                    log.err("tls needs either pem or both cert_path and key_path", .{});
+                    return error.MissingTlsCertificate;
+                } else tls.config.CertKeyPair.fromFilePath(
                     self.allocator,
                     self.io,
                     dir,
                     tls_cfg.cert_path,
                     tls_cfg.key_path,
-                ) catch |err| {
+                );
+                l.tls_auth = loaded catch |err| {
                     log.err("Failed to load TLS certificate/key: {}", .{err});
                     return err;
                 };

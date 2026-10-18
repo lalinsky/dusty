@@ -161,15 +161,28 @@ pub const ServerConfig = struct {
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
         /// Path to the PEM certificate (chain) file, resolved against `dir`.
-        cert_path: []const u8,
+        /// Ignored when `pem` is set.
+        cert_path: []const u8 = "",
         /// Path to the PEM private key file, resolved against `dir`.
-        key_path: []const u8,
+        /// Ignored when `pem` is set.
+        key_path: []const u8 = "",
+        /// The certificate (chain) and private key as PEM text in memory,
+        /// in place of `cert_path`/`key_path`: for keys that come from a
+        /// secret store or the environment, or are generated at startup, and
+        /// should never be written to disk. Read once by listen(); it does
+        /// not need to outlive that.
+        pem: ?Pem = null,
         /// Directory the cert/key paths are resolved against. Defaults to the
         /// current working directory.
         dir: ?std.Io.Dir = null,
         /// Ask connecting clients to authenticate with a certificate (mutual
         /// TLS). Null means client certificates are never requested.
         client_auth: ?ClientAuth = null,
+
+        pub const Pem = struct {
+            cert: []const u8,
+            key: []const u8,
+        };
 
         pub const ClientAuth = struct {
             /// Certificate authorities used to verify client certificates.

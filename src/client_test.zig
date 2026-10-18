@@ -716,6 +716,59 @@ test "Client: HTTPS with a custom CA file" {
     try client_future.await(io);
 }
 
+test "Client: HTTPS to a listener whose certificate is PEM in memory" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Read here only to have PEM text; the listener never sees a path.
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    var server = dusty.Server(void).init(gpa, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .pem = .{ .cert = cert_pem, .key = key_pem } } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try std.testing.expect(req.secure);
+            res.body = "pem in memory";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io) !void {
+            try s.ready.wait(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/", .{s.address.ip.getPort()});
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("pem in memory", (try response.body()).?);
+        }
+    }.run, .{ &server, io });
+
+    try client_future.await(io);
+}
+
 test "Client: presents a client certificate for mutual TLS" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
