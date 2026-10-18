@@ -9,6 +9,9 @@ All notable changes to this project will be documented in this file.
 - A failed TLS handshake is now logged at info instead of err (only
   `OutOfMemory` stays at err). Any peer that reaches the port can fail one at
   will, so err-level logging let anyone flood the error log.
+- Server and client connections now call `tls.Connection.deinit` on close
+  when the TLS module declares one, so an injected module backed by a C
+  library (one `SSL` object per connection) does not leak per connection.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.

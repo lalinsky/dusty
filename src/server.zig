@@ -294,6 +294,15 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        if (build_options.use_tls) {
+            // tls.zig's Connection owns no memory and has no deinit; a TLS
+            // module backed by a C library (one SSL object per connection)
+            // frees it here.
+            if (@hasDecl(tls.Connection, "deinit")) {
+                if (self.tls_conn) |*c| c.deinit();
+            }
+            self.tls_conn = null;
+        }
         self.allocator.free(self.buffers);
     }
 
