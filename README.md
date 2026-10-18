@@ -63,6 +63,26 @@ The application declares `custom_tls` in its own `build.zig.zon`, so it can
 point to another commit, fork, or local path. Omitting the injected module is a
 compile error. Use `.use_tls = false` instead when TLS should be compiled out.
 
+### Using your own nghttp2
+
+With `.use_http2 = true` Dusty compiles its vendored nghttp2. An application
+that already builds nghttp2 (a newer release, or one shared with other code)
+can inject its own bindings instead, so only one copy is linked:
+
+```zig
+const dusty_dep = b.dependency("dusty", .{
+    .target = target,
+    .optimize = optimize,
+    .use_http2 = true,
+    .use_bundled_nghttp2 = false,
+});
+const dusty_mod = dusty_dep.module("dusty");
+// A translate-c module of nghttp2.h that also links the nghttp2 library.
+dusty_mod.addImport("nghttp2", my_nghttp2_mod);
+```
+
+Omitting the injected module is a compile error.
+
 ## Usage
 
 ### Server Example

@@ -14,6 +14,11 @@ pub fn build(b: *std.Build) void {
     // the nghttp2 C library. Defaults off until the implementation lands. Requires
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
+    const use_bundled_nghttp2 = b.option(
+        bool,
+        "use_bundled_nghttp2",
+        "Compile Dusty's vendored nghttp2; disable to inject a compatible 'nghttp2' module",
+    ) orelse true;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
 
     const mod = b.addModule("dusty", .{
@@ -95,7 +100,14 @@ pub fn build(b: *std.Build) void {
 
     // HTTP/2 via vendored nghttp2 (src/nghttp2), gated behind use_http2. The
     // library is I/O-free (a pure protocol state machine), driven from Zig.
-    if (use_http2) {
+    // Applications that build nghttp2 themselves keep HTTP/2 active while
+    // injecting their own bindings (a module that also links the library):
+    //   dusty_mod.addImport("nghttp2", custom_nghttp2_mod);
+    if (use_http2 and !use_bundled_nghttp2) {
+        mod.addAnonymousImport("nghttp2", .{
+            .root_source_file = b.path("src/nghttp2_injection_required.zig"),
+        });
+    } else if (use_http2) {
         const nghttp2_translate_c = b.addTranslateC(.{
             .root_source_file = b.path("src/nghttp2/lib/includes/nghttp2/nghttp2.h"),
             .target = target,

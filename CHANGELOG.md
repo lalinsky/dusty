@@ -6,6 +6,9 @@ All notable changes to this project will be documented in this file.
 
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
+- Added the `use_bundled_nghttp2` build option. With `use_http2` enabled,
+  applications can inject their own `nghttp2` module instead of compiling the
+  vendored copy, so a binary that already builds nghttp2 links only one.
 - `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
   on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
   which then wait a second or more to retry.
