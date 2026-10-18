@@ -21,6 +21,8 @@ const Transport = @import("transport.zig").Transport;
 const have_auto_cancel = @import("deadline.zig").have_auto_cancel;
 const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
+/// The HTTP/2 engine, with the `use_http2` build option.
+const h2 = if (build_options.use_http2) @import("server/h2.zig") else struct {};
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
 const somaxconn = @import("somaxconn.zig").somaxconn;
@@ -648,6 +650,12 @@ pub fn Server(comptime Ctx: type) type {
                     log.err("tls is set but the library was built with use_tls=false", .{});
                     return error.TlsNotConfigured;
                 }
+                if (!build_options.use_http2) {
+                    for (tls_cfg.alpn_protocols) |p| if (std.mem.eql(u8, p, "h2")) {
+                        log.err("tls.alpn_protocols offers h2, but the library was built without use_http2", .{});
+                        return error.Http2NotConfigured;
+                    };
+                }
                 if (tls_cfg.client_auth) |client_auth| {
                     if (client_auth.ca == .none) {
                         log.err("tls.client_auth.ca is .none, so no client certificate could ever verify", .{});
@@ -877,7 +885,7 @@ pub fn Server(comptime Ctx: type) type {
 
         /// Wakes the drain when this was the last one: zero is the only
         /// count it acts on, so the others are not worth a syscall.
-        fn finishRequest(self: *Self) void {
+        pub fn finishRequest(self: *Self) void {
             const was = self.busy.fetchSub(.{ .count = 1 }, .acq_rel);
             if (was.count == 1) self.io.futexWake(Busy, &self.busy.raw, 1);
         }
@@ -1073,6 +1081,11 @@ pub fn Server(comptime Ctx: type) type {
                         };
                     }
 
+                    if (build_options.use_http2) {
+                        if (connection.negotiatedProtocol()) |p| if (std.mem.eql(u8, p, "h2")) {
+                            return h2.Engine(Ctx).serve(self, l.config, true, &connection, &busy);
+                        };
+                    }
                     return self.handleRequests(l, &connection, &timer, &busy);
                 }
             }
@@ -1095,6 +1108,12 @@ pub fn Server(comptime Ctx: type) type {
             } else {
                 timer.clear(self.io);
             }
+        }
+
+        /// The client address for a request from `peer` with `headers`,
+        /// through `X-Forwarded-For` as far as `trusted_proxy_hops` allows.
+        pub fn clientAddress(self: *const Self, peer: std.Io.net.IpAddress, headers: *const Headers) std.Io.net.IpAddress {
+            return remoteAddress(peer, headers, self.config.trusted_proxy_hops);
         }
 
         /// Routes `req` and runs its handler, with the middleware, writing to
@@ -1184,6 +1203,16 @@ pub fn Server(comptime Ctx: type) type {
                         .peer_gone => return,
                         // The request it refused was not read.
                         .refused => return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers),
+                    }
+                }
+                // Cleartext HTTP/2 with prior knowledge: the first bytes are
+                // the HTTP/2 preface rather than a request line.
+                if (build_options.use_http2 and first and l.config.http2_prior_knowledge and !request.secure) {
+                    const is_h2 = h2.sniffPreface(connection.reader) catch
+                        return connection.getReadError() orelse error.Unexpected;
+                    if (is_h2) {
+                        timer.clear(self.io);
+                        return h2.Engine(Ctx).serve(self, l.config, false, connection, busy);
                     }
                 }
                 if (!first) self.armTimer(timer, self.config.timeout.request);

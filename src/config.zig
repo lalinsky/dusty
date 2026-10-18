@@ -87,6 +87,13 @@ pub const Listener = struct {
     kernel_backlog: ?u31 = null,
     /// Sets SO_REUSEADDR (and SO_REUSEPORT on POSIX) on an IP listener.
     reuse_address: bool = true,
+    /// Serve cleartext HTTP/2 to a client that opens with the HTTP/2
+    /// connection preface ("prior knowledge", RFC 9113 §3.3), alongside
+    /// HTTP/1.x on the same port. Needs the `use_http2` build option, and
+    /// is ignored on a TLS listener, which negotiates "h2" through
+    /// `Tls.alpn_protocols` instead. The deprecated `Upgrade: h2c` is not
+    /// supported.
+    http2_prior_knowledge: bool = false,
     /// How many accept loops share the socket. With io_uring, an accept
     /// completes at most once per trip through the event loop, so a single
     /// loop takes one connection per trip however many are queued, which
@@ -132,6 +139,9 @@ pub const ServerConfig = struct {
     timeout: Timeout = .{},
     request: Request = .{},
     response: Response = .{},
+    /// HTTP/2 connections (with the `use_http2` build option): reached
+    /// through ALPN "h2" on a TLS listener or `Listener.http2_prior_knowledge`.
+    http2: Http2 = .{},
     /// Where the server accepts connections. `Server.run` serves all of
     /// them. An empty list uses the default, 127.0.0.1:8080. Borrowed for
     /// the server's life, and requests point back into it through
@@ -186,6 +196,29 @@ pub const ServerConfig = struct {
 
             pub const Mode = enum { request, require };
         };
+    };
+
+    pub const Http2 = struct {
+        /// SETTINGS_MAX_CONCURRENT_STREAMS: streams a client may have open
+        /// at once. Each costs a task and, once it sends a body, a buffer
+        /// of `stream_window` bytes.
+        max_concurrent_streams: u32 = 100,
+        /// SETTINGS_INITIAL_WINDOW_SIZE: request body bytes a client may
+        /// send on a stream before the handler reads them, which is also
+        /// the stream's body buffer.
+        stream_window: u31 = 64 * 1024,
+        /// Request body bytes in flight across all streams of a connection.
+        connection_window: u31 = 1024 * 1024,
+        /// SETTINGS_MAX_HEADER_LIST_SIZE: the decoded size of a request's
+        /// header block (names, values and 32 bytes each, RFC 9113 §6.5.2).
+        max_header_list_size: u32 = 64 * 1024,
+        /// RST_STREAM a client may send in a burst, refilled at
+        /// `stream_reset_rate` per second, before the connection is closed
+        /// (CVE-2023-44487, "rapid reset").
+        stream_reset_burst: u64 = 1000,
+        stream_reset_rate: u64 = 33,
+        /// CONTINUATION frames allowed after one HEADERS (CVE-2024-28182).
+        max_continuations: usize = 8,
     };
 
     pub const Timeout = struct {

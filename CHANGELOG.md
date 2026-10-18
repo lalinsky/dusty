@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- An HTTP/2 server engine on nghttp2, with the `use_http2` build option. A TLS
+  listener serves HTTP/2 when `tls.alpn_protocols` offers "h2" and the client
+  picks it; a cleartext listener with `http2_prior_knowledge` serves HTTP/2 to
+  a client that opens with the connection preface, and HTTP/1.x to the rest.
+  Streams reach the same router, middleware and handlers as HTTP/1.x, through
+  `Server.dispatch` and a sink-backed `Response`. Request and response bodies
+  stream with flow control in both directions, responses can carry trailers,
+  and a request body the handler leaves unread ends the stream with
+  RST_STREAM(NO_ERROR) after the response. Limits are in
+  `ServerConfig.http2`. A draining server refuses new streams and sends
+  GOAWAY.
+- An HTTP/1.0 request that asks to keep the connection now gets
+  `Connection: keep-alive` on its response when the server keeps it. Without
+  it an HTTP/1.0 client (ApacheBench with `-k`, for one) waits for the server
+  to close, while the server waits for the next request.
 - Added a protocol-neutral seam for engines other than the HTTP/1.x loop
   (HTTP/2 first): `Response.initSink` writes the head, body and end of a
   response to a `Sink` instead of formatting HTTP/1.x; `Response.trailer`
