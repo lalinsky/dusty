@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Added a protocol-neutral seam for engines other than the HTTP/1.x loop
+  (HTTP/2 first): `Response.initSink` writes the head, body and end of a
+  response to a `Sink` instead of formatting HTTP/1.x; `Response.trailer`
+  adds trailer fields, which a sink carries; `Request.body_source` delivers a
+  body that arrives unframed, decoded as usual; `Request.applyEntityHeaders`
+  fills the entity fields from the headers; and `Server.dispatch` routes a
+  request through the middleware to its handler. HTTP/1.x is unchanged.
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
 - Added `ServerConfig.Tls.alpn_protocols`, the protocols a TLS listener

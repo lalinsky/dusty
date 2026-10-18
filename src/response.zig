@@ -5,6 +5,7 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
+pub const Sink = @import("sink.zig").Sink;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
 
@@ -508,7 +509,7 @@ pub const StreamingBodyWriter = struct {
             try res.resolve(self.interface.flush());
         }
         if (res.chunked and res.sendsBody()) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
-        try res.resolve(res.conn.writer.flush());
+        try res.resolve(res.finish(res.bodyOut()));
         // Sending the wrong number of bytes for a declared length leaves
         // the connection out of sync and the client waiting.
         if (res.content_length) |declared| {
@@ -593,7 +594,18 @@ pub const Response = struct {
     arena: std.mem.Allocator,
     /// The body, when it is written rather than set with `body`.
     body_buffer: BodyBuffer = .{},
+    /// The HTTP/1.x connection the response is written to. Unused, and
+    /// undefined, when `sink` is set.
     conn: *Connection,
+    /// Set for a response that goes to a protocol engine rather than out as
+    /// HTTP/1.x bytes: an HTTP/2 stream. See `initSink`.
+    sink: ?Sink = null,
+    /// The connection's `Io`, for files.
+    io: std.Io = undefined,
+    /// Trailer fields, sent after the body. Only a `sink` carries them
+    /// (HTTP/2 does, for gRPC status among others); over HTTP/1.x they are
+    /// dropped.
+    trailers: ?http.Headers = null,
     written: bool = false,
     headers_written: bool = false,
     keepalive: bool = true,
@@ -675,8 +687,51 @@ pub const Response = struct {
             .arena = arena,
             .body_buffer = try .init(arena),
             .conn = conn,
+            .io = conn.io,
             .headers = try http.Headers.init(arena, max_headers),
         };
+    }
+
+    /// A response written to `sink` instead of a connection. Framing,
+    /// keep-alive and the status line are the sink's business: the response
+    /// hands over the head, the body bytes and the end.
+    pub fn initSink(arena: std.mem.Allocator, io: std.Io, sink: Sink, max_headers: usize) !Response {
+        return .{
+            .arena = arena,
+            .body_buffer = try .init(arena),
+            .conn = undefined,
+            .sink = sink,
+            .io = io,
+            .headers = try http.Headers.init(arena, max_headers),
+        };
+    }
+
+    /// Adds a trailer field, sent after the body. Carried only by a sink
+    /// (an HTTP/2 stream); an HTTP/1.x response drops it.
+    pub fn trailer(self: *Response, name: []const u8, value: []const u8) HeaderError!void {
+        try http.validateHeaderName(name);
+        try http.validateHeaderValue(value);
+        if (self.trailers == null) self.trailers = http.Headers.init(self.arena, 16) catch return error.TooManyHeaders;
+        try self.trailers.?.put(name, value);
+    }
+
+    /// Whether the peer went away, so a failure is not the handler's fault.
+    pub fn peerGone(self: *Response) bool {
+        if (self.sink) |sink| return sink.peerGone();
+        return self.conn.peerGone();
+    }
+
+    /// Where body bytes go: the sink's writer, or the connection.
+    fn bodyOut(self: *Response) *std.Io.Writer {
+        if (self.sink) |sink| return sink.body();
+        return self.conn.writer;
+    }
+
+    /// Ends the message on `w`: a flush for HTTP/1.x; for a sink, a flush
+    /// of its body writer and then the end, with any trailers.
+    fn finish(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.flush();
+        if (self.sink) |sink| try sink.end(if (self.trailers) |*t| t else null);
     }
 
     /// Closes a file body that `write` never got to send.
@@ -703,7 +758,7 @@ pub const Response = struct {
         std.debug.assert(!self.body_writer_open); // body writer already open
         std.debug.assert(!self.headers_written); // body cannot start after the headers
         std.debug.assert(self.body.len == 0 and self.body_buffer.len() == 0); // body already set
-        const io = self.conn.io;
+        const io = self.io;
         const handle = try dir.openFile(io, sub_path, .{ .resolve_beneath = options.resolve_beneath });
         errdefer handle.close(io);
         const stat = try handle.stat(io);
@@ -720,7 +775,7 @@ pub const Response = struct {
 
     fn closeFile(self: *Response) void {
         const body = self.file orelse return;
-        body.handle.close(self.conn.io);
+        body.handle.close(self.io);
         self.file = null;
     }
 
@@ -779,6 +834,9 @@ pub const Response = struct {
         if (compression == .gzip) self.markCompressed();
         if (declared) |len| {
             self.content_length = len;
+        } else if (self.sink != null) {
+            // The protocol under a sink frames the body itself.
+            self.streaming = true;
         } else if (self.http10) {
             // Chunked encoding came with HTTP/1.1. Before it, a body of
             // unknown length ends when the connection does. A response
@@ -788,7 +846,7 @@ pub const Response = struct {
         } else {
             self.chunked = true;
         }
-        try self.resolve(self.sendHeaderAlone(self.conn.writer));
+        try self.resolve(self.sendHeaderAlone(self.bodyOut()));
         return .init(self, buf, compressor);
     }
 
@@ -1020,6 +1078,9 @@ pub const Response = struct {
     /// Upgrade HTTP connection to WebSocket.
     /// Returns null if request is not a valid WebSocket upgrade request.
     pub fn upgradeWebSocket(self: *Response, req: *Request) !?WebSocket {
+        // An upgrade belongs to HTTP/1.1; HTTP/2 has its own way to carry a
+        // WebSocket (RFC 8441), which a sink does not offer.
+        if (self.sink != null) return null;
         // Validate upgrade headers
         const upgrade = req.headers.get("Upgrade") orelse return null;
         if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return null;
@@ -1060,7 +1121,10 @@ pub const Response = struct {
     /// which is what the writers' `err` fields are for.
     fn resolve(self: *Response, result: std.Io.Writer.Error!void) SendError!void {
         result catch |err| switch (err) {
-            error.WriteFailed => return self.conn.getWriteError() orelse error.Unexpected,
+            error.WriteFailed => {
+                if (self.sink) |sink| return sink.writeError() orelse error.Unexpected;
+                return self.conn.getWriteError() orelse error.Unexpected;
+            },
         };
     }
 
@@ -1207,7 +1271,7 @@ pub const Response = struct {
         splat: usize,
         total: usize,
     ) std.Io.Writer.Error!void {
-        const out = self.conn.writer;
+        const out = self.bodyOut();
         if (self.chunked) {
             // 16 hex digits covers any usize, plus the CRLF.
             var size_buf: [18]u8 = undefined;
@@ -1227,7 +1291,7 @@ pub const Response = struct {
         if (self.headers_written) return;
         try self.applyContentType();
         self.headers_written = true;
-        return self.resolve(self.sendHeaderAlone(self.conn.writer));
+        return self.resolve(self.sendHeaderAlone(self.bodyOut()));
     }
 
     /// The headers with nothing behind them. `write` sends them with a body
@@ -1243,6 +1307,8 @@ pub const Response = struct {
     /// The header block on the wire. Reports the sentinel, as anything
     /// writing to a `std.Io.Writer` does; the public entry point resolves it.
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.sink) |sink| return sink.head(self.status, &self.headers, self.headLength());
+
         // Write status line
         try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
 
@@ -1335,23 +1401,23 @@ pub const Response = struct {
             }
         }
         if (self.file) |body| {
-            if (send_header) try self.resolve(self.sendHeader(self.conn.writer));
+            if (send_header) try self.resolve(self.sendHeader(self.bodyOut()));
             if (self.sendsBody()) try self.sendFileBody(body);
-            return self.resolve(self.conn.writer.flush());
+            return self.resolve(self.finish(self.bodyOut()));
         }
-        return self.resolve(self.sendBody(self.conn.writer, send_header));
+        return self.resolve(self.sendBody(self.bodyOut(), send_header));
     }
 
     fn sendFileBody(self: *Response, body: BodyFile) WriteError!void {
         if (body.size == 0) return;
         // Unbuffered: without a sendfile of its own, the `Io` reads the
         // file straight into the connection's write buffer.
-        var reader = body.handle.reader(self.conn.io, &.{});
+        var reader = body.handle.reader(self.io, &.{});
         reader.seekTo(body.offset) catch unreachable; // a new reader is positional
-        const sent = self.conn.writer.sendFileAll(&reader, .limited(body.size)) catch |err| switch (err) {
+        const sent = self.bodyOut().sendFileAll(&reader, .limited(body.size)) catch |err| switch (err) {
             error.WriteFailed => {
                 self.keepalive = false;
-                return self.conn.getWriteError() orelse error.Unexpected;
+                return self.resolve(error.WriteFailed);
             },
             error.ReadFailed => {
                 self.keepalive = false;
@@ -1390,7 +1456,7 @@ pub const Response = struct {
             // terminator, which is body framing and so is not sent for a
             // HEAD either.
             if (self.sendsBody()) try w.writeAll("0\r\n\r\n");
-            return w.flush();
+            return self.finish(w);
         }
 
         if (send_header) try self.sendHeader(w);
@@ -1405,7 +1471,17 @@ pub const Response = struct {
             }
         }
 
-        return w.flush();
+        return self.finish(w);
+    }
+
+    /// The body length the head announces to a sink: the length a buffered
+    /// body or file has (a HEAD reports its GET's), a declared one for a
+    /// stream, and null for a stream of unknown length or a status that has
+    /// no body.
+    fn headLength(self: *const Response) ?usize {
+        if (!statusHasBody(self.status)) return null;
+        if (self.streaming or self.chunked) return self.content_length;
+        return self.bodyLen();
     }
 };
 
@@ -3517,4 +3593,165 @@ test "Response: print formats the body" {
     try response.write();
 
     try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhi x3"));
+}
+
+/// A sink that records what a response hands it, for the tests below.
+const TestSink = struct {
+    status: ?http.Status = null,
+    content_length: ?usize = null,
+    content_type: []const u8 = "",
+    interim: ?http.Status = null,
+    heads: usize = 0,
+    ends: usize = 0,
+    trailer_grpc_status: []const u8 = "",
+    body_buf: [4096]u8 = undefined,
+    body_writer: std.Io.Writer = undefined,
+
+    fn init(self: *TestSink) void {
+        self.* = .{};
+        self.body_writer = .fixed(&self.body_buf);
+    }
+
+    fn sink(self: *TestSink) Sink {
+        return .{ .ptr = self, .vtable = &.{
+            .head = head,
+            .interim = interimFn,
+            .body = bodyFn,
+            .end = end,
+            .writeError = writeError,
+            .peerGone = peerGone,
+        } };
+    }
+
+    fn body(self: *TestSink) []const u8 {
+        return self.body_writer.buffered();
+    }
+
+    fn head(ptr: *anyopaque, status: http.Status, headers: *const http.Headers, content_length: ?usize) std.Io.Writer.Error!void {
+        const self: *TestSink = @ptrCast(@alignCast(ptr));
+        self.heads += 1;
+        self.status = status;
+        self.content_length = content_length;
+        self.content_type = headers.get("Content-Type") orelse "";
+    }
+    fn interimFn(ptr: *anyopaque, status: http.Status) std.Io.Writer.Error!void {
+        const self: *TestSink = @ptrCast(@alignCast(ptr));
+        self.interim = status;
+    }
+    fn bodyFn(ptr: *anyopaque) *std.Io.Writer {
+        const self: *TestSink = @ptrCast(@alignCast(ptr));
+        return &self.body_writer;
+    }
+    fn end(ptr: *anyopaque, trailers: ?*const http.Headers) std.Io.Writer.Error!void {
+        const self: *TestSink = @ptrCast(@alignCast(ptr));
+        self.ends += 1;
+        if (trailers) |t| self.trailer_grpc_status = t.get("grpc-status") orelse "";
+    }
+    fn writeError(_: *anyopaque) ?Response.SendError {
+        return null;
+    }
+    fn peerGone(_: *anyopaque) bool {
+        return false;
+    }
+};
+
+test "Response sink: a buffered body goes to the sink with its length, and no HTTP/1 framing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    try response.print(.text, "hello {s}", .{"sink"});
+    try response.write();
+
+    try std.testing.expectEqual(http.Status.ok, ts.status.?);
+    try std.testing.expectEqual(@as(?usize, 10), ts.content_length);
+    try std.testing.expectEqualStrings("hello sink", ts.body());
+    try std.testing.expect(std.mem.startsWith(u8, ts.content_type, "text/plain"));
+    try std.testing.expectEqual(@as(usize, 1), ts.heads);
+    try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
+test "Response sink: a streamed body is unframed, of unknown length, and ends once" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var buf: [8]u8 = undefined;
+    var body = try response.stream(&buf);
+    try std.testing.expectEqual(@as(usize, 1), ts.heads);
+    try std.testing.expectEqual(@as(?usize, null), ts.content_length);
+    try body.interface.writeAll("hello ");
+    try body.interface.writeAll("streamed world");
+    try body.end();
+    try response.write(); // the server's call after the handler: nothing more
+
+    try std.testing.expectEqualStrings("hello streamed world", ts.body());
+    try std.testing.expect(!response.chunked);
+    try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
+test "Response sink: trailers reach the end of the message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    response.body = "payload";
+    try response.trailer("grpc-status", "0");
+    try response.write();
+
+    try std.testing.expectEqualStrings("payload", ts.body());
+    try std.testing.expectEqualStrings("0", ts.trailer_grpc_status);
+}
+
+test "Response sink: a HEAD reports the length and sends no body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    response.head = true;
+    response.body = "not sent";
+    try response.write();
+
+    try std.testing.expectEqual(@as(?usize, 8), ts.content_length);
+    try std.testing.expectEqualStrings("", ts.body());
+    try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
+test "Response sink: 204 announces no length" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    response.status = .no_content;
+    try response.write();
+
+    try std.testing.expectEqual(http.Status.no_content, ts.status.?);
+    try std.testing.expectEqual(@as(?usize, null), ts.content_length);
+    try std.testing.expectEqual(@as(usize, 1), ts.ends);
+}
+
+test "Response sink: no WebSocket upgrade over a sink" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ts: TestSink = undefined;
+    ts.init();
+
+    var response = try Response.initSink(arena.allocator(), std.testing.io, ts.sink(), 32);
+    var request: Request = .{ .arena = arena.allocator(), .parser = undefined, .transport = undefined, .headers = try http.Headers.init(arena.allocator(), 8) };
+    try request.headers.put("Upgrade", "websocket");
+    try request.headers.put("Connection", "Upgrade");
+    try request.headers.put("Sec-WebSocket-Version", "13");
+    try request.headers.put("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    try std.testing.expect((try response.upgradeWebSocket(&request)) == null);
+    try std.testing.expectEqual(@as(usize, 0), ts.heads);
 }

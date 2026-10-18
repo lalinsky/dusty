@@ -11,6 +11,10 @@ pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;
 pub const Request = @import("request.zig").Request;
 pub const Response = @import("response.zig").Response;
+/// Where a response goes when a protocol engine (HTTP/2) frames it; see `Response.initSink`.
+pub const Sink = @import("sink.zig").Sink;
+/// A request body delivered unframed by a protocol engine; see `Request.body_source`.
+pub const BodySource = @import("request.zig").BodySource;
 pub const BodyWriter = @import("response.zig").BodyWriter;
 pub const StreamingBodyWriter = @import("response.zig").StreamingBodyWriter;
 pub const EventStream = @import("response.zig").EventStream;

@@ -1097,6 +1097,30 @@ pub fn Server(comptime Ctx: type) type {
             }
         }
 
+        /// Routes `req` and runs its handler, with the middleware, writing to
+        /// `res`. For a protocol engine other than the HTTP/1.x loop -- an
+        /// HTTP/2 stream, whose request and response are built over a body
+        /// source and a sink -- so it serves the same router. A URL the
+        /// router cannot parse is answered 400 here; any other error is the
+        /// handler's, and the caller decides what it means for its stream.
+        pub fn dispatch(self: *Self, req: *Request, res: *Response) !void {
+            const found = self.router.findHandler(req) catch |err| switch (err) {
+                error.InvalidEscapeSequence, error.TooManyQueryParams => {
+                    res.status = .bad_request;
+                    return;
+                },
+                else => |e| return e,
+            };
+            var executor = Executor(Ctx){
+                .req = req,
+                .res = res,
+                .ctx = self.ctx,
+                .action = if (found) |r| r.action else null,
+                .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
+            };
+            try executor.run();
+        }
+
         /// Runs the HTTP request loop over a connection: each request is
         /// parsed, served and answered before the next is looked at, so
         /// pipelined requests are answered in order without any more

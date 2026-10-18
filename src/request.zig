@@ -4,6 +4,7 @@ const http = @import("http.zig");
 const RouteInfo = @import("router.zig").RouteInfo;
 const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
+pub const BodySource = @import("parser.zig").BodySource;
 const Transport = @import("transport.zig").Transport;
 const ParseError = @import("parser.zig").ParseError;
 const ServerConfig = @import("config.zig").ServerConfig;
@@ -63,6 +64,10 @@ pub const Request = struct {
     // Body reading support
     parser: *RequestParser,
     transport: Transport,
+    /// Set by a protocol engine that delivers the body itself, unframed (an
+    /// HTTP/2 stream), in place of `parser` and `transport`, which are then
+    /// unused.
+    body_source: ?BodySource = null,
     config: ServerConfig.Request = .{},
     _body: ?[]const u8 = null,
     _body_read: bool = false,
@@ -109,6 +114,21 @@ pub const Request = struct {
         };
     }
 
+    /// Fills `content_type`, `content_encoding` and `content_length` from
+    /// the headers. The HTTP/1.x parser calls it when the head is complete;
+    /// another protocol engine calls it once it has the headers.
+    pub fn applyEntityHeaders(self: *Request) void {
+        if (self.headers.get("Content-Type")) |content_type| {
+            self.content_type = http.ContentType.fromContentType(content_type);
+        }
+        if (self.headers.get("Content-Encoding")) |content_encoding| {
+            self.content_encoding = http.ContentEncoding.fromString(content_encoding);
+        }
+        if (self.headers.get("Content-Length")) |content_length| {
+            self.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
+        }
+    }
+
     /// Replaces the deadline for this request. A duration starts now, a
     /// deadline is absolute, and `.none` disables the deadline. The server
     /// installs its normal keepalive deadline after the handler returns.
@@ -134,6 +154,7 @@ pub const Request = struct {
     /// streams cannot then ask for the body whole.
     pub fn reader(self: *Request, buffer: []u8) !RequestBodyReader {
         var r = RequestBodyReader.init(self.parser, self.transport, buffer);
+        r.raw = self.body_source;
 
         // Once the body is in memory there is nothing left on the wire, and
         // what is cached has already been decoded.
@@ -1438,4 +1459,90 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
     try parseHeaders(&reader, &parser);
 
     try std.testing.expectError(error.InvalidMultiPartEncoding, req.multiFormData());
+}
+
+fn noBodySourceError(_: *std.Io.Reader) ?Transport.ReadError {
+    return null;
+}
+
+test "Request.body: a body source delivers the body without the HTTP/1 parser" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var source: std.Io.Reader = .fixed("unframed body bytes");
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    req.headers = try http.Headers.init(arena.allocator(), 4);
+    try req.headers.put("content-type", "application/json");
+    try req.headers.put("content-length", "19");
+    req.applyEntityHeaders();
+    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+
+    try std.testing.expectEqual(http.ContentType.json, req.content_type.?);
+    try std.testing.expectEqual(@as(?usize, 19), req.content_length);
+    try std.testing.expectEqualStrings("unframed body bytes", (try req.body()).?);
+}
+
+test "Request.body: a gzip body from a body source is decoded" {
+    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
+    var source: std.Io.Reader = .fixed(gzip_hello);
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    req.headers = try http.Headers.init(arena.allocator(), 4);
+    try req.headers.put("content-encoding", "gzip");
+    req.applyEntityHeaders();
+    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+
+    try std.testing.expectEqualStrings("hello", (try req.body()).?);
+}
+
+test "Request.body: 100 Continue goes through the response's sink" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const Probe = struct {
+        interim: ?http.Status = null,
+        w: std.Io.Writer = .failing,
+        fn sink(self: *@This()) @import("sink.zig").Sink {
+            return .{ .ptr = self, .vtable = &.{
+                .head = head,
+                .interim = interimFn,
+                .body = bodyFn,
+                .end = end,
+                .writeError = writeError,
+                .peerGone = peerGone,
+            } };
+        }
+        fn head(_: *anyopaque, _: http.Status, _: *const http.Headers, _: ?usize) std.Io.Writer.Error!void {}
+        fn interimFn(ptr: *anyopaque, status: http.Status) std.Io.Writer.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.interim = status;
+        }
+        fn bodyFn(ptr: *anyopaque) *std.Io.Writer {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return &self.w;
+        }
+        fn end(_: *anyopaque, _: ?*const http.Headers) std.Io.Writer.Error!void {}
+        fn writeError(_: *anyopaque) ?Response.SendError {
+            return null;
+        }
+        fn peerGone(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var probe: Probe = .{};
+    var res = try Response.initSink(arena.allocator(), std.testing.io, probe.sink(), 8);
+
+    var source: std.Io.Reader = .fixed("data");
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined };
+    req.headers = try http.Headers.init(arena.allocator(), 4);
+    req.body_source = .{ .reader = &source, .err = noBodySourceError };
+    req.expects_continue = true;
+    req.response = &res;
+
+    try std.testing.expectEqualStrings("data", (try req.body()).?);
+    try std.testing.expectEqual(http.Status.@"continue", probe.interim.?);
+    try std.testing.expect(!req.expects_continue);
 }

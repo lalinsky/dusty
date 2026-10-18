@@ -246,17 +246,7 @@ pub const RequestParser = struct {
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
 
-        if (self.request.headers.get("Content-Type")) |content_type| {
-            self.request.content_type = ContentType.fromContentType(content_type);
-        }
-
-        if (self.request.headers.get("Content-Encoding")) |content_encoding| {
-            self.request.content_encoding = ContentEncoding.fromString(content_encoding);
-        }
-
-        if (self.request.headers.get("Content-Length")) |content_length| {
-            self.request.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
-        }
+        self.request.applyEntityHeaders();
 
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
@@ -565,11 +555,25 @@ pub const ResponseParser = struct {
 /// `std.Io.Reader` and so needs one underneath it handing over raw framed
 /// bytes. That one is another `BodyReader` -- same type, lower role -- and
 /// `startDecoding` puts it and the decoder in one allocation.
+/// A request body that arrives already unframed, from a protocol engine
+/// rather than through the HTTP/1.x parser: an HTTP/2 stream's DATA frames.
+pub const BodySource = struct {
+    reader: *std.Io.Reader,
+    /// What an `error.ReadFailed` from `reader` actually was; null when
+    /// nothing was recorded. A peer that reset the stream is
+    /// `ConnectionResetByPeer`.
+    err: *const fn (reader: *std.Io.Reader) ?Transport.ReadError,
+};
+
 pub fn BodyReader(comptime Parser: type) type {
     return struct {
         parser: *Parser,
         transport: Transport,
         request: ?*Request = null,
+        /// The body as a plain reader, already unframed, in place of the
+        /// parser and transport: an HTTP/2 stream's DATA. See
+        /// `Request.body_source`.
+        raw: ?BodySource = null,
         /// Set when the headers called for a content coding. Null both when
         /// nothing is coded and on the lower reader that feeds the decoder.
         decode: ?*Decode = null,
@@ -726,9 +730,6 @@ pub fn BodyReader(comptime Parser: type) type {
         }
 
         fn streamFramed(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-            const parser = self.parser;
-            const conn = self.transport.reader;
-
             // Send 100 Continue on first body read if client expects it
             if (self.request) |req| {
                 if (req.expects_continue) {
@@ -740,12 +741,27 @@ pub fn BodyReader(comptime Parser: type) type {
                             req.expects_continue = false;
                             // A write, on a read: the caller asked for the body
                             // and this is what unblocks the peer from sending it.
-                            sendContinue(res.conn.writer) catch
-                                return self.fail(self.transport.getWriteError() orelse error.Unexpected);
+                            if (res.sink) |sink| {
+                                sink.interim(.@"continue") catch
+                                    return self.fail(sink.writeError() orelse error.Unexpected);
+                            } else {
+                                sendContinue(res.conn.writer) catch
+                                    return self.fail(self.transport.getWriteError() orelse error.Unexpected);
+                            }
                         }
                     }
                 }
             }
+
+            if (self.raw) |src| {
+                return src.reader.stream(w, limit) catch |err| switch (err) {
+                    error.ReadFailed => return self.fail(src.err(src.reader) orelse error.Unexpected),
+                    else => |e| return e,
+                };
+            }
+
+            const parser = self.parser;
+            const conn = self.transport.reader;
 
             const dest = limit.slice(try w.writableSliceGreedy(1));
             if (dest.len == 0) return 0;
