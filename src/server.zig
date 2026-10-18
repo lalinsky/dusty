@@ -296,6 +296,15 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection) void {
+        if (build_options.use_tls) {
+            // tls.zig's Connection owns no memory and has no deinit; a TLS
+            // module backed by a C library (one SSL object per connection)
+            // frees it here.
+            if (@hasDecl(tls.Connection, "deinit")) {
+                if (self.tls_conn) |*c| c.deinit();
+            }
+            self.tls_conn = null;
+        }
         self.allocator.free(self.buffers);
     }
 
@@ -1066,8 +1075,16 @@ pub fn Server(comptime Ctx: type) type {
                             }
                             if (Connection.isPeerGone(cause)) {
                                 log.debug("TLS handshake abandoned by peer: {}", .{cause});
-                            } else {
+                            } else if (cause == error.OutOfMemory) {
                                 log.err("TLS handshake failed: {}", .{cause});
+                            } else {
+                                // Anyone who can reach the port can fail a
+                                // handshake at will (a scanner, a client that
+                                // rejects the certificate or sends none), so
+                                // this is not the server's error and must not
+                                // flood the error log (nginx logs these at
+                                // info too).
+                                log.info("TLS handshake failed: {}", .{cause});
                             }
                             return;
                         };
