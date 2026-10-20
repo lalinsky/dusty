@@ -1252,9 +1252,14 @@ pub const Response = struct {
             try w.print("{s}: {s}\r\n", .{ entry.key, entry.value });
         }
 
-        // Write Connection header based on keepalive
+        // Write Connection header based on keepalive. HTTP/1.0 is
+        // close-by-default, so a 1.0 peer that asked to keep the connection
+        // only does so when told it was kept (RFC 9112 §9.3, appendix C.2.2);
+        // without this it waits for an EOF that never comes.
         if (!self.keepalive) {
             try w.writeAll("Connection: close\r\n");
+        } else if (self.http10) {
+            try w.writeAll("Connection: keep-alive\r\n");
         }
 
         // Framing, for a status that has a body to frame. RFC 9112 §6.1
@@ -2803,8 +2808,45 @@ test "Response: a HEAD streamed to an HTTP/1.0 peer keeps the connection" {
     const written = conn_writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "Connection: close") == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: keep-alive\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, written, "\r\n\r\n"));
     try std.testing.expect(response.keepalive);
+}
+
+test "Response: a kept HTTP/1.0 connection is announced with Connection: keep-alive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.http10 = true;
+    response.body = "hello";
+    try response.write();
+
+    const written = conn_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, written, "Connection: keep-alive\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5\r\n") != null);
+    try std.testing.expect(response.keepalive);
+}
+
+test "Response: an HTTP/1.1 response that keeps the connection sends no Connection header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.body = "hello";
+    try response.write();
+
+    try std.testing.expect(std.mem.indexOf(u8, conn_writer.buffered(), "Connection:") == null);
 }
 
 test "BodyWriter: a body over many segments goes out whole, with its length" {

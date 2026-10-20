@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- An HTTP/1.0 request that asks to keep the connection now gets
+  `Connection: keep-alive` on its response when the server keeps it. Without
+  it an HTTP/1.0 client (ApacheBench with `-k`, for one) waits for the server
+  to close, while the server waits for the next request.
 - Added the `use_bundled_tls` build option. Applications can keep TLS enabled
   while replacing Dusty's pinned tls.zig dependency with a compatible module.
 - Added `ServerConfig.Tls.alpn_protocols`, the protocols a TLS listener
