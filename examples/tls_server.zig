@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
         .listeners = &.{
             .{
                 .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8443) },
-                .tls = .{ .cert_path = cert_path, .key_path = key_path },
+                .tls = .{ .certificate = .{ .file = .{ .cert_path = cert_path, .key_path = key_path } } },
             },
             .{
                 .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) },

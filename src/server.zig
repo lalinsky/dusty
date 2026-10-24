@@ -665,14 +665,7 @@ pub fn Server(comptime Ctx: type) type {
                     l.client_auth_mode = client_auth.mode;
                 }
 
-                const dir = tls_cfg.dir orelse std.Io.Dir.cwd();
-                l.tls_auth = tls.config.CertKeyPair.fromFilePath(
-                    self.allocator,
-                    self.io,
-                    dir,
-                    tls_cfg.cert_path,
-                    tls_cfg.key_path,
-                ) catch |err| {
+                l.tls_auth = tls_cfg.certificate.load(self.allocator, self.io) catch |err| {
                     log.err("Failed to load TLS certificate/key: {}", .{err});
                     return err;
                 };

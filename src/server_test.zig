@@ -2173,8 +2173,7 @@ test "Server: client_auth with ca .none is rejected by run" {
         .listeners = &.{.{
             .address = loopback_addr,
             .tls = .{
-                .cert_path = "examples/certs/cert.pem",
-                .key_path = "examples/certs/key.pem",
+                .certificate = .{ .file = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" } },
                 .client_auth = .{ .ca = .none },
             },
         }},
@@ -2262,7 +2261,7 @@ test "Server: a listener that fails to open releases the ones opened before it" 
             .{ .address = addr },
             .{
                 .address = loopback_addr,
-                .tls = .{ .cert_path = "examples/certs/missing.pem", .key_path = "examples/certs/key.pem" },
+                .tls = .{ .certificate = .{ .file = .{ .cert_path = "examples/certs/missing.pem", .key_path = "examples/certs/key.pem" } } },
             },
         },
     }, {});
@@ -2281,7 +2280,7 @@ test "Server: a listener with tls set is refused when TLS is compiled out" {
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{
             .address = loopback_addr,
-            .tls = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" },
+            .tls = .{ .certificate = .{ .file = .{ .cert_path = "examples/certs/cert.pem", .key_path = "examples/certs/key.pem" } } },
         }},
     }, {});
     defer server.deinit();
