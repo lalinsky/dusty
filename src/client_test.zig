@@ -624,7 +624,7 @@ test "Client: one server serves a plain listener and a TLS listener" {
             .{ .address = loopback_addr },
             .{
                 .address = loopback_addr,
-                .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+                .tls = .{ .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } } },
             },
         },
     }, {});
@@ -670,12 +670,62 @@ test "Client: one server serves a plain listener and a TLS listener" {
     try client_future.await(io);
 }
 
+test "Client: HTTPS with the certificate, key and CA given as bytes" {
+    if (!build_options.use_tls) return error.SkipZigTest;
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const cert_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_cert_path, gpa, .limited(64 * 1024));
+    defer gpa.free(cert_pem);
+    const key_pem = try std.Io.Dir.cwd().readFileAlloc(io, test_key_path, gpa, .limited(64 * 1024));
+    defer gpa.free(key_pem);
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .certificate = .{ .bytes = .{ .cert = cert_pem, .key = key_pem } } } }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/secure", struct {
+        fn handle(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "over tls";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void), _io: std.Io, ca_pem: []const u8) !void {
+            try s.ready.wait(_io);
+
+            var client = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .bytes = ca_pem } },
+            });
+            defer client.deinit();
+
+            var url_buf: [64]u8 = undefined;
+            const url = try std.fmt.bufPrint(&url_buf, "https://localhost:{d}/secure", .{s.address.ip.getPort()});
+
+            var response = try client.fetch(url, .{});
+            defer response.deinit();
+
+            try std.testing.expectEqual(.ok, response.status());
+            try std.testing.expectEqualStrings("over tls", (try response.body()).?);
+        }
+    }.run, .{ &server, io, cert_pem });
+
+    try client_future.await(io);
+}
+
 test "Client: HTTPS with a custom CA file" {
     if (!build_options.use_tls) return error.SkipZigTest;
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } } } }},
     }, {});
     defer server.deinit();
 
@@ -723,8 +773,7 @@ test "Server: tls.alpn_protocols is offered to the client through ALPN" {
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
+            .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } },
             .alpn_protocols = &.{"http/1.1"},
         } }},
     }, {});
@@ -776,8 +825,7 @@ test "Client: presents a client certificate for mutual TLS" {
     // validates both.
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
+            .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } },
             .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } } },
         } }},
     }, {});
@@ -805,7 +853,7 @@ test "Client: presents a client certificate for mutual TLS" {
             var client = dusty.Client.init(std.testing.allocator, _io, .{
                 .tls = .{
                     .ca = .{ .file = .{ .path = test_cert_path } },
-                    .client_certificate = .{ .cert_path = test_cert_path, .key_path = test_key_path },
+                    .client_certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } },
                 },
             });
             defer client.deinit();
@@ -827,8 +875,7 @@ test "Server: client_auth .require rejects a client with no certificate" {
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
+            .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } },
             .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .require },
         } }},
     }, {});
@@ -876,8 +923,7 @@ test "Server: client_auth .request accepts a client with no certificate" {
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
         .listeners = &.{.{ .address = loopback_addr, .tls = .{
-            .cert_path = test_cert_path,
-            .key_path = test_key_path,
+            .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } },
             .client_auth = .{ .ca = .{ .file = .{ .path = test_cert_path } }, .mode = .request },
         } }},
     }, {});
@@ -923,7 +969,7 @@ test "Client: rejects a server certificate the configured CA does not cover" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
-        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .cert_path = test_cert_path, .key_path = test_key_path } }},
+        .listeners = &.{.{ .address = loopback_addr, .tls = .{ .certificate = .{ .file = .{ .cert_path = test_cert_path, .key_path = test_key_path } } } }},
     }, {});
     defer server.deinit();
 

@@ -136,17 +136,9 @@ pub const TlsConfig = struct {
     /// only valid together with `insecure_skip_verify`.
     pub const Ca = config_mod.TlsCa;
 
-    pub const ClientCertificate = struct {
-        /// PEM certificate chain, leaf first, resolved against `dir`.
-        cert_path: []const u8,
-        /// PEM private key for the leaf certificate, resolved against `dir`.
-        /// Must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
-        /// KEY"); passphrase-protected keys are not supported.
-        key_path: []const u8,
-        /// Directory the paths are resolved against. Defaults to the current
-        /// working directory.
-        dir: ?std.Io.Dir = null,
-    };
+    /// Certificate and key presented under mutual TLS, loaded when the
+    /// client first needs TLS.
+    pub const ClientCertificate = config_mod.TlsCertificate;
 
     pub const Path = config_mod.TlsPath;
 };
@@ -1003,13 +995,7 @@ pub const Client = struct {
         var client_cert: ?tls.config.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
-            client_cert = try tls.config.CertKeyPair.fromFilePath(
-                self.allocator,
-                self.io,
-                cc.dir orelse std.Io.Dir.cwd(),
-                cc.cert_path,
-                cc.key_path,
-            );
+            client_cert = try cc.load(self.allocator, self.io);
         }
 
         self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };

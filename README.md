@@ -95,7 +95,10 @@ can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 
 ```zig
 .listeners = &.{
-    .{ .address = addr443, .tls = .{ .cert_path = "server.pem", .key_path = "server.key" } },
+    .{ .address = addr443, .tls = .{ .certificate = .{ .file = .{
+        .cert_path = "server.pem",
+        .key_path = "server.key",
+    } } } },
     .{ .address = addr80 },
 },
 ```
@@ -269,15 +272,17 @@ overrides that, and adds a client certificate for servers that require mutual TL
 ```zig
 var client = http.Client.init(init.gpa, init.io, .{
     .tls = .{
-        // .system (default), .{ .file = ... }, .{ .dir = ... }, or .none
+        // .system (default), .{ .file = ... }, .{ .dir = ... }, .{ .bytes = ... }, or .none
         .ca = .{ .file = .{ .path = "ca.pem" } },
         // Presented when the server asks the client to authenticate itself.
-        .client_certificate = .{ .cert_path = "client.pem", .key_path = "client.key" },
+        .client_certificate = .{ .file = .{ .cert_path = "client.pem", .key_path = "client.key" } },
     },
 });
 ```
 
 The key must be an unencrypted PKCS#8 (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) PEM file.
+A certificate and key already in memory, such as from a secret store, go in as
+`.{ .bytes = .{ .cert = cert_pem, .key = key_pem } }`, here and on a listener.
 
 These settings apply to every connection a client makes; connections are pooled and reused
 across requests, so they cannot be varied per request. Use a separate `Client` per identity.
@@ -289,8 +294,7 @@ makes it ask connecting clients for a certificate:
 .listeners = &.{.{
     .address = addr,
     .tls = .{
-        .cert_path = "server.pem",
-        .key_path = "server.key",
+        .certificate = .{ .file = .{ .cert_path = "server.pem", .key_path = "server.key" } },
         .client_auth = .{
             .ca = .{ .file = .{ .path = "client-ca.pem" } },
             // .require (default) rejects a client that sends no certificate;

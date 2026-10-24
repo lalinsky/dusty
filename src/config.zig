@@ -1,4 +1,5 @@
 const std = @import("std");
+const tls = @import("tls");
 
 /// Where a TLS peer's certificate authorities are loaded from. Shared by the
 /// client (verifying server certificates) and the server (verifying client
@@ -10,6 +11,10 @@ pub const TlsCa = union(enum) {
     file: TlsPath,
     /// A directory of PEM files, each holding one or more certificates.
     dir: TlsPath,
+    /// PEM text in memory holding one or more certificates. Borrowed like a
+    /// path: a server reads it in listen(), a client on its first TLS
+    /// connection, so it must outlive the `Client`.
+    bytes: []const u8,
     /// Trust nothing. Rejected unless the side using it says otherwise.
     none,
 
@@ -34,9 +39,72 @@ pub const TlsCa = union(enum) {
                 src.dir orelse std.Io.Dir.cwd(),
                 src.path,
             ),
+            .bytes => |pem| try addCertsFromPem(&bundle, allocator, pem, now.toSeconds()),
             .none => {},
         }
         return bundle;
+    }
+};
+
+/// `Bundle.addCertsFromFile` for PEM text already in memory.
+fn addCertsFromPem(bundle: *std.crypto.Certificate.Bundle, allocator: std.mem.Allocator, pem: []const u8, now_sec: i64) !void {
+    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+
+    const decoded_size_upper_bound = std.math.cast(u32, pem.len / 4 * 3) orelse
+        return error.CertificateAuthorityBundleTooBig;
+    try bundle.bytes.ensureUnusedCapacity(allocator, decoded_size_upper_bound);
+
+    var start_index: usize = 0;
+    while (std.mem.findPos(u8, pem, start_index, begin_marker)) |begin_marker_start| {
+        const cert_start = begin_marker_start + begin_marker.len;
+        const cert_end = std.mem.findPos(u8, pem, cert_start, end_marker) orelse
+            return error.MissingEndCertificateMarker;
+        start_index = cert_end + end_marker.len;
+        const encoded_cert = std.mem.trim(u8, pem[cert_start..cert_end], " \t\r\n");
+        const decoded_start: u32 = @intCast(bundle.bytes.items.len);
+        const dest_buf = bundle.bytes.allocatedSlice()[decoded_start..];
+        bundle.bytes.items.len += try base64.decode(dest_buf, encoded_cert);
+        try bundle.parseCert(allocator, decoded_start, now_sec);
+    }
+}
+
+/// A certificate chain and its private key, presented to the peer: a
+/// server's own certificate, or a client's under mutual TLS.
+///
+/// The key must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
+/// KEY"); passphrase-protected keys are not supported.
+pub const TlsCertificate = union(enum) {
+    /// PEM files: the certificate chain, leaf first, and the private key.
+    file: struct {
+        cert_path: []const u8,
+        key_path: []const u8,
+        /// Directory the paths are resolved against. Defaults to the
+        /// current working directory.
+        dir: ?std.Io.Dir = null,
+    },
+    /// PEM text in memory, for a key from a secret store or generated at
+    /// startup that should never touch disk. Borrowed like the paths: a
+    /// server reads it in listen(), a client on its first TLS connection,
+    /// so it must outlive the `Client`.
+    bytes: struct {
+        cert: []const u8,
+        key: []const u8,
+    },
+
+    /// Reads the certificate chain and key into a pair owned by the caller.
+    pub fn load(self: TlsCertificate, allocator: std.mem.Allocator, io: std.Io) !tls.config.CertKeyPair {
+        return switch (self) {
+            .file => |f| tls.config.CertKeyPair.fromFilePath(
+                allocator,
+                io,
+                f.dir orelse std.Io.Dir.cwd(),
+                f.cert_path,
+                f.key_path,
+            ),
+            .bytes => |b| tls.config.CertKeyPair.fromSlice(allocator, io, b.cert, b.key),
+        };
     }
 };
 
@@ -160,13 +228,9 @@ pub const ServerConfig = struct {
     max_connections: ?u32 = 10_000,
     /// TLS is per listener: see `Listener.tls`.
     pub const Tls = struct {
-        /// Path to the PEM certificate (chain) file, resolved against `dir`.
-        cert_path: []const u8,
-        /// Path to the PEM private key file, resolved against `dir`.
-        key_path: []const u8,
-        /// Directory the cert/key paths are resolved against. Defaults to the
-        /// current working directory.
-        dir: ?std.Io.Dir = null,
+        /// The listener's certificate chain and private key. Loaded by
+        /// listen().
+        certificate: TlsCertificate,
         /// Ask connecting clients to authenticate with a certificate (mutual
         /// TLS). Null means client certificates are never requested.
         client_auth: ?ClientAuth = null,
