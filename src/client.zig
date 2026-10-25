@@ -76,7 +76,7 @@ test "nghttp2 links and reports a version" {
 }
 
 /// Default User-Agent sent with requests unless overridden.
-pub const default_user_agent = "dusty/0.4.0";
+pub const default_user_agent = "dusty/0.5.0";
 
 /// Configuration for the HTTP client.
 pub const ClientConfig = struct {

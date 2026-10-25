@@ -23,7 +23,7 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 Requires Zig 0.16 or 0.17.
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/dusty#v0.4.0"
+zig fetch --save "git+https://github.com/lalinsky/dusty#v0.5.0"
 ```
 
 Then in your `build.zig`, add the module as a dependency:
