@@ -20,7 +20,7 @@ CI publishes the tested `linux/amd64` image from `main` as:
 docker pull ghcr.io/lalinsky/dusty-httpbin:latest
 ```
 
-Release tags also produce full and major/minor version tags, such as `0.4.0` and `0.4`.
+Release tags also produce full and major/minor version tags, such as `0.5.0` and `0.5`.
 
 ## Run behind a proxy
 
