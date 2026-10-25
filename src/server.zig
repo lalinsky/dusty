@@ -108,6 +108,10 @@ const request_arena_reserve = 8 * 1024;
 /// of the way into the pooled buffer.
 const idle_read_buffer_len = 1024;
 
+/// An injected TLS module may predate `inPlaceWriter`; its writer then goes
+/// through the request write buffer.
+const tls_in_place = build_options.use_tls and @hasDecl(tls.Connection, "inPlaceWriter");
+
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer) and their buffers for one accepted connection. The buffer a
 /// request is read into and its arena are not the connection's: they come
@@ -217,7 +221,7 @@ pub const Connection = struct {
             .alpn_protocols = alpn_protocols,
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
-        self.tls_writer = self.tls_conn.?.writer(&.{});
+        self.tls_writer = if (tls_in_place) self.tls_conn.?.inPlaceWriter() else self.tls_conn.?.writer(&.{});
         self.reader = &self.tls_reader.interface;
         self.writer = &self.tls_writer.interface;
     }
@@ -238,7 +242,10 @@ pub const Connection = struct {
     /// Writes through `buffer` from now on, until `releaseWriteBuffer`.
     /// Without one, each write goes out as it is made, which is all that
     /// is written between requests: responses that are one constant string.
+    /// A TLS writer that writes in place has a buffer of its own, inside the
+    /// record being written, and keeps it.
     pub fn useWriteBuffer(self: *Connection, buffer: []u8) void {
+        if (tls_in_place and self.tls_conn != null) return;
         std.debug.assert(self.writer.end == 0);
         self.writer.buffer = buffer;
     }
@@ -247,6 +254,7 @@ pub const Connection = struct {
     /// response is flushed as it ends, so only a failed write leaves
     /// anything, on a connection that is closing.
     pub fn releaseWriteBuffer(self: *Connection) void {
+        if (tls_in_place and self.tls_conn != null) return;
         self.writer.buffer = &.{};
         self.writer.end = 0;
     }
