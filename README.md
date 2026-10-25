@@ -1,3 +1,11 @@
+# Dusty - HTTP client/server library for Zig
+
+[![CI](https://github.com/lalinsky/dusty/actions/workflows/test.yml/badge.svg)](https://github.com/lalinsky/dusty/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Zig](https://img.shields.io/badge/zig-0.17.0-orange.svg)](https://ziglang.org/download/)
+[![HTTP Arena H1](https://img.shields.io/endpoint?url=https://http-arena.com/badge/dusty/h1.json)](https://http-arena.com/#type=emerging,flagship&tuned=0)
+[![HTTP Arena WebSocket](https://img.shields.io/endpoint?url=https://http-arena.com/badge/dusty/ws.json)](https://http-arena.com/#scope=ws&type=emerging,flagship&tuned=0)
+
 Dusty is a HTTP client/server library built on top of Zig's standard library I/O interface (`std.Io`) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
 
 The library was originally written for [zio](https://github.com/lalinsky/zio), and later ported to `std.Io`. It's still recommended to use it with zio's
