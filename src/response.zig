@@ -1188,8 +1188,10 @@ pub const Response = struct {
             .level = compression_level,
             .window_bits = window_bits,
             // Any less and the symbol buffer ends deflate blocks early
-            // enough to cost a few percent on bodies of about 512 bytes.
-            .mem_level = @min(window_bits - 6, 8),
+            // enough to cost a few percent on bodies of about 512 bytes. Any
+            // more and zeroing the hash table, which zlib does per stream,
+            // takes longer than compressing a body of a few KB.
+            .mem_level = @min(window_bits - 6, 5),
         });
         defer gzip.deinit();
         if (self.body_buffer.len() > 0) try self.body_buffer.writeTo(&gzip.writer) else try gzip.writer.writeAll(self.body);
