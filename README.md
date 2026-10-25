@@ -324,7 +324,7 @@ release their connection slots:
 - `timeout.request` defaults to 30 seconds. It covers an entire request,
   including handler work and writing the response; a TLS handshake gets its own
   deadline of the same length.
-- `timeout.keepalive` defaults to 60 seconds between requests on a persistent
+- `timeout.keepalive` defaults to 30 seconds between requests on a persistent
   connection.
 - `timeout.shutdown` defaults to 30 seconds for a graceful shutdown drain.
 
