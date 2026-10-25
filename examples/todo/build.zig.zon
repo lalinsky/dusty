@@ -12,16 +12,16 @@
             .hash = "zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn",
         },
         .json = .{
-            .url = "git+https://github.com/lalinsky/json.zig#029d993bc2c0e9b644e95e5ced351793f9fd4c24",
-            .hash = "json-0.1.0-XOh3KkIQAgBBtfQYnKpI3WTEnrMh6x5spl2V7zj__o7N",
+            .url = "git+https://github.com/lalinsky/json.zig?ref=v0.2.0#9d3d4d951507a73732ae2f49275ad8fefd4a3cf8",
+            .hash = "json-0.2.0-XOh3KrE4AgCdShVOsbwBkMkH2H2oAHX_L3cPVQlU8bOE",
         },
         .pg = .{
-            .url = "git+https://github.com/lalinsky/pg.zig?ref=v26.10.0#7b4609ca35377101d39327eb8274243434d7fc4b",
-            .hash = "pg-0.0.0-Wp_7gWz9BgBeAtfduH-xeTY0XI96NFz8iwYPFANy9-RG",
+            .url = "git+https://github.com/lalinsky/pg.zig?ref=v2026.10.25.0#865dab2d86d14d76fa82e2ef7d61905d40197fa0",
+            .hash = "pg-0.0.0-Wp_7gVkXBwAosCT75tkekt6ZaVDCzugFEdCGdLxBFzLv",
         },
         .zt = .{
-            .url = "git+https://github.com/lalinsky/zt#3fc1fb4c103722f331d7519192616fe78ff441b8",
-            .hash = "zt-0.0.0-oSxxLDUZAgCiyj7icjxGgmrDtdBrvgD-8jooDE1gcI11",
+            .url = "git+https://github.com/lalinsky/zt?ref=v0.2.1#061e59dfec493d1c43e4417e8394daf6d70ddcc3",
+            .hash = "zt-0.2.1-oSxxLPnUAgDnCeXbjek_Rjh94dDPN3VdHkD-J_HjVmOH",
         },
     },
     .paths = .{
