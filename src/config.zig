@@ -262,9 +262,9 @@ pub const ServerConfig = struct {
         /// `std.Io.Threaded` setting either timeout means two threads per
         /// connection.
         request: ?std.Io.Duration = .fromSeconds(30),
-        /// Maximum time to keep idle connections open. Defaults to 60 seconds;
+        /// Maximum time to keep idle connections open. Defaults to 30 seconds;
         /// set to null to keep them open indefinitely.
-        keepalive: ?std.Io.Duration = .fromSeconds(60),
+        keepalive: ?std.Io.Duration = .fromSeconds(30),
         /// Maximum number of requests per keepalive connection
         request_count: ?usize = null,
         /// Maximum time a graceful shutdown waits for the connections still
@@ -337,7 +337,7 @@ pub const ServerConfig = struct {
 test "ServerConfig: connection timeouts are finite by default" {
     const cfg: ServerConfig = .{};
     try std.testing.expectEqual(std.Io.Duration.fromSeconds(30), cfg.timeout.request.?);
-    try std.testing.expectEqual(std.Io.Duration.fromSeconds(60), cfg.timeout.keepalive.?);
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(30), cfg.timeout.keepalive.?);
     try std.testing.expectEqual(@as(usize, 0), cfg.trusted_proxy_hops);
 }
 
