@@ -328,9 +328,8 @@ pub const ServerConfig = struct {
         /// assembled in it and sent as it is finished. Taken with the
         /// request's read buffer, and given back with it. Must not be 0.
         ///
-        /// 16K is the most a TLS record carries, so under TLS a smaller
-        /// buffer sends what passes through it, a file or a body written in
-        /// pieces, in more, smaller records.
+        /// Not used on a TLS connection, which writes into the record
+        /// being sent instead.
         write_buffer_size: usize = 16384,
     };
 };
