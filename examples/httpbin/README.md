@@ -9,7 +9,7 @@ Build a static release binary for the architecture on which the container will r
 ```sh
 cd examples/httpbin
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Duse_tls=false --prefix zig-out/container
-docker build -t dusty-httpbin:0.4.0 .
+docker build -t dusty-httpbin:0.5.0 .
 ```
 
 Use `aarch64-linux-musl` instead of `x86_64-linux-musl` for a 64-bit ARM host. The resulting image contains only the static executable, runs as user/group `65532`, listens on port 8080, and has no shell or TLS stack.
@@ -20,7 +20,7 @@ CI publishes the tested `linux/amd64` image from `main` as:
 docker pull ghcr.io/lalinsky/dusty-httpbin:latest
 ```
 
-Release tags also produce full and major/minor version tags, such as `0.4.0` and `0.4`.
+Release tags also produce full and major/minor version tags, such as `0.5.0` and `0.5`.
 
 ## Run behind a proxy
 
@@ -36,7 +36,7 @@ docker run -d \
   --memory 256m \
   --cpus 1 \
   -p 127.0.0.1:8080:8080 \
-  dusty-httpbin:0.4.0 \
+  dusty-httpbin:0.5.0 \
   -l 0.0.0.0:8080 --trusted-proxy-hops 1
 ```
 

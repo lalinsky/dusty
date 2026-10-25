@@ -4,24 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-- An HTTP/1.0 request that asks to keep the connection now gets
-  `Connection: keep-alive` on its response when the server keeps it. Without
-  it an HTTP/1.0 client (ApacheBench with `-k`, for one) waits for the server
-  to close, while the server waits for the next request.
-- Added the `use_bundled_tls` build option. Applications can keep TLS enabled
-  while replacing Dusty's pinned tls.zig dependency with a compatible module.
-- Added `ServerConfig.Tls.alpn_protocols`, the protocols a TLS listener
-  offers through ALPN in preference order, and the server
-  `Connection.negotiatedProtocol()` that reports the agreed one.
-- A failed TLS handshake is now logged at info instead of err (only
-  `OutOfMemory` stays at err). Any peer that reaches the port can fail one at
-  will, so err-level logging let anyone flood the error log.
-- Server and client connections now call `tls.Connection.deinit` on close
-  when the TLS module declares one, so an injected module backed by a C
-  library (one `SSL` object per connection) does not leak per connection.
-- `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn`
-  on Linux, instead of 1024. A full accept queue makes Linux drop new connections,
-  which then wait a second or more to retry.
+## [0.5.0] - 2026-10-25
+
+This release adds file and asset serving, more ways to produce a response body, and a more reliable HTTP client, while making TLS, compression and memory use cheaper per connection.
+
+### Highlights
+
+- Added `router.static(prefix, dir, opts)` and `Group.static` for serving a directory, `router.embedded(path, data, opts)` and `Group.embedded` for serving a file compiled into the binary, and the `addAssets` build helper, which embeds a directory of assets at build time and gives templates cache-busting URLs such as `/assets/app.css?v=6ec8ea7d`.
+- Added `Response.render(content_type, template, args)` for templating libraries such as [zt](https://github.com/lalinsky/zt), `Response.print(content_type, fmt, args)` for formatting a body directly, and `Response.encode(content_type, encodeFn, value)`, which writes the body with a serializer's write-to-writer function.
+- `WebSocket` gains `autoflush` and `flush()`, so frames can be batched into fewer writes, and `receiveMany` and `tryReceive` for taking every message that has already arrived. The default behavior is unchanged.
+- Added `query()` to `Router` and `Group` for QUERY requests, and `any()` now matches every method, following Go's `ServeMux`: a request is matched against routes of its own method first, then HEAD against GET routes, then `any()` routes.
+- TLS certificates and CA bundles can come from bytes in memory as well as files, for both listeners and the client's mutual-TLS certificate. Listeners offer protocols through ALPN with `ServerConfig.Tls.alpn_protocols`, and `Connection.negotiatedProtocol()` reports the one agreed.
+- The `use_bundled_tls` build option lets an application keep TLS enabled while injecting its own `tls` module in place of Dusty's pinned tls.zig. Connections call `tls.Connection.deinit` on close when the module declares one, so a module backed by a C library does not leak a connection object per connection.
+- Added `examples/todo`, a TodoMVC-style app built with zt, pg.zig and htmx.
+
+### Performance and memory
+
+- TLS responses are encrypted in place: the body is written straight into the record that gets encrypted, instead of being copied through the request write buffer first.
+- Responses with `compress` set are gzipped at zlib level 3 instead of zlib's default, 6. On JSON bodies of a few KB this sends about 43% more responses per second, for bodies about 12% larger.
+- The connection's write buffer moved into the pooled request buffers, so an idle connection no longer holds one, and `@sizeOf(Connection)` drops from about 9K to under 1K. The new `ServerConfig.response.write_buffer_size` sets it and defaults to 16K.
+- `Listener.kernel_backlog` now defaults to the system's limit, `net.core.somaxconn` on Linux, instead of 1024. A full accept queue makes Linux drop new connections, which then wait a second or more to retry.
+
+### HTTP client
+
+- A response whose body was not read to the end no longer costs the connection: up to 256 KiB of it is discarded in the background, within 50 ms, and the connection goes back to the pool, with the same bounds as Go's net/http.
+- An idempotent request (GET, HEAD, OPTIONS, TRACE, QUERY, or one with an `Idempotency-Key` header) that fails on a pooled connection before any response arrives is sent once more on a new connection, within the fetch's deadline. This covers servers that close idle connections without a `Keep-Alive: timeout=` hint.
+- When sending a request fails because the server has already answered and closed, for example with a 413 for a body it rejects, the client returns that response instead of `ConnectionResetByPeer`.
+- 301 and 302 redirects keep a QUERY request's method and body, as RFC 10008 requires; only 303 turns it into a GET.
+- A redirect no longer drains its body when the connection will not be reused, which could block until 2 KB arrived or the deadline passed.
+- Connections are no longer returned to the pool after a CONNECT request.
+
+### Fixes
+
+- The server closes the connection after a CONNECT request. A body sent with one was left on the connection and served as the next request, which behind a proxy that frames CONNECT bodies by `Content-Length` allowed request smuggling.
+- A handler that streamed part of its response before reading the request body no longer gets `100 Continue` written into the middle of it.
+- An HTTP/1.0 request that asks to keep the connection now gets `Connection: keep-alive` on its response when the server keeps it. Without it an HTTP/1.0 client (ApacheBench with `-k`, for one) waits for the server to close, while the server waits for the next request.
+- A failed TLS handshake is now logged at info instead of err (only `OutOfMemory` stays at err). Any peer that reaches the port can fail one at will, so err-level logging let anyone flood the error log.
+
+### Upgrade notes
+
+- `ServerConfig.Tls.cert_path`, `key_path` and `dir` are replaced by `.certificate = .{ .file = .{ .cert_path = ..., .key_path = ... } }` or `.certificate = .{ .bytes = .{ .cert = ..., .key = ... } }`. `TlsConfig.client_certificate` takes the same union. An injected `tls` module now needs `CertKeyPair.fromSlice` as well as `fromFilePath`.
+- `timeout.keepalive` now defaults to 30 seconds instead of 60, the same as `timeout.request`.
+- `Router.all_methods` is removed. Registering a method route and an `any()` route where both match some path and the method route is not at least as specific now panics, naming both routes; for example `get("/users/:id")` with `any("/users/me")`. This includes `static("/")` or `get("/*")` together with an `any()` route under a prefix.
+- `Listener.kernel_backlog` is now `?u31`; `null`, the default, means the system's limit.
 
 ## [0.4.0] - 2026-10-06
 
@@ -123,7 +148,8 @@ Initial release.
 - Cookie support.
 - Request/keepalive timeouts via coroutine auto-cancellation.
 
-[Unreleased]: https://github.com/lalinsky/dusty/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/lalinsky/dusty/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lalinsky/dusty/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/lalinsky/dusty/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/lalinsky/dusty/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/lalinsky/dusty/compare/v0.2.0...v0.3.0
