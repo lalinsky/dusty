@@ -33,12 +33,12 @@
     // internet connectivity.
     .dependencies = .{
         .tls = .{
-            .url = "git+https://github.com/lalinsky/tls.zig#e4fbd5bf099a575dbaee8c9d38dc5abd08d5c758",
+            .url = "git+https://github.com/lalinsky/tls.zig?ref=v2026.10.25.0#e4fbd5bf099a575dbaee8c9d38dc5abd08d5c758",
             .hash = "tls-0.1.0-ER2e0rknBwAlCJSPZKGoEFqV5vSPdCQLmCGgK9MsJveA",
             .lazy = true,
         },
         .zlib = .{
-            .url = "git+https://github.com/lalinsky/zlib.zig#537dbce25b1b29a0361845b019711dad35699aa6",
+            .url = "git+https://github.com/lalinsky/zlib.zig?ref=v0.1.0#8e7900c5287f0e1c0b2c7ed27b5b0a92912903e1",
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
             .lazy = true,
         },
