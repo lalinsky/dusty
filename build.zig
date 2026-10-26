@@ -227,7 +227,15 @@ pub fn build(b: *std.Build) void {
         "websocket",
     };
 
+    // These answer with JSON.
+    const json_examples = [_][]const u8{ "basic", "tls_server" };
+
     for (example_files) |name| {
+        if (!use_json) {
+            if (for (json_examples) |json_name| {
+                if (std.mem.eql(u8, name, json_name)) break true;
+            } else false) continue;
+        }
         const example = b.addExecutable(.{
             .name = b.fmt("{s}-example", .{name}),
             .root_module = b.createModule(.{
