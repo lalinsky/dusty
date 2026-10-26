@@ -882,16 +882,20 @@ pub const ClientResponse = struct {
         return result;
     }
 
-    /// Decodes the body as JSON into `T`, with json.zig, into the response's
-    /// arena. Null when there is no body. Needs the `use_json` build option.
+    /// Decodes the body as JSON into `T`, with json.zig, or with `std.json`
+    /// without the `use_json` build option, into the response's arena. Null
+    /// when there is no body.
     pub fn json(self: *ClientResponse, comptime T: type) !?T {
-        if (!build_options.use_json) @compileError("ClientResponse.json needs the use_json build option");
         const b = try self.body() orelse return null;
-        return json_lib.decodeFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
-            // Decoded from a slice, whose reader cannot fail.
-            error.ReadFailed => unreachable,
-            else => |e| return e,
-        };
+        if (build_options.use_json) {
+            return json_lib.decodeFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
+                // Decoded from a slice, whose reader cannot fail.
+                error.ReadFailed => unreachable,
+                else => |e| return e,
+            };
+        } else {
+            return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});
+        }
     }
 
     /// Decodes the body as MessagePack into `T`, with msgpack.zig, into the
@@ -2000,11 +2004,11 @@ test "Client: no std.Io sentinel escapes its public API" {
         }
     }.f;
     // `json` and `msgpack` are generic, so an instance of each stands in.
-    const json_errors = if (build_options.use_json) ErrorSetOf(struct {
+    const json_errors = ErrorSetOf(struct {
         fn f(r: *ClientResponse) !?u8 {
             return r.json(u8);
         }
-    }.f) else error{};
+    }.f);
     const msgpack_errors = if (build_options.use_msgpack) ErrorSetOf(struct {
         fn f(r: *ClientResponse) !?u8 {
             return r.msgpack(u8);
@@ -2303,7 +2307,6 @@ fn testClientResponse(arena: std.mem.Allocator, raw_response: []const u8, reader
 }
 
 test "ClientResponse.json: decodes the body into a type" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2346,7 +2349,6 @@ test "ClientResponse.msgpack: decodes the body into a type, and a truncated one 
 }
 
 test "ClientResponse.json: no body is null" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

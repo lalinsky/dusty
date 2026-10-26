@@ -179,8 +179,9 @@ fn handleUserMsgpack(req: *http.Request, res: *http.Response) !void {
 
 `http.json` and `http.msgpack` are the libraries themselves, for a type that shapes its own encoding
 (`jsonFormat`, `jsonWrite`, `msgpackWrite`). Unlike `std.json`, json.zig leaves out optional fields that
-are null, unless the type says otherwise. Build with `-Duse_json=false` or `-Duse_msgpack=false` to
-leave either library out.
+are null, unless the type says otherwise. Build with `-Duse_json=false` to leave json.zig out, and
+`req.json` and `res.json` use `std.json` instead, or with `-Duse_msgpack=false` to leave msgpack.zig
+out. Dusty's own types (`Headers`, `Params`, `Cookie`) encode the same either way.
 
 `res.encode` writes a value with any serializer's write-to-writer function, telling its parameters
 apart by type, so other libraries plug in as they are, [serde.zig](https://github.com/OrlovEvgeny/serde.zig)'s

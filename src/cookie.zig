@@ -81,6 +81,17 @@ pub const Cookie = struct {
         try encoder.endObject();
     }
 
+    /// The same as `jsonWrite`, for `std.json`.
+    pub fn jsonStringify(self: Cookie, jw: anytype) !void {
+        try jw.beginObject();
+        var it = self.iterator();
+        while (it.next()) |entry| {
+            try jw.objectField(entry.name);
+            try jw.write(entry.value);
+        }
+        try jw.endObject();
+    }
+
     /// Encodes as a MessagePack map of name to value, for msgpack.zig.
     pub fn msgpackWrite(self: Cookie, packer: anytype) !void {
         var count: usize = 0;
@@ -297,7 +308,11 @@ test "serializeCookie: zero max_age deletes cookie" {
 fn expectCookieJson(expected: []const u8, header: []const u8) !void {
     var buf: [512]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    try json_lib.encode(Cookie{ .header = header }, &out);
+    if (build_options.use_json) {
+        try json_lib.encode(Cookie{ .header = header }, &out);
+    } else {
+        try std.json.Stringify.value(Cookie{ .header = header }, .{}, &out);
+    }
     try std.testing.expectEqualStrings(expected, out.buffered());
 }
 
@@ -336,7 +351,6 @@ test "Cookie: msgpackWrite" {
 }
 
 test "Cookie: jsonWrite" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     try expectCookieJson(
         \\{"a":"1","b":"2"}
     , "a=1; b=2");

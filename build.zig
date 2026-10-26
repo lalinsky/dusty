@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
-    const use_json = b.option(bool, "use_json", "Build with JSON bodies via json.zig") orelse true;
+    const use_json = b.option(bool, "use_json", "Encode and decode JSON bodies with json.zig; without it, std.json") orelse true;
     const use_bundled_json = b.option(
         bool,
         "use_bundled_json",
@@ -89,8 +89,9 @@ pub fn build(b: *std.Build) void {
     }
 
     // JSON and MessagePack bodies are lazy dependencies too, and need no
-    // stub: without them, `Request.json`/`Response.json` and the msgpack
-    // pair fail to compile if they are used, and nothing else refers to them.
+    // stub: without json.zig, `Request.json`/`Response.json` use std.json,
+    // and without msgpack.zig the msgpack pair fails to compile if it is
+    // used.
     // Like TLS, either can be replaced with a compatible module:
     //   dusty_mod.addImport("json", custom_json_mod);
     if (use_json) {
@@ -227,15 +228,7 @@ pub fn build(b: *std.Build) void {
         "websocket",
     };
 
-    // These answer with JSON.
-    const json_examples = [_][]const u8{ "basic", "tls_server" };
-
     for (example_files) |name| {
-        if (!use_json) {
-            if (for (json_examples) |json_name| {
-                if (std.mem.eql(u8, name, json_name)) break true;
-            } else false) continue;
-        }
         const example = b.addExecutable(.{
             .name = b.fmt("{s}-example", .{name}),
             .root_module = b.createModule(.{

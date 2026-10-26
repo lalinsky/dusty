@@ -837,22 +837,26 @@ pub const Response = struct {
         _ = self.headers.remove("Content-Encoding");
     }
 
-    /// Options for `json`: json.zig's, when it is built in.
-    pub const JsonOptions = if (build_options.use_json) json_lib.EncodeOptions else struct {};
+    /// Options for `json`: json.zig's, or `std.json`'s without the
+    /// `use_json` build option.
+    pub const JsonOptions = if (build_options.use_json) json_lib.EncodeOptions else std.json.Stringify.Options;
 
-    /// Sets the body to `value` encoded as JSON, with json.zig. A type can
-    /// shape its encoding with json.zig's `jsonFormat` or `jsonWrite`. Needs
-    /// the `use_json` build option.
+    /// Sets the body to `value` encoded as JSON, with json.zig, or with
+    /// `std.json` without the `use_json` build option. A type can shape its
+    /// encoding with json.zig's `jsonFormat` or `jsonWrite`, and with
+    /// `std.json`'s `jsonStringify`.
     ///
     /// If the encoding fails, what it wrote is discarded, so the handler can
     /// still send something else.
     pub fn json(self: *Response, value: anytype, options: JsonOptions) !void {
-        if (!build_options.use_json) @compileError("Response.json needs the use_json build option");
         // The open writer owns the segment being filled, and would write
         // over this, or publish a length past the end of it.
         if (self.body_writer_buffering) return error.BodyWriterOpen;
         var w = self.writer();
-        const result = json_lib.encodeWithOptions(value, &w.interface, options);
+        const result = if (build_options.use_json)
+            json_lib.encodeWithOptions(value, &w.interface, options)
+        else
+            std.json.Stringify.value(value, options, &w.interface);
         return self.endBody(&w, .json, result);
     }
 
@@ -2151,7 +2155,6 @@ test "StreamingBodyWriter: a failed end does not leave a second terminator" {
 }
 
 test "Response: json() with simple object" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2172,7 +2175,6 @@ test "Response: json() with simple object" {
 }
 
 test "Response: json() writes complete response" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2201,7 +2203,6 @@ test "Response: json() writes complete response" {
 }
 
 test "Response: json() with array" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2221,7 +2222,6 @@ test "Response: json() with array" {
 }
 
 test "Response: json() with nested object" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3087,7 +3087,6 @@ test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
 }
 
 test "Response: json is refused while a body writer is open" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

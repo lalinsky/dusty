@@ -202,16 +202,20 @@ pub const Request = struct {
         return result;
     }
 
-    /// Decodes the body as JSON into `T`, with json.zig, into the request
-    /// arena. Null when there is no body. Needs the `use_json` build option.
+    /// Decodes the body as JSON into `T`, with json.zig, or with `std.json`
+    /// without the `use_json` build option, into the request arena. Null
+    /// when there is no body.
     pub fn json(self: *Request, comptime T: type) !?T {
-        if (!build_options.use_json) @compileError("Request.json needs the use_json build option");
         const b = try self.body() orelse return null;
-        return json_lib.decodeFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
-            // Decoded from a slice, whose reader cannot fail.
-            error.ReadFailed => unreachable,
-            else => |e| return e,
-        };
+        if (build_options.use_json) {
+            return json_lib.decodeFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
+                // Decoded from a slice, whose reader cannot fail.
+                error.ReadFailed => unreachable,
+                else => |e| return e,
+            };
+        } else {
+            return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});
+        }
     }
 
     /// Decodes the body as MessagePack into `T`, with msgpack.zig, into the
@@ -713,11 +717,11 @@ test "Request: no std.Io.Reader sentinel escapes the body-reading API" {
         }
     }.f;
     // `json` and `msgpack` are generic, so an instance of each stands in.
-    const json_errors = if (build_options.use_json) ErrorSetOf(struct {
+    const json_errors = ErrorSetOf(struct {
         fn f(r: *Request) !?u8 {
             return r.json(u8);
         }
-    }.f) else error{};
+    }.f);
     const msgpack_errors = if (build_options.use_msgpack) ErrorSetOf(struct {
         fn f(r: *Request) !?u8 {
             return r.msgpack(u8);
@@ -791,7 +795,6 @@ test "Request.body: built without zlib, a coded body is refused" {
 }
 
 test "Request.json: decodes the body into a type" {
-    if (comptime !build_options.use_json) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1160,9 +1163,7 @@ test "Request.body: a body read that failed before it started can be asked for a
     // assert on a request a peer chose the encoding for.
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
     try std.testing.expectError(error.UnsupportedContentEncoding, req.body());
-    if (comptime build_options.use_json) {
-        try std.testing.expectError(error.UnsupportedContentEncoding, req.json(u8));
-    }
+    try std.testing.expectError(error.UnsupportedContentEncoding, req.json(u8));
 }
 
 test "Request: a streaming read resolves through the reader it hands out" {
