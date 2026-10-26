@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const use_brotli = b.option(bool, "use_brotli", "Compress buffered response bodies with brotli for clients that take it (experimental)") orelse false;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -26,6 +27,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
     build_options.addOption(bool, "use_zlib", use_zlib);
+    build_options.addOption(bool, "use_brotli", use_brotli);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -72,6 +74,32 @@ pub fn build(b: *std.Build) void {
         mod.addAnonymousImport("zlib", .{
             .root_source_file = b.path("src/zlib_stub.zig"),
         });
+    }
+
+    // Google's brotli encoder, built from its release tarball.
+    if (use_brotli) {
+        if (b.lazyDependency("brotli", .{})) |brotli_dep| {
+            mod.addCSourceFiles(.{
+                .root = brotli_dep.path("c"),
+                .files = &.{
+                    "common/constants.c",         "common/context.c",
+                    "common/dictionary.c",        "common/platform.c",
+                    "common/shared_dictionary.c", "common/transform.c",
+                    "enc/backward_references.c",  "enc/backward_references_hq.c",
+                    "enc/bit_cost.c",             "enc/block_splitter.c",
+                    "enc/brotli_bit_stream.c",    "enc/cluster.c",
+                    "enc/command.c",              "enc/compound_dictionary.c",
+                    "enc/compress_fragment.c",    "enc/compress_fragment_two_pass.c",
+                    "enc/dictionary_hash.c",      "enc/encode.c",
+                    "enc/encoder_dict.c",         "enc/entropy_encode.c",
+                    "enc/fast_log.c",             "enc/histogram.c",
+                    "enc/literal_cost.c",         "enc/memory.c",
+                    "enc/metablock.c",            "enc/static_dict.c",
+                    "enc/utf8_util.c",
+                },
+            });
+            mod.addIncludePath(brotli_dep.path("c/include"));
+        }
     }
 
     const translate_c = b.addTranslateC(.{

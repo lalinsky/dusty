@@ -776,7 +776,7 @@ pub const Response = struct {
         self.headers_written = true;
 
         if (compression != .off) self.addVary();
-        if (compression == .gzip) self.markCompressed();
+        if (compression == .gzip) self.markCompressed("gzip");
         if (declared) |len| {
             self.content_length = len;
         } else if (self.http10) {
@@ -1083,6 +1083,25 @@ pub const Response = struct {
     /// its default of 6 takes half again the CPU of 3 for 12% fewer bytes.
     const compression_level: zlib.Level = @enumFromInt(3);
 
+    /// brotli's quality for buffered bodies, with the `use_brotli` build
+    /// option. 2 and 3 are smaller than zlib's level 3 on JSON bodies of a
+    /// few KB, for less CPU.
+    pub var brotli_quality: c_int = 3;
+
+    const brotli = struct {
+        const mode_text = 1;
+        extern fn BrotliEncoderMaxCompressedSize(input_size: usize) usize;
+        extern fn BrotliEncoderCompress(
+            quality: c_int,
+            lgwin: c_int,
+            mode: c_int,
+            input_size: usize,
+            input: [*]const u8,
+            encoded_size: *usize,
+            encoded: [*]u8,
+        ) c_int;
+    };
+
     /// A buffered body shorter than this is sent as it is, without trying:
     /// gzip adds 18 bytes of its own.
     const min_compress_len = 128;
@@ -1125,6 +1144,11 @@ pub const Response = struct {
         return if (http.acceptsGzip(&request.headers)) .gzip else .identity;
     }
 
+    fn takesBrotli(self: *const Response) bool {
+        const request = self.request orelse return false;
+        return http.acceptsEncoding(&request.headers, "br");
+    }
+
     /// `Vary: *` included, which says the response varies by anything.
     fn variesByAcceptEncoding(self: *const Response) bool {
         var it = self.headers.iterator();
@@ -1153,7 +1177,7 @@ pub const Response = struct {
     /// A 304 gets the validators of the gzipped 200 it stands in for, but
     /// no `Content-Encoding`: RFC 9110 §15.4.5 leaves representation
     /// metadata off it.
-    fn markCompressed(self: *Response) void {
+    fn markCompressed(self: *Response, coding: []const u8) void {
         _ = self.headers.remove("Accept-Ranges");
         if (self.headers.get("ETag")) |etag| {
             if (!std.mem.startsWith(u8, etag, "W/")) {
@@ -1165,7 +1189,7 @@ pub const Response = struct {
             }
         }
         if (self.status == .not_modified) return;
-        self.headers.add("Content-Encoding", "gzip") catch unreachable; // reserved
+        self.headers.add("Content-Encoding", coding) catch unreachable; // reserved
     }
 
     /// Replaces the buffered body with its gzipped form, unless it is short
@@ -1177,7 +1201,33 @@ pub const Response = struct {
         if (compressed.len() >= len) return;
         self.body_buffer = compressed;
         self.body = "";
-        self.markCompressed();
+        self.markCompressed("gzip");
+    }
+
+    /// `compressBody` with brotli. False when the body was left for gzip
+    /// to try.
+    fn brotliBody(self: *Response) bool {
+        const len = self.bodyLen();
+        if (len < min_compress_len) return true;
+        const input: []const u8 = if (self.body_buffer.len() == 0)
+            self.body
+        else if (self.body_buffer.segments.first == self.body_buffer.segments.last)
+            self.body_buffer.last().?.bytes()[0..len]
+        else blk: {
+            const flat = self.arena.alloc(u8, len) catch return false;
+            var w: std.Io.Writer = .fixed(flat);
+            self.body_buffer.writeTo(&w) catch unreachable;
+            break :blk flat;
+        };
+        const out = self.arena.alloc(u8, brotli.BrotliEncoderMaxCompressedSize(len)) catch return false;
+        var out_len = out.len;
+        const lgwin: c_int = @intCast(std.math.clamp(std.math.log2_int_ceil(usize, len), 10, 24));
+        if (brotli.BrotliEncoderCompress(brotli_quality, lgwin, brotli.mode_text, len, input.ptr, &out_len, out.ptr) == 0) return false;
+        if (out_len >= len) return true;
+        self.body_buffer.clear();
+        self.body = out[0..out_len];
+        self.markCompressed("br");
+        return true;
     }
 
     fn deflateBody(self: *Response, len: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!BodyBuffer {
@@ -1324,7 +1374,11 @@ pub const Response = struct {
             const compression = self.negotiateCompression();
             if (compression != .off) self.addVary();
             if (compression == .gzip) {
-                if (self.status == .not_modified) self.markCompressed() else self.compressBody();
+                if (self.status == .not_modified) {
+                    self.markCompressed("gzip");
+                } else if (!(build_options.use_brotli and self.takesBrotli() and self.brotliBody())) {
+                    self.compressBody();
+                }
             }
             self.headers_written = true;
         }

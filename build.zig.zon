@@ -42,6 +42,11 @@
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
             .lazy = true,
         },
+        .brotli = .{
+            .url = "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz",
+            .hash = "N-V-__8AAF_gIQDX2wVzXI-r96NyCgKuDj9W_Gab-TU7Qzoi",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
