@@ -45,7 +45,7 @@ const dusty_dep = b.dependency("dusty", .{
 exe.root_module.addImport("dusty", dusty_dep.module("dusty"));
 ```
 
-### Using a custom tls.zig
+### Using a custom tls.zig, json.zig or msgpack.zig
 
 TLS is enabled with Dusty's pinned tls.zig dependency by default. To inject a
 different compatible version without fetching or compiling the bundled one,
@@ -71,6 +71,9 @@ exe.root_module.addImport("dusty", dusty_mod);
 The application declares `custom_tls` in its own `build.zig.zon`, so it can
 point to another commit, fork, or local path. Omitting the injected module is a
 compile error. Use `.use_tls = false` instead when TLS should be compiled out.
+
+json.zig and msgpack.zig are replaced the same way, with `.use_bundled_json = false` and an
+injected `json` module, or `.use_bundled_msgpack = false` and an injected `msgpack` module.
 
 ## Usage
 

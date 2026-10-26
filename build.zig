@@ -16,7 +16,17 @@ pub fn build(b: *std.Build) void {
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
     const use_json = b.option(bool, "use_json", "Build with JSON bodies via json.zig") orelse true;
+    const use_bundled_json = b.option(
+        bool,
+        "use_bundled_json",
+        "Use Dusty's pinned json.zig dependency; disable to inject a compatible 'json' module",
+    ) orelse true;
     const use_msgpack = b.option(bool, "use_msgpack", "Build with MessagePack bodies via msgpack.zig") orelse true;
+    const use_bundled_msgpack = b.option(
+        bool,
+        "use_bundled_msgpack",
+        "Use Dusty's pinned msgpack.zig dependency; disable to inject a compatible 'msgpack' module",
+    ) orelse true;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -81,8 +91,14 @@ pub fn build(b: *std.Build) void {
     // JSON and MessagePack bodies are lazy dependencies too, and need no
     // stub: without them, `Request.json`/`Response.json` and the msgpack
     // pair fail to compile if they are used, and nothing else refers to them.
+    // Like TLS, either can be replaced with a compatible module:
+    //   dusty_mod.addImport("json", custom_json_mod);
     if (use_json) {
-        if (b.lazyDependency("json", .{
+        if (!use_bundled_json) {
+            mod.addAnonymousImport("json", .{
+                .root_source_file = b.path("src/json_injection_required.zig"),
+            });
+        } else if (b.lazyDependency("json", .{
             .target = target,
             .optimize = optimize,
         })) |json_dep| {
@@ -90,7 +106,11 @@ pub fn build(b: *std.Build) void {
         }
     }
     if (use_msgpack) {
-        if (b.lazyDependency("msgpack", .{
+        if (!use_bundled_msgpack) {
+            mod.addAnonymousImport("msgpack", .{
+                .root_source_file = b.path("src/msgpack_injection_required.zig"),
+            });
+        } else if (b.lazyDependency("msgpack", .{
             .target = target,
             .optimize = optimize,
         })) |msgpack_dep| {
