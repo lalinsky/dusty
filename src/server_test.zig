@@ -1716,6 +1716,97 @@ test "Server: an unread chunked body is not answered with a reset" {
     }
 }
 
+/// Sends a chunked POST whose body is `chunks`, to a handler that reads it
+/// whole. Returns what the read failed with, if anything, after checking
+/// the status of the answer and that the connection is closed behind it.
+fn chunkedPost(chunks: []const u8, status: []const u8) !?anyerror {
+    const io = std.testing.io;
+
+    const Ctx = struct {
+        err: ?anyerror = null,
+
+        fn handle(ctx: *@This(), req: *dusty.Request, res: *dusty.Response) !void {
+            _ = req.body() catch |err| {
+                ctx.err = err;
+                return err;
+            };
+            res.body = "OK";
+        }
+    };
+    var ctx: Ctx = .{};
+
+    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    defer server.deinit();
+    server.router.post("/", Ctx.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    var client_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(Ctx), _io: std.Io, body: []const u8, expected_status: []const u8) !void {
+            try s.ready.wait(_io);
+
+            const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
+            defer stream.close(_io);
+
+            var write_buf: [1024]u8 = undefined;
+            var writer = stream.writer(_io, &write_buf);
+            var read_buf: [1024]u8 = undefined;
+            var reader = stream.reader(_io, &read_buf);
+
+            try writer.interface.writeAll("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n");
+            try writer.interface.writeAll(body);
+            try writer.interface.flush();
+
+            const status_line = try reader.interface.takeDelimiterExclusive('\n');
+            try std.testing.expectStringStartsWith(status_line, expected_status);
+            _ = try reader.interface.discardRemaining();
+        }
+    }.run, .{ &server, io, chunks, status });
+
+    try client_future.await(io);
+    return ctx.err;
+}
+
+test "Server: chunk extensions past the limit fail the body read" {
+    const ext: [32 * 1024]u8 = @splat('x');
+    const err = try chunkedPost("1;" ++ ext ++ "\r\nX\r\n0\r\n\r\n", "HTTP/1.1 500 ");
+    try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
+}
+
+test "Server: trailers past the limit fail the body read" {
+    // Whitespace before a value reaches no llhttp callback.
+    const ows: [32 * 1024]u8 = @splat(' ');
+    const err = try chunkedPost("1\r\nX\r\n0\r\nX-Trailer:" ++ ows ++ "v\r\n\r\n", "HTTP/1.1 500 ");
+    try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
+}
+
+test "Server: leading zeros in a chunk size past the limit fail the body read" {
+    const zeros: [32 * 1024]u8 = @splat('0');
+    const err = try chunkedPost(zeros ++ "1\r\nX\r\n0\r\n\r\n", "HTTP/1.1 500 ");
+    try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
+}
+
+test "Server: leading zeros in the last chunk past the limit fail the body read" {
+    const zeros: [32 * 1024]u8 = @splat('0');
+    const err = try chunkedPost("1\r\nX\r\n" ++ zeros ++ "0\r\n\r\n", "HTTP/1.1 500 ");
+    try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
+}
+
+test "Server: a body of many one-byte chunks is read whole" {
+    const chunk = "1\r\nx\r\n";
+    const last = "0\r\n\r\n";
+    var chunks: [chunk.len * 10000 + last.len]u8 = undefined;
+    for (0..10000) |i| @memcpy(chunks[i * chunk.len ..][0..chunk.len], chunk);
+    @memcpy(chunks[chunk.len * 10000 ..], last);
+    const err = try chunkedPost(&chunks, "HTTP/1.1 200 ");
+    try std.testing.expectEqual(@as(?anyerror, null), err);
+}
+
 test "Server: a 417 before an unread body is not answered with a reset" {
     var buf: [256]u8 = undefined;
     for ([_]bool{ true, false }) |timeouts| {
