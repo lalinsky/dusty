@@ -428,18 +428,15 @@ pub const RequestParser = struct {
 };
 
 /// RFC 9112 3.2: `uri-host [ ":" port ]`, with uri-host an IP-literal or a
-/// reg-name (which an IPv4address also is) as in RFC 3986 3.2.2. The
-/// brackets of an IP-literal are checked for its characters only. Empty
-/// is valid here; whether it is allowed depends on the target.
+/// reg-name (which an IPv4address also is) as in RFC 3986 3.2.2. Empty is
+/// valid here; whether it is allowed depends on the target.
 fn isValidHost(value: []const u8) bool {
     if (value.len == 0) return true;
     var port: []const u8 = undefined;
     if (value[0] == '[') {
         const close = std.mem.indexOfScalar(u8, value, ']') orelse return false;
-        if (close == 1) return false;
-        for (value[1..close]) |ch| {
-            if (!isUnreserved(ch) and !isSubDelim(ch) and ch != ':') return false;
-        }
+        // An IPvFuture literal is refused.
+        _ = std.Io.net.Ip6Address.parse(value[1..close], 0) catch return false;
         port = value[close + 1 ..];
         if (port.len > 0) {
             if (port[0] != ':') return false;
@@ -1167,7 +1164,7 @@ test "RequestParser: basic" {
 test "isValidHost" {
     const valid = [_][]const u8{ "", "example.com.", "EXAMPLE.com:0", "localhost:", "[::1]:8080", "xn--bcher-kva.example%2D1", "127.0.0.1" };
     for (valid) |host| try std.testing.expect(isValidHost(host));
-    const invalid = [_][]const u8{ "local host", "localhost/", "user@localhost", "b\xc3\xbccher.example", ":80", "[]", "%", "a%4" };
+    const invalid = [_][]const u8{ "local host", "localhost/", "user@localhost", "b\xc3\xbccher.example", ":80", "[]", "[abc]", "[fe80::1%25eth0]", "%", "a%4" };
     for (invalid) |host| try std.testing.expect(!isValidHost(host));
 }
 
