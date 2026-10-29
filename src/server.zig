@@ -8,7 +8,8 @@ const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
-const Headers = @import("http.zig").Headers;
+const http = @import("http.zig");
+const Headers = http.Headers;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
 const default_listeners = @import("config.zig").default_listeners;
@@ -23,7 +24,6 @@ const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
-const http_date = @import("http_date.zig");
 const somaxconn = @import("somaxconn.zig").somaxconn;
 
 const log = std.log.scoped(.dusty);
@@ -366,6 +366,25 @@ pub const Connection = struct {
     }
 };
 
+const DateCache = struct {
+    second: i64 = std.math.minInt(i64),
+    line: [http.date_line_len]u8 = undefined,
+};
+
+threadlocal var date_cache: DateCache = .{};
+
+/// The `Date` header line for the current second of the wall clock,
+/// reformatted only when the second changes. Returned by value: the task
+/// can resume on another thread whose cache is rewritten under it.
+pub fn dateLine(io: std.Io) [http.date_line_len]u8 {
+    const second = std.Io.Timestamp.now(io, .real).toSeconds();
+    if (second != date_cache.second) {
+        http.formatDateLine(&date_cache.line, second);
+        date_cache.second = second;
+    }
+    return date_cache.line;
+}
+
 /// The status line of the reply to a request whose head was not accepted,
 /// which cannot go through `Response`. `sendBareStatus` sends it with
 /// `Connection: close`, because the rest of that head may still be queued
@@ -377,7 +396,7 @@ fn bareStatus(comptime status_line: []const u8) []const u8 {
 fn sendBareStatus(conn: *Connection, status_line: []const u8) std.Io.Writer.Error!void {
     const w = conn.writer;
     try w.writeAll(status_line);
-    try w.writeAll(&http_date.line(conn.io));
+    try w.writeAll(&dateLine(conn.io));
     try w.writeAll("Connection: close\r\n" ++
         "Content-Length: 0\r\n" ++
         "\r\n");

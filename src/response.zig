@@ -1,11 +1,11 @@
 const std = @import("std");
 const http = @import("http.zig");
-const http_date = @import("http_date.zig");
 const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
+const dateLine = @import("server.zig").dateLine;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
 
@@ -1248,7 +1248,7 @@ pub const Response = struct {
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
         try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
-        if (self.headers.get("Date") == null) try w.writeAll(&http_date.line(self.conn.io));
+        if (self.headers.get("Date") == null) try w.writeAll(&dateLine(self.conn.io));
 
         // Write headers
         var iter = self.headers.iterator();
@@ -1423,11 +1423,11 @@ pub const Response = struct {
 fn withoutDate(written: []u8) ![]const u8 {
     const status_end = (std.mem.indexOf(u8, written, "\r\n") orelse return error.TestUnexpectedResult) + 2;
     const rest = written[status_end..];
-    try std.testing.expect(rest.len >= http_date.line_len);
+    try std.testing.expect(rest.len >= http.date_line_len);
     try std.testing.expectStringStartsWith(rest, "Date: ");
-    try std.testing.expectStringEndsWith(rest[0..http_date.line_len], " GMT\r\n");
-    std.mem.copyForwards(u8, rest, rest[http_date.line_len..]);
-    return written[0 .. written.len - http_date.line_len];
+    try std.testing.expectStringEndsWith(rest[0..http.date_line_len], " GMT\r\n");
+    std.mem.copyForwards(u8, rest, rest[http.date_line_len..]);
+    return written[0 .. written.len - http.date_line_len];
 }
 
 /// The body a response has collected, in one piece, for comparing.
@@ -3595,11 +3595,11 @@ test "Response: a Date header for the current second follows the status line" {
     const written = conn_writer.buffered();
     const status_line = "HTTP/1.1 200 OK\r\n";
     try std.testing.expectStringStartsWith(written, status_line);
-    const sent = written[status_line.len..][0..http_date.line_len];
+    const sent = written[status_line.len..][0..http.date_line_len];
     var second = before;
     while (second <= after) : (second += 1) {
-        var expected: [http_date.line_len]u8 = undefined;
-        http_date.formatLine(&expected, second);
+        var expected: [http.date_line_len]u8 = undefined;
+        http.formatDateLine(&expected, second);
         if (std.mem.eql(u8, sent, &expected)) break;
     } else return error.TestUnexpectedResult;
 }

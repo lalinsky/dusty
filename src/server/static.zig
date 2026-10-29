@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("../http.zig");
-const http_date = @import("../http_date.zig");
 const Request = @import("../request.zig").Request;
 const Response = @import("../response.zig").Response;
 
@@ -237,8 +236,8 @@ pub const Embedded = struct {
 fn finish(req: *Request, res: *Response, etag: []const u8, mtime: ?i64) !void {
     try res.header("ETag", etag);
     if (mtime) |m| {
-        const last_modified = try req.arena.create([http_date.len]u8);
-        http_date.format(last_modified, m);
+        const last_modified = try req.arena.create([http.date_len]u8);
+        http.formatDate(last_modified, m);
         try res.header("Last-Modified", last_modified);
     }
     try res.header("Accept-Ranges", "bytes");
@@ -451,7 +450,7 @@ fn parseHttpDate(value: []const u8) ?i64 {
     if (!std.mem.eql(u8, v[25..], " GMT")) return null;
 
     const day = parseDecimal(u8, v[5..7]) orelse return null;
-    const month: u8 = for (http_date.month_names, 1..) |name, i| {
+    const month: u8 = for (http.month_names, 1..) |name, i| {
         if (std.mem.eql(u8, v[8..11], name)) break @intCast(i);
     } else return null;
     const year = parseDecimal(u16, v[12..16]) orelse return null;
@@ -567,8 +566,8 @@ test parseRange {
 }
 
 test "HTTP date round trip" {
-    var buf: [http_date.len]u8 = undefined;
-    http_date.format(&buf, 784111777);
+    var buf: [http.date_len]u8 = undefined;
+    http.formatDate(&buf, 784111777);
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", &buf);
     try std.testing.expectEqual(784111777, parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(951782400, parseHttpDate("Tue, 29 Feb 2000 00:00:00 GMT"));
