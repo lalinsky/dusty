@@ -1834,6 +1834,14 @@ fn bodyReadResponse(raw: []const u8, out: []u8) ![]const u8 {
             res.body = "OK";
         }
     }.handle);
+    server.router.post("/stream", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var buf: [64]u8 = undefined;
+            var r = try req.reader(&buf);
+            _ = try r.interface.discardRemaining();
+            res.body = "OK";
+        }
+    }.handle);
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(void)) !void {
@@ -1873,6 +1881,10 @@ test "Server: a body the client got wrong is answered with a 4xx and a close" {
 
     res = try bodyReadResponse("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Encoding: br\r\nContent-Length: 1\r\n\r\nx", &buf);
     try std.testing.expectStringStartsWith(res, "HTTP/1.1 415 ");
+
+    res = try bodyReadResponse("POST /stream HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", &buf);
+    try std.testing.expectStringStartsWith(res, "HTTP/1.1 400 ");
+    try std.testing.expect(std.mem.indexOf(u8, res, "\r\nConnection: close\r\n") != null);
 }
 
 test "Server: a 417 before an unread body is not answered with a reset" {

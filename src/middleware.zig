@@ -73,7 +73,7 @@ pub fn Executor(comptime Ctx: type) type {
         middlewares: []const Middleware(Ctx),
 
         pub fn run(self: *Self) !void {
-            self.next() catch |err| switch (err) {
+            self.handle() catch |err| switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
                 error.ReadFailed, error.WriteFailed, error.Canceled => return err,
@@ -106,6 +106,19 @@ pub fn Executor(comptime Ctx: type) type {
                     }
                     self.handleError(err);
                 },
+            };
+        }
+
+        /// A handler streaming the body sees the reader's failure as
+        /// `ReadFailed`; the request kept the cause.
+        fn handle(self: *Self) anyerror!void {
+            self.next() catch |err| {
+                if (err == error.ReadFailed) {
+                    if (self.req._body_err) |cause| {
+                        if (self.req.bodyErrorStatus(cause) != null) return cause;
+                    }
+                }
+                return err;
             };
         }
 
