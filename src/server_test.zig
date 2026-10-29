@@ -1797,6 +1797,17 @@ test "Server: leading zeros in the last chunk past the limit fail the body read"
     try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
 }
 
+test "Server: allowance banked by small chunks does not pay for a large extension" {
+    const chunk = "1\r\nx\r\n";
+    const ext: [40 * 1024]u8 = @splat('x');
+    const tail = "1;" ++ ext ++ "\r\nX\r\n0\r\n\r\n";
+    var chunks: [chunk.len * 2000 + tail.len]u8 = undefined;
+    for (0..2000) |i| @memcpy(chunks[i * chunk.len ..][0..chunk.len], chunk);
+    @memcpy(chunks[chunk.len * 2000 ..], tail);
+    const err = try chunkedPost(&chunks, "HTTP/1.1 500 ");
+    try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
+}
+
 test "Server: a body of many one-byte chunks is read whole" {
     const chunk = "1\r\nx\r\n";
     const last = "0\r\n\r\n";
