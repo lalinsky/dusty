@@ -70,6 +70,9 @@ pub const Request = struct {
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*RequestBodyReader.Decode = null,
     _body_reader_taken: bool = false,
+    // What the last failed body read failed with, so an error coming out of
+    // a handler can be told apart from one of the same name it made itself.
+    _body_err: ?anyerror = null,
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
@@ -151,7 +154,10 @@ pub const Request = struct {
         if (self._decode) |decode| {
             r.decode = decode;
         } else if (self.config.decompress) {
-            try r.startDecoding(self.arena, self.content_encoding);
+            r.startDecoding(self.arena, self.content_encoding) catch |err| {
+                self._body_err = err;
+                return err;
+            };
             if (r.decode != null) self.dropEncodedBodyHeaders();
             self._decode = r.decode;
         }
@@ -183,7 +189,10 @@ pub const Request = struct {
         var no_buf: [0]u8 = .{};
         var r = try self.reader(&no_buf);
         const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
-            error.StreamTooLong => return error.BodyTooBig,
+            error.StreamTooLong => {
+                self._body_err = error.BodyTooBig;
+                return error.BodyTooBig;
+            },
             // The interface can only say that a read failed; the reader
             // holds what it was.
             error.ReadFailed => return r.err orelse error.Unexpected,
@@ -197,6 +206,29 @@ pub const Request = struct {
         }
         self._body = result;
         return result;
+    }
+
+    /// The status to answer with when `err` is what reading this request's
+    /// body failed with, and the client is the one at fault: a body over
+    /// `max_body_size`, broken framing or coding, or a coding this server
+    /// cannot undo. Null for any other error, including one of the same name
+    /// that did not come from the body.
+    pub fn bodyErrorStatus(self: *const Request, err: anyerror) ?http.Status {
+        const cause = self._body_err orelse return null;
+        if (cause != err) return null;
+        return switch (err) {
+            error.BodyTooBig => .payload_too_large,
+            // RFC 9110 15.5.16 names this status for an unsupported content coding.
+            error.UnsupportedContentEncoding => .unsupported_media_type,
+            error.InvalidChunkSize,
+            error.ChunkFramingTooLarge,
+            error.InvalidHeaderToken,
+            error.ParseFailed,
+            error.IncompleteBody,
+            error.CorruptInput,
+            => .bad_request,
+            else => null,
+        };
     }
 
     /// Parse body as JSON into type T, with `std.json`. json.zig is
@@ -1320,6 +1352,15 @@ test "Request.formData: entry with no value" {
 
     const form_data = try req.formData();
     try std.testing.expectEqualStrings("", form_data.get("foo").?);
+}
+
+test "Request.bodyErrorStatus: only the body read's own error is mapped" {
+    var req: Request = undefined;
+    req._body_err = null;
+    try std.testing.expectEqual(null, req.bodyErrorStatus(error.IncompleteBody));
+    req._body_err = error.IncompleteBody;
+    try std.testing.expectEqual(.bad_request, req.bodyErrorStatus(error.IncompleteBody).?);
+    try std.testing.expectEqual(null, req.bodyErrorStatus(error.CorruptInput));
 }
 
 test "Request.multiFormData: basic key and value" {

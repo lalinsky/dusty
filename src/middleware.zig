@@ -73,7 +73,7 @@ pub fn Executor(comptime Ctx: type) type {
         middlewares: []const Middleware(Ctx),
 
         pub fn run(self: *Self) !void {
-            self.next() catch |err| switch (err) {
+            self.handle() catch |err| switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
                 error.ReadFailed, error.WriteFailed, error.Canceled => return err,
@@ -99,9 +99,26 @@ pub fn Executor(comptime Ctx: type) type {
                         log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
-                    log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    if (self.req.bodyErrorStatus(err) != null) {
+                        log.debug("request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    } else {
+                        log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    }
                     self.handleError(err);
                 },
+            };
+        }
+
+        /// A handler streaming the body sees the reader's failure as
+        /// `ReadFailed`; the request kept the cause.
+        fn handle(self: *Self) anyerror!void {
+            self.next() catch |err| {
+                if (err == error.ReadFailed) {
+                    if (self.req._body_err) |cause| {
+                        if (self.req.bodyErrorStatus(cause) != null) return cause;
+                    }
+                }
+                return err;
             };
         }
 
@@ -152,6 +169,14 @@ pub fn Executor(comptime Ctx: type) type {
             self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(self.req, self.res, err);
+            } else if (self.req.bodyErrorStatus(err)) |status| {
+                self.res.status = status;
+                self.res.content_type = .text;
+                self.res.body = switch (status) {
+                    .payload_too_large => "413 Content Too Large\n",
+                    .unsupported_media_type => "415 Unsupported Media Type\n",
+                    else => "400 Bad Request\n",
+                };
             } else {
                 self.res.status = .internal_server_error;
                 self.res.content_type = .text;

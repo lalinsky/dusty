@@ -1323,6 +1323,13 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
 
+                // A body over `max_body_size` closes the connection even when
+                // the reader took all of it, the same as one the drain below
+                // gives up on.
+                if (request._body_err) |e| {
+                    if (e == error.BodyTooBig) response.keepalive = false;
+                }
+
                 if (!parser.isBodyComplete()) {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {
