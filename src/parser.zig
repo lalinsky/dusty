@@ -54,8 +54,14 @@ fn mapError(err: c.llhttp_errno_t) ParseError {
         // Likewise: `onHeaderValueComplete` only fails when `Headers.add`
         // is out of room.
         c.HPE_CB_HEADER_VALUE_COMPLETE => ParseError.TooManyHeaders,
-        // And `RequestParser.onVersion` only on a major version other than 1.
+        // And `RequestParser.onVersion` only on a major version other than 1,
         c.HPE_CB_VERSION_COMPLETE => ParseError.UnsupportedVersion,
+        // `RequestParser.onHeadersComplete` only on a request line with no
+        // version, which is HTTP/0.9,
+        c.HPE_CB_HEADERS_COMPLETE => ParseError.UnsupportedVersion,
+        // and `RequestParser.onProtocolComplete` only on a protocol other
+        // than HTTP.
+        c.HPE_CB_PROTOCOL_COMPLETE => ParseError.InvalidVersion,
         c.HPE_INVALID_CHUNK_SIZE => ParseError.InvalidChunkSize,
         c.HPE_UNEXPECTED_CONTENT_LENGTH => ParseError.UnexpectedContentLength,
         c.HPE_CLOSED_CONNECTION => ParseError.ClosedConnection,
@@ -81,6 +87,7 @@ pub const RequestParser = struct {
         has_method: bool = false,
         has_version: bool = false,
         has_url: bool = false,
+        protocol: []const u8 = "",
 
         // Temporary state for header parsing
         has_header_field: bool = false,
@@ -104,6 +111,8 @@ pub const RequestParser = struct {
 
         self.settings = std.mem.zeroes(c.llhttp_settings_t);
         self.settings.on_method_complete = onMethod;
+        self.settings.on_protocol = onProtocol;
+        self.settings.on_protocol_complete = onProtocolComplete;
         self.settings.on_version_complete = onVersion;
         self.settings.on_url = onUrl;
         self.settings.on_url_complete = onUrlComplete;
@@ -191,6 +200,19 @@ pub const RequestParser = struct {
         return 0;
     }
 
+    fn onProtocol(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
+        const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+        appendSlice(&self.state.protocol, at, length);
+        return 0;
+    }
+
+    /// llhttp also takes RTSP and ICE in a request line.
+    fn onProtocolComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+        if (!std.mem.eql(u8, self.state.protocol, "HTTP")) return -1;
+        return 0;
+    }
+
     fn onVersion(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         if (c.llhttp_get_http_major(&self.parser) != 1) return -1;
@@ -253,6 +275,7 @@ pub const RequestParser = struct {
 
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+        if (!self.state.has_version) return -1;
 
         if (self.request.headers.get("Content-Type")) |content_type| {
             self.request.content_type = ContentType.fromContentType(content_type);

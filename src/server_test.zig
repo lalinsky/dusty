@@ -1769,13 +1769,20 @@ test "Server: a request target too long for the buffer is a 414" {
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 414 ");
 }
 
-test "Server: an HTTP major version other than 1 is a 505" {
+test "Server: a request line not of HTTP/1.x is refused" {
     var buf: [256]u8 = undefined;
-    for ([_][]const u8{ "HTTP/2.0", "HTTP/3.0", "HTTP/0.9" }) |version| {
-        var head_buf: [64]u8 = undefined;
-        const head = try std.fmt.bufPrint(&head_buf, "GET / {s}\r\nHost: localhost\r\n\r\n", .{version});
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "GET / HTTP/2.0\r\nHost: localhost\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET / HTTP/3.0\r\nHost: localhost\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET / HTTP/0.9\r\nHost: localhost\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET /\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET / RTSP/1.0\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET / RTSP/1.2\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+    };
+    for (cases) |case| {
+        const head, const expected = case;
         const status = try statusLineWithUnreadBody(head, 0, false, true, &buf);
-        try std.testing.expectStringStartsWith(status, "HTTP/1.1 505 ");
+        try std.testing.expectStringStartsWith(status, expected);
     }
 }
 
