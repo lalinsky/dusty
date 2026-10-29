@@ -300,8 +300,7 @@ pub const ServerConfig = struct {
         /// line and all headers. This is also the limit on it -- the parsed
         /// header names and values are slices into this buffer rather than
         /// copies, so the head is held whole and cannot be read in pieces.
-        /// A head that does not fit is answered with 431. Chunked framing
-        /// (extensions, trailers) is held to the same size.
+        /// A head that does not fit is answered with 431.
         buffer_size: usize = 16384,
         /// Whether a keep-alive connection keeps the buffer its requests
         /// are read into, and their arena, while it waits for the next one.

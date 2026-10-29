@@ -78,26 +78,22 @@ fn inTrailers(parser: *const c.llhttp_t) bool {
     return parser.flags & @as(u16, @intCast(c.F_TRAILING)) != 0;
 }
 
+/// Chunked framing -- extensions, trailers, chunk-size lines -- is held to
+/// this much per message, plus `chunk_framing_allowance` per chunk. llhttp
+/// bounds none of it, and none of it is body for `max_body_size` to count.
+const max_chunk_framing = 16 * 1024;
+
 /// What one chunk needs besides its data: up to 16 hex digits of size and
 /// two CRLFs, with room to spare.
 const chunk_framing_allowance = 32;
 
-/// llhttp bounds no part of chunked framing -- extensions, trailers, leading
-/// zeros in a chunk size -- and none of it is body for `max_body_size` to
-/// count. A message gets `max` bytes of it, plus `chunk_framing_allowance`
-/// for each chunk.
 const FramingBudget = struct {
-    max: usize,
-    left: usize,
+    left: usize = max_chunk_framing,
     /// Body bytes llhttp handed over during the current feed.
     body_len: usize = 0,
     /// Sticky: llhttp is left mid-message, or paused at its end, and must not
     /// be fed again.
     err: ?ParseError = null,
-
-    fn init(max: usize) FramingBudget {
-        return .{ .max = max, .left = max };
-    }
 
     fn charge(self: *FramingBudget, parser: *const c.llhttp_t, data: []const u8, err: c.llhttp_errno_t) void {
         const consumed = if (err == c.HPE_OK) data.len else @intFromPtr(c.llhttp_get_error_pos(parser)) - @intFromPtr(data.ptr);
@@ -121,7 +117,7 @@ pub const RequestParser = struct {
     parser: c.llhttp_t,
     request: *Request,
     state: State = .{},
-    framing: FramingBudget,
+    framing: FramingBudget = .{},
 
     const State = struct {
         has_method: bool = false,
@@ -147,7 +143,6 @@ pub const RequestParser = struct {
             .parser = undefined,
             .settings = undefined,
             .request = request,
-            .framing = .init(request.config.buffer_size),
         };
 
         self.settings = std.mem.zeroes(c.llhttp_settings_t);
@@ -179,7 +174,7 @@ pub const RequestParser = struct {
 
     pub fn reset(self: *RequestParser) void {
         self.state = .{};
-        self.framing = .init(self.framing.max);
+        self.framing = .{};
         c.llhttp_reset(&self.parser);
     }
 
@@ -392,7 +387,7 @@ pub const ResponseParser = struct {
     response: *ParsedResponse,
     max_headers: usize,
     state: State = .{},
-    framing: FramingBudget,
+    framing: FramingBudget = .{},
     /// The request was HEAD, so the response has no body whatever its
     /// headers say. llhttp cannot tell from the response alone.
     head_request: bool = false,
@@ -422,14 +417,12 @@ pub const ResponseParser = struct {
         body_dest_pos: usize = 0, // How much onBody has written
     };
 
-    /// `max_framing` bounds chunked framing in one response; see `FramingBudget`.
-    pub fn init(self: *ResponseParser, response: *ParsedResponse, max_headers: usize, max_framing: usize) !void {
+    pub fn init(self: *ResponseParser, response: *ParsedResponse, max_headers: usize) !void {
         self.* = .{
             .parser = undefined,
             .settings = undefined,
             .response = response,
             .max_headers = max_headers,
-            .framing = .init(max_framing),
         };
         response.headers = try Headers.init(response.arena, max_headers);
 
@@ -454,7 +447,7 @@ pub const ResponseParser = struct {
 
     pub fn reset(self: *ResponseParser) void {
         self.state = .{};
-        self.framing = .init(self.framing.max);
+        self.framing = .{};
         c.llhttp_reset(&self.parser);
     }
 
@@ -1070,7 +1063,7 @@ test "ResponseParser: basic" {
     };
 
     var parser: ResponseParser = undefined;
-    try parser.init(&response, 64, 16384);
+    try parser.init(&response, 64);
     defer parser.deinit();
 
     const http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
@@ -1110,7 +1103,7 @@ test "ResponseParser: 404 status" {
     };
 
     var parser: ResponseParser = undefined;
-    try parser.init(&response, 64, 16384);
+    try parser.init(&response, 64);
     defer parser.deinit();
 
     const http_response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
@@ -1134,7 +1127,7 @@ test "ResponseParser: rejects a status code Status cannot name" {
     };
 
     var parser: ResponseParser = undefined;
-    try parser.init(&response, 64, 16384);
+    try parser.init(&response, 64);
     defer parser.deinit();
 
     // llhttp is happy with any three digits, so without the check in

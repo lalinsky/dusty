@@ -90,8 +90,7 @@ pub const ClientConfig = struct {
     /// and all headers. This is also the limit on it -- parsed header names
     /// and values are slices into this buffer rather than copies, so the head
     /// is held whole. A server that sends more gets error.HeadersTooLarge and
-    /// its connection torn down. Chunked framing (extensions, trailers) is
-    /// held to the same size.
+    /// its connection torn down.
     buffer_size: usize = 16384,
     /// TLS settings for https:// (and wss://) connections. Requires the
     /// `use_tls` build option; with TLS compiled out any HTTPS request fails
@@ -538,7 +537,7 @@ pub const Connection = struct {
         }
 
         self.parsed_response = .{ .arena = self.arena.allocator() };
-        try self.parser.init(&self.parsed_response, self.max_response_headers, self.buffer_size);
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
 
         // Protocol and TLS initialization
         self.protocol = protocol;
@@ -681,7 +680,7 @@ pub const Connection = struct {
         _ = self.arena.reset(.retain_capacity);
         self.parsed_response = .{ .arena = self.arena.allocator() };
         self.parser.reset();
-        try self.parser.init(&self.parsed_response, self.max_response_headers, self.buffer_size);
+        try self.parser.init(&self.parsed_response, self.max_response_headers);
         self.closing = false;
 
         // As part of reading body, we shrank the buffer
@@ -1843,7 +1842,7 @@ test "ClientResponse.body: basic response" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1869,7 +1868,7 @@ test "ClientResponse.body: a corrupt gzip body reports the decompression failure
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1890,13 +1889,13 @@ test "ClientResponse.body: chunk extensions past the limit fail the read" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const ext: [4096]u8 = @splat('x');
+    const ext: [32 * 1024]u8 = @splat('x');
     const raw_response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;" ++ ext ++ "\r\nX\r\n0\r\n\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_response);
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 1024);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1924,7 +1923,7 @@ test "ClientResponse: a streaming read can be resolved without going through bod
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -1958,7 +1957,7 @@ test "ClientResponse.body: a body read that failed before it started can be aske
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2039,7 +2038,7 @@ test "ClientResponse.body: large body over 128 bytes" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2065,7 +2064,7 @@ test "ClientResponse.body: no body" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2093,7 +2092,7 @@ test "parseResponseHeaders: interim responses are dropped on the way to the fina
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2121,7 +2120,7 @@ test "parseResponseHeaders: an endless run of interim responses is refused" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try std.testing.expectError(error.TooManyInterimResponses, parseResponseHeaders(&reader, &parser));
 }
@@ -2136,7 +2135,7 @@ test "ClientResponse.body: chunked trailers are not headers" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2162,7 +2161,7 @@ test "ClientResponse.body: a body cut short is IncompleteBody" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2188,7 +2187,7 @@ test "ClientResponse.body: connection-close (EOF-delimited) body" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2214,7 +2213,7 @@ test "ClientResponse.reader: streaming read" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2250,7 +2249,7 @@ test "ClientResponse.reader: after body() returns cached data" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2285,7 +2284,7 @@ test "ClientResponse.body: gzip decompression" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2313,7 +2312,7 @@ test "ClientResponse: decoding takes the headers that described the encoded body
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2351,7 +2350,7 @@ test "ClientResponse.body: gzip decompression disabled" {
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
@@ -2380,7 +2379,7 @@ test "ClientResponse.body: an empty body with a Content-Encoding is not decoded"
 
     var parsed: ParsedResponse = .{ .arena = arena.allocator() };
     var parser: ResponseParser = undefined;
-    try parser.init(&parsed, 64, 16384);
+    try parser.init(&parsed, 64);
 
     try parseResponseHeaders(&reader, &parser);
 
