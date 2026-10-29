@@ -1894,6 +1894,50 @@ test "Server: an HTTP/1.2 request is served as HTTP/1.1" {
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 200 ");
 }
 
+test "Server: Host is checked as RFC 9112 3.2 asks" {
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "GET / HTTP/1.1\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET / HTTP/1.1\r\nHost: localhost\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET / HTTP/1.1\r\nHost: local host\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET / HTTP/1.0\r\n\r\n", "HTTP/1.1 200 " },
+        .{ "GET http://example.com/ HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 200 " },
+        .{ "GET http://user@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", "HTTP/1.1 400 " },
+        // No route for either.
+        .{ "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 404 " },
+        .{ "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n", "HTTP/1.1 404 " },
+        .{ "CONNECT example.com:443 HTTP/1.1\r\n\r\n", "HTTP/1.1 400 " },
+    };
+    for (cases) |case| {
+        const head, const expected = case;
+        const status = try statusLineFor(head, &buf);
+        std.testing.expectStringStartsWith(status, expected) catch |err| {
+            std.debug.print("request: {s}\n", .{head});
+            return err;
+        };
+    }
+}
+
+test "Server: an absolute-form target is routed by its path, and its authority is the Host" {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    const Echo = struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.print(.text, "{s} q={s} {s}", .{ req.url, req.query.get("q") orelse "-", req.headers.get("Host").? });
+        }
+    };
+    server.router.get("/", Echo.handle);
+    server.router.get("/a/:id", Echo.handle);
+
+    try expectPipelinedResponses(&server, "GET http://example.com/a/1?q=x HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET https://example.com:8443?q=y HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET http://example.com HTTP/1.0\r\n\r\n", &.{
+        "/a/1?q=x q=x example.com",
+        "/?q=y q=y example.com:8443",
+        "/ q=- example.com",
+    });
+}
+
 test "Server: a response written without reading the body does not wait for one held back by Expect" {
     // No POST route, so the 404 is written by nothing that reads the body,
     // and the peer never sends it: it is waiting for 100 Continue.
