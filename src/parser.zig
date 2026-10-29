@@ -384,9 +384,10 @@ pub const RequestParser = struct {
         }
         if (url.len == 0 or url[0] == '/' or url[0] == '*') return;
 
-        const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
-        const rest = url[scheme_end + 3 ..];
-        const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+        // llhttp only lets such a target through as ALPHA+ "://" followed by
+        // an authority without '#'.
+        const rest = url[std.mem.indexOf(u8, url, "://").? + 3 ..];
+        const authority_end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
         const authority = rest[0..authority_end];
         // RFC 9110 4.2.1 and 4.2.4: an http(s) authority has a host and no
         // userinfo.
@@ -1161,6 +1162,13 @@ test "RequestParser: basic" {
     const host_val = req.headers.get("Host");
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("example.com", host_val.?);
+}
+
+test "isValidHost" {
+    const valid = [_][]const u8{ "", "example.com.", "EXAMPLE.com:0", "localhost:", "[::1]:8080", "xn--bcher-kva.example%2D1", "127.0.0.1" };
+    for (valid) |host| try std.testing.expect(isValidHost(host));
+    const invalid = [_][]const u8{ "local host", "localhost/", "user@localhost", "b\xc3\xbccher.example", ":80", "[]", "%", "a%4" };
+    for (invalid) |host| try std.testing.expect(!isValidHost(host));
 }
 
 test "ResponseParser: basic" {
