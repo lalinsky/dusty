@@ -5,7 +5,7 @@ pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
 const serializeCookie = @import("cookie.zig").serializeCookie;
 const Connection = @import("server.zig").Connection;
-const dateLine = @import("server.zig").dateLine;
+const writeDateLine = @import("server.zig").writeDateLine;
 const zlib = @import("zlib");
 const build_options = @import("build_options");
 
@@ -1248,7 +1248,7 @@ pub const Response = struct {
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
         try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
-        if (self.headers.get("Date") == null) try w.writeAll(&dateLine(self.conn.io));
+        if (self.headers.get("Date") == null) try writeDateLine(w, self.conn.io);
 
         // Write headers
         var iter = self.headers.iterator();

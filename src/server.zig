@@ -373,16 +373,16 @@ const DateCache = struct {
 
 threadlocal var date_cache: DateCache = .{};
 
-/// The `Date` header line for the current second of the wall clock,
-/// reformatted only when the second changes. Returned by value: the task
-/// can resume on another thread whose cache is rewritten under it.
-pub fn dateLine(io: std.Io) [http.date_line_len]u8 {
+/// Writes the `Date` header line for the current second of the wall clock,
+/// reformatted only when the second changes.
+pub fn writeDateLine(w: *std.Io.Writer, io: std.Io) std.Io.Writer.Error!void {
+    const dest = try w.writableArray(http.date_line_len);
     const second = std.Io.Timestamp.now(io, .real).toSeconds();
     if (second != date_cache.second) {
         http.formatDateLine(&date_cache.line, second);
         date_cache.second = second;
     }
-    return date_cache.line;
+    dest.* = date_cache.line;
 }
 
 /// Replies to a request whose head was not accepted, which cannot go
@@ -393,7 +393,7 @@ fn sendBareStatus(conn: *Connection, status: []const u8) std.Io.Writer.Error!voi
     var buf: [1024]u8 = undefined;
     var reply: std.Io.Writer = .fixed(&buf);
     reply.print("HTTP/1.1 {s}\r\n", .{status}) catch unreachable;
-    reply.writeAll(&dateLine(conn.io)) catch unreachable;
+    writeDateLine(&reply, conn.io) catch unreachable;
     reply.writeAll("Connection: close\r\n" ++
         "Content-Length: 0\r\n" ++
         "\r\n") catch unreachable;
