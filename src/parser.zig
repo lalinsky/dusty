@@ -25,6 +25,7 @@ pub const ParseError = error{
     ClosedConnection,
     TooManyHeaders,
     ChunkFramingTooLarge,
+    InvalidHost,
     ParseFailed,
 };
 
@@ -53,12 +54,12 @@ fn mapError(err: c.llhttp_errno_t) ParseError {
         // `Status` cannot name, so this is that.
         c.HPE_CB_STATUS_COMPLETE => ParseError.InvalidStatus,
         // Likewise: `onHeaderValueComplete` only fails when `Headers.add`
-        // is out of room.
+        // is out of room, or else through `RequestParser.State.err`.
         c.HPE_CB_HEADER_VALUE_COMPLETE => ParseError.TooManyHeaders,
         // And `RequestParser.onVersion` only on a major version other than 1,
         c.HPE_CB_VERSION_COMPLETE => ParseError.UnsupportedVersion,
-        // `RequestParser.onHeadersComplete` only on a request line with no
-        // version, which is HTTP/0.9,
+        // `RequestParser.onHeadersComplete`, other than through `State.err`,
+        // only on a request line with no version, which is HTTP/0.9,
         c.HPE_CB_HEADERS_COMPLETE => ParseError.UnsupportedVersion,
         // and `RequestParser.onProtocolComplete` only on a protocol other
         // than HTTP.
@@ -130,6 +131,11 @@ pub const RequestParser = struct {
         has_version: bool = false,
         has_url: bool = false,
         protocol: []const u8 = "",
+        host: ?[]const u8 = null,
+        absolute_form: bool = false,
+        /// Set by a callback that fails for a reason llhttp's error code
+        /// would misreport.
+        err: ?ParseError = null,
 
         // Temporary state for header parsing
         has_header_field: bool = false,
@@ -192,6 +198,7 @@ pub const RequestParser = struct {
         const err = c.llhttp_execute(&self.parser, data.ptr, data.len);
         if (chunked) self.framing.charge(&self.parser, data, err);
         if (self.framing.err) |e| return e;
+        if (self.state.err) |e| return e;
 
         if (err == c.HPE_OK) {
             return;
@@ -314,6 +321,18 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
+        if (std.ascii.eqlIgnoreCase(self.state.header_field, "Host")) {
+            // llhttp keeps trailing whitespace, which RFC 9110 5.5 leaves
+            // out of the field value.
+            self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
+            // RFC 9112 3.2: more than one Host, or an invalid one, is a 400.
+            if (self.state.host != null or !isValidHost(self.state.header_value)) {
+                self.state.err = error.InvalidHost;
+                return -1;
+            }
+            self.state.host = self.state.header_value;
+        }
+
         // Headers point directly into the read buffer, no copy needed
         self.request.headers.add(self.state.header_field, self.state.header_value) catch return -1;
 
@@ -327,6 +346,11 @@ pub const RequestParser = struct {
     fn onHeadersComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         if (!self.state.has_version) return -1;
+
+        self.checkTarget() catch |err| {
+            self.state.err = err;
+            return -1;
+        };
 
         if (self.request.headers.get("Content-Type")) |content_type| {
             self.request.content_type = ContentType.fromContentType(content_type);
@@ -342,6 +366,35 @@ pub const RequestParser = struct {
 
         self.state.headers_complete = true;
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
+    }
+
+    /// Checks Host against the target. RFC 9112 3.2.2: an absolute-form
+    /// target is routed by its path and query, and its authority takes the
+    /// place of Host. An empty path is left for `parseHeaders` to make "/",
+    /// which may take an allocation.
+    fn checkTarget(self: *RequestParser) ParseError!void {
+        // RFC 9112 3.2: HTTP/1.0 may leave Host out, HTTP/1.1 may not.
+        if (self.state.host == null and self.request.version_minor >= 1) return error.InvalidHost;
+        const empty_host = if (self.state.host) |host| host.len == 0 else false;
+        const url = self.request.url;
+        if (self.request.method == .connect) {
+            // RFC 9112 3.2: Host is empty only for a target with no authority.
+            if (empty_host) return error.InvalidHost;
+            return;
+        }
+        if (url.len == 0 or url[0] == '/' or url[0] == '*') return;
+
+        const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
+        const rest = url[scheme_end + 3 ..];
+        const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+        const authority = rest[0..authority_end];
+        // RFC 9110 4.2.1 and 4.2.4: an http(s) authority has a host and no
+        // userinfo.
+        if (authority.len == 0 or !isValidHost(authority)) return error.InvalidUrl;
+        if (empty_host) return error.InvalidHost;
+        self.request.headers.put("Host", authority) catch return error.TooManyHeaders;
+        self.state.absolute_form = true;
+        self.request.url = rest[authority_end..];
     }
 
     fn onBody(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
@@ -372,6 +425,54 @@ pub const RequestParser = struct {
         return c.HPE_PAUSED;
     }
 };
+
+/// RFC 9112 3.2: `uri-host [ ":" port ]`, with uri-host an IP-literal or a
+/// reg-name (which an IPv4address also is) as in RFC 3986 3.2.2. The
+/// brackets of an IP-literal are checked for its characters only. Empty
+/// is valid here; whether it is allowed depends on the target.
+fn isValidHost(value: []const u8) bool {
+    if (value.len == 0) return true;
+    var port: []const u8 = undefined;
+    if (value[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, value, ']') orelse return false;
+        if (close == 1) return false;
+        for (value[1..close]) |ch| {
+            if (!isUnreserved(ch) and !isSubDelim(ch) and ch != ':') return false;
+        }
+        port = value[close + 1 ..];
+        if (port.len > 0) {
+            if (port[0] != ':') return false;
+            port = port[1..];
+        }
+    } else {
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse value.len;
+        if (colon == 0) return false;
+        var i: usize = 0;
+        while (i < colon) : (i += 1) {
+            const ch = value[i];
+            if (ch == '%') {
+                if (i + 2 >= colon or !std.ascii.isHex(value[i + 1]) or !std.ascii.isHex(value[i + 2])) return false;
+                i += 2;
+            } else if (!isUnreserved(ch) and !isSubDelim(ch)) return false;
+        }
+        port = if (colon < value.len) value[colon + 1 ..] else "";
+    }
+    for (port) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
+fn isUnreserved(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '.' or ch == '_' or ch == '~';
+}
+
+fn isSubDelim(ch: u8) bool {
+    return switch (ch) {
+        '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=' => true,
+        else => false,
+    };
+}
 
 /// Minimal struct for holding parsed HTTP response data.
 /// Used by ResponseParser to store parsed fields.

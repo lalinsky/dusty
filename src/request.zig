@@ -630,6 +630,11 @@ pub fn parseHeaders(reader: *std.Io.Reader, parser: *RequestParser) ParseHeaders
     // loop above could -- so the head is over the limit either way.
     if (reader.buffer.len - parsed_len < body_read_reserve) return error.HeadersTooLarge;
 
+    if (parser.state.absolute_form and !std.mem.startsWith(u8, parser.request.url, "/")) {
+        const url = parser.request.url;
+        parser.request.url = if (url.len == 0) "/" else try std.mem.concat(parser.request.arena, u8, &.{ "/", url });
+    }
+
     reader.toss(parsed_len);
     parser.resumeParsing();
 
@@ -728,7 +733,7 @@ test "Request.body: basic POST" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -753,7 +758,7 @@ test "Request.body: built without zlib, a coded body is refused" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -778,7 +783,7 @@ test "Request.body: a gzip request body is decoded" {
 
     // "hello", gzip compressed.
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -810,7 +815,7 @@ test "Request.body: a chunked gzip body is unwrapped by both layers" {
         "e\r\n\x00\x00\x02\x03\xf3\x48\xcd\xc9\xc9\x57\x48\x2b\xca\xcf\r\n" ++
         "10\r\n\x55\x28\x49\x2d\x2e\x51\x04\x00\x7c\xe6\xd9\x99\x10\x00\x00\x00\r\n" ++
         "0\r\n\r\n";
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\n" ++
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\n" ++
         "Transfer-Encoding: chunked\r\n\r\n" ++ chunked_gzip;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
@@ -881,7 +886,7 @@ test "Request.body: a chunked trailer split across a buffer wrap is dropped, not
     // sized so the region ends inside the trailer name: the first fill
     // stops there, the body reader drains it, and the next fill lands at
     // the start of the buffer with the rest of the name.
-    const head = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const head = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n";
     const region = 2048;
     const data = &@as([2033]u8, @splat('a'));
     const body = "7f1\r\n" ++ data ++ "\r\n0\r\n" ++ "X-Trailer: value\r\n\r\n";
@@ -913,7 +918,7 @@ test "Request: decoding takes the headers that described the encoded body" {
     defer arena.deinit();
 
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -951,7 +956,7 @@ test "Request: decoding off leaves the headers alone" {
     defer arena.deinit();
 
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -979,7 +984,7 @@ test "Request.body: decoding off yields what the wire carried" {
     defer arena.deinit();
 
     const gzip_hello = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\xcb\x48\xcd\xc9\xc9\x07\x00\x86\xa6\x10\x36\x05\x00\x00\x00";
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n" ++ gzip_hello;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1008,7 +1013,7 @@ test "Request.body: a compressed body cut short is a bad body, not a departed pe
     // A valid gzip stream, truncated. The peer is still there and the HTTP
     // message is whole; it is the compressed stream inside that stops early.
     const cut_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xcb\x48\xcd\xc9\xc9";
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 15\r\n\r\n" ++ cut_gzip;
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 15\r\n\r\n" ++ cut_gzip;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1036,7 +1041,7 @@ test "Request.body: a coding we cannot undo is refused rather than guessed at" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1061,7 +1066,7 @@ test "Request.body: a body read that failed before it started can be asked for a
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1091,7 +1096,7 @@ test "Request: a streaming read resolves through the reader it hands out" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: 32\r\n\r\n" ++
         ("not a gzip stream at all" ++ "12345678");
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
@@ -1123,7 +1128,7 @@ test "Request.body: a body cut short is IncompleteBody, not a failed read" {
     defer arena.deinit();
 
     // The headers promise five bytes and the peer sends two, then stops.
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 5\r\n\r\nhe";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhe";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1149,7 +1154,7 @@ test "Request.body: a chunked body cut short is IncompleteBody" {
     defer arena.deinit();
 
     // A chunk of five bytes, two of them sent.
-    const raw_request = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1173,7 +1178,7 @@ test "Request.body: framing the parser rejects is reported as itself" {
     defer arena.deinit();
 
     // A chunk size that is not a number.
-    const raw_request = "POST /test HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1197,7 +1202,7 @@ test "Request.body: large body over 128 bytes" {
     defer arena.deinit();
 
     const body_content = &@as([256]u8, @splat('A'));
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Length: 256\r\n\r\n" ++ body_content;
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 256\r\n\r\n" ++ body_content;
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1222,7 +1227,7 @@ test "Request.cookies: parse cookies from header" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "GET /test HTTP/1.1\r\nCookie: session=abc123; user=john\r\n\r\n";
+    const raw_request = "GET /test HTTP/1.1\r\nHost: localhost\r\nCookie: session=abc123; user=john\r\n\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1248,7 +1253,7 @@ test "Request.formData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\nfoo=123&bar=abc";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 15\r\n\r\nfoo=123&bar=abc";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1273,7 +1278,7 @@ test "Request.formData: URL-encoded key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 17\r\n\r\nfoo+bar=123%21abc";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 17\r\n\r\nfoo+bar=123%21abc";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1297,7 +1302,7 @@ test "Request.formData: entry with no value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nfoo";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 3\r\n\r\nfoo";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1321,7 +1326,7 @@ test "Request.multiFormData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 155\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"\r\n\r\n123\r\n----boundary123\r\nContent-Disposition: form-data; name=\"bar\"\r\n\r\nabc\r\n----boundary123--\r\n";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 155\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"\r\n\r\n123\r\n----boundary123\r\nContent-Disposition: form-data; name=\"bar\"\r\n\r\nabc\r\n----boundary123--\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1346,7 +1351,7 @@ test "Request.multiFormData: entry with filename" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 133\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"; filename=\"foo.txt\"\r\nContent-Type: text/plain\r\n\r\n123\r\n----boundary123--\r\n";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=--boundary123\r\nContent-Length: 133\r\n\r\n----boundary123\r\nContent-Disposition: form-data; name=\"foo\"; filename=\"foo.txt\"\r\nContent-Type: text/plain\r\n\r\n123\r\n----boundary123--\r\n";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1380,7 +1385,7 @@ test "Request.multiFormData: semicolon in attribute name (regression)" {
 
     var req_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer req_buf.deinit(std.testing.allocator);
-    try req_buf.appendSlice(std.testing.allocator, "POST /t HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--b\r\nContent-Length: ");
+    try req_buf.appendSlice(std.testing.allocator, "POST /t HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=--b\r\nContent-Length: ");
     try req_buf.appendSlice(std.testing.allocator, cl);
     try req_buf.appendSlice(std.testing.allocator, "\r\n\r\n");
     try req_buf.appendSlice(std.testing.allocator, body);
@@ -1417,7 +1422,7 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
 
     var req_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer req_buf.deinit(std.testing.allocator);
-    try req_buf.appendSlice(std.testing.allocator, "POST /t HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=--b\r\nContent-Length: ");
+    try req_buf.appendSlice(std.testing.allocator, "POST /t HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=--b\r\nContent-Length: ");
     try req_buf.appendSlice(std.testing.allocator, cl);
     try req_buf.appendSlice(std.testing.allocator, "\r\n\r\n");
     try req_buf.appendSlice(std.testing.allocator, body);
