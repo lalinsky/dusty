@@ -1756,6 +1756,42 @@ test "Server: more headers than the limit is a 431, not a dropped connection" {
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 431 ");
 }
 
+test "Server: a request that is not HTTP is a 400 and the connection is closed" {
+    var buf: [256]u8 = undefined;
+    const status = try statusLineWithUnreadBody("\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", 0, false, true, &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
+}
+
+test "Server: a request target too long for the buffer is a 414" {
+    var buf: [256]u8 = undefined;
+    // The "body" continues the target, there being no end of line.
+    const status = try statusLineWithUnreadBody("GET /", 32768, false, true, &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 414 ");
+}
+
+test "Server: a request line not of HTTP/1.x is refused" {
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "GET / HTTP/2.0\r\nHost: localhost\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET / HTTP/3.0\r\nHost: localhost\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET / HTTP/0.9\r\nHost: localhost\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET /\r\n\r\n", "HTTP/1.1 505 " },
+        .{ "GET / RTSP/1.0\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET / RTSP/1.2\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+    };
+    for (cases) |case| {
+        const head, const expected = case;
+        const status = try statusLineWithUnreadBody(head, 0, false, true, &buf);
+        try std.testing.expectStringStartsWith(status, expected);
+    }
+}
+
+test "Server: an HTTP/1.2 request is served as HTTP/1.1" {
+    var buf: [256]u8 = undefined;
+    const status = try statusLineFor("GET / HTTP/1.2\r\nHost: localhost\r\n\r\n", &buf);
+    try std.testing.expectStringStartsWith(status, "HTTP/1.1 200 ");
+}
+
 test "Server: a response written without reading the body does not wait for one held back by Expect" {
     // No POST route, so the 404 is written by nothing that reads the body,
     // and the peer never sends it: it is waiting for 100 Continue.

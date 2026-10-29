@@ -365,15 +365,19 @@ pub const Connection = struct {
     }
 };
 
-/// The one reply that cannot go through `Response`: what overran is the head
-/// that would have said how to frame it. Fixed bytes instead, and
-/// `Connection: close`, because the rest of that head is still queued on the
-/// socket and there is no framing to skip it by.
-fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.writeAll("HTTP/1.1 503 Service Unavailable\r\n" ++
+/// The reply to a request whose head was not accepted, which cannot go
+/// through `Response`. Fixed bytes instead, and `Connection: close`, because
+/// the rest of that head may still be queued on the socket and there is no
+/// framing to skip it by.
+fn bareStatus(comptime status_line: []const u8) []const u8 {
+    return "HTTP/1.1 " ++ status_line ++ "\r\n" ++
         "Connection: close\r\n" ++
         "Content-Length: 0\r\n" ++
-        "\r\n");
+        "\r\n";
+}
+
+fn sendBareStatus(w: *std.Io.Writer, response: []const u8) std.Io.Writer.Error!void {
+    try w.writeAll(response);
     return w.flush();
 }
 
@@ -382,14 +386,6 @@ fn sendServiceUnavailable(w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// within a round trip, and the request deadline may be off.
 const linger_limit: usize = 64 * 1024;
 const linger_timeout: std.Io.Duration = .fromSeconds(1);
-
-fn sendHeadersTooLarge(w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.writeAll("HTTP/1.1 431 Request Header Fields Too Large\r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "\r\n");
-    return w.flush();
-}
 
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
@@ -923,7 +919,7 @@ pub fn Server(comptime Ctx: type) type {
             if (was.draining) {
                 busy.* = false;
                 self.finishRequest();
-                sendServiceUnavailable(connection.writer) catch
+                sendBareStatus(connection.writer, bareStatus("503 Service Unavailable")) catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
             }
@@ -1191,22 +1187,45 @@ pub fn Server(comptime Ctx: type) type {
                     request.arena = b.arena.allocator();
                 }
 
-                parseHeaders(connection.reader, &parser) catch |err| switch (err) {
-                    error.EndOfStream => return,
-                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
-                    error.HeadersTooLarge => {
-                        log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
-                        sendHeadersTooLarge(connection.writer) catch
-                            return connection.getWriteError() orelse error.Unexpected;
-                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                    },
-                    error.TooManyHeaders => {
-                        log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
-                        sendHeadersTooLarge(connection.writer) catch
-                            return connection.getWriteError() orelse error.Unexpected;
-                        return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
-                    },
-                    else => |e| return e,
+                parseHeaders(connection.reader, &parser) catch |err| {
+                    const reply = switch (err) {
+                        error.EndOfStream => return,
+                        error.IncompleteRequest => {
+                            log.debug("Request head cut short by peer", .{});
+                            return;
+                        },
+                        error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.HeadersTooLarge => blk: {
+                            log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
+                            break :blk if (parser.state.has_url) bareStatus("431 Request Header Fields Too Large") else bareStatus("414 URI Too Long");
+                        },
+                        error.TooManyHeaders => blk: {
+                            log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
+                            break :blk bareStatus("431 Request Header Fields Too Large");
+                        },
+                        error.UnsupportedVersion => blk: {
+                            log.debug("Request had an unsupported HTTP version", .{});
+                            break :blk bareStatus("505 HTTP Version Not Supported");
+                        },
+                        error.InvalidMethod,
+                        error.InvalidUrl,
+                        error.InvalidHeaderToken,
+                        error.InvalidHeaderValue,
+                        error.InvalidVersion,
+                        error.InvalidStatus,
+                        error.InvalidChunkSize,
+                        error.UnexpectedContentLength,
+                        error.ClosedConnection,
+                        error.ParseFailed,
+                        => blk: {
+                            log.debug("Malformed request head: {}", .{err});
+                            break :blk bareStatus("400 Bad Request");
+                        },
+                    };
+                    sendBareStatus(connection.writer, reply) catch
+                        return connection.getWriteError() orelse error.Unexpected;
+                    return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                 };
 
                 // This is per request, not per connection: a keepalive
