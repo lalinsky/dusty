@@ -1885,6 +1885,33 @@ test "ClientResponse.body: a corrupt gzip body reports the decompression failure
     try std.testing.expectError(error.CorruptInput, response.body());
 }
 
+test "ClientResponse.body: chunk extensions past the limit fail the read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const ext: [32 * 1024]u8 = @splat('x');
+    const raw_response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;" ++ ext ++ "\r\nX\r\n0\r\n\r\n";
+    var reader = try fixedMessageReader(arena.allocator(), raw_response);
+
+    var parsed: ParsedResponse = .{ .arena = arena.allocator() };
+    var parser: ResponseParser = undefined;
+    try parser.init(&parsed, 64);
+
+    try parseResponseHeaders(&reader, &parser);
+
+    var response = ClientResponse{
+        .arena = arena.allocator(),
+        .parser = &parser,
+        .transport = .{ .reader = &reader, .writer = undefined },
+        .parsed = &parsed,
+        .max_response_size = 1024,
+    };
+
+    try std.testing.expectError(error.ChunkFramingTooLarge, response.body());
+    try std.testing.expect(parser.hasFailed());
+    try std.testing.expect(!parser.isBodyComplete());
+}
+
 test "ClientResponse: a streaming read can be resolved without going through body" {
     if (!@import("build_options").use_zlib) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

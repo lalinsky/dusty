@@ -1217,6 +1217,7 @@ pub fn Server(comptime Ctx: type) type {
                         error.InvalidChunkSize,
                         error.UnexpectedContentLength,
                         error.ClosedConnection,
+                        error.ChunkFramingTooLarge,
                         error.ParseFailed,
                         => blk: {
                             log.debug("Malformed request head: {}", .{err});

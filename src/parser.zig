@@ -24,6 +24,7 @@ pub const ParseError = error{
     UnexpectedContentLength,
     ClosedConnection,
     TooManyHeaders,
+    ChunkFramingTooLarge,
     ParseFailed,
 };
 
@@ -77,11 +78,52 @@ fn inTrailers(parser: *const c.llhttp_t) bool {
     return parser.flags & @as(u16, @intCast(c.F_TRAILING)) != 0;
 }
 
+/// Chunked framing -- extensions, trailers, chunk-size lines -- is held to
+/// this much at a time: each chunk earns `chunk_framing_allowance` back, but
+/// the budget never grows past this. llhttp bounds none of it, and none of
+/// it is body for `max_body_size` to count.
+const max_chunk_framing = 16 * 1024;
+
+/// What one chunk needs besides its data: up to 16 hex digits of size and
+/// two CRLFs, with room to spare.
+const chunk_framing_allowance = 32;
+
+const FramingBudget = struct {
+    left: usize = max_chunk_framing,
+    /// Body bytes llhttp handed over during the current feed.
+    body_len: usize = 0,
+    /// Allowance earned by chunks that started during the current feed.
+    earned: usize = 0,
+    /// Sticky: llhttp is left mid-message, or paused at its end, and must not
+    /// be fed again.
+    err: ?ParseError = null,
+
+    fn charge(self: *FramingBudget, parser: *const c.llhttp_t, data: []const u8, err: c.llhttp_errno_t) void {
+        const consumed = if (err == c.HPE_OK) data.len else @intFromPtr(c.llhttp_get_error_pos(parser)) - @intFromPtr(data.ptr);
+        const framing = consumed - self.body_len;
+        // What a feed earns is spent before the cap applies, or a feed of
+        // small chunks bigger than the budget would be refused.
+        const available = self.left +| self.earned;
+        if (framing > available) {
+            self.err = error.ChunkFramingTooLarge;
+            return;
+        }
+        self.left = @min(available - framing, max_chunk_framing);
+    }
+};
+
+/// The flag is set as soon as the head says chunked, so on its own it would
+/// charge the rest of a head that arrives in pieces.
+fn inChunkedBody(parser: *const c.llhttp_t, headers_complete: bool) bool {
+    return headers_complete and parser.flags & @as(u16, @intCast(c.F_CHUNKED)) != 0;
+}
+
 pub const RequestParser = struct {
     settings: c.llhttp_settings_t,
     parser: c.llhttp_t,
     request: *Request,
     state: State = .{},
+    framing: FramingBudget = .{},
 
     const State = struct {
         has_method: bool = false,
@@ -122,6 +164,7 @@ pub const RequestParser = struct {
         self.settings.on_header_value_complete = onHeaderValueComplete;
         self.settings.on_headers_complete = onHeadersComplete;
         self.settings.on_body = onBody;
+        self.settings.on_chunk_header = onChunkHeader;
         self.settings.on_message_complete = onMessageComplete;
 
         c.llhttp_init(&self.parser, c.HTTP_REQUEST, &self.settings);
@@ -137,11 +180,18 @@ pub const RequestParser = struct {
 
     pub fn reset(self: *RequestParser) void {
         self.state = .{};
+        self.framing = .{};
         c.llhttp_reset(&self.parser);
     }
 
     pub fn feed(self: *RequestParser, data: []const u8) (ParseError || error{Paused})!void {
+        if (self.framing.err) |e| return e;
+        const chunked = inChunkedBody(&self.parser, self.state.headers_complete);
+        self.framing.body_len = 0;
+        self.framing.earned = 0;
         const err = c.llhttp_execute(&self.parser, data.ptr, data.len);
+        if (chunked) self.framing.charge(&self.parser, data, err);
+        if (self.framing.err) |e| return e;
 
         if (err == c.HPE_OK) {
             return;
@@ -155,6 +205,7 @@ pub const RequestParser = struct {
     }
 
     pub fn finish(self: *RequestParser) FinishError!void {
+        if (self.framing.err) |e| return e;
         return finishParser(&self.parser);
     }
 
@@ -177,7 +228,7 @@ pub const RequestParser = struct {
     }
 
     pub fn isBodyComplete(self: *RequestParser) bool {
-        return self.state.message_complete;
+        return self.state.message_complete and self.framing.err == null;
     }
 
     pub fn messageNeedsEof(self: *RequestParser) bool {
@@ -295,6 +346,7 @@ pub const RequestParser = struct {
 
     fn onBody(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+        self.framing.body_len += length;
 
         const available = self.state.body_dest_buf.len - self.state.body_dest_pos;
         const to_copy = @min(length, available);
@@ -304,6 +356,12 @@ pub const RequestParser = struct {
             self.state.body_dest_pos += to_copy;
         }
 
+        return 0;
+    }
+
+    fn onChunkHeader(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+        self.framing.earned +|= chunk_framing_allowance;
         return 0;
     }
 
@@ -336,6 +394,7 @@ pub const ResponseParser = struct {
     response: *ParsedResponse,
     max_headers: usize,
     state: State = .{},
+    framing: FramingBudget = .{},
     /// The request was HEAD, so the response has no body whatever its
     /// headers say. llhttp cannot tell from the response alone.
     head_request: bool = false,
@@ -383,6 +442,7 @@ pub const ResponseParser = struct {
         self.settings.on_header_value_complete = onHeaderValueComplete;
         self.settings.on_headers_complete = onHeadersComplete;
         self.settings.on_body = onBody;
+        self.settings.on_chunk_header = onChunkHeader;
         self.settings.on_message_complete = onMessageComplete;
 
         c.llhttp_init(&self.parser, c.HTTP_RESPONSE, &self.settings);
@@ -394,6 +454,7 @@ pub const ResponseParser = struct {
 
     pub fn reset(self: *ResponseParser) void {
         self.state = .{};
+        self.framing = .{};
         c.llhttp_reset(&self.parser);
     }
 
@@ -407,7 +468,16 @@ pub const ResponseParser = struct {
     }
 
     pub fn feed(self: *ResponseParser, data: []const u8) !void {
+        if (self.framing.err) |e| return e;
+        const chunked = inChunkedBody(&self.parser, self.state.headers_complete);
+        self.framing.body_len = 0;
+        self.framing.earned = 0;
         const err = c.llhttp_execute(&self.parser, data.ptr, data.len);
+        if (chunked) self.framing.charge(&self.parser, data, err);
+        if (self.framing.err) |e| {
+            self.state.failed = true;
+            return e;
+        }
 
         if (err == c.HPE_OK) {
             return;
@@ -423,6 +493,7 @@ pub const ResponseParser = struct {
 
     pub fn finish(self: *ResponseParser) FinishError!void {
         errdefer self.state.failed = true;
+        if (self.framing.err) |e| return e;
         return finishParser(&self.parser);
     }
 
@@ -449,7 +520,7 @@ pub const ResponseParser = struct {
     }
 
     pub fn isBodyComplete(self: *ResponseParser) bool {
-        return self.state.message_complete;
+        return self.state.message_complete and self.framing.err == null;
     }
 
     pub fn messageNeedsEof(self: *ResponseParser) bool {
@@ -551,6 +622,7 @@ pub const ResponseParser = struct {
 
     fn onBody(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
+        self.framing.body_len += length;
 
         const available = self.state.body_dest_buf.len - self.state.body_dest_pos;
         const to_copy = @min(length, available);
@@ -560,6 +632,12 @@ pub const ResponseParser = struct {
             self.state.body_dest_pos += to_copy;
         }
 
+        return 0;
+    }
+
+    fn onChunkHeader(parser: ?*c.llhttp_t) callconv(.c) c_int {
+        const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
+        self.framing.earned +|= chunk_framing_allowance;
         return 0;
     }
 
