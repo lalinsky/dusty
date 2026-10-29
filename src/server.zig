@@ -23,6 +23,7 @@ const Watch = @import("deadline.zig").Watch;
 const Timer = @import("deadline.zig").Timer;
 const MiddlewareConfig = @import("middleware.zig").MiddlewareConfig;
 const cgroup = @import("cgroup.zig");
+const http_date = @import("http_date.zig");
 const somaxconn = @import("somaxconn.zig").somaxconn;
 
 const log = std.log.scoped(.dusty);
@@ -290,7 +291,7 @@ pub const Connection = struct {
     /// error a write failure should surface.
     pub fn initWriterForTesting(self: *Connection, w: *std.Io.Writer) void {
         self.* = .{
-            .io = undefined,
+            .io = std.testing.io,
             .stream = undefined,
             .allocator = undefined,
             .buffers = &.{},
@@ -365,19 +366,21 @@ pub const Connection = struct {
     }
 };
 
-/// The reply to a request whose head was not accepted, which cannot go
-/// through `Response`. Fixed bytes instead, and `Connection: close`, because
-/// the rest of that head may still be queued on the socket and there is no
-/// framing to skip it by.
+/// The status line of the reply to a request whose head was not accepted,
+/// which cannot go through `Response`. `sendBareStatus` sends it with
+/// `Connection: close`, because the rest of that head may still be queued
+/// on the socket and there is no framing to skip it by.
 fn bareStatus(comptime status_line: []const u8) []const u8 {
-    return "HTTP/1.1 " ++ status_line ++ "\r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "\r\n";
+    return "HTTP/1.1 " ++ status_line ++ "\r\n";
 }
 
-fn sendBareStatus(w: *std.Io.Writer, response: []const u8) std.Io.Writer.Error!void {
-    try w.writeAll(response);
+fn sendBareStatus(conn: *Connection, status_line: []const u8) std.Io.Writer.Error!void {
+    const w = conn.writer;
+    try w.writeAll(status_line);
+    try w.writeAll(&http_date.line(conn.io));
+    try w.writeAll("Connection: close\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n");
     return w.flush();
 }
 
@@ -919,7 +922,7 @@ pub fn Server(comptime Ctx: type) type {
             if (was.draining) {
                 busy.* = false;
                 self.finishRequest();
-                sendBareStatus(connection.writer, bareStatus("503 Service Unavailable")) catch
+                sendBareStatus(connection, bareStatus("503 Service Unavailable")) catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
             }
@@ -1224,7 +1227,7 @@ pub fn Server(comptime Ctx: type) type {
                             break :blk bareStatus("400 Bad Request");
                         },
                     };
-                    sendBareStatus(connection.writer, reply) catch
+                    sendBareStatus(connection, reply) catch
                         return connection.getWriteError() orelse error.Unexpected;
                     return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                 };

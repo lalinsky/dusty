@@ -1,5 +1,6 @@
 const std = @import("std");
 const http = @import("http.zig");
+const http_date = @import("http_date.zig");
 const Request = @import("request.zig").Request;
 pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const CookieOpts = @import("cookie.zig").CookieOpts;
@@ -1247,6 +1248,7 @@ pub const Response = struct {
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
         try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
+        if (self.headers.get("Date") == null) try w.writeAll(&http_date.line(self.conn.io));
 
         // Write headers
         var iter = self.headers.iterator();
@@ -1415,6 +1417,18 @@ pub const Response = struct {
         return w.flush();
     }
 };
+
+/// The bytes on the wire with the `Date` line after the status line taken
+/// out, once checked to be there.
+fn withoutDate(written: []u8) ![]const u8 {
+    const status_end = (std.mem.indexOf(u8, written, "\r\n") orelse return error.TestUnexpectedResult) + 2;
+    const rest = written[status_end..];
+    try std.testing.expect(rest.len >= http_date.line_len);
+    try std.testing.expectStringStartsWith(rest, "Date: ");
+    try std.testing.expectStringEndsWith(rest[0..http_date.line_len], " GMT\r\n");
+    std.mem.copyForwards(u8, rest, rest[http_date.line_len..]);
+    return written[0 .. written.len - http_date.line_len];
+}
 
 /// The body a response has collected, in one piece, for comparing.
 fn testBody(response: *const Response, buf: []u8) ![]const u8 {
@@ -1703,7 +1717,7 @@ test "StreamingBodyWriter: sends the headers immediately and chunks the body" {
             "5\r\nfirst\r\n" ++
             "6\r\nsecond\r\n" ++
             "0\r\n\r\n",
-        conn_writer.buffered(),
+        try withoutDate(conn_writer.buffered()),
     );
 }
 
@@ -1783,7 +1797,7 @@ test "StreamingBodyWriter: a declared Content-Length streams without chunk frami
             "Content-Length: 11\r\n" ++
             "\r\n" ++
             "hello world",
-        conn_writer.buffered(),
+        try withoutDate(conn_writer.buffered()),
     );
 }
 
@@ -3242,7 +3256,7 @@ test "Response: a streamed HEAD sends the framing headers and nothing after" {
     // but no chunk and no terminator follow it.
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
-        conn_writer.buffered(),
+        try withoutDate(conn_writer.buffered()),
     );
 }
 
@@ -3268,7 +3282,7 @@ test "Response: a streamed HEAD still checks a declared length" {
 
     try std.testing.expectEqualStrings(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
-        conn_writer.buffered(),
+        try withoutDate(conn_writer.buffered()),
     );
 }
 
@@ -3561,4 +3575,50 @@ test "Response: print formats the body" {
     try response.write();
 
     try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhi x3"));
+}
+
+test "Response: a Date header for the current second follows the status line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.body = "hi";
+    const before = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
+    try response.write();
+    const after = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
+
+    const written = conn_writer.buffered();
+    const status_line = "HTTP/1.1 200 OK\r\n";
+    try std.testing.expectStringStartsWith(written, status_line);
+    const sent = written[status_line.len..][0..http_date.line_len];
+    var second = before;
+    while (second <= after) : (second += 1) {
+        var expected: [http_date.line_len]u8 = undefined;
+        http_date.formatLine(&expected, second);
+        if (std.mem.eql(u8, sent, &expected)) break;
+    } else return error.TestUnexpectedResult;
+}
+
+test "Response: a Date set by the handler is not sent twice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("date", "Sun, 06 Nov 1994 08:49:37 GMT");
+    try response.write();
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\ndate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 0\r\n\r\n",
+        conn_writer.buffered(),
+    );
 }
