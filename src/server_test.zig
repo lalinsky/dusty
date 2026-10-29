@@ -1774,26 +1774,26 @@ fn chunkedPost(chunks: []const u8, status: []const u8) !?anyerror {
 
 test "Server: chunk extensions past the limit fail the body read" {
     const ext: [32 * 1024]u8 = @splat('x');
-    const err = try chunkedPost("1;" ++ ext ++ "\r\nX\r\n0\r\n\r\n", "HTTP/1.1 500 ");
+    const err = try chunkedPost("1;" ++ ext ++ "\r\nX\r\n0\r\n\r\n", "HTTP/1.1 400 ");
     try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
 }
 
 test "Server: trailers past the limit fail the body read" {
     // Whitespace before a value reaches no llhttp callback.
     const ows: [32 * 1024]u8 = @splat(' ');
-    const err = try chunkedPost("1\r\nX\r\n0\r\nX-Trailer:" ++ ows ++ "v\r\n\r\n", "HTTP/1.1 500 ");
+    const err = try chunkedPost("1\r\nX\r\n0\r\nX-Trailer:" ++ ows ++ "v\r\n\r\n", "HTTP/1.1 400 ");
     try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
 }
 
 test "Server: leading zeros in a chunk size past the limit fail the body read" {
     const zeros: [32 * 1024]u8 = @splat('0');
-    const err = try chunkedPost(zeros ++ "1\r\nX\r\n0\r\n\r\n", "HTTP/1.1 500 ");
+    const err = try chunkedPost(zeros ++ "1\r\nX\r\n0\r\n\r\n", "HTTP/1.1 400 ");
     try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
 }
 
 test "Server: leading zeros in the last chunk past the limit fail the body read" {
     const zeros: [32 * 1024]u8 = @splat('0');
-    const err = try chunkedPost("1\r\nX\r\n" ++ zeros ++ "0\r\n\r\n", "HTTP/1.1 500 ");
+    const err = try chunkedPost("1\r\nX\r\n" ++ zeros ++ "0\r\n\r\n", "HTTP/1.1 400 ");
     try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
 }
 
@@ -1804,7 +1804,7 @@ test "Server: allowance banked by small chunks does not pay for a large extensio
     var chunks: [chunk.len * 2000 + tail.len]u8 = undefined;
     for (0..2000) |i| @memcpy(chunks[i * chunk.len ..][0..chunk.len], chunk);
     @memcpy(chunks[chunk.len * 2000 ..], tail);
-    const err = try chunkedPost(&chunks, "HTTP/1.1 500 ");
+    const err = try chunkedPost(&chunks, "HTTP/1.1 400 ");
     try std.testing.expectEqual(@as(?anyerror, error.ChunkFramingTooLarge), err);
 }
 
@@ -1816,6 +1816,63 @@ test "Server: a body of many one-byte chunks is read whole" {
     @memcpy(chunks[chunk.len * 10000 ..], last);
     const err = try chunkedPost(&chunks, "HTTP/1.1 200 ");
     try std.testing.expectEqual(@as(?anyerror, null), err);
+}
+
+/// Sends `raw` to a handler that reads the body whole, with a
+/// `max_body_size` of 16, and returns the whole answer up to the close.
+fn bodyReadResponse(raw: []const u8, out: []u8) ![]const u8 {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .request = .{ .max_body_size = 16 },
+    }, {});
+    defer server.deinit();
+    server.router.post("/", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            _ = try req.body();
+            res.body = "OK";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    var reader = stream.reader(io, out);
+
+    try writer.interface.writeAll(raw);
+    try writer.interface.flush();
+
+    while (reader.interface.fillMore()) {} else |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    }
+    return reader.interface.buffered();
+}
+
+test "Server: a body the client got wrong is answered with a 4xx and a close" {
+    var buf: [1024]u8 = undefined;
+
+    var res = try bodyReadResponse("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 17\r\n\r\nxxxxxxxxxxxxxxxxx", &buf);
+    try std.testing.expectStringStartsWith(res, "HTTP/1.1 413 ");
+    try std.testing.expect(std.mem.indexOf(u8, res, "\r\nConnection: close\r\n") != null);
+
+    res = try bodyReadResponse("POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", &buf);
+    try std.testing.expectStringStartsWith(res, "HTTP/1.1 400 ");
+    try std.testing.expect(std.mem.indexOf(u8, res, "\r\nConnection: close\r\n") != null);
+
+    res = try bodyReadResponse("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Encoding: br\r\nContent-Length: 1\r\n\r\nx", &buf);
+    try std.testing.expectStringStartsWith(res, "HTTP/1.1 415 ");
 }
 
 test "Server: a 417 before an unread body is not answered with a reset" {

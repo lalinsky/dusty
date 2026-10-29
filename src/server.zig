@@ -1323,6 +1323,12 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
 
+                // Closed whether or not the reader happened to take the
+                // whole body, as a drain past `max_body_size` is below.
+                if (request._body_err) |e| {
+                    if (e == error.BodyTooBig) response.keepalive = false;
+                }
+
                 if (!parser.isBodyComplete()) {
                     const max = self.config.request.max_body_size;
                     const drainable = blk: {

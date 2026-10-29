@@ -828,6 +828,7 @@ pub fn BodyReader(comptime Parser: type) type {
         /// vtable requires. Mirrors `fail` on the buffered body writer.
         fn fail(self: *Self, cause: Error) std.Io.Reader.StreamError {
             self.err = cause;
+            if (self.request) |req| req._body_err = cause;
             return error.ReadFailed;
         }
 

@@ -99,7 +99,11 @@ pub fn Executor(comptime Ctx: type) type {
                         log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                         return err;
                     }
-                    log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    if (self.req.bodyErrorStatus(err) != null) {
+                        log.debug("Request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    } else {
+                        log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    }
                     self.handleError(err);
                 },
             };
@@ -152,6 +156,14 @@ pub fn Executor(comptime Ctx: type) type {
             self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
                 self.ctx.uncaughtError(self.req, self.res, err);
+            } else if (self.req.bodyErrorStatus(err)) |status| {
+                self.res.status = status;
+                self.res.content_type = .text;
+                self.res.body = switch (status) {
+                    .payload_too_large => "413 Content Too Large\n",
+                    .unsupported_media_type => "415 Unsupported Media Type\n",
+                    else => "400 Bad Request\n",
+                };
             } else {
                 self.res.status = .internal_server_error;
                 self.res.content_type = .text;
