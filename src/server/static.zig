@@ -235,7 +235,11 @@ pub const Embedded = struct {
 /// no `Last-Modified` to give.
 fn finish(req: *Request, res: *Response, etag: []const u8, mtime: ?i64) !void {
     try res.header("ETag", etag);
-    if (mtime) |m| try res.header("Last-Modified", try formatHttpDate(req.arena, m));
+    if (mtime) |m| {
+        const last_modified = try req.arena.create([http.date_len]u8);
+        http.formatDate(last_modified, m);
+        try res.header("Last-Modified", last_modified);
+    }
     try res.header("Accept-Ranges", "bytes");
 
     switch (checkPreconditions(req, etag, mtime)) {
@@ -436,28 +440,6 @@ fn mtimeSeconds(stat: std.Io.File.Stat) i64 {
     return @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s));
 }
 
-const day_names = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
-const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-
-/// IMF-fixdate, the HTTP date format: `Sun, 06 Nov 1994 08:49:37 GMT`. A
-/// time before 1970 is given as 1970.
-fn formatHttpDate(allocator: std.mem.Allocator, seconds: i64) ![]const u8 {
-    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
-    const day = epoch_seconds.getEpochDay();
-    const year_day = day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_seconds = epoch_seconds.getDaySeconds();
-    return std.fmt.allocPrint(allocator, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        day_names[day.day % 7],
-        month_day.day_index + 1,
-        month_names[month_day.month.numeric() - 1],
-        year_day.year,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    });
-}
-
 /// Seconds since the epoch for an IMF-fixdate, or null for anything else.
 /// RFC 9110 also asks for the obsolete RFC 850 and asctime forms, which
 /// clients only send back when the server sent them.
@@ -468,7 +450,7 @@ fn parseHttpDate(value: []const u8) ?i64 {
     if (!std.mem.eql(u8, v[25..], " GMT")) return null;
 
     const day = parseDecimal(u8, v[5..7]) orelse return null;
-    const month: u8 = for (month_names, 1..) |name, i| {
+    const month: u8 = for (http.month_names, 1..) |name, i| {
         if (std.mem.eql(u8, v[8..11], name)) break @intCast(i);
     } else return null;
     const year = parseDecimal(u16, v[12..16]) orelse return null;
@@ -584,9 +566,9 @@ test parseRange {
 }
 
 test "HTTP date round trip" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", try formatHttpDate(arena.allocator(), 784111777));
+    var buf: [http.date_len]u8 = undefined;
+    http.formatDate(&buf, 784111777);
+    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", &buf);
     try std.testing.expectEqual(784111777, parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT"));
     try std.testing.expectEqual(951782400, parseHttpDate("Tue, 29 Feb 2000 00:00:00 GMT"));
     try std.testing.expectEqual(null, parseHttpDate("Sun, 29 Feb 1999 00:00:00 GMT"));

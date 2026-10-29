@@ -8,7 +8,8 @@ const RequestParser = @import("parser.zig").RequestParser;
 const RequestBodyReader = @import("parser.zig").RequestBodyReader;
 const Request = @import("request.zig").Request;
 const parseHeaders = @import("request.zig").parseHeaders;
-const Headers = @import("http.zig").Headers;
+const http = @import("http.zig");
+const Headers = http.Headers;
 const Response = @import("response.zig").Response;
 const ServerConfig = @import("config.zig").ServerConfig;
 const default_listeners = @import("config.zig").default_listeners;
@@ -290,7 +291,7 @@ pub const Connection = struct {
     /// error a write failure should surface.
     pub fn initWriterForTesting(self: *Connection, w: *std.Io.Writer) void {
         self.* = .{
-            .io = undefined,
+            .io = std.testing.io,
             .stream = undefined,
             .allocator = undefined,
             .buffers = &.{},
@@ -365,19 +366,39 @@ pub const Connection = struct {
     }
 };
 
-/// The reply to a request whose head was not accepted, which cannot go
-/// through `Response`. Fixed bytes instead, and `Connection: close`, because
-/// the rest of that head may still be queued on the socket and there is no
-/// framing to skip it by.
-fn bareStatus(comptime status_line: []const u8) []const u8 {
-    return "HTTP/1.1 " ++ status_line ++ "\r\n" ++
-        "Connection: close\r\n" ++
-        "Content-Length: 0\r\n" ++
-        "\r\n";
+const DateCache = struct {
+    second: i64 = std.math.minInt(i64),
+    line: [http.date_line_len]u8 = undefined,
+};
+
+threadlocal var date_cache: DateCache = .{};
+
+/// Writes the `Date` header line for the current second of the wall clock,
+/// reformatted only when the second changes.
+pub fn writeDateLine(w: *std.Io.Writer, io: std.Io) std.Io.Writer.Error!void {
+    const dest = try w.writableArray(http.date_line_len);
+    const second = std.Io.Timestamp.now(io, .real).toSeconds();
+    if (second != date_cache.second) {
+        http.formatDateLine(&date_cache.line, second);
+        date_cache.second = second;
+    }
+    dest.* = date_cache.line;
 }
 
-fn sendBareStatus(w: *std.Io.Writer, response: []const u8) std.Io.Writer.Error!void {
-    try w.writeAll(response);
+/// Replies to a request whose head was not accepted, which cannot go
+/// through `Response`. The reply carries `Connection: close`, because the
+/// rest of that head may still be queued on the socket and there is no
+/// framing to skip it by.
+fn sendBareStatus(conn: *Connection, status: []const u8) std.Io.Writer.Error!void {
+    var buf: [1024]u8 = undefined;
+    var reply: std.Io.Writer = .fixed(&buf);
+    reply.print("HTTP/1.1 {s}\r\n", .{status}) catch unreachable;
+    writeDateLine(&reply, conn.io) catch unreachable;
+    reply.writeAll("Connection: close\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n") catch unreachable;
+    const w = conn.writer;
+    try w.writeAll(reply.buffered());
     return w.flush();
 }
 
@@ -919,7 +940,7 @@ pub fn Server(comptime Ctx: type) type {
             if (was.draining) {
                 busy.* = false;
                 self.finishRequest();
-                sendBareStatus(connection.writer, bareStatus("503 Service Unavailable")) catch
+                sendBareStatus(connection, "503 Service Unavailable") catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
             }
@@ -1188,7 +1209,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 parseHeaders(connection.reader, &parser) catch |err| {
-                    const reply = switch (err) {
+                    const status = switch (err) {
                         error.EndOfStream => return,
                         error.IncompleteRequest => {
                             log.debug("Request head cut short by peer", .{});
@@ -1198,15 +1219,15 @@ pub fn Server(comptime Ctx: type) type {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.HeadersTooLarge => blk: {
                             log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
-                            break :blk if (parser.state.has_url) bareStatus("431 Request Header Fields Too Large") else bareStatus("414 URI Too Long");
+                            break :blk if (parser.state.has_url) "431 Request Header Fields Too Large" else "414 URI Too Long";
                         },
                         error.TooManyHeaders => blk: {
                             log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
-                            break :blk bareStatus("431 Request Header Fields Too Large");
+                            break :blk "431 Request Header Fields Too Large";
                         },
                         error.UnsupportedVersion => blk: {
                             log.debug("Request had an unsupported HTTP version", .{});
-                            break :blk bareStatus("505 HTTP Version Not Supported");
+                            break :blk "505 HTTP Version Not Supported";
                         },
                         error.InvalidMethod,
                         error.InvalidUrl,
@@ -1221,10 +1242,10 @@ pub fn Server(comptime Ctx: type) type {
                         error.ParseFailed,
                         => blk: {
                             log.debug("Malformed request head: {}", .{err});
-                            break :blk bareStatus("400 Bad Request");
+                            break :blk "400 Bad Request";
                         },
                     };
-                    sendBareStatus(connection.writer, reply) catch
+                    sendBareStatus(connection, status) catch
                         return connection.getWriteError() orelse error.Unexpected;
                     return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                 };
