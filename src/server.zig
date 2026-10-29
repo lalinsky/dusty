@@ -385,21 +385,20 @@ pub fn dateLine(io: std.Io) [http.date_line_len]u8 {
     return date_cache.line;
 }
 
-/// The status line of the reply to a request whose head was not accepted,
-/// which cannot go through `Response`. `sendBareStatus` sends it with
-/// `Connection: close`, because the rest of that head may still be queued
-/// on the socket and there is no framing to skip it by.
-fn bareStatus(comptime status_line: []const u8) []const u8 {
-    return "HTTP/1.1 " ++ status_line ++ "\r\n";
-}
-
-fn sendBareStatus(conn: *Connection, status_line: []const u8) std.Io.Writer.Error!void {
-    const w = conn.writer;
-    try w.writeAll(status_line);
-    try w.writeAll(&dateLine(conn.io));
-    try w.writeAll("Connection: close\r\n" ++
+/// Replies to a request whose head was not accepted, which cannot go
+/// through `Response`. The reply carries `Connection: close`, because the
+/// rest of that head may still be queued on the socket and there is no
+/// framing to skip it by.
+fn sendBareStatus(conn: *Connection, status: []const u8) std.Io.Writer.Error!void {
+    var buf: [1024]u8 = undefined;
+    var reply: std.Io.Writer = .fixed(&buf);
+    reply.print("HTTP/1.1 {s}\r\n", .{status}) catch unreachable;
+    reply.writeAll(&dateLine(conn.io)) catch unreachable;
+    reply.writeAll("Connection: close\r\n" ++
         "Content-Length: 0\r\n" ++
-        "\r\n");
+        "\r\n") catch unreachable;
+    const w = conn.writer;
+    try w.writeAll(reply.buffered());
     return w.flush();
 }
 
@@ -941,7 +940,7 @@ pub fn Server(comptime Ctx: type) type {
             if (was.draining) {
                 busy.* = false;
                 self.finishRequest();
-                sendBareStatus(connection, bareStatus("503 Service Unavailable")) catch
+                sendBareStatus(connection, "503 Service Unavailable") catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
             }
@@ -1210,7 +1209,7 @@ pub fn Server(comptime Ctx: type) type {
                 }
 
                 parseHeaders(connection.reader, &parser) catch |err| {
-                    const reply = switch (err) {
+                    const status = switch (err) {
                         error.EndOfStream => return,
                         error.IncompleteRequest => {
                             log.debug("Request head cut short by peer", .{});
@@ -1220,15 +1219,15 @@ pub fn Server(comptime Ctx: type) type {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.HeadersTooLarge => blk: {
                             log.debug("Request head did not fit in {d} bytes", .{self.config.request.buffer_size});
-                            break :blk if (parser.state.has_url) bareStatus("431 Request Header Fields Too Large") else bareStatus("414 URI Too Long");
+                            break :blk if (parser.state.has_url) "431 Request Header Fields Too Large" else "414 URI Too Long";
                         },
                         error.TooManyHeaders => blk: {
                             log.debug("Request had more than {d} headers", .{self.config.request.max_header_count});
-                            break :blk bareStatus("431 Request Header Fields Too Large");
+                            break :blk "431 Request Header Fields Too Large";
                         },
                         error.UnsupportedVersion => blk: {
                             log.debug("Request had an unsupported HTTP version", .{});
-                            break :blk bareStatus("505 HTTP Version Not Supported");
+                            break :blk "505 HTTP Version Not Supported";
                         },
                         error.InvalidMethod,
                         error.InvalidUrl,
@@ -1243,10 +1242,10 @@ pub fn Server(comptime Ctx: type) type {
                         error.ParseFailed,
                         => blk: {
                             log.debug("Malformed request head: {}", .{err});
-                            break :blk bareStatus("400 Bad Request");
+                            break :blk "400 Bad Request";
                         },
                     };
-                    sendBareStatus(connection, reply) catch
+                    sendBareStatus(connection, status) catch
                         return connection.getWriteError() orelse error.Unexpected;
                     return self.lingeringClose(connection, timer, &idle_read_buffer, &buffers);
                 };
