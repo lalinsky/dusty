@@ -18,6 +18,7 @@ pub const ParseError = error{
     InvalidHeaderToken,
     InvalidHeaderValue,
     InvalidVersion,
+    UnsupportedVersion,
     InvalidStatus,
     InvalidChunkSize,
     UnexpectedContentLength,
@@ -53,6 +54,8 @@ fn mapError(err: c.llhttp_errno_t) ParseError {
         // Likewise: `onHeaderValueComplete` only fails when `Headers.add`
         // is out of room.
         c.HPE_CB_HEADER_VALUE_COMPLETE => ParseError.TooManyHeaders,
+        // And `RequestParser.onVersion` only on a major version other than 1.
+        c.HPE_CB_VERSION_COMPLETE => ParseError.UnsupportedVersion,
         c.HPE_INVALID_CHUNK_SIZE => ParseError.InvalidChunkSize,
         c.HPE_UNEXPECTED_CONTENT_LENGTH => ParseError.UnexpectedContentLength,
         c.HPE_CLOSED_CONNECTION => ParseError.ClosedConnection,
@@ -113,6 +116,10 @@ pub const RequestParser = struct {
         self.settings.on_message_complete = onMessageComplete;
 
         c.llhttp_init(&self.parser, c.HTTP_REQUEST, &self.settings);
+        // Any DIGIT "." DIGIT reaches `onVersion`, which judges it: llhttp
+        // would reject HTTP/1.2, which RFC 9112 2.3 says to serve as 1.1,
+        // and accept HTTP/2.0 and HTTP/0.9.
+        c.llhttp_set_lenient_version(&self.parser, 1);
     }
 
     pub fn deinit(self: *RequestParser) void {
@@ -186,6 +193,7 @@ pub const RequestParser = struct {
 
     fn onVersion(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
+        if (c.llhttp_get_http_major(&self.parser) != 1) return -1;
         self.state.has_version = true;
         self.request.version_major = c.llhttp_get_http_major(&self.parser);
         self.request.version_minor = c.llhttp_get_http_minor(&self.parser);
