@@ -1323,8 +1323,9 @@ pub fn Server(comptime Ctx: type) type {
                     else => |e| return e,
                 };
 
-                // Closed whether or not the reader happened to take the
-                // whole body, as a drain past `max_body_size` is below.
+                // A body over `max_body_size` closes the connection even when
+                // the reader took all of it, the same as one the drain below
+                // gives up on.
                 if (request._body_err) |e| {
                     if (e == error.BodyTooBig) response.keepalive = false;
                 }

@@ -100,7 +100,7 @@ pub fn Executor(comptime Ctx: type) type {
                         return err;
                     }
                     if (self.req.bodyErrorStatus(err) != null) {
-                        log.debug("Request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                        log.debug("request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     }
