@@ -1354,6 +1354,15 @@ test "Request.formData: entry with no value" {
     try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
 
+test "Request.bodyErrorStatus: only the body read's own error is mapped" {
+    var req: Request = undefined;
+    req._body_err = null;
+    try std.testing.expectEqual(null, req.bodyErrorStatus(error.IncompleteBody));
+    req._body_err = error.IncompleteBody;
+    try std.testing.expectEqual(.bad_request, req.bodyErrorStatus(error.IncompleteBody).?);
+    try std.testing.expectEqual(null, req.bodyErrorStatus(error.CorruptInput));
+}
+
 test "Request.multiFormData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
