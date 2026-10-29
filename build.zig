@@ -15,6 +15,18 @@ pub fn build(b: *std.Build) void {
     // use_tls, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const use_json = b.option(bool, "use_json", "Encode and decode JSON bodies with json.zig; without it, std.json") orelse true;
+    const use_bundled_json = b.option(
+        bool,
+        "use_bundled_json",
+        "Use Dusty's pinned json.zig dependency; disable to inject a compatible 'json' module",
+    ) orelse true;
+    const use_msgpack = b.option(bool, "use_msgpack", "Build with MessagePack bodies via msgpack.zig") orelse true;
+    const use_bundled_msgpack = b.option(
+        bool,
+        "use_bundled_msgpack",
+        "Use Dusty's pinned msgpack.zig dependency; disable to inject a compatible 'msgpack' module",
+    ) orelse true;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -26,6 +38,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
     build_options.addOption(bool, "use_zlib", use_zlib);
+    build_options.addOption(bool, "use_json", use_json);
+    build_options.addOption(bool, "use_msgpack", use_msgpack);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -72,6 +86,37 @@ pub fn build(b: *std.Build) void {
         mod.addAnonymousImport("zlib", .{
             .root_source_file = b.path("src/zlib_stub.zig"),
         });
+    }
+
+    // JSON and MessagePack bodies are lazy dependencies too, and need no
+    // stub: without json.zig, `Request.json`/`Response.json` use std.json,
+    // and without msgpack.zig the msgpack pair fails to compile if it is
+    // used.
+    // Like TLS, either can be replaced with a compatible module:
+    //   dusty_mod.addImport("json", custom_json_mod);
+    if (use_json) {
+        if (!use_bundled_json) {
+            mod.addAnonymousImport("json", .{
+                .root_source_file = b.path("src/json_injection_required.zig"),
+            });
+        } else if (b.lazyDependency("json", .{
+            .target = target,
+            .optimize = optimize,
+        })) |json_dep| {
+            mod.addImport("json", json_dep.module("json"));
+        }
+    }
+    if (use_msgpack) {
+        if (!use_bundled_msgpack) {
+            mod.addAnonymousImport("msgpack", .{
+                .root_source_file = b.path("src/msgpack_injection_required.zig"),
+            });
+        } else if (b.lazyDependency("msgpack", .{
+            .target = target,
+            .optimize = optimize,
+        })) |msgpack_dep| {
+            mod.addImport("msgpack", msgpack_dep.module("msgpack"));
+        }
     }
 
     const translate_c = b.addTranslateC(.{

@@ -1,4 +1,7 @@
 const std = @import("std");
+const build_options = @import("build_options");
+const json_lib = if (build_options.use_json) @import("json") else struct {};
+const msgpack_lib = if (build_options.use_msgpack) @import("msgpack") else struct {};
 
 const c = @import("llhttp");
 
@@ -335,14 +338,40 @@ pub const Headers = struct {
         return null;
     }
 
-    /// Serializes as a JSON object. HTTP lets a name appear more than
-    /// once and a JSON object cannot hold the same key twice, so those
-    /// become an array rather than a repeated key that a parser would
+    /// Encodes as a JSON object, for json.zig. HTTP lets a name appear
+    /// more than once and a JSON object cannot hold the same key twice, so
+    /// those become an array rather than a repeated key that a parser would
     /// silently reduce to whichever copy it saw last.
+    pub fn jsonWrite(self: Headers, encoder: anytype) !void {
+        try encoder.beginObject();
+        var first = true;
+        for (self.keys[0..self.len], self.hashes[0..self.len], 0..) |name, h, i| {
+            // Later copies are written with the first, so skip them here.
+            if (self.find(name, h, 0).? != i) continue;
+            if (!first) try encoder.comma();
+            first = false;
+
+            try encoder.writeKey(name);
+            const second = self.find(name, h, i + 1) orelse {
+                try encoder.writeStringValue(self.values[i]);
+                continue;
+            };
+            try encoder.beginArray();
+            try encoder.writeStringValue(self.values[i]);
+            var next: ?usize = second;
+            while (next) |j| : (next = self.find(name, h, j + 1)) {
+                try encoder.comma();
+                try encoder.writeStringValue(self.values[j]);
+            }
+            try encoder.endArray();
+        }
+        try encoder.endObject();
+    }
+
+    /// The same as `jsonWrite`, for `std.json`.
     pub fn jsonStringify(self: Headers, jw: anytype) !void {
         try jw.beginObject();
         for (self.keys[0..self.len], self.hashes[0..self.len], 0..) |name, h, i| {
-            // Later copies are written with the first, so skip them here.
             if (self.find(name, h, 0).? != i) continue;
 
             try jw.objectField(name);
@@ -359,6 +388,34 @@ pub const Headers = struct {
             try jw.endArray();
         }
         try jw.endObject();
+    }
+
+    /// Encodes as a MessagePack map, for msgpack.zig, with a repeated name
+    /// grouped into an array as `jsonWrite` does.
+    pub fn msgpackWrite(self: Headers, packer: anytype) !void {
+        var names: usize = 0;
+        for (self.keys[0..self.len], self.hashes[0..self.len], 0..) |name, h, i| {
+            if (self.find(name, h, 0).? == i) names += 1;
+        }
+        try packer.writeMapHeader(names);
+        for (self.keys[0..self.len], self.hashes[0..self.len], 0..) |name, h, i| {
+            if (self.find(name, h, 0).? != i) continue;
+
+            try packer.writeString(name);
+            const second = self.find(name, h, i + 1) orelse {
+                try packer.writeString(self.values[i]);
+                continue;
+            };
+            var copies: usize = 2;
+            var next = self.find(name, h, second + 1);
+            while (next) |j| : (next = self.find(name, h, j + 1)) copies += 1;
+            try packer.writeArrayHeader(copies);
+            try packer.writeString(self.values[i]);
+            next = second;
+            while (next) |j| : (next = self.find(name, h, j + 1)) {
+                try packer.writeString(self.values[j]);
+            }
+        }
     }
 
     pub fn iterator(self: *const Headers) Iterator {
@@ -415,8 +472,22 @@ pub const Params = struct {
         return .{ .inner = self.map.iterator() };
     }
 
-    /// Serializes as a JSON object. Keys are unique here, so unlike
-    /// `Headers` every value is a plain string.
+    /// Encodes as a JSON object, for json.zig. Keys are unique here, so
+    /// unlike `Headers` every value is a plain string.
+    pub fn jsonWrite(self: Params, encoder: anytype) !void {
+        try encoder.beginObject();
+        var first = true;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (!first) try encoder.comma();
+            first = false;
+            try encoder.writeKey(entry.key_ptr.*);
+            try encoder.writeStringValue(entry.value_ptr.*);
+        }
+        try encoder.endObject();
+    }
+
+    /// The same as `jsonWrite`, for `std.json`.
     pub fn jsonStringify(self: Params, jw: anytype) !void {
         try jw.beginObject();
         var it = self.map.iterator();
@@ -425,6 +496,16 @@ pub const Params = struct {
             try jw.write(entry.value_ptr.*);
         }
         try jw.endObject();
+    }
+
+    /// Encodes as a MessagePack map of strings, for msgpack.zig.
+    pub fn msgpackWrite(self: Params, packer: anytype) !void {
+        try packer.writeMapHeader(self.map.count());
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            try packer.writeString(entry.key_ptr.*);
+            try packer.writeString(entry.value_ptr.*);
+        }
     }
 
     /// Yields the same `Entry` shape as `Headers.Iterator`, so a loop over
@@ -923,11 +1004,22 @@ test "Headers: remove compacts so later entries stay reachable" {
 fn expectJson(expected: []const u8, value: anytype) !void {
     var buf: [512]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    try std.json.Stringify.value(value, .{}, &out);
+    if (build_options.use_json) {
+        try json_lib.encode(value, &out);
+    } else {
+        try std.json.Stringify.value(value, .{}, &out);
+    }
     try std.testing.expectEqualStrings(expected, out.buffered());
 }
 
-test "Headers: jsonStringify" {
+fn expectMsgpack(expected: []const u8, value: anytype) !void {
+    var buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try msgpack_lib.encode(value, &out);
+    try std.testing.expectEqualSlices(u8, expected, out.buffered());
+}
+
+test "Headers: jsonWrite" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
@@ -938,7 +1030,7 @@ test "Headers: jsonStringify" {
     , headers);
 }
 
-test "Headers: jsonStringify groups a repeated name into an array" {
+test "Headers: jsonWrite groups a repeated name into an array" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
@@ -953,7 +1045,7 @@ test "Headers: jsonStringify groups a repeated name into an array" {
     , headers);
 }
 
-test "Headers: jsonStringify groups case-insensitively" {
+test "Headers: jsonWrite groups case-insensitively" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
@@ -964,7 +1056,7 @@ test "Headers: jsonStringify groups case-insensitively" {
     , headers);
 }
 
-test "Headers: jsonStringify escapes names and values" {
+test "Headers: jsonWrite escapes names and values" {
     var headers = try Headers.init(std.testing.allocator, 8);
     defer headers.deinit(std.testing.allocator);
 
@@ -974,12 +1066,46 @@ test "Headers: jsonStringify escapes names and values" {
     , headers);
 }
 
-test "Headers: jsonStringify of an empty map" {
+test "Headers: jsonWrite of an empty map" {
     const headers: Headers = .{};
     try expectJson("{}", headers);
 }
 
-test "Params: jsonStringify" {
+test "Headers: msgpackWrite groups a repeated name into an array" {
+    if (comptime !build_options.use_msgpack) return error.SkipZigTest;
+    var headers = try Headers.init(std.testing.allocator, 8);
+    defer headers.deinit(std.testing.allocator);
+
+    try headers.add("Host", "a.b");
+    try headers.add("X-Tag", "a");
+    try headers.add("x-tag", "b");
+    try expectMsgpack(&.{
+        0x82, // map of 2
+        0xa4,
+        'H',
+        'o',
+        's',
+        't',
+        0xa3,
+        'a',
+        '.',
+        'b',
+        0xa5, 'X', '-', 'T', 'a', 'g', 0x92, 0xa1, 'a', 0xa1, 'b', // array of 2
+    }, headers);
+
+    const empty: Headers = .{};
+    try expectMsgpack(&.{0x80}, empty);
+}
+
+test "Params: msgpackWrite" {
+    if (comptime !build_options.use_msgpack) return error.SkipZigTest;
+    var params: Params = .{};
+    defer params.map.deinit(std.testing.allocator);
+    try params.map.put(std.testing.allocator, "a", "1");
+    try expectMsgpack(&.{ 0x81, 0xa1, 'a', 0xa1, '1' }, params);
+}
+
+test "Params: jsonWrite" {
     var params: Params = .{};
     defer params.map.deinit(std.testing.allocator);
     try params.map.put(std.testing.allocator, "a", "1");

@@ -18,6 +18,7 @@ or if you are using WebSocket. However, it's usable with any implementation, lik
 - Supports chunked transfer encoding in both request/response bodies
 - Transparent gzip/deflate decoding of request and response bodies
 - gzip compression of response bodies, opt-in per response with `res.compress = true`
+- JSON and MessagePack request and response bodies (via [json.zig](https://github.com/lalinsky/json.zig) and [msgpack.zig](https://github.com/lalinsky/msgpack.zig))
 - Server-Sent Events (SSE) for streaming responses
 - Static file serving with conditional and range requests, and precompressed files
 - Assets embedded in the binary at build time, with cache-busting URLs
@@ -44,7 +45,7 @@ const dusty_dep = b.dependency("dusty", .{
 exe.root_module.addImport("dusty", dusty_dep.module("dusty"));
 ```
 
-### Using a custom tls.zig
+### Using a custom tls.zig, json.zig or msgpack.zig
 
 TLS is enabled with Dusty's pinned tls.zig dependency by default. To inject a
 different compatible version without fetching or compiling the bundled one,
@@ -70,6 +71,9 @@ exe.root_module.addImport("dusty", dusty_mod);
 The application declares `custom_tls` in its own `build.zig.zon`, so it can
 point to another commit, fork, or local path. Omitting the injected module is a
 compile error. Use `.use_tls = false` instead when TLS should be compiled out.
+
+json.zig and msgpack.zig are replaced the same way, with `.use_bundled_json = false` and an
+injected `json` module, or `.use_bundled_msgpack = false` and an injected `msgpack` module.
 
 ## Usage
 
@@ -156,33 +160,32 @@ and [htmx](https://htmx.org), with live updates across browser tabs over Server-
 
 ### Serialization
 
-`res.encode` writes a value with a serializer's write-to-writer function, telling its parameters
-apart by type, so libraries plug in as they are. We recommend
-[json.zig](https://github.com/lalinsky/json.zig) for JSON and
-[msgpack.zig](https://github.com/lalinsky/msgpack.zig) for MessagePack, both specialized to your
-types at compile time.
+`req.json` and `res.json` decode and encode JSON bodies with [json.zig](https://github.com/lalinsky/json.zig),
+and `req.msgpack` and `res.msgpack` MessagePack bodies with [msgpack.zig](https://github.com/lalinsky/msgpack.zig),
+both specialized to your types at compile time. Decoded values live in the request arena.
 
 ```zig
-const json = @import("json");
-const msgpack = @import("msgpack");
-
 fn handleUser(req: *http.Request, res: *http.Response) !void {
-    const input = try json.decodeFromSliceLeaky(UserInput, req.arena, try req.body() orelse "", .{});
+    const input = try req.json(UserInput) orelse return error.MissingBody;
     const user = try updateUser(input);
-    try res.encode(.json, json.encode, user);
+    try res.json(user, .{});
 }
 
 fn handleUserMsgpack(req: *http.Request, res: *http.Response) !void {
     const user = try loadUser(req.params.get("id").?);
-    try res.encode(.msgpack, msgpack.encode, user);
+    try res.msgpack(user);
 }
 ```
 
-Other serializers fit the same way, [serde.zig](https://github.com/OrlovEvgeny/serde.zig)'s `toWriter` for one. Unlike `std.json`, json.zig
-leaves out optional fields that are null, unless the type says otherwise.
+`http.json` and `http.msgpack` are the libraries themselves, for a type that shapes its own encoding
+(`jsonFormat`, `jsonWrite`, `msgpackWrite`). Unlike `std.json`, json.zig leaves out optional fields that
+are null, unless the type says otherwise. Build with `-Duse_json=false` to leave json.zig out, and
+`req.json` and `res.json` use `std.json` instead, or with `-Duse_msgpack=false` to leave msgpack.zig
+out. Dusty's own types (`Headers`, `Params`, `Cookie`) encode the same either way.
 
-`res.json` and `req.json` are there for convenience. They use `std.json`, so they take any type,
-`std.json.Value` included, but json.zig is considerably faster at both encoding and decoding.
+`res.encode` writes a value with any serializer's write-to-writer function, telling its parameters
+apart by type, so other libraries plug in as they are, [serde.zig](https://github.com/OrlovEvgeny/serde.zig)'s
+`toWriter` for one. JSON of no fixed shape can still be parsed with `std.json` from `req.body()`.
 
 ### Static Files
 

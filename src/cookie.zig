@@ -3,6 +3,9 @@
 // Copyright (c) 2024 Karl Seguin.
 
 const std = @import("std");
+const build_options = @import("build_options");
+const json_lib = if (build_options.use_json) @import("json") else struct {};
+const msgpack_lib = if (build_options.use_msgpack) @import("msgpack") else struct {};
 
 /// Cookie parser for reading cookies from a request.
 /// Lazily parses the Cookie header on demand.
@@ -64,7 +67,21 @@ pub const Cookie = struct {
         }
     };
 
-    /// Serializes as a JSON object of name to value.
+    /// Encodes as a JSON object of name to value, for json.zig.
+    pub fn jsonWrite(self: Cookie, encoder: anytype) !void {
+        try encoder.beginObject();
+        var first = true;
+        var it = self.iterator();
+        while (it.next()) |entry| {
+            if (!first) try encoder.comma();
+            first = false;
+            try encoder.writeKey(entry.name);
+            try encoder.writeStringValue(entry.value);
+        }
+        try encoder.endObject();
+    }
+
+    /// The same as `jsonWrite`, for `std.json`.
     pub fn jsonStringify(self: Cookie, jw: anytype) !void {
         try jw.beginObject();
         var it = self.iterator();
@@ -73,6 +90,19 @@ pub const Cookie = struct {
             try jw.write(entry.value);
         }
         try jw.endObject();
+    }
+
+    /// Encodes as a MessagePack map of name to value, for msgpack.zig.
+    pub fn msgpackWrite(self: Cookie, packer: anytype) !void {
+        var count: usize = 0;
+        var counting = self.iterator();
+        while (counting.next()) |_| count += 1;
+        try packer.writeMapHeader(count);
+        var it = self.iterator();
+        while (it.next()) |entry| {
+            try packer.writeString(entry.name);
+            try packer.writeString(entry.value);
+        }
     }
 };
 
@@ -278,7 +308,11 @@ test "serializeCookie: zero max_age deletes cookie" {
 fn expectCookieJson(expected: []const u8, header: []const u8) !void {
     var buf: [512]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buf);
-    try std.json.Stringify.value(Cookie{ .header = header }, .{}, &out);
+    if (build_options.use_json) {
+        try json_lib.encode(Cookie{ .header = header }, &out);
+    } else {
+        try std.json.Stringify.value(Cookie{ .header = header }, .{}, &out);
+    }
     try std.testing.expectEqualStrings(expected, out.buffered());
 }
 
@@ -308,7 +342,15 @@ test "Cookie: iterator skips what get would never match" {
     try std.testing.expectEqual(@as(?Cookie.Iterator.Entry, null), it.next());
 }
 
-test "Cookie: jsonStringify" {
+test "Cookie: msgpackWrite" {
+    if (comptime !build_options.use_msgpack) return error.SkipZigTest;
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    try msgpack_lib.encode(Cookie{ .header = "a=1; novalue; b=" }, &out);
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 0xa1, 'a', 0xa1, '1', 0xa1, 'b', 0xa0 }, out.buffered());
+}
+
+test "Cookie: jsonWrite" {
     try expectCookieJson(
         \\{"a":"1","b":"2"}
     , "a=1; b=2");
