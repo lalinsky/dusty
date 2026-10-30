@@ -751,6 +751,13 @@ pub const ResponseParser = struct {
             self.response.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
         }
 
+        // llhttp takes "chunked" followed by a tab for another coding, and
+        // would read the chunks as a body that runs to the close.
+        if (self.state.has_transfer_encoding and self.parser.flags & @as(u16, @intCast(c.F_CHUNKED)) == 0) {
+            self.state.err = error.UnsupportedTransferEncoding;
+            return -1;
+        }
+
         // Returning 1 is how a callback normally asks llhttp to skip the
         // body, but this one has to return HPE_PAUSED, so set the flag it
         // would have set.

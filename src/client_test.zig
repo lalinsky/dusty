@@ -1309,6 +1309,7 @@ fn expectUnsupportedTransferEncoding(comptime response: []const u8) !void {
 test "Client: a transfer coding other than a lone chunked is rejected" {
     try expectUnsupportedTransferEncoding("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n");
     try expectUnsupportedTransferEncoding("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n");
+    try expectUnsupportedTransferEncoding("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\t\r\n\r\n2\r\nok\r\n0\r\n\r\n");
 }
 
 test "Client: an HTTP/1.0 response with Transfer-Encoding is not pooled" {
