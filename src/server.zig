@@ -1321,6 +1321,8 @@ pub fn Server(comptime Ctx: type) type {
                     .action = if (found) |r| r.action else null,
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
+                executor.attachState();
+                defer executor.detachState();
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,

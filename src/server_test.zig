@@ -536,6 +536,66 @@ test "Server: void context handlers" {
     try client_future.await(io);
 }
 
+test "Server: middleware hands request state to the handler, fresh for each request" {
+    const io = std.testing.io;
+
+    const App = struct {
+        pub const RequestState = struct {
+            user: ?[]const u8 = null,
+        };
+    };
+
+    const Auth = struct {
+        pub fn execute(_: *const @This(), req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
+            if (req.headers.get("X-User")) |user| executor.state.user = user;
+            return executor.next();
+        }
+    };
+
+    var app: App = .{};
+    var server = dusty.Server(App).init(std.testing.allocator, io, .{ .listeners = loopback }, &app);
+    defer server.deinit();
+
+    var auth: Auth = .{};
+    const middlewares = [_]dusty.Middleware(App){.init(&auth)};
+    server.router.middlewares = &middlewares;
+    server.router.get("/whoami", struct {
+        fn handle(_: *App, req: *dusty.Request, res: *dusty.Response) !void {
+            res.body = req.state(App).user orelse "nobody";
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(App)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    var status: [64]u8 = undefined;
+    var body: [64]u8 = undefined;
+
+    try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\nX-User: alice\r\n\r\n");
+    try writer.interface.flush();
+    const first = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectEqualStrings("alice", first.body);
+
+    try writer.interface.writeAll("GET /whoami HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+    const second = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectEqualStrings("nobody", second.body);
+}
+
 test "Server: graceful shutdown drain still blocks after an earlier connection closed" {
     const io = std.testing.io;
 

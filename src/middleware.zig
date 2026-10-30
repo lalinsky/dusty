@@ -1,5 +1,6 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
+const RequestState = @import("request.zig").RequestState;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
 const Connection = @import("server.zig").Connection;
@@ -71,6 +72,17 @@ pub fn Executor(comptime Ctx: type) type {
         ctx: if (Ctx == void) void else *Ctx,
         action: ?Action(Ctx),
         middlewares: []const Middleware(Ctx),
+        /// The app's `RequestState` for this request, also reachable as
+        /// `req.state(Ctx)` between `attachState` and `detachState`.
+        state: RequestState(Ctx) = .{},
+
+        pub fn attachState(self: *Self) void {
+            self.req._state = .init(RequestState(Ctx), &self.state);
+        }
+
+        pub fn detachState(self: *Self) void {
+            self.req._state = .empty;
+        }
 
         pub fn run(self: *Self) !void {
             self.handle() catch |err| switch (err) {
@@ -730,4 +742,43 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "404 Not Found\n"));
+}
+
+test "Executor: middleware passes request state to the handler" {
+    const StateCtx = struct {
+        pub const RequestState = struct {
+            user: ?[]const u8 = null,
+        };
+    };
+
+    const AuthMiddleware = struct {
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, executor: anytype) !void {
+            executor.state.user = "alice";
+            return executor.next();
+        }
+    };
+
+    var ctx: StateCtx = .{};
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+
+    var mw: AuthMiddleware = .{};
+    const middlewares = [_]Middleware(StateCtx){.init(&mw)};
+    var executor: Executor(StateCtx) = .{
+        .req = &req,
+        .res = &res,
+        .ctx = &ctx,
+        .action = struct {
+            fn handle(_: *StateCtx, r: *Request, rs: *Response) !void {
+                rs.body = r.state(StateCtx).user orelse "nobody";
+            }
+        }.handle,
+        .middlewares = &middlewares,
+    };
+    executor.attachState();
+
+    try executor.run();
+    try std.testing.expectEqualStrings("alice", res.body);
 }
