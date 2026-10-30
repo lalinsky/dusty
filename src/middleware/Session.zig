@@ -83,10 +83,20 @@ pub fn init(config: Config) !Session {
     return .{ .config = config };
 }
 
+/// Keeps the session in the app's request state, which has to declare it:
+///
+///     pub const RequestState = struct {
+///         session: dusty.SessionData = .{},
+///     };
 pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
+    if (comptime !@hasField(@TypeOf(executor.state), "session")) {
+        @compileError("the Session middleware needs `session: dusty.SessionData = .{}` in the app's RequestState");
+    }
+    const session = &executor.state.session;
+
     const cookie_value = req.cookies().get(self.config.cookie_name);
     if (cookie_value) |raw| {
-        self.load(req.arena, &req.session, raw, req.io) catch |err| switch (err) {
+        self.load(req.arena, session, raw, req.io) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => |e| log.debug("session load failed: {}", .{e}),
         };
@@ -95,16 +105,16 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
     try executor.next();
 
     // Re-sign if modified, or if max_age is set and session has data (sliding expiry)
-    const should_set = req.session.modified or (self.config.max_age != null and req.session.len > 0);
+    const should_set = session.modified or (self.config.max_age != null and session.len > 0);
 
     if (should_set) {
-        const result = if (req.session.len == 0) blk: {
+        const result = if (session.len == 0) blk: {
             // Session was cleared — delete the cookie
             var delete_opts = self.config.cookie_opts;
             delete_opts.max_age = .zero;
             break :blk res.setCookie(self.config.cookie_name, "", delete_opts);
         } else blk: {
-            const signed = try self.signSession(req.arena, &req.session, .now(req.io, .real));
+            const signed = try self.signSession(req.arena, session, .now(req.io, .real));
             var opts = self.config.cookie_opts;
             if (self.config.max_age) |ma| {
                 opts.max_age = ma;
@@ -432,4 +442,57 @@ test "SessionData: clear" {
     try testing.expect(s.modified);
     try testing.expectEqual(0, s.len);
     try testing.expect(s.get("a") == null);
+}
+
+test "Session: the handler reads and writes the session in the request state" {
+    const Executor = @import("../middleware.zig").Executor;
+    const Middleware = @import("../middleware.zig").Middleware;
+    const Connection = @import("../server.zig").Connection;
+
+    const App = struct {
+        pub const RequestState = struct {
+            session: SessionData = .{},
+        };
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var session: Session = .{ .config = .{ .secret_key = "test-secret-key-that-is-long-enough" } };
+    var s: SessionData = .{};
+    try s.set("user_id", "42");
+    const signed = try session.signSession(arena.allocator(), &s, .now(testing.io, .real));
+
+    var req: Request = .{ .arena = arena.allocator(), .io = testing.io, .transport = undefined, .parser = undefined, .method = .get, .url = "/" };
+    req.headers = try .init(arena.allocator(), 4);
+    try req.headers.add("Cookie", try std.fmt.allocPrint(arena.allocator(), "session={s}", .{signed}));
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = try Response.init(arena.allocator(), &connection, 32);
+
+    const middlewares = [_]Middleware(App){.init(&session)};
+    var app: App = .{};
+    var executor: Executor(App) = .{
+        .req = &req,
+        .res = &res,
+        .ctx = &app,
+        .action = struct {
+            fn handle(_: *App, r: *Request, rs: *Response) !void {
+                const state = r.state(App);
+                rs.body = state.session.get("user_id") orelse "none";
+                try state.session.set("role", "admin");
+            }
+        }.handle,
+        .middlewares = &middlewares,
+    };
+    executor.attachState();
+    try executor.run();
+
+    try testing.expectEqualStrings("42", res.body);
+    const cookie = res.headers.get("Set-Cookie").?;
+    try testing.expect(std.mem.startsWith(u8, cookie, "session="));
+    const value = cookie["session=".len..std.mem.indexOfScalar(u8, cookie, ';').?];
+    var loaded: SessionData = .{};
+    try session.load(arena.allocator(), &loaded, value, testing.io);
+    try testing.expectEqualStrings("admin", loaded.get("role").?);
 }

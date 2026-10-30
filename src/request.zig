@@ -11,9 +11,57 @@ const Listener = @import("config.zig").Listener;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const Response = @import("response.zig").Response;
 pub const Cookie = @import("cookie.zig").Cookie;
-pub const SessionData = @import("middleware/Session.zig").SessionData;
 
 const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
+
+/// The per-request state an app declares as `App.RequestState`, or an
+/// empty struct when it declares none.
+pub fn RequestState(comptime App: type) type {
+    if (App == void or !@hasDecl(App, "RequestState")) return struct {};
+    const S = App.RequestState;
+    if (@typeInfo(S) != .@"struct") @compileError(@typeName(App) ++ ".RequestState must be a struct");
+    const info = @typeInfo(S).@"struct";
+    // Zig 0.17 split `fields` into parallel arrays.
+    if (@hasField(@TypeOf(info), "fields")) {
+        for (info.fields) |f| {
+            if (f.default_value_ptr == null) @compileError(@typeName(App) ++ ".RequestState." ++ f.name ++ " needs a default value");
+        }
+    } else {
+        for (info.field_names, info.field_attrs) |name, attrs| {
+            if (attrs.default_value_ptr == null) @compileError(@typeName(App) ++ ".RequestState." ++ name ++ " needs a default value");
+        }
+    }
+    return S;
+}
+
+const StatePtr = struct {
+    ptr: ?*anyopaque,
+    tag: if (std.debug.runtime_safety) ?*const anyopaque else void,
+
+    pub const empty: StatePtr = .{ .ptr = null, .tag = if (std.debug.runtime_safety) null else {} };
+
+    pub fn init(comptime T: type, ptr: *T) StatePtr {
+        return .{ .ptr = ptr, .tag = if (std.debug.runtime_safety) tagOf(T) else {} };
+    }
+
+    pub inline fn get(self: StatePtr, comptime T: type) *T {
+        const ptr = self.ptr orelse @panic("request has no state attached");
+        if (std.debug.runtime_safety and self.tag != tagOf(T)) {
+            @panic("request state read as " ++ @typeName(T) ++ ", which is not the server's");
+        }
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    /// A distinct address for each type, so a cast back from `*anyopaque`
+    /// can be checked.
+    fn tagOf(comptime T: type) *const anyopaque {
+        return &struct {
+            // Captured so each `T` gets its own struct, and its own `byte`.
+            const Type = T;
+            var byte: u8 = 0;
+        }.byte;
+    }
+};
 
 pub const Request = struct {
     method: http.Method = undefined,
@@ -86,7 +134,9 @@ pub const Request = struct {
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
     _mfd_read: bool = false,
-    session: SessionData = .{},
+    // The executor's `RequestState`, attached by the server until the
+    // response is written.
+    _state: StatePtr = .empty,
 
     // 100-continue support
     response: ?*Response = null,
@@ -119,6 +169,12 @@ pub const Request = struct {
             ._timeout_context = timeout_context,
             ._set_timeout = set_timeout,
         };
+    }
+
+    /// The `RequestState` of this request, as middleware sees it through
+    /// `executor.state`. Valid until the response has been written.
+    pub fn state(self: *const Request, comptime App: type) *RequestState(App) {
+        return self._state.get(RequestState(App));
     }
 
     /// Replaces the deadline for this request. A duration starts now, a
