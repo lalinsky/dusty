@@ -412,22 +412,45 @@ pub fn Router(comptime Ctx: type) type {
             }.handle;
         }
 
-        pub fn group(self: *Self, prefix: []const u8, middlewares: []const Middleware(Ctx)) Group {
-            return .{ .router = self, .prefix = prefix, .middlewares = middlewares };
+        /// Routes registered on the group get `prefix` in front of their
+        /// path and run `middlewares` after the router's. A null or "/"
+        /// prefix adds nothing, and trailing slashes are dropped.
+        pub fn group(self: *Self, prefix: ?[]const u8, middlewares: []const Middleware(Ctx)) Group {
+            return .{ .router = self, .prefix = trimPrefix(prefix), .middlewares = middlewares };
+        }
+
+        fn trimPrefix(prefix: ?[]const u8) []const u8 {
+            return std.mem.trimEnd(u8, prefix orelse "", "/");
+        }
+
+        fn concatMiddlewares(self: *Self, a: []const Middleware(Ctx), b: []const Middleware(Ctx)) []const Middleware(Ctx) {
+            if (a.len == 0) return b;
+            if (b.len == 0) return a;
+            const merged = self.arena.allocator().alloc(Middleware(Ctx), a.len + b.len) catch @panic("OOM");
+            @memcpy(merged[0..a.len], a);
+            @memcpy(merged[a.len..], b);
+            return merged;
         }
 
         pub const Group = struct {
             router: *Self,
             prefix: []const u8,
+            /// The group's own and its parents', not the router's, which
+            /// are added at registration.
             middlewares: []const Middleware(Ctx),
 
+            /// A group inside this one: the prefixes join, and its
+            /// middlewares run after this group's.
+            pub fn group(g: Group, prefix: ?[]const u8, middlewares: []const Middleware(Ctx)) Group {
+                return .{
+                    .router = g.router,
+                    .prefix = g.concatPath(trimPrefix(prefix)),
+                    .middlewares = g.router.concatMiddlewares(g.middlewares, middlewares),
+                };
+            }
+
             fn mergeMiddlewares(g: Group) []const Middleware(Ctx) {
-                if (g.router.middlewares.len == 0) return g.middlewares;
-                if (g.middlewares.len == 0) return g.router.middlewares;
-                const merged = g.router.arena.allocator().alloc(Middleware(Ctx), g.router.middlewares.len + g.middlewares.len) catch @panic("OOM");
-                @memcpy(merged[0..g.router.middlewares.len], g.router.middlewares);
-                @memcpy(merged[g.router.middlewares.len..], g.middlewares);
-                return merged;
+                return g.router.concatMiddlewares(g.router.middlewares, g.middlewares);
             }
 
             fn concatPath(g: Group, path: []const u8) []const u8 {
@@ -1436,6 +1459,66 @@ test "Group: no global middlewares, only group middlewares" {
     const route = try router.findHandler(try split(&req));
     try std.testing.expect(route != null);
     try std.testing.expectEqual(1, route.?.middlewares.len);
+}
+
+test "Group: a null, \"/\" or slash-terminated prefix adds no extra slash" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router: TestVoidRouter = .init(std.testing.allocator);
+    defer router.deinit();
+
+    router.group(null, &.{}).get("/a", voidHandler1);
+    router.group("/", &.{}).get("/b", voidHandler1);
+    router.group("/api/", &.{}).get("/c", voidHandler1);
+
+    for ([_][]const u8{ "/a", "/b", "/api/c" }) |url| {
+        var req: Request = .{
+            .method = .get,
+            .url = url,
+            .arena = arena.allocator(),
+            .parser = undefined,
+            .transport = undefined,
+        };
+        const route = (try router.findHandler(try split(&req))).?;
+        try std.testing.expectEqualStrings(url, route.info.path);
+    }
+}
+
+test "Group: nested groups join prefixes and run middlewares outermost first" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router: TestVoidRouter = .init(std.testing.allocator);
+    defer router.deinit();
+
+    const TestMw = struct {
+        id: u8,
+        pub fn execute(_: *const @This(), _: *Request, _: *Response, _: *@import("middleware.zig").Executor(void)) !void {}
+    };
+
+    var mw_global: TestMw = .{ .id = 1 };
+    var mw_outer: TestMw = .{ .id = 2 };
+    var mw_inner: TestMw = .{ .id = 3 };
+
+    const api = router.group("/api", &.{.init(&mw_outer)});
+    const v1 = api.group("/v1", &.{.init(&mw_inner)});
+    // Router middlewares set after the groups were made still apply.
+    router.middlewares = &.{.init(&mw_global)};
+    v1.get("/users", voidHandler1);
+
+    var req: Request = .{
+        .method = .get,
+        .url = "/api/v1/users",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    const route = (try router.findHandler(try split(&req))).?;
+    try std.testing.expectEqual(3, route.middlewares.len);
+    for (route.middlewares, [_]*TestMw{ &mw_global, &mw_outer, &mw_inner }) |mw, want| {
+        try std.testing.expect(mw.ptr == @as(*anyopaque, want));
+    }
 }
 
 test "Group: direct routes have no middlewares when none set" {
