@@ -1198,6 +1198,10 @@ test "Client: HEAD response with chunked Transfer-Encoding has no body" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
 }
 
+test "Client: HEAD response may name a transfer coding dusty does not decode" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n");
+}
+
 test "Client: HEAD response with Content-Encoding has no body to decode" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
 }

@@ -657,6 +657,12 @@ pub const ResponseParser = struct {
         }
     }
 
+    fn bodyless(self: *const ResponseParser) bool {
+        const code = @intFromEnum(self.response.status);
+        return self.head_request or (self.connect_request and code / 100 == 2) or
+            code / 100 == 1 or code == 204 or code == 304;
+    }
+
     fn onStatusComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
         // llhttp accepts any three digit code, but `Status` only names the
@@ -708,7 +714,9 @@ pub const ResponseParser = struct {
 
         self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
 
-        if (std.ascii.eqlIgnoreCase(self.state.header_field, "Transfer-Encoding")) {
+        // RFC 9112 6.1 and 6.3: a response with no body may describe the
+        // codings of one it does not have, and a CONNECT tunnel's are ignored.
+        if (!self.bodyless() and std.ascii.eqlIgnoreCase(self.state.header_field, "Transfer-Encoding")) {
             // A single chunked is the only transfer coding dusty decodes.
             // Unlike in a request, llhttp lets a second chunked through.
             if (self.state.has_transfer_encoding or !std.ascii.eqlIgnoreCase(self.state.header_value, "chunked")) {
