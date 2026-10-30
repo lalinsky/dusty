@@ -217,6 +217,9 @@ pub const RequestParser = struct {
     }
 
     pub fn shouldKeepAlive(self: *RequestParser) bool {
+        // RFC 9112 6.1: an HTTP/1.0 message with Transfer-Encoding has faulty
+        // framing, so the connection closes after it.
+        if (self.parser.http_minor == 0 and self.parser.flags & @as(u16, @intCast(c.F_TRANSFER_ENCODING)) != 0) return false;
         return c.llhttp_should_keep_alive(&self.parser) != 0;
     }
 
@@ -601,6 +604,7 @@ pub const ResponseParser = struct {
     }
 
     pub fn shouldKeepAlive(self: *ResponseParser) bool {
+        if (self.parser.http_major == 1 and self.parser.http_minor == 0 and self.parser.flags & @as(u16, @intCast(c.F_TRANSFER_ENCODING)) != 0) return false;
         return c.llhttp_should_keep_alive(&self.parser) != 0;
     }
 

@@ -1887,6 +1887,15 @@ test "Server: a body the client got wrong is answered with a 4xx and a close" {
     try std.testing.expect(std.mem.indexOf(u8, res, "\r\nConnection: close\r\n") != null);
 }
 
+test "Server: an HTTP/1.0 request with Transfer-Encoding ends the connection after it" {
+    var buf: [1024]u8 = undefined;
+    const res = try bodyReadResponse("POST / HTTP/1.0\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n" ++
+        "POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 2\r\n\r\nhi", &buf);
+    try std.testing.expectStringStartsWith(res, "HTTP/1.1 200 ");
+    try std.testing.expect(std.mem.indexOf(u8, res, "\r\nConnection: close\r\n") != null);
+    try std.testing.expectEqual(1, std.mem.count(u8, res, "HTTP/1.1 "));
+}
+
 test "Server: a 417 before an unread body is not answered with a reset" {
     var buf: [256]u8 = undefined;
     for ([_]bool{ true, false }) |timeouts| {
