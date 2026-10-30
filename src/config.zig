@@ -309,8 +309,10 @@ pub const ServerConfig = struct {
         /// its own 2K, but every request on a busy one pays for the trip,
         /// which costs throughput on a server with many cores.
         keep_buffers_between_requests: bool = true,
-        /// Maximum number of headers allowed in a request
-        max_header_count: usize = 32,
+        /// Maximum number of headers allowed in a request, and the most a
+        /// response can carry. Each one counts for 33 bytes of the arena,
+        /// twice per request, whether it is used or not.
+        max_header_count: usize = 64,
         /// Maximum number of route parameters (e.g., /user/:id/:action)
         max_param_count: usize = 8,
         /// Maximum number of query string parameters
