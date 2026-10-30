@@ -1925,10 +1925,11 @@ test "Server: too many query parameters is a 400, not a dropped connection" {
 }
 
 test "Server: more headers than the limit is a 431, not a dropped connection" {
-    // One past the default limit of 32.
+    // With Host, one past the default limit of 64.
     const headers = comptime blk: {
+        @setEvalBranchQuota(100_000);
         var h: []const u8 = "";
-        for (0..33) |i| h = h ++ std.fmt.comptimePrint("X-H{d}: v\r\n", .{i});
+        for (0..64) |i| h = h ++ std.fmt.comptimePrint("X-H{d}: v\r\n", .{i});
         break :blk h;
     };
     var buf: [256]u8 = undefined;
