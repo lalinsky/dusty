@@ -527,6 +527,10 @@ pub const ResponseParser = struct {
         // Set by a failed `feed` or `finish`. llhttp keeps no record of an
         // end-of-stream the message was not ready for.
         failed: bool = false,
+        /// Set by a callback that fails for a reason llhttp's error code
+        /// would misreport.
+        err: ?ParseError = null,
+        has_transfer_encoding: bool = false,
         // An interim response was read and dropped on the way to this one.
         saw_interim: bool = false,
 
@@ -586,6 +590,11 @@ pub const ResponseParser = struct {
         const err = c.llhttp_execute(&self.parser, data.ptr, data.len);
         if (chunked) self.framing.charge(&self.parser, data, err);
         if (self.framing.err) |e| {
+            self.state.failed = true;
+            return e;
+        }
+
+        if (self.state.err) |e| {
             self.state.failed = true;
             return e;
         }
@@ -698,6 +707,16 @@ pub const ResponseParser = struct {
         std.debug.assert(self.state.has_header_field);
 
         self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
+
+        if (std.ascii.eqlIgnoreCase(self.state.header_field, "Transfer-Encoding")) {
+            // A single chunked is the only transfer coding dusty decodes.
+            // Unlike in a request, llhttp lets a second chunked through.
+            if (self.state.has_transfer_encoding or !std.ascii.eqlIgnoreCase(self.state.header_value, "chunked")) {
+                self.state.err = error.UnsupportedTransferEncoding;
+                return -1;
+            }
+            self.state.has_transfer_encoding = true;
+        }
 
         // Headers point directly into arena-allocated read buffer, no copy needed
         self.response.headers.add(self.state.header_field, self.state.header_value) catch return -1;
