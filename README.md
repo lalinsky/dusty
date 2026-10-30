@@ -98,6 +98,9 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+A handler takes only the parameters it needs, in any order: the app context, `*http.Request`,
+`*http.Response`, and the app's `RequestState`.
+
 `listeners` takes any number of listeners, each with its own TLS, so one server
 can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 

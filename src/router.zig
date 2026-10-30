@@ -1,5 +1,6 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
+const RequestState = @import("request.zig").RequestState;
 const Response = @import("response.zig").Response;
 const Method = @import("http.zig").Method;
 const Middleware = @import("middleware.zig").Middleware;
@@ -58,6 +59,9 @@ pub fn Router(comptime Ctx: type) type {
     return struct {
         const Self = @This();
 
+        /// What the router calls. A handler registered with `get`, `post`
+        /// and the like can instead take any of `*Ctx`, `*Request`,
+        /// `*Response` and `*Ctx.RequestState`, in any order.
         pub const Handler = if (Ctx == void)
             fn (*Request, *Response) anyerror!void
         else
@@ -324,36 +328,36 @@ pub fn Router(comptime Ctx: type) type {
             return @ptrCast(@alignCast(opaque_route));
         }
 
-        pub fn get(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .get, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .get, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn head(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .head, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .head, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn post(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .post, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .post, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn put(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .put, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .put, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn delete(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .delete, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .delete, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn patch(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .patch, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .patch, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn options(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .options, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .options, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
-        pub fn query(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, .query, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, .query, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
         /// Matches every method, for requests that no route of their own
@@ -361,8 +365,8 @@ pub fn Router(comptime Ctx: type) type {
         /// conflicts with an `any` route when both match some path and its
         /// own path is not more specific, and registering the second of the
         /// two panics.
-        pub fn any(self: *Self, path: []const u8, handler: Handler) void {
-            self.insertRoute(path, null, handler, self.middlewares, null) catch @panic("OOM");
+        pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
+            self.insertRoute(path, null, wrap(handler), self.middlewares, null) catch @panic("OOM");
         }
 
         /// Serves the files under `dir` at `prefix`: `GET prefix/a/b.css` is
@@ -399,17 +403,44 @@ pub fn Router(comptime Ctx: type) type {
             const alloc = self.arena.allocator();
             const file = alloc.create(Embedded) catch @panic("OOM");
             file.* = Embedded.init(alloc, path, data, opts) catch @panic("OOM");
-            self.insertRoute(path, .get, plainAction(Embedded.handle), middlewares, file) catch @panic("OOM");
+            self.insertRoute(path, .get, wrap(Embedded.handle), middlewares, file) catch @panic("OOM");
         }
 
-        const staticAction = plainAction(Static.handle);
+        const staticAction = wrap(Static.handle);
 
-        fn plainAction(comptime handler: fn (*Request, *Response) anyerror!void) Handler {
-            return if (Ctx == void) handler else struct {
-                fn handle(_: *Ctx, req: *Request, res: *Response) anyerror!void {
-                    return handler(req, res);
+        const CtxPtr = if (Ctx == void) void else *Ctx;
+
+        fn wrap(comptime handler: anytype) Handler {
+            const F = @TypeOf(handler);
+            if (@typeInfo(F) != .@"fn") @compileError("expected a handler function, found " ++ @typeName(F));
+            const R = @typeInfo(F).@"fn".return_type orelse @compileError("handler " ++ @typeName(F) ++ " has a generic return type");
+            const returns_error = @typeInfo(R) == .error_union and @typeInfo(R).error_union.payload == void;
+            if (R != void and !returns_error) @compileError("handler " ++ @typeName(F) ++ " must return void or !void");
+            if (returns_error and std.meta.ArgsTuple(F) == std.meta.ArgsTuple(Handler)) return handler;
+            const H = struct {
+                fn call(ctx: CtxPtr, req: *Request, res: *Response) anyerror!void {
+                    var args: std.meta.ArgsTuple(F) = undefined;
+                    inline for (0..args.len) |i| args[i] = inject(@TypeOf(args[i]), ctx, req, res);
+                    return @call(.auto, handler, args);
                 }
-            }.handle;
+
+                fn callVoid(req: *Request, res: *Response) anyerror!void {
+                    return call({}, req, res);
+                }
+            };
+            return if (Ctx == void) H.callVoid else H.call;
+        }
+
+        fn inject(comptime P: type, ctx: CtxPtr, req: *Request, res: *Response) P {
+            if (comptime pointsTo(P, Request)) return req;
+            if (comptime pointsTo(P, Response)) return res;
+            if (comptime Ctx != void and pointsTo(P, Ctx)) return ctx;
+            if (comptime pointsTo(P, RequestState(Ctx))) return req.state(Ctx);
+            @compileError("can't inject a handler parameter of type " ++ @typeName(P));
+        }
+
+        fn pointsTo(comptime P: type, comptime T: type) bool {
+            return P == *T or P == *const T;
         }
 
         /// Routes registered on the group get `prefix` in front of their
@@ -458,44 +489,44 @@ pub fn Router(comptime Ctx: type) type {
                 return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}{s}", .{ g.prefix, sep, path }) catch @panic("OOM");
             }
 
-            fn register(g: Group, method: ?Method, path: []const u8, handler: Handler) void {
+            fn register(g: Group, method: ?Method, path: []const u8, handler: *const Handler) void {
                 g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), null) catch @panic("OOM");
             }
 
-            pub fn get(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.get, path, handler);
+            pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.get, path, wrap(handler));
             }
 
-            pub fn head(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.head, path, handler);
+            pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.head, path, wrap(handler));
             }
 
-            pub fn post(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.post, path, handler);
+            pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.post, path, wrap(handler));
             }
 
-            pub fn put(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.put, path, handler);
+            pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.put, path, wrap(handler));
             }
 
-            pub fn delete(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.delete, path, handler);
+            pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.delete, path, wrap(handler));
             }
 
-            pub fn patch(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.patch, path, handler);
+            pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.patch, path, wrap(handler));
             }
 
-            pub fn options(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.options, path, handler);
+            pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.options, path, wrap(handler));
             }
 
-            pub fn query(g: Group, path: []const u8, handler: Handler) void {
-                g.register(.query, path, handler);
+            pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(.query, path, wrap(handler));
             }
 
-            pub fn any(g: Group, path: []const u8, handler: Handler) void {
-                g.register(null, path, handler);
+            pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
+                g.register(null, path, wrap(handler));
             }
 
             pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
