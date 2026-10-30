@@ -454,7 +454,8 @@ pub fn Router(comptime Ctx: type) type {
             }
 
             fn concatPath(g: Group, path: []const u8) []const u8 {
-                return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}", .{ g.prefix, path }) catch @panic("OOM");
+                const sep = if (path.len > 0 and path[0] != '/') "/" else "";
+                return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}{s}", .{ g.prefix, sep, path }) catch @panic("OOM");
             }
 
             fn register(g: Group, method: ?Method, path: []const u8, handler: Handler) void {
@@ -1461,7 +1462,7 @@ test "Group: no global middlewares, only group middlewares" {
     try std.testing.expectEqual(1, route.?.middlewares.len);
 }
 
-test "Group: a null, \"/\" or slash-terminated prefix adds no extra slash" {
+test "Group: prefix and path are joined by exactly one slash" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
 
@@ -1471,8 +1472,10 @@ test "Group: a null, \"/\" or slash-terminated prefix adds no extra slash" {
     router.group(null, &.{}).get("/a", voidHandler1);
     router.group("/", &.{}).get("/b", voidHandler1);
     router.group("/api/", &.{}).get("/c", voidHandler1);
+    router.group("/api/", &.{}).get("d", voidHandler1);
+    router.group("/x", &.{}).group("y", &.{}).get("z", voidHandler1);
 
-    for ([_][]const u8{ "/a", "/b", "/api/c" }) |url| {
+    for ([_][]const u8{ "/a", "/b", "/api/c", "/api/d", "/x/y/z" }) |url| {
         var req: Request = .{
             .method = .get,
             .url = url,
