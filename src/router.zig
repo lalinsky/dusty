@@ -192,8 +192,17 @@ pub fn Router(comptime Ctx: type) type {
                 else
                     null;
 
+                // Matched against the decoded segments of a request, so
+                // `/a%2Fb` is the one segment `a/b`, as in Go's ServeMux.
+                const static_segment = if (kind == .static and std.mem.indexOfScalar(u8, segment, '%') != null) blk: {
+                    const buf = try self.arena.allocator().alloc(u8, segment.len);
+                    const n = Request.unescapeSegment(buf, segment) catch
+                        std.debug.panic("route {s} has a '%' that starts no escape", .{path});
+                    break :blk buf[0..n];
+                } else segment;
+
                 // Find or create child
-                var child = findChild(current, segment, kind);
+                var child = findChild(current, static_segment, kind);
                 if (child) |existing| {
                     // One wildcard node captures under one name, and a route
                     // reading another would never find its value.
@@ -204,7 +213,7 @@ pub fn Router(comptime Ctx: type) type {
                 if (child == null) {
                     const new_node = try self.arena.allocator().create(Node);
                     new_node.* = Node{
-                        .segment = try self.arena.allocator().dupe(u8, segment),
+                        .segment = try self.arena.allocator().dupe(u8, static_segment),
                         .kind = kind,
                         .param_name = if (param_name) |name| try self.arena.allocator().dupe(u8, name) else null,
                         .static_children = null,
@@ -242,15 +251,15 @@ pub fn Router(comptime Ctx: type) type {
             current.route = @ptrCast(route);
         }
 
-        fn matchRecursive(node: *Node, req: *Request, path: []const u8, segments: []const []const u8, segment_offsets: []const usize, index: usize) !?*Node {
+        fn matchRecursive(node: *Node, req: *Request, index: usize) !?*Node {
             // Terminal case: consumed all segments
-            if (index >= segments.len) {
+            if (index >= req._segments.len) {
                 // Only return node if it has a route registered
                 if (node.route == null) return null;
                 return node;
             }
 
-            const current_segment = segments[index];
+            const current_segment = req._segments[index];
 
             // Check children in precedence order: static > param > wildcard
 
@@ -258,7 +267,7 @@ pub fn Router(comptime Ctx: type) type {
             var static_child = node.static_children;
             while (static_child) |c| {
                 if (std.mem.eql(u8, c.segment, current_segment)) {
-                    const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
+                    const result = try matchRecursive(c, req, index + 1);
                     if (result != null) return result;
                 }
                 static_child = c.next_sibling;
@@ -270,7 +279,7 @@ pub fn Router(comptime Ctx: type) type {
                     return error.TooManyParams;
                 }
                 try req.params.map.put(req.arena, c.param_name.?, current_segment);
-                const result = try matchRecursive(c, req, path, segments, segment_offsets, index + 1);
+                const result = try matchRecursive(c, req, index + 1);
                 if (result != null) return result;
                 _ = req.params.map.remove(c.param_name.?); // backtrack
             }
@@ -281,7 +290,8 @@ pub fn Router(comptime Ctx: type) type {
                     return error.TooManyParams;
                 }
                 // Capture remaining path (without query parameters)
-                const remaining = path[segment_offsets[index]..];
+                const start = @intFromPtr(current_segment.ptr) - @intFromPtr(req.path.ptr);
+                const remaining = req.path[start..];
                 try req.params.map.put(req.arena, c.param_name.?, remaining);
                 return c;
             }
@@ -293,16 +303,13 @@ pub fn Router(comptime Ctx: type) type {
             req.route = null;
             req.query.map.clearRetainingCapacity();
             try parseQueryString(req, req.query_string);
-            const path = req.path;
-            const segments = req._segments;
-            const offsets = req._segment_offsets;
 
-            const route = try self.matchIn(req.method, req, path, segments, offsets) orelse
+            const route = try self.matchIn(req.method, req) orelse
                 // A HEAD response is the GET response without the body, so a
                 // HEAD with no route of its own is answered by the GET one.
                 // Second, so a route registered with `head` still wins.
-                (if (req.method == .head) try self.matchIn(.get, req, path, segments, offsets) else null) orelse
-                try self.matchIn(null, req, path, segments, offsets);
+                (if (req.method == .head) try self.matchIn(.get, req) else null) orelse
+                try self.matchIn(null, req);
             if (route) |r| {
                 req.route = &r.info;
                 return r.*;
@@ -310,16 +317,9 @@ pub fn Router(comptime Ctx: type) type {
             return null;
         }
 
-        fn matchIn(
-            self: *const Self,
-            method: ?Method,
-            req: *Request,
-            path: []const u8,
-            segments: []const []const u8,
-            offsets: []const usize,
-        ) !?*const Route {
+        fn matchIn(self: *const Self, method: ?Method, req: *Request) !?*const Route {
             const root = (if (method) |m| self.trees[@intFromEnum(m)] else self.any_tree) orelse return null;
-            const node = try matchRecursive(root, req, path, segments, offsets, 0) orelse return null;
+            const node = try matchRecursive(root, req, 0) orelse return null;
             const opaque_route = node.route orelse return null;
             return @ptrCast(@alignCast(opaque_route));
         }
@@ -1637,4 +1637,28 @@ test "Router: HEAD falling back to GET still captures path params" {
     };
     try std.testing.expect(try router.findHandler(try split(&req)) != null);
     try std.testing.expectEqualStrings("42", req.params.get("id").?);
+}
+
+test "Router: a route's path is decoded segment by segment, like a request's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/a%2fb", testHandler);
+    router.get("/c%20d", testHandler2);
+
+    var req = Request{
+        .method = .get,
+        .url = "/a%2Fb",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(try split(&req))).?.action);
+    req.url = "/a/b";
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
+    req.url = "/c d";
+    try std.testing.expectEqual(&testHandler2, (try router.findHandler(try split(&req))).?.action);
 }

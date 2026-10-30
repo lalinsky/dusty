@@ -80,9 +80,8 @@ pub const Request = struct {
     // What the last failed body read failed with, so an error coming out of
     // a handler can be told apart from one of the same name it made itself.
     _body_err: ?anyerror = null,
-    // The non-empty segments of `path`, and where each one starts in it.
+    // The non-empty segments of `path`, each a slice of it.
     _segments: []const []const u8 = &.{},
-    _segment_offsets: []const usize = &.{},
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
@@ -407,52 +406,45 @@ pub const Request = struct {
         const raw = self.url[0 .. query_start orelse self.url.len];
         self.query_string = if (query_start) |q| self.url[q + 1 ..] else "";
 
-        // RFC 3986 2.1: in a path every '%' starts an escape of two hex
-        // digits. Unlike in a query, a '+' is itself.
-        var escapes: usize = 0;
-        var pos: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, raw, pos, '%')) |i| : (escapes += 1) {
-            if (!isEscape(raw, i)) return error.InvalidUrl;
-            pos = i + 3;
-        }
+        const segments = try self.arena.alloc([]const u8, std.mem.count(u8, raw, "/") + 1);
+        const decode = std.mem.indexOfScalar(u8, raw, '%') != null;
+        // Decoding only shrinks, so this is enough.
+        const buf: []u8 = if (decode) try self.arena.alloc(u8, raw.len) else &.{};
+        const path: []const u8 = if (decode) buf else raw;
 
-        const max_segments = std.mem.count(u8, raw, "/") + 1;
-        const segments = try self.arena.alloc([]const u8, max_segments);
-        const offsets = try self.arena.alloc(usize, max_segments);
-        const decoded: []u8 = if (escapes == 0) &.{} else try self.arena.alloc(u8, raw.len - 2 * escapes);
-        const path: []const u8 = if (escapes == 0) raw else decoded;
         var len: usize = 0;
         var out: usize = 0;
         var it = std.mem.splitScalar(u8, raw, '/');
-        while (it.next()) |segment| {
+        while (it.next()) |segment| : (out += 1) {
             const start = out;
-            if (escapes == 0) {
-                out += segment.len;
-            } else {
-                var i: usize = 0;
-                while (i < segment.len) : (out += 1) {
-                    if (segment[i] == '%') {
-                        decoded[out] = decodeHex(segment[i + 1]) << 4 | decodeHex(segment[i + 2]);
-                        i += 3;
-                    } else {
-                        decoded[out] = segment[i];
-                        i += 1;
-                    }
-                }
-            }
+            out += if (decode) try unescapeSegment(buf[out..], segment) else segment.len;
             if (out > start) {
                 segments[len] = path[start..out];
-                offsets[len] = start;
                 len += 1;
             }
-            if (it.index != null) {
-                if (escapes != 0) decoded[out] = '/';
-                out += 1;
+            if (decode and it.index != null) buf[out] = '/';
+        }
+        self.path = path[0 .. out - 1];
+        self._segments = segments[0..len];
+    }
+
+    /// Decodes one path segment into `out`, which must be at least as long,
+    /// and returns the decoded length. RFC 3986 2.1: in a path every '%'
+    /// starts an escape of two hex digits, and a '+' is itself.
+    pub fn unescapeSegment(out: []u8, segment: []const u8) error{InvalidUrl}!usize {
+        var i: usize = 0;
+        var n: usize = 0;
+        while (i < segment.len) : (n += 1) {
+            if (segment[i] == '%') {
+                if (!isEscape(segment, i)) return error.InvalidUrl;
+                out[n] = decodeHex(segment[i + 1]) << 4 | decodeHex(segment[i + 2]);
+                i += 3;
+            } else {
+                out[n] = segment[i];
+                i += 1;
             }
         }
-        self.path = path;
-        self._segments = segments[0..len];
-        self._segment_offsets = offsets[0..len];
+        return n;
     }
 
     fn isEscape(input: []const u8, i: usize) bool {
@@ -781,8 +773,6 @@ test "Request.splitTarget: segments are split at a literal '/' and decoded in pl
     try std.testing.expectEqualStrings("a/b", req._segments[0]);
     try std.testing.expectEqualStrings("c d", req._segments[1]);
     try std.testing.expectEqualStrings("e+f", req._segments[2]);
-    // A capture from the second segment on is the rest of `path`.
-    try std.testing.expectEqualStrings("c d/e+f/", req.path[req._segment_offsets[1]..]);
 
     for ([_][]const u8{ "/%", "/a%2", "/%zz/b", "/%2/b" }) |url| {
         req.url = url;
