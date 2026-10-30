@@ -1282,6 +1282,30 @@ test "Client: a 2xx CONNECT response has no body and its connection is not poole
     peer_future.cancel(io);
 }
 
+test "Client: an HTTP/1.0 response with Transfer-Encoding is not pooled" {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer("HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n", "").run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    {
+        var resp = try client.fetch(url, .{});
+        defer resp.deinit();
+        try std.testing.expectEqualStrings("ok", (try resp.body()).?);
+    }
+    try std.testing.expectEqual(0, client.pool.idle_len);
+    peer_future.cancel(io);
+}
+
 // The exchange in #159: a server that sends Early Hints ahead of the real
 // response, and then answers a second request on the same connection.
 // That second answer is what shows the first one left nothing behind.
