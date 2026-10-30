@@ -530,10 +530,33 @@ fn conflicts(method_path: []const u8, any_path: []const u8) bool {
         if (s2[0] == '*') return more_general;
         if (s1[0] == ':') {
             if (s2[0] != ':') more_general = true;
-        } else if (s2[0] != ':' and !std.mem.eql(u8, s1, s2)) {
+        } else if (s2[0] != ':' and !staticEql(s1, s2)) {
             return false;
         }
     }
+}
+
+/// Whether two static segments of route paths match the same request
+/// segment, once decoded.
+fn staticEql(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < a.len and j < b.len) {
+        if (decodedByte(a, &i) != decodedByte(b, &j)) return false;
+    }
+    return i == a.len and j == b.len;
+}
+
+fn decodedByte(s: []const u8, i: *usize) u8 {
+    var out: [1]u8 = undefined;
+    if (s[i.*] == '%') {
+        if (Request.unescapeSegment(&out, s[i.*..@min(i.* + 3, s.len)])) |_| {
+            i.* += 3;
+            return out[0];
+        } else |_| {}
+    }
+    i.* += 1;
+    return s[i.* - 1];
 }
 
 // Tests
@@ -1543,6 +1566,8 @@ test "Router: a method route conflicts with a more specific any() route" {
         .{ "/files", "/files/*p", false },
         .{ "/*", "/a/*p", true },
         .{ "/a/*p", "/*", false },
+        .{ "/:x/c%20d", "/y/c d", true },
+        .{ "/:x/c%2fd", "/y/c/d", false },
     };
     for (cases) |case| {
         try std.testing.expectEqual(case[2], conflicts(case[0], case[1]));
