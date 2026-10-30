@@ -324,10 +324,11 @@ pub const RequestParser = struct {
 
         std.debug.assert(self.state.has_header_field);
 
+        // llhttp keeps trailing whitespace, which RFC 9110 5.5 leaves out of
+        // the field value.
+        self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
+
         if (std.ascii.eqlIgnoreCase(self.state.header_field, "Host")) {
-            // llhttp keeps trailing whitespace, which RFC 9110 5.5 leaves
-            // out of the field value.
-            self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
             // RFC 9112 3.2: more than one Host, or an invalid one, is a 400.
             if (self.state.host != null or !isValidHost(self.state.header_value)) {
                 self.state.err = error.InvalidHost;
@@ -687,6 +688,8 @@ pub const ResponseParser = struct {
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
 
         std.debug.assert(self.state.has_header_field);
+
+        self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
 
         // Headers point directly into arena-allocated read buffer, no copy needed
         self.response.headers.add(self.state.header_field, self.state.header_value) catch return -1;
@@ -1139,7 +1142,7 @@ test "RequestParser: basic" {
     try parser.init(&req);
     defer parser.deinit();
 
-    const request = "GET /example HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    const request = "GET /example HTTP/1.1\r\nHost: example.com\r\nX-Test: a b \t\r\n\r\n";
 
     // We will feed it the requst 1 byte at a time
     for (0..request.len) |i| {
@@ -1164,6 +1167,7 @@ test "RequestParser: basic" {
     const host_val = req.headers.get("Host");
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("example.com", host_val.?);
+    try std.testing.expectEqualStrings("a b", req.headers.get("X-Test").?);
 }
 
 test "isValidHost" {
@@ -1185,7 +1189,7 @@ test "ResponseParser: basic" {
     try parser.init(&response, 64);
     defer parser.deinit();
 
-    const http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+    const http_response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain \t\r\nContent-Length: 5\r\n\r\nhello";
 
     // Feed the response 1 byte at a time
     for (0..http_response.len) |i| {
