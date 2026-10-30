@@ -389,12 +389,21 @@ pub const RequestParser = struct {
         if (self.state.host == null and self.request.version_minor >= 1) return error.InvalidHost;
         const empty_host = if (self.state.host) |host| host.len == 0 else false;
         const url = self.request.url;
+        // RFC 9112 3.2: no form of request-target has a fragment.
+        if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidUrl;
         if (self.request.method == .connect) {
+            // RFC 9112 3.2.3: CONNECT takes only host:port.
+            if (!isValidHost(url) or !hasPort(url)) return error.InvalidUrl;
             // RFC 9112 3.2: Host is empty only for a target with no authority.
             if (empty_host) return error.InvalidHost;
             return;
         }
-        if (url.len == 0 or url[0] == '/' or url[0] == '*') return;
+        if (url.len > 0 and url[0] == '*') {
+            // RFC 9112 3.2.4: asterisk-form is a lone '*', and only for OPTIONS.
+            if (url.len != 1 or self.request.method != .options) return error.InvalidUrl;
+            return;
+        }
+        if (url.len == 0 or url[0] == '/') return;
 
         // llhttp only lets such a target through as ALPHA+ "://" followed by
         // an authority without '#'.
@@ -442,7 +451,7 @@ pub const RequestParser = struct {
 /// RFC 9112 3.2: `uri-host [ ":" port ]`, with uri-host an IP-literal or a
 /// reg-name (which an IPv4address also is) as in RFC 3986 3.2.2. Empty is
 /// valid here; whether it is allowed depends on the target.
-fn isValidHost(value: []const u8) bool {
+pub fn isValidHost(value: []const u8) bool {
     if (value.len == 0) return true;
     var port: []const u8 = undefined;
     if (value[0] == '[') {
@@ -471,6 +480,12 @@ fn isValidHost(value: []const u8) bool {
         if (!std.ascii.isDigit(ch)) return false;
     }
     return true;
+}
+
+/// For a value `isValidHost` accepts: whether it ends in a non-empty port.
+fn hasPort(host: []const u8) bool {
+    const colon = std.mem.lastIndexOfScalar(u8, host, ':') orelse return false;
+    return colon + 1 < host.len and host[host.len - 1] != ']';
 }
 
 fn isUnreserved(ch: u8) bool {
