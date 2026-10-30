@@ -276,15 +276,14 @@ class HttpbinTest(unittest.TestCase):
         self.assertEqual(data["data"], "raw text")
         self.assertIsNone(data["json"])
 
-    def test_malformed_form_is_rejected(self):
-        status, _, raw = self.request(
-            "POST",
+    def test_form_keeps_a_stray_percent(self):
+        data = self.get_json(
             "/post",
+            method="POST",
             body="ok=1&bad%ZZ=2",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        self.assertEqual(status, 400)
-        self.assertEqual(json.loads(raw)["error"], "Invalid form body")
+        self.assertEqual(data["form"], {"ok": "1", "bad%ZZ": "2"})
 
     def test_anything_reports_the_method(self):
         for method in ("GET", "POST", "PUT", "PATCH", "DELETE"):

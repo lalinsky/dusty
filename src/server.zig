@@ -1305,7 +1305,7 @@ pub fn Server(comptime Ctx: type) type {
 
                 const found = self.router.findHandler(&request) catch |err| switch (err) {
                     // The request's own doing, and the connection is fine.
-                    error.InvalidEscapeSequence, error.TooManyQueryParams => {
+                    error.TooManyQueryParams => {
                         response.status = .bad_request;
                         response.keepalive = false;
                         try response.write();
