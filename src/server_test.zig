@@ -1996,6 +1996,30 @@ test "Server: Host is checked as RFC 9112 3.2 asks" {
     }
 }
 
+test "Server: a request-target in no form RFC 9112 3.2 allows is a 400" {
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "OPTIONS *x HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET * HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET /#frag HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET /?q=1#frag HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "CONNECT / HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "CONNECT example.com: HTTP/1.1\r\nHost: example.com\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "CONNECT [::1] HTTP/1.1\r\nHost: [::1]\r\n\r\n", "HTTP/1.1 400 " },
+        // No route for it.
+        .{ "CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n", "HTTP/1.1 404 " },
+    };
+    for (cases) |case| {
+        const head, const expected = case;
+        const status = try statusLineFor(head, &buf);
+        std.testing.expectStringStartsWith(status, expected) catch |err| {
+            std.debug.print("request: {s}\n", .{head});
+            return err;
+        };
+    }
+}
+
 test "Server: a transfer coding other than a lone chunked is a 501" {
     var buf: [256]u8 = undefined;
     const cases = [_]struct { []const u8, []const u8 }{
