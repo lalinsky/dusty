@@ -2003,6 +2003,8 @@ test "Server: a request-target in no form RFC 9112 3.2 allows is a 400" {
         .{ "GET * HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
         .{ "GET /#frag HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
         .{ "GET /?q=1#frag HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET /%zz HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
+        .{ "GET /?q=%4 HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
         .{ "CONNECT / HTTP/1.1\r\nHost: localhost\r\n\r\n", "HTTP/1.1 400 " },
         .{ "CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n", "HTTP/1.1 400 " },
         .{ "CONNECT example.com: HTTP/1.1\r\nHost: example.com\r\n\r\n", "HTTP/1.1 400 " },

@@ -24,6 +24,7 @@ const WebSocket = @import("websocket.zig").WebSocket;
 const ResponseParser = @import("parser.zig").ResponseParser;
 const ParsedResponse = @import("parser.zig").ParsedResponse;
 const ResponseBodyReader = @import("parser.zig").ResponseBodyReader;
+const isValidHost = @import("parser.zig").isValidHost;
 const Transport = @import("transport.zig").Transport;
 const Deadline = @import("deadline.zig").Deadline;
 const KeepAliveParams = @import("parser.zig").KeepAliveParams;
@@ -1495,12 +1496,18 @@ fn writeRequest(writer: *std.Io.Writer, opts: WriteRequestOptions) !void {
     // "http://foo%0d%0aX-Evil:1/" would otherwise inject a header).
     try http.validateHeaderValue(opts.host);
 
-    // Request line - path with query
-    const path = uriPath(opts.uri);
-    if (opts.uri.query) |query| {
-        try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ opts.method.name(), path, query.percent_encoded });
+    // Request line - path with query, or for CONNECT host:port (RFC 9112 3.2.3)
+    if (opts.method == .connect) {
+        // The host is decoded, so it can hold what no authority may.
+        if (!isValidHost(opts.host)) return error.InvalidUrl;
+        try writer.print("CONNECT {s}:{d} HTTP/1.1\r\n", .{ opts.host, opts.port });
     } else {
-        try writer.print("{s} {s} HTTP/1.1\r\n", .{ opts.method.name(), path });
+        const path = uriPath(opts.uri);
+        if (opts.uri.query) |query| {
+            try writer.print("{s} {s}?{s} HTTP/1.1\r\n", .{ opts.method.name(), path, query.percent_encoded });
+        } else {
+            try writer.print("{s} {s} HTTP/1.1\r\n", .{ opts.method.name(), path });
+        }
     }
 
     // Host header
@@ -2448,6 +2455,38 @@ test "isDomainOrSubdomain: IPv6 never a subdomain" {
 test "isDomainOrSubdomain: IPv6 zone ID never a subdomain" {
     try std.testing.expect(!isDomainOrSubdomain("::1%25.example.com", "example.com"));
     try std.testing.expect(!isDomainOrSubdomain("fe80::1%eth0.example.com", "example.com"));
+}
+
+test "writeRequest: a CONNECT request-target is host:port" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://[::1]:8443/ignored?x=1");
+    try writeRequest(&writer, .{
+        .method = .connect,
+        .uri = uri,
+        .host = "[::1]",
+        .port = 8443,
+        .protocol = .http,
+        .user_agent = null,
+    });
+
+    try std.testing.expectStringStartsWith(writer.buffered(), "CONNECT [::1]:8443 HTTP/1.1\r\nHost: [::1]:8443\r\n");
+}
+
+test "writeRequest: a CONNECT to a host no authority can hold is rejected" {
+    var buf: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    const uri = try parseUrl("http://a%20HTTP%2F1.1/");
+    try std.testing.expectError(error.InvalidUrl, writeRequest(&writer, .{
+        .method = .connect,
+        .uri = uri,
+        .host = "a HTTP/1.1",
+        .port = 80,
+        .protocol = .http,
+        .user_agent = null,
+    }));
 }
 
 test "writeRequest: sends default User-Agent" {

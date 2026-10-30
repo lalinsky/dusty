@@ -389,8 +389,7 @@ pub const RequestParser = struct {
         if (self.state.host == null and self.request.version_minor >= 1) return error.InvalidHost;
         const empty_host = if (self.state.host) |host| host.len == 0 else false;
         const url = self.request.url;
-        // RFC 9112 3.2: no form of request-target has a fragment.
-        if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidUrl;
+        if (!hasValidEscapes(url)) return error.InvalidUrl;
         if (self.request.method == .connect) {
             // RFC 9112 3.2.3: CONNECT takes only host:port.
             if (!isValidHost(url) or !hasPort(url)) return error.InvalidUrl;
@@ -451,7 +450,7 @@ pub const RequestParser = struct {
 /// RFC 9112 3.2: `uri-host [ ":" port ]`, with uri-host an IP-literal or a
 /// reg-name (which an IPv4address also is) as in RFC 3986 3.2.2. Empty is
 /// valid here; whether it is allowed depends on the target.
-fn isValidHost(value: []const u8) bool {
+pub fn isValidHost(value: []const u8) bool {
     if (value.len == 0) return true;
     var port: []const u8 = undefined;
     if (value[0] == '[') {
@@ -478,6 +477,31 @@ fn isValidHost(value: []const u8) bool {
     }
     for (port) |ch| {
         if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
+/// RFC 3986 2.1: every '%' starts an escape of two hex digits. RFC 9112 3.2:
+/// no form of request-target has a fragment, so a '#' fails too. Blocks of
+/// 16 cover the short paths most requests have.
+fn hasValidEscapes(url: []const u8) bool {
+    const V = @Vector(16, u8);
+    var i: usize = 0;
+    while (i < url.len) {
+        if (i + 16 <= url.len) {
+            const block: V = url[i..][0..16].*;
+            const hits = (block == @as(V, @splat('%'))) | (block == @as(V, @splat('#')));
+            if (!@reduce(.Or, hits)) {
+                i += 16;
+                continue;
+            }
+            i += std.simd.firstTrue(hits).?;
+        } else if (url[i] != '%' and url[i] != '#') {
+            i += 1;
+            continue;
+        }
+        if (url[i] == '#' or i + 2 >= url.len or !std.ascii.isHex(url[i + 1]) or !std.ascii.isHex(url[i + 2])) return false;
+        i += 3;
     }
     return true;
 }
@@ -1225,6 +1249,13 @@ test "RequestParser: basic" {
     try std.testing.expect(host_val != null);
     try std.testing.expectEqualStrings("example.com", host_val.?);
     try std.testing.expectEqualStrings("a b", req.headers.get("X-Test").?);
+}
+
+test "hasValidEscapes" {
+    const valid = [_][]const u8{ "", "/", "/a%2Fb", "/?q=%41%42", "/aaaaaaaaaaaaaaaaaaaa%7e", "/aaaaaaaaaaaaaa%41", "%41bbbbbbbbbbbbbb%41" };
+    for (valid) |url| try std.testing.expect(hasValidEscapes(url));
+    const invalid = [_][]const u8{ "#", "/#a", "/%", "/%4", "/%zz", "/%4g", "/aaaaaaaaaaaaaaaaaaaa%7", "/aaaaaaaaaaaaaa%zz", "/aaaaaaaaaaaaaaa#", "/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#", "/?q=1#", "/?q=100%" };
+    for (invalid) |url| try std.testing.expect(!hasValidEscapes(url));
 }
 
 test "isValidHost" {
