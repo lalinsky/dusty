@@ -65,8 +65,8 @@ pub const Static = struct {
     /// False when there is no file to serve, which the caller answers with
     /// its 404.
     pub fn serve(self: *const Static, req: *Request, res: *Response) !bool {
-        const raw = req.params.get(param) orelse "";
-        const sub_path = try cleanPath(req.arena, raw, self.options.hide_dotfiles) orelse return false;
+        const captured = req.params.get(param) orelse "";
+        const sub_path = try cleanPath(req.arena, captured, self.options.hide_dotfiles) orelse return false;
         const open: Response.SendFileOptions = .{ .resolve_beneath = self.options.resolve_beneath };
 
         const url_path = urlPath(req.url);
@@ -384,29 +384,13 @@ fn extension(path: []const u8) []const u8 {
     return path[name_start + dot + 1 ..];
 }
 
-/// Turns the path a route captured, still percent-encoded, into one that
-/// is relative to the served directory and cannot leave it. Null for a
-/// path that is malformed or tries to.
-fn cleanPath(allocator: std.mem.Allocator, raw: []const u8, hide_dotfiles: bool) !?[]const u8 {
-    const decoded = try allocator.alloc(u8, raw.len);
-    var len: usize = 0;
-    var i: usize = 0;
-    while (i < raw.len) : (len += 1) {
-        if (raw[i] == '%') {
-            if (raw.len - i < 3) return null;
-            const hi = std.fmt.charToDigit(raw[i + 1], 16) catch return null;
-            const lo = std.fmt.charToDigit(raw[i + 2], 16) catch return null;
-            decoded[len] = hi << 4 | lo;
-            i += 3;
-        } else {
-            decoded[len] = raw[i];
-            i += 1;
-        }
-    }
-
-    const out = try allocator.alloc(u8, len);
+/// Turns the path a route captured, already decoded, into one that is
+/// relative to the served directory and cannot leave it. Null for a path
+/// that tries to. A '/' that arrived escaped separates here like any other.
+fn cleanPath(allocator: std.mem.Allocator, captured: []const u8, hide_dotfiles: bool) !?[]const u8 {
+    const out = try allocator.alloc(u8, captured.len);
     var out_len: usize = 0;
-    var segments = std.mem.splitScalar(u8, decoded[0..len], '/');
+    var segments = std.mem.splitScalar(u8, captured, '/');
     while (segments.next()) |segment| {
         if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
         if (std.mem.eql(u8, segment, "..")) return null;
@@ -517,19 +501,16 @@ test cleanPath {
     const a = arena.allocator();
 
     try std.testing.expectEqualStrings("a/b.css", (try cleanPath(a, "/a//./b.css", false)).?);
-    try std.testing.expectEqualStrings("a b/c", (try cleanPath(a, "a%20b/c", false)).?);
+    try std.testing.expectEqualStrings("a b/c", (try cleanPath(a, "a b/c", false)).?);
     try std.testing.expectEqualStrings("a+b", (try cleanPath(a, "a+b", false)).?);
     try std.testing.expectEqualStrings("", (try cleanPath(a, "/", false)).?);
     try std.testing.expectEqual(null, try cleanPath(a, "a/../b", false));
-    try std.testing.expectEqual(null, try cleanPath(a, "a/%2E%2e/b", false));
-    try std.testing.expectEqual(null, try cleanPath(a, "a%2f..%2fb", false));
-    try std.testing.expectEqual(null, try cleanPath(a, "a%5cb", false));
-    try std.testing.expectEqual(null, try cleanPath(a, "a%00b", false));
-    try std.testing.expectEqual(null, try cleanPath(a, "a%2", false));
-    try std.testing.expectEqual(null, try cleanPath(a, "a%+1", false));
+    try std.testing.expectEqual(null, try cleanPath(a, "a/..", false));
+    try std.testing.expectEqual(null, try cleanPath(a, "a\\b", false));
+    try std.testing.expectEqual(null, try cleanPath(a, "a\x00b", false));
     try std.testing.expectEqualStrings(".well-known/x", (try cleanPath(a, "/.well-known/x", false)).?);
     try std.testing.expectEqual(null, try cleanPath(a, "/.well-known/x", true));
-    try std.testing.expectEqual(null, try cleanPath(a, "a/%2Egit/config", true));
+    try std.testing.expectEqual(null, try cleanPath(a, "a/.git/config", true));
 }
 
 test etagListMatches {

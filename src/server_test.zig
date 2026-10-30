@@ -1636,10 +1636,50 @@ fn statusLineFor(raw: []const u8, out: []u8) ![]const u8 {
     return client_future.await(io);
 }
 
-test "Server: a bad percent escape in the query is a 400, not a dropped connection" {
+test "Server: a bad percent escape in the path is a 400" {
     var buf: [256]u8 = undefined;
-    const status = try statusLineFor("GET /?q=100% HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    const status = try statusLineFor("GET /%zz HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
+}
+
+test "Server: the path is matched segment by segment, each one decoded" {
+    var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    const Echo = struct {
+        fn param(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.print(.text, "name={s}", .{req.params.get("name").?});
+        }
+        fn nested(_: *dusty.Request, res: *dusty.Response) !void {
+            res.body = "nested";
+        }
+        fn query(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.print(.text, "q={s}", .{req.query.get("q").?});
+        }
+        fn rest(req: *dusty.Request, res: *dusty.Response) !void {
+            try res.print(.text, "rest={s}", .{req.params.get("rest").?});
+        }
+    };
+    server.router.get("/files/:name", Echo.param);
+    server.router.get("/files/a/b", Echo.nested);
+    server.router.get("/q", Echo.query);
+    server.router.get("/raw/*rest", Echo.rest);
+
+    try expectPipelinedResponses(&server, "GET /files/a%2Fb HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /files/a/b HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /files/john%20doe HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /files/a+b HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /%66iles/x HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        // A '%' that starts no escape is kept, as browsers send it.
+        "GET /q?q=100% HTTP/1.1\r\nHost: localhost\r\n\r\n" ++
+        "GET /raw/a%20b/c%2Fd HTTP/1.1\r\nHost: localhost\r\n\r\n", &.{
+        "name=a/b",
+        "nested",
+        "name=john doe",
+        "name=a+b",
+        "name=x",
+        "q=100%",
+        "rest=a b/c/d",
+    });
 }
 
 /// Sends `head`, then `body_len` bytes of body the server will not read, and
@@ -1907,20 +1947,21 @@ test "Server: a 417 before an unread body is not answered with a reset" {
 test "Server: a 400 before an unread body is not answered with a reset" {
     var buf: [256]u8 = undefined;
     for ([_]bool{ true, false }) |timeouts| {
-        const status = try statusLineWithUnreadBody("POST /?q=100% HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", 32768, false, timeouts, &buf);
+        const status = try statusLineWithUnreadBody("POST /?" ++ too_many_query_params ++ " HTTP/1.1\r\nHost: localhost\r\nContent-Length: 32768\r\n\r\n", 32768, false, timeouts, &buf);
         try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
     }
 }
 
+/// One past the default limit of 32, each under its own name.
+const too_many_query_params = blk: {
+    var q: []const u8 = "";
+    for (0..33) |i| q = q ++ std.fmt.comptimePrint("k{d}=v&", .{i});
+    break :blk q;
+};
+
 test "Server: too many query parameters is a 400, not a dropped connection" {
-    // One past the default limit of 32, each under its own name.
-    const query = comptime blk: {
-        var q: []const u8 = "";
-        for (0..33) |i| q = q ++ std.fmt.comptimePrint("k{d}=v&", .{i});
-        break :blk q;
-    };
     var buf: [256]u8 = undefined;
-    const status = try statusLineFor("GET /?" ++ query ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
+    const status = try statusLineFor("GET /?" ++ too_many_query_params ++ " HTTP/1.1\r\nHost: localhost\r\n\r\n", &buf);
     try std.testing.expectStringStartsWith(status, "HTTP/1.1 400 ");
 }
 

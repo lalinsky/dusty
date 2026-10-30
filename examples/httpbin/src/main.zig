@@ -195,7 +195,7 @@ fn sendDescription(req: *Request, res: *Response, with_method: bool) !void {
     const data = (try req.body()) orelse "";
     const desc = describe(req, res, .{ .body = data, .with_method = with_method }) catch |err| switch (err) {
         // A body that does not parse is the client's mistake, not ours.
-        error.InvalidEscapeSequence, error.TooManyFormFields => return fail(res, .bad_request, "Invalid form body"),
+        error.TooManyFormFields => return fail(res, .bad_request, "Invalid form body"),
         else => |e| return e,
     };
     try res.json(desc, Description.options);

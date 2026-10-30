@@ -291,41 +291,18 @@ pub fn Router(comptime Ctx: type) type {
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
             req.route = null;
-            // Strip query parameters from URL and parse them
             req.query.map.clearRetainingCapacity();
-            const path = if (std.mem.indexOfScalar(u8, req.url, '?')) |query_start| blk: {
-                const query_string = req.url[query_start + 1 ..];
-                try parseQueryString(req, query_string);
-                break :blk req.url[0..query_start];
-            } else req.url;
+            try parseQueryString(req, req.query_string);
+            const path = req.path;
+            const segments = req._segments;
+            const offsets = req._segment_offsets;
 
-            // Count segments (max possible is number of '/' + 1)
-            const max_segments = std.mem.count(u8, path, "/") + 1;
-
-            // Pre-allocate exact capacity needed
-            var segments = try std.ArrayList([]const u8).initCapacity(req.arena, max_segments);
-            defer segments.deinit(req.arena);
-
-            var offsets = try std.ArrayList(usize).initCapacity(req.arena, max_segments);
-            defer offsets.deinit(req.arena);
-
-            // Split path into segments and track their offsets
-            var offset: usize = 0;
-            var iter = std.mem.splitScalar(u8, path, '/');
-            while (iter.next()) |segment| {
-                if (segment.len > 0) {
-                    segments.appendAssumeCapacity(segment);
-                    offsets.appendAssumeCapacity(offset);
-                }
-                offset += segment.len + 1; // +1 for the '/'
-            }
-
-            const route = try self.matchIn(req.method, req, path, segments.items, offsets.items) orelse
+            const route = try self.matchIn(req.method, req, path, segments, offsets) orelse
                 // A HEAD response is the GET response without the body, so a
                 // HEAD with no route of its own is answered by the GET one.
                 // Second, so a route registered with `head` still wins.
-                (if (req.method == .head) try self.matchIn(.get, req, path, segments.items, offsets.items) else null) orelse
-                try self.matchIn(null, req, path, segments.items, offsets.items);
+                (if (req.method == .head) try self.matchIn(.get, req, path, segments, offsets) else null) orelse
+                try self.matchIn(null, req, path, segments, offsets);
             if (route) |r| {
                 req.route = &r.info;
                 return r.*;
@@ -578,6 +555,11 @@ fn testHandler2(ctx: *TestContext, req: *Request, res: *Response) !void {
     _ = ctx;
 }
 
+fn split(req: *Request) !*Request {
+    try req.splitTarget();
+    return req;
+}
+
 test "Router: register and find GET route" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -595,7 +577,7 @@ test "Router: register and find GET route" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler);
 }
@@ -617,7 +599,7 @@ test "Router: register and find POST route" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler);
 }
@@ -639,7 +621,7 @@ test "Router: method mismatch returns null" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler == null);
 }
 
@@ -660,7 +642,7 @@ test "Router: path mismatch returns null" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler == null);
 }
 
@@ -681,7 +663,7 @@ test "Router: parameterized routes" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler);
 }
@@ -705,7 +687,7 @@ test "Router: multiple routes" {
         .parser = undefined,
         .transport = undefined,
     };
-    const handler1 = try router.findHandler(&req1);
+    const handler1 = try router.findHandler(try split(&req1));
     try std.testing.expect(handler1 != null);
     try std.testing.expect(handler1.?.action == testHandler);
 
@@ -717,7 +699,7 @@ test "Router: multiple routes" {
         .parser = undefined,
         .transport = undefined,
     };
-    const handler2 = try router.findHandler(&req2);
+    const handler2 = try router.findHandler(try split(&req2));
     try std.testing.expect(handler2 != null);
     try std.testing.expect(handler2.?.action == testHandler2);
 
@@ -729,7 +711,7 @@ test "Router: multiple routes" {
         .parser = undefined,
         .transport = undefined,
     };
-    const handler3 = try router.findHandler(&req3);
+    const handler3 = try router.findHandler(try split(&req3));
     try std.testing.expect(handler3 != null);
     try std.testing.expect(handler3.?.action == testHandler2);
 }
@@ -751,7 +733,7 @@ test "Router: all HTTP methods" {
             .parser = undefined,
             .transport = undefined,
         };
-        const handler = try router.findHandler(&req);
+        const handler = try router.findHandler(try split(&req));
         try std.testing.expect(handler != null);
     }
 }
@@ -773,7 +755,7 @@ test "Router: extract single parameter" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const id = req.params.get("id");
@@ -798,11 +780,11 @@ test "Router: the matched route is on the request, by its pattern" {
         .parser = undefined,
         .transport = undefined,
     };
-    _ = try router.findHandler(&req);
+    _ = try router.findHandler(try split(&req));
     try std.testing.expectEqualStrings("/api/users/:id", req.route.?.path);
 
     req.url = "/nowhere";
-    _ = try router.findHandler(&req);
+    _ = try router.findHandler(try split(&req));
     try std.testing.expectEqual(null, req.route);
 }
 
@@ -823,7 +805,7 @@ test "Router: extract multiple parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const userId = req.params.get("userId");
@@ -852,7 +834,7 @@ test "Router: mixed static and parameter segments" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const id = req.params.get("id");
@@ -880,7 +862,7 @@ test "Router: static route has precedence over param route" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler2);
 
@@ -905,7 +887,7 @@ test "Router: wildcard route basic matching" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler);
 }
@@ -927,7 +909,7 @@ test "Router: wildcard captures remaining path" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const path = req.params.get("path");
@@ -953,7 +935,7 @@ test "Router: static route has precedence over wildcard" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler2);
 
@@ -979,7 +961,7 @@ test "Router: param route has precedence over wildcard" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler2);
 
@@ -1007,7 +989,7 @@ test "Router: wildcard with multiple segments" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const filepath = req.params.get("filepath");
@@ -1032,7 +1014,7 @@ test "Router: wildcard with prefix path" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const path = req.params.get("path");
@@ -1057,7 +1039,7 @@ test "Router: static route with query parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler);
 
@@ -1083,7 +1065,7 @@ test "Router: param route with query parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
     try std.testing.expect(handler.?.action == testHandler);
 
@@ -1113,7 +1095,7 @@ test "Router: multiple params with query parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     // Parameters should not include query string
@@ -1147,7 +1129,7 @@ test "Router: wildcard route with query parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     // Wildcard should not include query string
@@ -1176,7 +1158,7 @@ test "Router: empty query string" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const id = req.params.get("id");
@@ -1204,7 +1186,7 @@ test "Router: no query parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     const id = req.params.get("id");
@@ -1232,7 +1214,7 @@ test "Router: URL encoded query parameters" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     // URL decoding: + -> space, %20 -> space, %XX -> byte
@@ -1258,7 +1240,7 @@ test "Router: query parameter without value" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     // Parameters without values should have empty string value
@@ -1283,7 +1265,7 @@ test "Router: query with empty key-value pairs" {
         .transport = undefined,
     };
 
-    const handler = try router.findHandler(&req);
+    const handler = try router.findHandler(try split(&req));
     try std.testing.expect(handler != null);
 
     // Should handle double && and trailing &
@@ -1324,7 +1306,7 @@ test "Group: prefix concatenation" {
         .parser = undefined,
         .transport = undefined,
     };
-    const route1 = try router.findHandler(&req1);
+    const route1 = try router.findHandler(try split(&req1));
     try std.testing.expect(route1 != null);
     try std.testing.expect(route1.?.action == testHandler);
 
@@ -1335,7 +1317,7 @@ test "Group: prefix concatenation" {
         .parser = undefined,
         .transport = undefined,
     };
-    const route2 = try router.findHandler(&req2);
+    const route2 = try router.findHandler(try split(&req2));
     try std.testing.expect(route2 != null);
     try std.testing.expect(route2.?.action == testHandler2);
 }
@@ -1365,7 +1347,7 @@ test "Group: routes without group middleware get global middlewares" {
         .parser = undefined,
         .transport = undefined,
     };
-    const route = try router.findHandler(&req);
+    const route = try router.findHandler(try split(&req));
     try std.testing.expect(route != null);
     try std.testing.expectEqual(2, route.?.middlewares.len);
 }
@@ -1396,7 +1378,7 @@ test "Group: group middlewares appended after global" {
         .parser = undefined,
         .transport = undefined,
     };
-    const route = try router.findHandler(&req);
+    const route = try router.findHandler(try split(&req));
     try std.testing.expect(route != null);
     // Should have global + group middlewares
     try std.testing.expectEqual(2, route.?.middlewares.len);
@@ -1428,7 +1410,7 @@ test "Group: no global middlewares, only group middlewares" {
         .parser = undefined,
         .transport = undefined,
     };
-    const route = try router.findHandler(&req);
+    const route = try router.findHandler(try split(&req));
     try std.testing.expect(route != null);
     try std.testing.expectEqual(1, route.?.middlewares.len);
 }
@@ -1449,7 +1431,7 @@ test "Group: direct routes have no middlewares when none set" {
         .parser = undefined,
         .transport = undefined,
     };
-    const route = try router.findHandler(&req);
+    const route = try router.findHandler(try split(&req));
     try std.testing.expect(route != null);
     try std.testing.expectEqual(0, route.?.middlewares.len);
 }
@@ -1472,7 +1454,7 @@ test "Group: any method registers all methods" {
             .parser = undefined,
             .transport = undefined,
         };
-        const route = try router.findHandler(&req);
+        const route = try router.findHandler(try split(&req));
         try std.testing.expect(route != null);
     }
 }
@@ -1494,12 +1476,12 @@ test "Router: QUERY route" {
         .parser = undefined,
         .transport = undefined,
     };
-    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(try split(&req))).?.action);
     req.url = "/api/search";
-    try std.testing.expectEqual(&testHandler2, (try router.findHandler(&req)).?.action);
+    try std.testing.expectEqual(&testHandler2, (try router.findHandler(try split(&req))).?.action);
 
     req.method = .get;
-    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
 }
 
 test "Router: any() comes after the method's own routes" {
@@ -1530,7 +1512,7 @@ test "Router: any() comes after the method's own routes" {
             .parser = undefined,
             .transport = undefined,
         };
-        try std.testing.expectEqual(case[2], (try router.findHandler(&req)).?.action);
+        try std.testing.expectEqual(case[2], (try router.findHandler(try split(&req))).?.action);
     }
 }
 
@@ -1583,14 +1565,14 @@ test "Router: a GET route answers HEAD" {
         .parser = undefined,
         .transport = undefined,
     };
-    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(try split(&req))).?.action);
 
     // The fallback is HEAD's alone; nothing else borrows from GET.
     req.method = .post;
-    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
     req.url = "/nothing";
     req.method = .head;
-    try std.testing.expect(try router.findHandler(&req) == null);
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
 }
 
 test "Router: an explicit HEAD route wins over the GET one" {
@@ -1610,10 +1592,10 @@ test "Router: an explicit HEAD route wins over the GET one" {
         .parser = undefined,
         .transport = undefined,
     };
-    try std.testing.expectEqual(&testHandler2, (try router.findHandler(&req)).?.action);
+    try std.testing.expectEqual(&testHandler2, (try router.findHandler(try split(&req))).?.action);
 
     req.method = .get;
-    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(try split(&req))).?.action);
 }
 
 test "Router: HEAD falls back per path, not per tree" {
@@ -1634,7 +1616,7 @@ test "Router: HEAD falls back per path, not per tree" {
         .parser = undefined,
         .transport = undefined,
     };
-    try std.testing.expectEqual(&testHandler, (try router.findHandler(&req)).?.action);
+    try std.testing.expectEqual(&testHandler, (try router.findHandler(try split(&req))).?.action);
 }
 
 test "Router: HEAD falling back to GET still captures path params" {
@@ -1653,6 +1635,6 @@ test "Router: HEAD falling back to GET still captures path params" {
         .parser = undefined,
         .transport = undefined,
     };
-    try std.testing.expect(try router.findHandler(&req) != null);
+    try std.testing.expect(try router.findHandler(try split(&req)) != null);
     try std.testing.expectEqualStrings("42", req.params.get("id").?);
 }
