@@ -1996,6 +1996,29 @@ test "Server: Host is checked as RFC 9112 3.2 asks" {
     }
 }
 
+test "Server: a transfer coding other than a lone chunked is a 501" {
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "Transfer-Encoding: chunked\r\n", "HTTP/1.1 200 " },
+        .{ "Transfer-Encoding: Chunked\r\n", "HTTP/1.1 200 " },
+        .{ "Transfer-Encoding: gzip, chunked\r\n", "HTTP/1.1 501 " },
+        .{ "Transfer-Encoding: identity, chunked\r\n", "HTTP/1.1 501 " },
+        .{ "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n", "HTTP/1.1 501 " },
+        // llhttp rejects chunked applied twice before the value is complete.
+        .{ "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", "HTTP/1.1 400 " },
+    };
+    for (cases) |case| {
+        const te, const expected = case;
+        var raw_buf: [256]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&raw_buf, "GET / HTTP/1.1\r\nHost: localhost\r\n{s}\r\n0\r\n\r\n", .{te});
+        const status = try statusLineFor(raw, &buf);
+        std.testing.expectStringStartsWith(status, expected) catch |err| {
+            std.debug.print("request: {s}\n", .{raw});
+            return err;
+        };
+    }
+}
+
 test "Server: an absolute-form target is routed by its path, and its authority is the Host" {
     var server = dusty.Server(void).init(std.testing.allocator, std.testing.io, .{ .listeners = loopback }, {});
     defer server.deinit();

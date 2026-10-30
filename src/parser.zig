@@ -26,6 +26,7 @@ pub const ParseError = error{
     TooManyHeaders,
     ChunkFramingTooLarge,
     InvalidHost,
+    UnsupportedTransferEncoding,
     ParseFailed,
 };
 
@@ -335,6 +336,13 @@ pub const RequestParser = struct {
                 return -1;
             }
             self.state.host = self.state.header_value;
+        } else if (std.ascii.eqlIgnoreCase(self.state.header_field, "Transfer-Encoding")) {
+            // RFC 9112 6.1: a transfer coding the server does not understand
+            // is a 501, and chunked is the only one dusty decodes.
+            if (!std.ascii.eqlIgnoreCase(self.state.header_value, "chunked")) {
+                self.state.err = error.UnsupportedTransferEncoding;
+                return -1;
+            }
         }
 
         // Headers point directly into the read buffer, no copy needed

@@ -1229,6 +1229,10 @@ pub fn Server(comptime Ctx: type) type {
                             log.debug("Request had an unsupported HTTP version", .{});
                             break :blk "505 HTTP Version Not Supported";
                         },
+                        error.UnsupportedTransferEncoding => blk: {
+                            log.debug("Request had an unsupported transfer coding", .{});
+                            break :blk "501 Not Implemented";
+                        },
                         error.InvalidMethod,
                         error.InvalidUrl,
                         error.InvalidHeaderToken,
