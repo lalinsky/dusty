@@ -1198,6 +1198,10 @@ test "Client: HEAD response with chunked Transfer-Encoding has no body" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
 }
 
+test "Client: HEAD response may name a transfer coding dusty does not decode" {
+    try expectHeadThenGet("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n");
+}
+
 test "Client: HEAD response with Content-Encoding has no body to decode" {
     try expectHeadThenGet("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\n\r\n");
 }
@@ -1280,6 +1284,32 @@ test "Client: a 2xx CONNECT response has no body and its connection is not poole
     }
     try std.testing.expectEqual(0, client.pool.idle_len);
     peer_future.cancel(io);
+}
+
+fn expectUnsupportedTransferEncoding(comptime response: []const u8) !void {
+    const io = std.testing.io;
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer_future = try io.concurrent(twoResponsePeer(response, "").run, .{ &listener, io });
+    defer peer_future.cancel(io);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    var client = dusty.Client.init(std.testing.allocator, io, .{});
+    defer client.deinit();
+
+    try std.testing.expectError(error.UnsupportedTransferEncoding, client.fetch(url, .{}));
+    try std.testing.expectEqual(0, client.pool.idle_len);
+    peer_future.cancel(io);
+}
+
+test "Client: a transfer coding other than a lone chunked is rejected" {
+    try expectUnsupportedTransferEncoding("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n");
+    try expectUnsupportedTransferEncoding("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n");
+    try expectUnsupportedTransferEncoding("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\t\r\n\r\n2\r\nok\r\n0\r\n\r\n");
 }
 
 test "Client: an HTTP/1.0 response with Transfer-Encoding is not pooled" {

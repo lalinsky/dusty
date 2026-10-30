@@ -527,6 +527,10 @@ pub const ResponseParser = struct {
         // Set by a failed `feed` or `finish`. llhttp keeps no record of an
         // end-of-stream the message was not ready for.
         failed: bool = false,
+        /// Set by a callback that fails for a reason llhttp's error code
+        /// would misreport.
+        err: ?ParseError = null,
+        has_transfer_encoding: bool = false,
         // An interim response was read and dropped on the way to this one.
         saw_interim: bool = false,
 
@@ -590,6 +594,11 @@ pub const ResponseParser = struct {
             return e;
         }
 
+        if (self.state.err) |e| {
+            self.state.failed = true;
+            return e;
+        }
+
         if (err == c.HPE_OK) {
             return;
         }
@@ -648,6 +657,12 @@ pub const ResponseParser = struct {
         }
     }
 
+    fn bodyless(self: *const ResponseParser) bool {
+        const code = @intFromEnum(self.response.status);
+        return self.head_request or (self.connect_request and code / 100 == 2) or
+            code / 100 == 1 or code == 204 or code == 304;
+    }
+
     fn onStatusComplete(parser: ?*c.llhttp_t) callconv(.c) c_int {
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
         // llhttp accepts any three digit code, but `Status` only names the
@@ -699,6 +714,18 @@ pub const ResponseParser = struct {
 
         self.state.header_value = std.mem.trimEnd(u8, self.state.header_value, " \t");
 
+        // RFC 9112 6.1 and 6.3: a response with no body may describe the
+        // codings of one it does not have, and a CONNECT tunnel's are ignored.
+        if (!self.bodyless() and std.ascii.eqlIgnoreCase(self.state.header_field, "Transfer-Encoding")) {
+            // A single chunked is the only transfer coding dusty decodes.
+            // Unlike in a request, llhttp lets a second chunked through.
+            if (self.state.has_transfer_encoding or !std.ascii.eqlIgnoreCase(self.state.header_value, "chunked")) {
+                self.state.err = error.UnsupportedTransferEncoding;
+                return -1;
+            }
+            self.state.has_transfer_encoding = true;
+        }
+
         // Headers point directly into arena-allocated read buffer, no copy needed
         self.response.headers.add(self.state.header_field, self.state.header_value) catch return -1;
 
@@ -722,6 +749,13 @@ pub const ResponseParser = struct {
 
         if (self.response.headers.get("Content-Length")) |content_length| {
             self.response.content_length = std.fmt.parseInt(usize, content_length, 10) catch null;
+        }
+
+        // llhttp takes "chunked" followed by a tab for another coding, and
+        // would read the chunks as a body that runs to the close.
+        if (self.state.has_transfer_encoding and self.parser.flags & @as(u16, @intCast(c.F_CHUNKED)) == 0) {
+            self.state.err = error.UnsupportedTransferEncoding;
+            return -1;
         }
 
         // Returning 1 is how a callback normally asks llhttp to skip the
