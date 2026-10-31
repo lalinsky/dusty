@@ -204,6 +204,7 @@ pub fn build(b: *std.Build) void {
         "static_files",
         "tls_server",
         "websocket",
+        "websocket_client",
     };
 
     for (example_files) |name| {

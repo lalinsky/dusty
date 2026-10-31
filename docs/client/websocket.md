@@ -1,22 +1,29 @@
 # WebSocket
 
-!!! warning "Draft"
-
-    This page is a draft. Still to cover:
-
-    - Complete example against the server example
-    - `wss://`, extra headers for the upgrade, Unix sockets
-    - Handling close, `deinit`
-
-`client.connectWebSocket` sends the upgrade request and returns an `http.WebSocketClient`:
+[`client.connectWebSocket`](../../apidocs/#http.Client.connectWebSocket) connects to a WebSocket
+server and returns an [`http.WebSocketClient`](../../apidocs/#http.WebSocketClient). This talks to
+the [echo server](../server/websocket.md) from the server docs:
 
 ```zig
-var ws = try client.connectWebSocket("ws://127.0.0.1:8080/ws", .{});
-defer ws.deinit();
-
-try ws.send(.text, "hello");
-const msg = try ws.receive();
+--8<-- "examples/websocket_client.zig:connect"
 ```
 
-It has the same methods as the server side: `send`, `receive`, `ping` and `close`. Both `ws://` and
-`wss://` URLs work.
+If the server doesn't accept the upgrade, `connectWebSocket` returns
+`error.WebSocketUpgradeFailed`.
+
+`ws.send`, `ws.receive`, `ws.ping` and `ws.close` work the same as on an
+[`http.WebSocket`](../../apidocs/#http.WebSocket) in a handler. See the [server WebSocket
+page](../server/websocket.md). `ws.deinit()` drops the connection without sending a close message.
+Call `ws.close` first, as the example does.
+
+`wss://` URLs connect over TLS and use the client's [TLS settings](configuration.md#tls).
+
+## Options
+
+The second argument to `connectWebSocket` holds the options. `.headers` are sent with the upgrade
+request, for example an `Authorization` header. `.unix_socket_path` connects over a Unix socket
+instead of TCP.
+
+## Next Steps
+
+- [Configuration](configuration.md) covers the client settings.
