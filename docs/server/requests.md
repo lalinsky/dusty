@@ -86,6 +86,18 @@ To set a cookie, see [Responses](responses.md).
 after the response has been sent. Values the request gives you, like headers, the body and form
 fields, live in the same memory, so copy them if you need them after that.
 
+## I/O
+
+`req.io` is the `std.Io` the server runs on. Pass it to anything in a handler that takes an `Io`,
+like reading a file, sleeping or a database client:
+
+```zig
+try req.io.sleep(.fromMilliseconds(100), .awake);
+```
+
+That way the work runs on the same I/O as the server, for example on zio in
+[production](deployment.md).
+
 ## Next Steps
 
 - [Responses](responses.md) covers status codes, headers and the ways to write a body.
