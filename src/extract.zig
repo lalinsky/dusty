@@ -1,13 +1,14 @@
+//! Types a handler can take as parameters, each filled from the request
+//! by its `extract(scope: anytype)`. `scope` has the `app`, `req`, `res`
+//! and `ctx` fields middleware sees on its executor. `extract` returns
+//! `error.MissingValue` for a value the request doesn't have and
+//! `error.InvalidValue` for one that doesn't parse, which are answered
+//! with a 400; anything else it returns goes through the usual error
+//! handling.
+
 const std = @import("std");
 const Request = @import("request.zig").Request;
 
-/// Extractors are types a handler takes as parameters, each filled from
-/// the request by its `extract(scope: anytype)`. `scope` has the `app`,
-/// `req`, `res` and `ctx` fields middleware sees on its executor. An
-/// extractor returns `error.MissingValue` for a value the request doesn't
-/// have and `error.InvalidValue` for one that doesn't parse, which are
-/// answered with a 400; anything else it returns goes through the usual
-/// error handling.
 /// A path parameter of the route, parsed as `T`:
 ///
 ///     fn getUser(id: http.Param("id", u64), res: *http.Response) !void
@@ -46,7 +47,7 @@ pub fn Param(comptime name: []const u8, comptime T: type) type {
 /// `?T` is null when the parameter is missing; a value that is there but
 /// doesn't parse is a 400 either way.
 pub fn Query(comptime name: []const u8, comptime T: type) type {
-    return Value(name, T, "http.Query", struct {
+    return Value(T, "http.Query", struct {
         fn get(req: *const Request) ?[]const u8 {
             return req.query.get(name);
         }
@@ -56,7 +57,7 @@ pub fn Query(comptime name: []const u8, comptime T: type) type {
 /// A request header, found by its name in any case, and parsed as `T`
 /// like `Query`. The first one counts when there are several.
 pub fn Header(comptime name: []const u8, comptime T: type) type {
-    return Value(name, T, "http.Header", struct {
+    return Value(T, "http.Header", struct {
         fn get(req: *const Request) ?[]const u8 {
             return req.headers.get(name);
         }
@@ -64,7 +65,6 @@ pub fn Header(comptime name: []const u8, comptime T: type) type {
 }
 
 fn Value(
-    comptime name: []const u8,
     comptime T: type,
     comptime what: []const u8,
     comptime get: fn (*const Request) ?[]const u8,
@@ -74,8 +74,6 @@ fn Value(
     comptime checkType(Inner, what);
     return struct {
         value: T,
-
-        pub const value_name = name;
 
         pub fn extract(scope: anytype) error{ MissingValue, InvalidValue }!@This() {
             const raw = get(scope.req) orelse {

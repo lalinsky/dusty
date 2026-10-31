@@ -101,6 +101,8 @@ pub fn main(init: std.process.Init) !void {
 A handler takes only the parameters it needs, in any order: the app (`*App`), `*http.Request`,
 `*http.Response`, and the app's `RequestContext`. So do the app's `notFound` and `uncaughtError`
 hooks, which don't need `self` either, and `uncaughtError` can also take the error as `anyerror`.
+Neither takes a `Param`, and `uncaughtError` can't fail, so it can't take `Query` or `Header`
+either.
 
 A handler can also take a path parameter, parsed:
 
@@ -129,10 +131,13 @@ fn handleList(
 ```
 
 A missing value is a 400, or null when the type is optional, and a value that doesn't parse is
-always a 400. These are extractors: types with `pub fn extract(scope: anytype) !@This()`, where
-`scope` has `app`, `req`, `res` and `ctx`. An app can write its own the same way. One that returns
-`error.MissingValue` or `error.InvalidValue` gets a 400, and any other error is handled like one
-from the handler.
+always a 400.
+
+An app can add parameter types of its own the same way, with `pub fn extract(scope: anytype)
+!@This()`, where `scope` has `app`, `req`, `res` and `ctx`. Returning `error.MissingValue` or
+`error.InvalidValue` from it gives a 400, and any other error is handled like one from the
+handler. An app with `uncaughtError` gets these errors too, and `req.extractErrorStatus(err)`
+tells it which ones to answer with a 400.
 
 `listeners` takes any number of listeners, each with its own TLS, so one server
 can serve HTTPS on 443 and plain HTTP on 80 with the same router:

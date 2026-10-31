@@ -128,7 +128,7 @@ pub const Request = struct {
     // What the last failed body read failed with, so an error coming out of
     // a handler can be told apart from one of the same name it made itself.
     _body_err: ?anyerror = null,
-    // What the extractor that failed returned, for the same reason.
+    // What a failed `extract` of a handler parameter returned, for the same reason.
     _extract_err: ?anyerror = null,
     // The non-empty segments of `path`, each a slice of it.
     _segments: []const []const u8 = &.{},
@@ -299,7 +299,7 @@ pub const Request = struct {
     }
 
     /// 400 when `err` is the `error.MissingValue` or `error.InvalidValue`
-    /// an extractor such as `http.Query` failed with for this request, null
+    /// a handler parameter such as `http.Query` failed with for this request, null
     /// for any other error, including one of the same name from elsewhere.
     pub fn extractErrorStatus(self: *const Request, err: anyerror) ?http.Status {
         const cause = self._extract_err orelse return null;
@@ -1514,6 +1514,15 @@ test "Request.bodyErrorStatus: only the body read's own error is mapped" {
     req._body_err = error.IncompleteBody;
     try std.testing.expectEqual(.bad_request, req.bodyErrorStatus(error.IncompleteBody).?);
     try std.testing.expectEqual(null, req.bodyErrorStatus(error.CorruptInput));
+}
+
+test "Request.extractErrorStatus: only an extractor's own error is mapped" {
+    var req: Request = undefined;
+    req._extract_err = null;
+    try std.testing.expectEqual(null, req.extractErrorStatus(error.MissingValue));
+    req._extract_err = error.MissingValue;
+    try std.testing.expectEqual(.bad_request, req.extractErrorStatus(error.MissingValue).?);
+    try std.testing.expectEqual(null, req.extractErrorStatus(error.InvalidValue));
 }
 
 test "Request.multiFormData: basic key and value" {
