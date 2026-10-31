@@ -54,6 +54,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "=== Formatting code ==="
+# zig fmt from other versions rewrites code (and the zig-pkg copies) so it no
+# longer builds on 0.16.
+ZIG_VERSION="$(zig version)"
+if [[ "$ZIG_VERSION" != 0.16.* ]]; then
+    echo "Refusing to run zig fmt with Zig $ZIG_VERSION, only 0.16 is supported."
+    echo "Put Zig 0.16 on the PATH, or run 'zig build test --summary all' directly."
+    exit 1
+fi
 if [ "$CI_MODE" = true ]; then
     echo "Checking formatting (CI mode)..."
     zig fmt --check .
