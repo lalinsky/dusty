@@ -488,8 +488,7 @@ test "Server: void context handlers" {
     defer server.deinit();
 
     server.router.get("/test", struct {
-        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
-            _ = req;
+        fn handle(res: *dusty.Response) void {
             res.body = "Hello from void context!\n";
         }
     }.handle);
@@ -560,8 +559,8 @@ test "Server: middleware hands request state to the handler, fresh for each requ
     const middlewares = [_]dusty.Middleware(App){.init(&auth)};
     server.router.middlewares = &middlewares;
     server.router.get("/whoami", struct {
-        fn handle(_: *App, req: *dusty.Request, res: *dusty.Response) !void {
-            res.body = req.state(App).user orelse "nobody";
+        fn handle(res: *dusty.Response, state: *App.RequestState) void {
+            res.body = state.user orelse "nobody";
         }
     }.handle);
 
