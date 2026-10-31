@@ -74,10 +74,8 @@ returns its error.
 Build with optimizations for production:
 
 ```sh
-$ zig build -Doptimize=ReleaseFast
+$ zig build -Doptimize=ReleaseSafe
 ```
-
-`ReleaseSafe` keeps the safety checks, at some cost in speed.
 
 ## Behind a Reverse Proxy
 
