@@ -41,6 +41,8 @@ nav:
     - Handlers: server/handlers.md
     - Requests: server/requests.md
     - Responses: server/responses.md
+    - Templating: server/templating.md
+    - Serialization: server/serialization.md
     - Middleware: server/middleware.md
     - Static Files and Assets: server/static-files.md
     - WebSocket: server/websocket.md
