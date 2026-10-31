@@ -74,7 +74,8 @@ To set a cookie, see [Responses](responses.md).
 ## The Client
 
 `req.remote_address` is the address of the client. Behind a reverse proxy it's the proxy's address.
-[Deployment](deployment.md) shows how to get the client's address from `X-Forwarded-For`.
+[Configuration](configuration.md#behind-a-proxy) shows how to get the client's address from
+`X-Forwarded-For`.
 
 `req.secure` is true when the connection uses TLS. On a server with more than one listener,
 `req.listener` is the one the request came in on.

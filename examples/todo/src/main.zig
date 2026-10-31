@@ -292,5 +292,19 @@ pub fn main(init: std.process.Init) !void {
     defer listen_task.cancel(io) catch {};
 
     std.log.info("Todo app running at http://127.0.0.1:8080", .{});
-    try server.run();
+
+    // --8<-- [start:shutdown]
+    var interrupt = try zio.Signal.init(.interrupt);
+    defer interrupt.deinit();
+    var terminate = try zio.Signal.init(.terminate);
+    defer terminate.deinit();
+
+    var server_task = try zio.spawn(http.Server(App).run, .{&server});
+    defer server_task.cancel();
+
+    switch (try zio.select(.{ .interrupt = &interrupt, .terminate = &terminate, .server = &server_task })) {
+        .server => |result| return result,
+        else => std.log.info("Shutting down", .{}),
+    }
+    // --8<-- [end:shutdown]
 }
