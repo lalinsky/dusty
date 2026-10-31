@@ -209,7 +209,7 @@ pub const Connection = struct {
         self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
             .auth = auth,
             // Built here rather than passed in as a tls.config.ClientAuth, so
-            // tls_stub.zig does not have to mirror the type.
+            // stubs/tls.zig does not have to mirror the type.
             .client_auth = if (client_auth) |ca| .{
                 .root_ca = ca.bundle.*,
                 .auth_type = switch (ca.mode) {

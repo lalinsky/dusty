@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     // zio.AutoCancel instead:
     //   dusty_mod.addImport("zio", zio_dep.module("zio"));
     mod.addAnonymousImport("zio", .{
-        .root_source_file = b.path("src/zio_stub.zig"),
+        .root_source_file = b.path("src/stubs/zio.zig"),
     });
 
     // TLS support is a lazy dependency: only fetched when both TLS and the
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
     //   dusty_mod.addImport("tls", custom_tls_mod);
     if (!use_tls) {
         mod.addAnonymousImport("tls", .{
-            .root_source_file = b.path("src/tls_stub.zig"),
+            .root_source_file = b.path("src/stubs/tls.zig"),
         });
     } else if (use_bundled_tls) {
         if (b.lazyDependency("tls", .{
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
         }
     } else {
         mod.addAnonymousImport("tls", .{
-            .root_source_file = b.path("src/tls_injection_required.zig"),
+            .root_source_file = b.path("src/stubs/tls_injection_required.zig"),
         });
     }
 
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
         }
     } else {
         mod.addAnonymousImport("zlib", .{
-            .root_source_file = b.path("src/zlib_stub.zig"),
+            .root_source_file = b.path("src/stubs/zlib.zig"),
         });
     }
 
