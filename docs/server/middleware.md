@@ -37,9 +37,9 @@ A request to `/admin/` without the right `Authorization` header gets a 401.
 
 ## Passing Values to Handlers
 
-`Auth` sets `executor.ctx.user` for the handler. `executor.ctx` is the app's `RequestContext`, a
-struct you declare on the app type. Every field needs a default, because each request starts with
-a new one:
+`Auth` in the snippet above sets `executor.ctx.user` for the handler. `executor.ctx` is the app's
+`RequestContext`, a struct you declare on the app type. Every field needs a default, because each
+request starts with a new one:
 
 ```zig
 --8<-- "examples/middleware.zig:app"

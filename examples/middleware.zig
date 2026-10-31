@@ -4,7 +4,7 @@ const http = @import("dusty");
 // --8<-- [start:app]
 const App = struct {
     pub const RequestContext = struct {
-        user: ?[]const u8 = null,
+        user: []const u8 = "guest",
         session: http.SessionData = .{},
     };
 };
@@ -76,7 +76,7 @@ const AccessLog = struct {
 
 // --8<-- [start:handlers]
 fn dashboard(ctx: *App.RequestContext, res: *http.Response) !void {
-    try res.print(.text, "Hello, {s}\n", .{ctx.user.?});
+    try res.print(.text, "Hello, {s}\n", .{ctx.user});
 }
 // --8<-- [end:handlers]
 
