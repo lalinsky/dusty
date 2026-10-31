@@ -420,6 +420,7 @@ pub fn Router(comptime App: type) type {
             const files = alloc.create(Static) catch @panic("OOM");
             files.* = .{ .dir = dir, .options = opts };
             if (opts.index) |index| files.options.index = alloc.dupe(u8, index) catch @panic("OOM");
+            if (opts.cache_control) |c| files.options.cache_control = alloc.dupe(u8, c) catch @panic("OOM");
             files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
             const base = std.mem.trimEnd(u8, prefix, "/");
             // The directory itself, for its index.
@@ -453,7 +454,7 @@ pub fn Router(comptime App: type) type {
             if (returns_error and std.meta.ArgsTuple(F) == std.meta.ArgsTuple(Handler)) return handler;
             const H = struct {
                 fn call(app: AppPtr, req: *Request, res: *Response) anyerror!void {
-                    return @call(.auto, handler, inject.args(App, F, app, req, res, {}));
+                    return @call(.auto, handler, try inject.args(App, F, app, req, res, {}));
                 }
 
                 fn callVoid(req: *Request, res: *Response) anyerror!void {
@@ -1881,7 +1882,8 @@ test "Router: a route's path is decoded segment by segment, like a request's" {
     try std.testing.expectEqual(&testHandler2, (try router.findHandler(try split(&req))).?.action);
 }
 
-const Param = @import("param.zig").Param;
+const Param = @import("extract.zig").Param;
+const RequestContext = @import("request.zig").RequestContext;
 
 fn testRequest(arena: std.mem.Allocator, url: []const u8) Request {
     return .{ .method = .get, .url = url, .arena = arena, .parser = undefined, .transport = undefined };
@@ -1905,6 +1907,8 @@ test "Router: a Param that does not parse makes the route not match" {
     var req = testRequest(arena.allocator(), "/page/12");
     const route = (try router.findHandler(try split(&req))).?;
     var app: App = .{};
+    var ctx: RequestContext(App) = .{};
+    req._ctx = .init(RequestContext(App), &ctx);
     try route.action(&app, &req, undefined);
     try std.testing.expectEqual(@as(u32, 12), app.page);
 

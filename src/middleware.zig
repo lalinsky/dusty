@@ -175,6 +175,8 @@ pub fn Executor(comptime App: type) type {
                     }
                     if (self.req.bodyErrorStatus(err) != null) {
                         log.debug("request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    } else if (self.req.extractErrorStatus(err) != null) {
+                        log.debug("request parameter rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     }
@@ -244,11 +246,12 @@ pub fn Executor(comptime App: type) type {
                 return mw.execute(self.req, self.res, self);
             }
 
-            // All middlewares executed, call dispatcher or handler
+            // TODO: remove this check for dusty 1.0.
+            if (comptime App != void and @hasDecl(App, "dispatch")) {
+                @compileError(@typeName(App) ++ ".dispatch is no longer supported; wrap the handlers in a middleware instead");
+            }
             const action = self.action orelse return self.handleNotFound();
-            const result = if (comptime App != void and @hasDecl(App, "dispatch"))
-                self.app.dispatch(action, self.req, self.res)
-            else if (comptime App == void)
+            const result = if (comptime App == void)
                 action(self.req, self.res)
             else
                 action(self.app, self.req, self.res);
@@ -270,7 +273,7 @@ pub fn Executor(comptime App: type) type {
             if (comptime App != void and @hasDecl(App, "notFound")) {
                 comptime inject.noParams(@TypeOf(App.notFound), @typeName(App) ++ ".notFound");
                 _ = inject.returnsError(@TypeOf(App.notFound), @typeName(App) ++ ".notFound", true);
-                return @call(.auto, App.notFound, inject.args(App, @TypeOf(App.notFound), self.app, self.req, self.res, {}));
+                return @call(.auto, App.notFound, try inject.args(App, @TypeOf(App.notFound), self.app, self.req, self.res, {}));
             } else {
                 self.res.status = .not_found;
                 self.res.content_type = .text;
@@ -285,10 +288,11 @@ pub fn Executor(comptime App: type) type {
             // headers are still open.
             self.res.resetBody();
             if (comptime App != void and @hasDecl(App, "uncaughtError")) {
-                comptime inject.noParams(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError");
+                comptime inject.noExtractors(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError");
                 _ = inject.returnsError(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError", false);
-                @call(.auto, App.uncaughtError, inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err));
-            } else if (self.req.bodyErrorStatus(err)) |status| {
+                const call_args = inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err) catch |e| switch (e) {};
+                @call(.auto, App.uncaughtError, call_args);
+            } else if (self.req.bodyErrorStatus(err) orelse self.req.extractErrorStatus(err)) |status| {
                 self.res.status = status;
                 self.res.content_type = .text;
                 self.res.body = switch (status) {
@@ -638,7 +642,6 @@ test "Executor: error after headers written propagates instead of rewriting the 
 const CustomApp = struct {
     not_found_called: bool = false,
     uncaught_error_called: bool = false,
-    dispatch_called: bool = false,
     last_error: ?anyerror = null,
 
     pub fn notFound(self: *CustomApp, _: *Request, res: *Response) !void {
@@ -652,12 +655,6 @@ const CustomApp = struct {
         self.last_error = err;
         res.status = .internal_server_error;
         res.body = "custom 500";
-    }
-
-    pub fn dispatch(self: *CustomApp, action: Action(CustomApp), req: *Request, res: *Response) !void {
-        self.dispatch_called = true;
-        res.body = "before dispatch | ";
-        try action(self, req, res);
     }
 };
 
@@ -719,27 +716,6 @@ test "Executor: custom uncaughtError handler" {
     try std.testing.expectEqual(error.CustomError, app.last_error.?);
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("custom 500", res.body);
-}
-
-test "Executor: custom dispatch method" {
-    var app: CustomApp = .{};
-    var req = testRequest();
-    var connection: Connection = undefined;
-    connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
-
-    var executor = Executor(CustomApp){
-        .req = &req,
-        .res = &res,
-        .app = &app,
-        .action = customAppHandler,
-        .middlewares = &.{},
-    };
-
-    try executor.run();
-
-    try std.testing.expect(app.dispatch_called);
-    try std.testing.expectEqualStrings("custom handler", res.body);
 }
 
 test "Executor: middleware error triggers custom uncaughtError" {
