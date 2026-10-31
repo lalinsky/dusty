@@ -1,5 +1,13 @@
 # Getting Started
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - An app type with state (`http.Server(App)`), and how handlers get `*App`
+    - Where to go next: routing, handlers, the client
+    - Running the same example on zio
+
 Dusty needs Zig 0.16 or 0.17. We'll start from an empty project.
 
 ## Setup
@@ -49,5 +57,5 @@ A handler only takes the parameters it needs. `hello` takes the `:name` part of 
 take a pointer to it.
 
 The server uses `init.io`, the threaded `std.Io` implementation from the standard library. That's
-fine for development, but it uses an OS thread per connection. See [Deployment](deployment.md) for
+fine for development, but it uses an OS thread per connection. See [Deployment](server/deployment.md) for
 running it on zio.

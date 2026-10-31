@@ -1,5 +1,14 @@
 # Streaming Responses
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Include examples/client.zig
+    - Buffer size and `peek`/`take`
+    - `decompress = false`
+    - Whether the connection goes back to the pool when the body isn't read to the end
+
 With `.stream = true`, `fetch` returns as soon as it has the headers, and you read the body from the
 connection yourself:
 

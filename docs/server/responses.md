@@ -1,5 +1,16 @@
 # Responses
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - `http.ContentType` values, setting headers, `Content-Length` vs chunked
+    - `BodyWriter` and `StreamingBodyWriter`, and what HTTP/1.0 clients get
+    - `sendFile` options
+    - `setCookie` and `CookieOpts`
+    - `resetBody` and `clearWriter` for error handling
+    - What happens when a handler fails after writing part of the body
+
 In the simple case, the handler sets a status, maybe some headers, and a body, and all of it goes out
 after the handler returns, so middleware can still change it:
 

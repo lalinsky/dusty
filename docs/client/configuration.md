@@ -1,5 +1,14 @@
 # Configuration
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - `tls.ca` options, `insecure_skip_verify` for testing
+    - `http2` option
+    - `buffer_size` and `max_response_header_count`
+    - Sharing one client between tasks
+
 The third argument to `http.Client.init` is an `http.ClientConfig`. Its settings apply to every
 request the client makes.
 

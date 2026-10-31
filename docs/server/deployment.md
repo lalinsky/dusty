@@ -1,5 +1,15 @@
 # Deployment
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - zio setup code and `build.zig` changes, executors
+    - Graceful shutdown: canceling `run`, `timeout.shutdown`
+    - Building with `-Doptimize=ReleaseFast`
+    - HTTP/2 build option
+    - Running behind nginx or similar, systemd, containers
+
 For production, run the server on [zio](https://lalinsky.github.io/zio/). It runs each connection
 as a coroutine, and many coroutines share one OS thread. With `std.Io.Threaded`, every connection holds an OS thread of
 its own, plus a second one while timeouts are enabled, and a handler waiting on a database keeps its

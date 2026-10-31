@@ -1,5 +1,13 @@
 # WebSocket
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Complete example against the server example
+    - `wss://`, extra headers for the upgrade, Unix sockets
+    - Handling close, `deinit`
+
 `client.connectWebSocket` sends the upgrade request and returns an `http.WebSocketClient`:
 
 ```zig

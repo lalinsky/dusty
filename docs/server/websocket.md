@@ -1,5 +1,15 @@
 # WebSocket
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Compiled echo example
+    - Message types, `receiveMany`, `tryReceive`, ping and pong, close codes
+    - Sending from another task while one is receiving
+    - Timeouts for long-lived connections
+    - Message size limits
+
 `res.upgradeWebSocket(req)` turns a request into a WebSocket connection. It returns null if the
 request isn't a valid upgrade request, and the handler can answer it as a normal request.
 

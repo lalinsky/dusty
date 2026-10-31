@@ -1,5 +1,13 @@
 # Dusty
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Build options: `use_tls`, `use_zlib`, and HTTP/2 through `use_http2` (off by default)
+    - Supported Zig versions, and how 0.16 and 0.17 are both tested
+    - Pointer to the examples directory
+
 Dusty is an HTTP client and server library for Zig. It's built on the standard library's
 [`std.Io`](https://ziglang.org/documentation/0.16.0/std/#std.Io) interface, and parses HTTP with
 [llhttp](https://github.com/nodejs/llhttp), the parser from Node.js.
@@ -32,7 +40,8 @@ A server with two routes:
 --8<-- "examples/hello_world.zig"
 ```
 
-See [Getting Started](server/getting-started.md) for how to set up a project and run it.
+See [Getting Started](getting-started.md) for how to set up a project and run it, and
+[Making Requests](client/requests.md) for the client.
 
 ## License
 

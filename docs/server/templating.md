@@ -1,5 +1,14 @@
 # Templating
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Compiled example project for zt, so the snippets are checked
+    - Layouts and components in zt, HTML escaping
+    - Using `assets.url` from templates
+    - Walkthrough of examples/todo with htmx
+
 Dusty has no templating language of its own. `res.render` works with anything that writes to a
 `*std.Io.Writer`, and we recommend [zt](https://github.com/lalinsky/zt), which compiles templates to
 Zig at build time.

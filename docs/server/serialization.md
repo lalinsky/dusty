@@ -1,5 +1,14 @@
 # Serialization
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Compiled example project for json.zig and msgpack.zig
+    - `zig fetch` commands with pinned versions
+    - Decoding request bodies with json.zig, and answering bad input with a 400
+    - Picking JSON or MessagePack from the request
+
 `res.encode` writes a value as the body with a serializer's write-to-writer function. It tells the
 function's parameters apart by type, so most libraries work with it as they are. We recommend
 [json.zig](https://github.com/lalinsky/json.zig) for JSON and

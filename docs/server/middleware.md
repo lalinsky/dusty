@@ -1,5 +1,17 @@
 # Middleware
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - `init` with `http.MiddlewareConfig` (arena, allocator)
+    - Answering without calling `executor.next()`, like an auth check
+    - `onHeaders` and `onComplete` hooks, when they run and in what order
+    - Order of middleware in a chain, router vs group middleware
+    - `RequestContext` example: authenticated user passed to the handler
+    - `Cors` options
+    - `Session`: `SessionData`, signing, cookie options
+
 Middleware is a type with a `Config`, an `init` and an `execute` method. In `execute`, it can look at
 the request, call `executor.next()` to run the rest of the chain, and look at the response after it
 returns:

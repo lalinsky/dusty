@@ -1,5 +1,16 @@
 # Configuration
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - TLS listener setup: certificates, keys, client certificates
+    - Unix socket listeners (`Address.unix`)
+    - `kernel_backlog`, `reuse_address`, `acceptors`
+    - All request limits: params, query, form fields
+    - Response buffer sizes, `timeout.request_count`
+    - Link to `ServerConfig` in the API reference
+
 The third argument to `http.Server(App).init` is an `http.ServerConfig`:
 
 ```zig

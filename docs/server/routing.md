@@ -1,5 +1,16 @@
 # Routing
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - `http.Param` types: integers, enums, `bool`, `[]const u8`, custom `parseParam`
+    - A value that doesn't parse means no match, so another route or a 404
+    - Conflicting routes panic at startup
+    - All the method functions, including `query`, and `any`
+    - Nested groups and `Group(prefix)`
+    - URL decoding of path segments, trailing slashes
+
 Every server has a router, `server.router`. You register a handler for a method and a path, and
 the router picks one for each request.
 

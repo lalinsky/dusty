@@ -1,5 +1,14 @@
 # Handlers
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Full list of what a handler can take, and custom injected types
+    - App state is shared by all connections at once, so it has to be safe for concurrent use
+    - Signatures of `uncaughtError` and `notFound`
+    - `req.setTimeout` for handlers that need longer than the request timeout
+
 A handler is a function that gets the request and fills in the response:
 
 ```zig

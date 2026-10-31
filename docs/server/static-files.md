@@ -1,5 +1,15 @@
 # Static Files and Assets
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - `StaticOptions`: `index`, `precompressed`, `hide_dotfiles`, `resolve_beneath`
+    - Path traversal protection
+    - `embedded` options
+    - `addAssets` setup in `build.zig`, `assets.url` and `assets.register`
+    - Caching: `ETag`, `Last-Modified`, `Cache-Control`
+
 `router.static` serves a directory from disk under a prefix:
 
 ```zig

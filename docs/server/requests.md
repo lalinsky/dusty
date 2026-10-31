@@ -1,5 +1,17 @@
 # Requests
 
+!!! warning "Draft"
+
+    This page is a draft. Still to cover:
+
+    - Method, URL, path and query parsing details
+    - Header lookup (case-insensitive?), repeated headers
+    - Streaming a large body with `req.reader`
+    - Forms and multipart, file uploads
+    - Cookies API
+    - `remote_address` and `trusted_proxy_hops`
+    - `request.decompress`, body size limits and the status codes they give
+
 `http.Request` has the method and URL, the `headers`, the parsed `query` string, and the route's
 `params`:
 
