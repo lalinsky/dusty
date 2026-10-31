@@ -78,12 +78,6 @@ function with the arguments from the tuple, followed by the writer. A type with 
 `render(args, writer)` function works too. So you can also write templates by hand, or use another
 template library that writes to a `std.Io.Writer`.
 
-[zmpl](https://github.com/jetzig-framework/zmpl) renders a template into a slice instead. Send its
-output with `res.print(.html, "{s}", .{output})`.
-
-For a small piece of HTML, use `res.print(.html, "<p>Hello, {s}</p>", .{name})`. It doesn't escape
-anything, so only pass it text you trust.
-
 ## Next Steps
 
 - [Static Files and Assets](static-files.md) covers `assets.url` and serving the files.
