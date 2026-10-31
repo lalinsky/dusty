@@ -199,10 +199,13 @@ pub fn Router(comptime App: type) type {
 
             var current = slot.*.?;
             const alloc = self.arena.allocator();
-            var params: std.ArrayList(RouteParam) = .empty;
+            // The route's own copy, which its parameter names are slices of.
+            const own_path = try alloc.dupe(u8, path);
+            const params = try alloc.alloc(RouteParam, countNamedParams(own_path));
+            var param_count: usize = 0;
             var index: usize = 0;
 
-            var iter = std.mem.splitScalar(u8, path, '/');
+            var iter = std.mem.splitScalar(u8, own_path, '/');
             while (iter.next()) |segment| {
                 if (segment.len == 0) continue;
                 defer index += 1;
@@ -216,7 +219,8 @@ pub fn Router(comptime App: type) type {
 
                 // An unnamed parameter or wildcard captures nothing.
                 if (kind != .static and segment.len > 1) {
-                    try params.append(alloc, .{ .index = index, .name = try alloc.dupe(u8, segment[1..]), .rest = kind == .wildcard });
+                    params[param_count] = .{ .index = index, .name = segment[1..], .rest = kind == .wildcard };
+                    param_count += 1;
                 }
 
                 // Matched against the decoded segments of a request, so
@@ -270,15 +274,25 @@ pub fn Router(comptime App: type) type {
             // Create and store route
             const route = try alloc.create(Route);
             route.* = .{
-                .info = .{ .path = try alloc.dupe(u8, path), .data = data },
+                .info = .{ .path = own_path, .data = data },
                 .action = handler,
                 .middlewares = middlewares,
                 .accepts = accepts,
                 .yields = yields,
-                .params = params.items,
+                .params = params,
             };
             current.route = @ptrCast(route);
-            self.max_params = @max(self.max_params, @as(u32, @intCast(params.items.len)));
+            self.max_params = @max(self.max_params, @as(u32, @intCast(params.len)));
+        }
+
+        /// The `:name` and `*name` segments of a route path.
+        fn countNamedParams(path: []const u8) usize {
+            var n: usize = 0;
+            var it = std.mem.tokenizeScalar(u8, path, '/');
+            while (it.next()) |segment| {
+                if ((segment[0] == ':' or segment[0] == '*') and segment.len > 1) n += 1;
+            }
+            return n;
         }
 
         fn matchRecursive(node: *Node, req: *Request, index: usize) ?*Node {
