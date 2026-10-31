@@ -15,6 +15,26 @@ pub const MiddlewareConfig = struct {
     allocator: std.mem.Allocator,
 };
 
+/// A middleware is a type with `execute(self, req, res, executor)`, which
+/// calls `executor.next()` to go on. It can also declare:
+///
+/// - `deinit(self)`
+/// - `onHeaders(self, req, res, ctx) !void`, run right before the response
+///   headers are sent, whether the body is buffered, streamed or an
+///   upgrade. An error on a buffered response becomes the error response.
+///   From `res.stream()`, `res.startEventStream()` or `res.upgradeWebSocket()`
+///   the handler gets `error.HeadersHookFailed`, with nothing sent; if it
+///   returns that, the hook's own error is what the app sees. Not run for
+///   the error response that replaces a failed handler or middleware, the
+///   same as code after `executor.next()`.
+/// - `onComplete(self, req, res, ctx, err: ?anyerror) void`, run once the
+///   response has been sent or has failed. `err` is the error the error
+///   response replaced, or what failed sending the response. It cannot
+///   return an error, so it should not wait on cancelable I/O.
+///
+/// `ctx` is the app's `RequestContext`. Hooks run innermost first, for
+/// every middleware whose `execute` was called, including one that
+/// returned an error before calling `next()`.
 pub fn Middleware(comptime App: type) type {
     return struct {
         const Self = @This();
@@ -27,6 +47,19 @@ pub fn Middleware(comptime App: type) type {
             executor: *Executor(App),
         ) anyerror!void,
         deinitFn: ?*const fn (ptr: *anyopaque) void,
+        onHeadersFn: ?*const fn (
+            ptr: *anyopaque,
+            req: *Request,
+            res: *Response,
+            ctx: *RequestContext(App),
+        ) anyerror!void,
+        onCompleteFn: ?*const fn (
+            ptr: *anyopaque,
+            req: *Request,
+            res: *Response,
+            ctx: *RequestContext(App),
+            err: ?anyerror,
+        ) void,
 
         pub fn init(impl: anytype) Self {
             const Ptr = @TypeOf(impl);
@@ -42,12 +75,24 @@ pub fn Middleware(comptime App: type) type {
                     const self: Ptr = @ptrCast(@alignCast(ptr));
                     self.deinit();
                 }
+
+                fn onHeaders(ptr: *anyopaque, req: *Request, res: *Response, ctx: *RequestContext(App)) anyerror!void {
+                    const self: Ptr = @ptrCast(@alignCast(ptr));
+                    return self.onHeaders(req, res, ctx);
+                }
+
+                fn onComplete(ptr: *anyopaque, req: *Request, res: *Response, ctx: *RequestContext(App), err: ?anyerror) void {
+                    const self: Ptr = @ptrCast(@alignCast(ptr));
+                    self.onComplete(req, res, ctx, err);
+                }
             };
 
             return .{
                 .ptr = @ptrCast(@constCast(impl)),
                 .executeFn = gen.execute,
                 .deinitFn = if (@hasDecl(Impl, "deinit")) gen.deinit else null,
+                .onHeadersFn = if (@hasDecl(Impl, "onHeaders")) gen.onHeaders else null,
+                .onCompleteFn = if (@hasDecl(Impl, "onComplete")) gen.onComplete else null,
             };
         }
 
@@ -76,6 +121,12 @@ pub fn Executor(comptime App: type) type {
         /// The app's `RequestContext` for this request, also reachable as
         /// `req.ctx(App)` between `attachCtx` and `detachCtx`.
         ctx: RequestContext(App) = .{},
+        headers_hooks_ran: bool = false,
+        completed: bool = false,
+        /// The error that the error response replaced.
+        failure: ?anyerror = null,
+        /// What the hook behind a `HeadersHookFailed` returned.
+        hook_err: ?anyerror = null,
 
         pub fn attachCtx(self: *Self) void {
             self.req._ctx = .init(RequestContext(App), &self.ctx);
@@ -86,7 +137,17 @@ pub fn Executor(comptime App: type) type {
         }
 
         pub fn run(self: *Self) !void {
-            self.handle() catch |err| switch (err) {
+            self.res.headers_hook = .{ .ptr = self, .call = callHeadersHooks };
+            defer self.res.headers_hook = null;
+            self.handle() catch |err| return self.recover(err);
+            // A buffered response: its headers go out after this returns,
+            // and a hook that fails can still turn it into an error response.
+            if (!self.res.headers_written) self.headersHooks() catch |err| return self.recover(err);
+        }
+
+        fn recover(self: *Self, returned: anyerror) !void {
+            const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
+            switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
                 error.ReadFailed, error.WriteFailed, error.Canceled => return err,
@@ -117,9 +178,50 @@ pub fn Executor(comptime App: type) type {
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     }
+                    self.failure = err;
+                    self.headers_hooks_ran = true;
                     self.handleError(err);
                 },
+            }
+        }
+
+        fn callHeadersHooks(ptr: *anyopaque) Response.HeadersHookError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.headersHooks() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    self.hook_err = err;
+                    return error.HeadersHookFailed;
+                },
             };
+        }
+
+        /// Runs `onHeaders` of the middlewares that ran, innermost first,
+        /// once per request.
+        fn headersHooks(self: *Self) anyerror!void {
+            if (self.headers_hooks_ran) return;
+            self.headers_hooks_ran = true;
+            var i = self.index;
+            while (i > 0) {
+                i -= 1;
+                const mw = self.middlewares[i];
+                if (mw.onHeadersFn) |f| try f(mw.ptr, self.req, self.res, &self.ctx);
+            }
+        }
+
+        /// Runs `onComplete` of the middlewares that ran, innermost first,
+        /// once the response has been sent or has failed. `err` is what
+        /// failed sending it, if anything did.
+        pub fn complete(self: *Self, send_err: ?anyerror) void {
+            if (self.completed) return;
+            self.completed = true;
+            const err: ?anyerror = if (send_err) |e| e else self.failure;
+            var i = self.index;
+            while (i > 0) {
+                i -= 1;
+                const mw = self.middlewares[i];
+                if (mw.onCompleteFn) |f| f(mw.ptr, self.req, self.res, &self.ctx, err);
+            }
         }
 
         /// A handler streaming the body sees the reader's failure as
@@ -784,4 +886,171 @@ test "Executor: middleware passes the request context to the handler" {
 
     try executor.run();
     try std.testing.expectEqualStrings("alice", res.body);
+}
+
+const HookLog = struct {
+    entries: [8][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(self: *HookLog, entry: []const u8) void {
+        self.entries[self.len] = entry;
+        self.len += 1;
+    }
+};
+
+const HookingMiddleware = struct {
+    log: *HookLog,
+    name: []const u8,
+    short_circuit: bool = false,
+    fail_headers: bool = false,
+
+    pub fn execute(self: *const HookingMiddleware, _: *Request, res: *Response, executor: anytype) !void {
+        if (self.short_circuit) {
+            res.status = .unauthorized;
+            return;
+        }
+        return executor.next();
+    }
+
+    pub fn onHeaders(self: *const HookingMiddleware, _: *Request, _: *Response, _: anytype) !void {
+        self.log.add(self.name);
+        if (self.fail_headers) return error.HookFailed;
+    }
+
+    pub fn onComplete(self: *const HookingMiddleware, _: *Request, _: *Response, _: anytype, err: ?anyerror) void {
+        self.log.add(if (err) |e| @errorName(e) else "complete");
+    }
+};
+
+test "Executor: hooks run innermost first, only for middleware that ran" {
+    var hooks: HookLog = .{};
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+
+    var outer: HookingMiddleware = .{ .log = &hooks, .name = "outer" };
+    var inner: HookingMiddleware = .{ .log = &hooks, .name = "inner", .short_circuit = true };
+    var skipped: HookingMiddleware = .{ .log = &hooks, .name = "skipped" };
+    const middlewares = [_]Middleware(void){ .init(&outer), .init(&inner), .init(&skipped) };
+    var executor: Executor(void) = .{
+        .req = &req,
+        .res = &res,
+        .app = {},
+        .action = null,
+        .middlewares = &middlewares,
+    };
+
+    try executor.run();
+    executor.complete(null);
+    executor.complete(error.Ignored);
+
+    try std.testing.expectEqual(.unauthorized, res.status);
+    try std.testing.expectEqual(4, hooks.len);
+    try std.testing.expectEqualStrings("inner", hooks.entries[0]);
+    try std.testing.expectEqualStrings("outer", hooks.entries[1]);
+    try std.testing.expectEqualStrings("complete", hooks.entries[2]);
+    try std.testing.expectEqualStrings("complete", hooks.entries[3]);
+}
+
+test "Executor: onHeaders failing on a buffered response gives an error response" {
+    var hooks: HookLog = .{};
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+
+    var failing: HookingMiddleware = .{ .log = &hooks, .name = "failing", .fail_headers = true };
+    const middlewares = [_]Middleware(void){.init(&failing)};
+    var executor: Executor(void) = .{
+        .req = &req,
+        .res = &res,
+        .app = {},
+        .action = struct {
+            fn handle(_: *Request, r: *Response) !void {
+                r.body = "ok";
+            }
+        }.handle,
+        .middlewares = &middlewares,
+    };
+
+    try executor.run();
+    executor.complete(null);
+
+    try std.testing.expectEqual(.internal_server_error, res.status);
+    try std.testing.expectEqualStrings("500 Internal Server Error\n", res.body);
+    // Not run a second time for the error response.
+    try std.testing.expectEqual(2, hooks.len);
+    try std.testing.expectEqualStrings("failing", hooks.entries[0]);
+    try std.testing.expectEqualStrings("HookFailed", hooks.entries[1]);
+}
+
+test "Executor: the error response for a failed handler gets no onHeaders" {
+    var hooks: HookLog = .{};
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+
+    var mw: HookingMiddleware = .{ .log = &hooks, .name = "mw" };
+    const middlewares = [_]Middleware(void){.init(&mw)};
+    var executor: Executor(void) = .{
+        .req = &req,
+        .res = &res,
+        .app = {},
+        .action = struct {
+            fn handle(_: *Request, _: *Response) !void {
+                return error.Boom;
+            }
+        }.handle,
+        .middlewares = &middlewares,
+    };
+
+    try executor.run();
+    executor.complete(null);
+
+    try std.testing.expectEqual(.internal_server_error, res.status);
+    try std.testing.expectEqual(1, hooks.len);
+    try std.testing.expectEqualStrings("Boom", hooks.entries[0]);
+}
+
+test "Executor: a stream whose onHeaders fails reports the hook's error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+
+    var hooks: HookLog = .{};
+    var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
+    var res = try Response.init(arena.allocator(), &connection, 32);
+
+    var failing: HookingMiddleware = .{ .log = &hooks, .name = "failing", .fail_headers = true };
+    const middlewares = [_]Middleware(void){.init(&failing)};
+    var executor: Executor(void) = .{
+        .req = &req,
+        .res = &res,
+        .app = {},
+        .action = struct {
+            fn handle(_: *Request, r: *Response) !void {
+                var stream_buf: [64]u8 = undefined;
+                _ = r.stream(&stream_buf) catch |err| {
+                    try std.testing.expectEqual(error.HeadersHookFailed, err);
+                    return err;
+                };
+                unreachable;
+            }
+        }.handle,
+        .middlewares = &middlewares,
+    };
+
+    try executor.run();
+    executor.complete(null);
+
+    try std.testing.expectEqual(0, conn_writer.buffered().len);
+    try std.testing.expectEqual(.internal_server_error, res.status);
+    try std.testing.expectEqual(2, hooks.len);
+    try std.testing.expectEqualStrings("HookFailed", hooks.entries[1]);
 }

@@ -641,6 +641,20 @@ pub const Response = struct {
     /// The body, when it is a file: opened by `sendFile`, sent and closed
     /// by `write`.
     file: ?BodyFile = null,
+    /// Runs the middlewares' `onHeaders` before a stream or an upgrade
+    /// sends the headers. Set by the executor, which runs them itself for
+    /// a buffered body.
+    headers_hook: ?HeadersHook = null,
+
+    pub const HeadersHook = struct {
+        ptr: *anyopaque,
+        call: *const fn (ptr: *anyopaque) HeadersHookError!void,
+    };
+
+    /// A middleware's `onHeaders` failed, so the headers were not sent.
+    /// The executor kept the hook's own error, and reports that one if the
+    /// handler returns this.
+    pub const HeadersHookError = error{ HeadersHookFailed, Canceled };
 
     pub const BodyFile = struct {
         handle: std.Io.File,
@@ -754,6 +768,7 @@ pub const Response = struct {
     /// The headers are on the wire when this returns, so nothing can change
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
+        try self.runHeadersHook();
         self.startBody();
         // Everything that can fail comes before anything is committed: a
         // handler that gets an error from here still has open headers,
@@ -791,6 +806,11 @@ pub const Response = struct {
         }
         try self.resolve(self.sendHeaderAlone(self.conn.writer));
         return .init(self, buf, compressor);
+    }
+
+    fn runHeadersHook(self: *Response) HeadersHookError!void {
+        const hook = self.headers_hook orelse return;
+        return hook.call(hook.ptr);
     }
 
     fn startBody(self: *Response) void {
@@ -1036,6 +1056,10 @@ pub const Response = struct {
         // Compute accept key
         var accept_key: [28]u8 = undefined;
         WebSocket.computeAcceptKey(key, &accept_key);
+
+        // Before anything is changed, so a hook that fails leaves a
+        // response the error path can still replace.
+        try self.runHeadersHook();
 
         // Send 101 Switching Protocols response
         self.status = .switching_protocols;

@@ -88,7 +88,7 @@ pub fn init(config: Config) !Session {
 ///     pub const RequestContext = struct {
 ///         session: dusty.SessionData = .{},
 ///     };
-pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
+pub fn execute(self: *const Session, req: *Request, _: *Response, executor: anytype) !void {
     if (comptime !@hasField(@TypeOf(executor.ctx), "session")) {
         @compileError("the Session middleware needs `session: dusty.SessionData = .{}` in the app's RequestContext");
     }
@@ -102,33 +102,24 @@ pub fn execute(self: *const Session, req: *Request, res: *Response, executor: an
         };
     }
 
-    try executor.next();
+    return executor.next();
+}
 
-    // Re-sign if modified, or if max_age is set and session has data (sliding expiry)
-    const should_set = session.modified or (self.config.max_age != null and session.len > 0);
+/// Re-signs the cookie when the session changed, or on every response
+/// that has a session when `max_age` slides the expiry.
+pub fn onHeaders(self: *const Session, req: *Request, res: *Response, ctx: anytype) !void {
+    const session = &ctx.session;
+    if (!session.modified and (self.config.max_age == null or session.len == 0)) return;
 
-    if (should_set) {
-        const result = if (session.len == 0) blk: {
-            // Session was cleared — delete the cookie
-            var delete_opts = self.config.cookie_opts;
-            delete_opts.max_age = .zero;
-            break :blk res.setCookie(self.config.cookie_name, "", delete_opts);
-        } else blk: {
-            const signed = try self.signSession(req.arena, session, .now(req.io, .real));
-            var opts = self.config.cookie_opts;
-            if (self.config.max_age) |ma| {
-                opts.max_age = ma;
-            }
-            break :blk res.setCookie(self.config.cookie_name, signed, opts);
-        };
-        result catch |err| switch (err) {
-            // The handler streamed its response, so the headers left before
-            // we got here and the cookie cannot be refreshed. That is the
-            // handler's choice to make, not a failure of the request.
-            error.HeadersAlreadySent => log.debug("session cookie not set: response already started", .{}),
-            else => |e| return e,
-        };
+    if (session.len == 0) {
+        var delete_opts = self.config.cookie_opts;
+        delete_opts.max_age = .zero;
+        return res.setCookie(self.config.cookie_name, "", delete_opts);
     }
+    const signed = try self.signSession(req.arena, session, .now(req.io, .real));
+    var opts = self.config.cookie_opts;
+    if (self.config.max_age) |ma| opts.max_age = ma;
+    return res.setCookie(self.config.cookie_name, signed, opts);
 }
 
 const Header = packed struct(u64) {
@@ -495,4 +486,52 @@ test "Session: the handler reads and writes the session in the request context" 
     var loaded: SessionData = .{};
     try session.load(arena.allocator(), &loaded, value, testing.io);
     try testing.expectEqualStrings("admin", loaded.get("role").?);
+}
+
+test "Session: a streaming handler that changes the session still gets the cookie" {
+    const Executor = @import("../middleware.zig").Executor;
+    const Middleware = @import("../middleware.zig").Middleware;
+    const Connection = @import("../server.zig").Connection;
+
+    const App = struct {
+        pub const RequestContext = struct {
+            session: SessionData = .{},
+        };
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var session: Session = .{ .config = .{ .secret_key = "test-secret-key-that-is-long-enough" } };
+    var req: Request = .{ .arena = arena.allocator(), .io = testing.io, .transport = undefined, .parser = undefined, .method = .get, .url = "/" };
+    req.headers = try .init(arena.allocator(), 4);
+    var buf: [1024]u8 = undefined;
+    var conn_writer: std.Io.Writer = .fixed(&buf);
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&conn_writer);
+    var res = try Response.init(arena.allocator(), &connection, 32);
+
+    const middlewares = [_]Middleware(App){.init(&session)};
+    var app: App = .{};
+    var executor: Executor(App) = .{
+        .req = &req,
+        .res = &res,
+        .app = &app,
+        .action = struct {
+            fn handle(_: *App, r: *Request, rs: *Response) !void {
+                try r.ctx(App).session.set("user_id", "42");
+                var stream_buf: [64]u8 = undefined;
+                var body = try rs.stream(&stream_buf);
+                try body.interface.writeAll("streamed");
+                try body.end();
+            }
+        }.handle,
+        .middlewares = &middlewares,
+    };
+    executor.attachCtx();
+    try executor.run();
+
+    const written = conn_writer.buffered();
+    const head = written[0..std.mem.indexOf(u8, written, "\r\n\r\n").?];
+    try testing.expect(std.mem.indexOf(u8, head, "\r\nSet-Cookie: session=") != null);
 }
