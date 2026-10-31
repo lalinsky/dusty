@@ -1,0 +1,75 @@
+site_name: Dusty
+site_description: HTTP client and server library for Zig
+site_url: https://lalinsky.github.io/dusty/
+repo_url: https://github.com/lalinsky/dusty
+repo_name: lalinsky/dusty
+
+theme:
+  name: material
+  icon:
+    logo: material/weather-dust
+  palette:
+    - scheme: default
+      primary: brown
+      accent: orange
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: brown
+      accent: orange
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.tabs.link
+    - content.code.annotation
+    - content.code.copy
+
+nav:
+  - Overview: index.md
+  - Getting Started: getting-started.md
+  - Build Options: build-options.md
+  - API Reference: apidocs/
+  - Changelog: changelog.md
+  - Server:
+    - Routing: server/routing.md
+    - Handlers: server/handlers.md
+    - Requests: server/requests.md
+    - Responses: server/responses.md
+    - Templating: server/templating.md
+    - Serialization: server/serialization.md
+    - Middleware: server/middleware.md
+    - Static Files and Assets: server/static-files.md
+    - WebSocket: server/websocket.md
+    - Server-Sent Events: server/sse.md
+    - Configuration: server/configuration.md
+    - Deployment: server/deployment.md
+  - Client:
+    - Making Requests: client/requests.md
+    - Streaming Responses: client/streaming.md
+    - WebSocket: client/websocket.md
+    - Configuration: client/configuration.md
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      check_paths: true
+  - pymdownx.superfences
+  - admonition
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - md_in_html

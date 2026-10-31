@@ -485,8 +485,7 @@ Serialization:
 
 Templating:
 
-- [zmpl](https://github.com/jetzig-framework/zmpl) - Templating language inspired by Go Templ
-- [zt](https://github.com/lalinsky/zt) - Another templating language inspired by Go Templ
+- [zt](https://github.com/lalinsky/zt) - Templating language inspired by Go Templ
 
 Others:
 

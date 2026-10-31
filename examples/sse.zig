@@ -1,57 +1,44 @@
 const std = @import("std");
 const http = @import("dusty");
 
-const App = struct {
-    counter: std.atomic.Value(u64),
-};
+// --8<-- [start:countdown]
+fn countdown(req: *http.Request, res: *http.Response) !void {
+    req.setTimeout(.none);
 
-fn handleEvents(app: *App, req: *http.Request, res: *http.Response) !void {
-    var event_buf: [4096]u8 = undefined;
-    var stream = try res.startEventStream(&event_buf);
+    var buf: [4096]u8 = undefined;
+    var events = try res.startEventStream(&buf);
 
-    try stream.send("connected", .{});
-
-    var last_seen: u64 = 0;
-    while (true) {
-        const current = app.counter.load(.acquire);
-        if (current != last_seen) {
-            last_seen = current;
-            var buf: [64]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&buf, "tick {d}", .{current});
-            try stream.send(msg, .{ .event = "tick" });
-        }
-        try req.io.sleep(.fromMilliseconds(100), .real);
+    var n: u32 = 10;
+    while (n > 0) : (n -= 1) {
+        const id = try std.fmt.allocPrint(req.arena, "{d}", .{n});
+        try events.send(id, .{ .event = "tick", .id = id });
+        try req.io.sleep(.fromSeconds(1), .awake);
     }
+    try events.send("liftoff", .{ .event = "done" });
 }
+// --8<-- [end:countdown]
 
-pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
-    var app: App = .{ .counter = std.atomic.Value(u64).init(0) };
+// --8<-- [start:writer]
+fn status(req: *http.Request, res: *http.Response) !void {
+    var buf: [4096]u8 = undefined;
+    var events = try res.startEventStream(&buf);
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    var server = http.Server(App).init(allocator, io, .{
-        .listeners = &.{.{ .address = addr }},
-    }, &app);
-    defer server.deinit();
-
-    server.router.get("/events", handleEvents);
-
-    std.log.info("SSE server running at http://127.0.0.1:8080", .{});
-    std.log.info("Try: curl http://127.0.0.1:8080/events", .{});
-
-    // Run ticker in background
-    var ticker_future = try io.concurrent(struct {
-        fn run(counter: *std.atomic.Value(u64), _io: std.Io) !void {
-            while (true) {
-                try _io.sleep(.fromMilliseconds(1000), .real);
-                _ = counter.fetchAdd(1, .release);
-            }
-        }
-    }.run, .{ &app.counter, io });
-    defer ticker_future.cancel(io) catch {};
-
-    try server.run();
+    var event = try events.startSend(.{ .event = "status" });
+    try event.interface.print("{{\"method\":\"{f}\",\"path\":\"{s}\"}}", .{ req.method, req.url });
+    try event.end();
 }
+// --8<-- [end:writer]
 
 pub fn main(init: std.process.Init) !void {
-    try runServer(init.gpa, init.io);
+    var server = http.Server(void).init(init.gpa, init.io, .{
+        .listeners = &.{.{
+            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) },
+        }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/countdown", countdown);
+    server.router.get("/status", status);
+
+    try server.run();
 }
