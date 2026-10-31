@@ -28,6 +28,33 @@ fn echo(req: *http.Request, res: *http.Response) !void {
 }
 // --8<-- [end:echo]
 
+// --8<-- [start:batch]
+fn echoBatch(req: *http.Request, res: *http.Response) !void {
+    var ws = try res.upgradeWebSocket(req) orelse {
+        res.status = .bad_request;
+        return res.print(.text, "Expected a WebSocket upgrade\n", .{});
+    };
+    defer ws.deinit();
+    ws.autoflush = false;
+
+    while (true) {
+        req.setTimeout(idle_timeout);
+        const batch = ws.receiveMany() catch |err| switch (err) {
+            error.EndOfStream => return,
+            else => return err,
+        };
+        for (batch) |msg| {
+            switch (msg.type) {
+                .text, .binary => try ws.send(msg.type, msg.data),
+                .close => return,
+                else => {},
+            }
+        }
+        try ws.flush();
+    }
+}
+// --8<-- [end:batch]
+
 fn index(res: *http.Response) !void {
     try res.print(.html,
         \\<!DOCTYPE html>
@@ -55,6 +82,7 @@ pub fn main(init: std.process.Init) !void {
 
     server.router.get("/", index);
     server.router.get("/ws", echo);
+    server.router.get("/ws/batch", echoBatch);
 
     try server.run();
 }
