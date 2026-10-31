@@ -1,14 +1,14 @@
 const std = @import("std");
 const http = @import("dusty");
 
-const AppContext = struct {
+const App = struct {
     client: *http.Client,
     upstream_url: []const u8,
 };
 
-fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+fn handleProxy(app: *App, req: *http.Request, res: *http.Response) !void {
     // Build the full upstream URL
-    const full_url = try std.fmt.allocPrint(req.arena, "{s}{s}", .{ ctx.upstream_url, req.url });
+    const full_url = try std.fmt.allocPrint(req.arena, "{s}{s}", .{ app.upstream_url, req.url });
     std.log.info("Proxying {s} {s} -> {s}", .{ @tagName(req.method), req.url, full_url });
 
     // Create upstream request options
@@ -57,7 +57,7 @@ fn handleProxy(ctx: *AppContext, req: *http.Request, res: *http.Response) !void 
     }
 
     // Make upstream request
-    var upstream_res = ctx.client.fetch(full_url, upstream_req) catch |err| {
+    var upstream_res = app.client.fetch(full_url, upstream_req) catch |err| {
         std.log.err("Upstream request failed: {}", .{err});
         res.status = .bad_gateway;
         res.body = try std.fmt.allocPrint(res.arena, "Upstream error: {s}\n", .{@errorName(err)});
@@ -107,15 +107,15 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io, upstream_url: []const
     var client = http.Client.init(allocator, io, .{});
     defer client.deinit();
 
-    var ctx: AppContext = .{
+    var app: App = .{
         .client = &client,
         .upstream_url = upstream_url,
     };
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    var server = http.Server(AppContext).init(allocator, io, .{
+    var server = http.Server(App).init(allocator, io, .{
         .listeners = &.{.{ .address = addr }},
-    }, &ctx);
+    }, &app);
     defer server.deinit();
 
     // Catch-all route - proxy everything for all common HTTP methods

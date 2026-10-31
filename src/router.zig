@@ -51,26 +51,26 @@ const Node = struct {
     route: ?*const anyopaque,
 };
 
-pub fn Action(comptime Ctx: type) type {
-    return *const Router(Ctx).Handler;
+pub fn Action(comptime App: type) type {
+    return *const Router(App).Handler;
 }
 
-pub fn Router(comptime Ctx: type) type {
+pub fn Router(comptime App: type) type {
     return struct {
         const Self = @This();
 
         /// What the router calls. A handler registered with `get`, `post`
-        /// and the like can instead take any of `*Ctx`, `*Request`,
-        /// `*Response` and `*Ctx.RequestState`, in any order.
-        pub const Handler = if (Ctx == void)
+        /// and the like can instead take any of `*App`, `*Request`,
+        /// `*Response` and `*App.RequestContext`, in any order.
+        pub const Handler = if (App == void)
             fn (*Request, *Response) anyerror!void
         else
-            fn (*Ctx, *Request, *Response) anyerror!void;
+            fn (*App, *Request, *Response) anyerror!void;
 
         pub const Route = struct {
             info: RouteInfo,
             action: *const Handler,
-            middlewares: []const Middleware(Ctx),
+            middlewares: []const Middleware(App),
         };
 
         arena: std.heap.ArenaAllocator,
@@ -79,7 +79,7 @@ pub fn Router(comptime Ctx: type) type {
         // Routes registered with `any`, tried after the method's own tree
         any_tree: ?*Node = null,
         // Global middlewares applied to all routes
-        middlewares: []const Middleware(Ctx) = &.{},
+        middlewares: []const Middleware(App) = &.{},
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
@@ -153,7 +153,7 @@ pub fn Router(comptime Ctx: type) type {
             path: []const u8,
             method: ?Method,
             handler: *const Handler,
-            middlewares: []const Middleware(Ctx),
+            middlewares: []const Middleware(App),
             data: ?*const anyopaque,
         ) !void {
             if (self.findConflict(path, method)) |c| {
@@ -378,7 +378,7 @@ pub fn Router(comptime Ctx: type) type {
             self.addStatic(prefix, dir, opts, self.middlewares);
         }
 
-        fn addStatic(self: *Self, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions, middlewares: []const Middleware(Ctx)) void {
+        fn addStatic(self: *Self, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions, middlewares: []const Middleware(App)) void {
             const alloc = self.arena.allocator();
             const files = alloc.create(Static) catch @panic("OOM");
             files.* = .{ .dir = dir, .options = opts };
@@ -399,7 +399,7 @@ pub fn Router(comptime Ctx: type) type {
             self.addEmbedded(path, data, opts, self.middlewares);
         }
 
-        fn addEmbedded(self: *Self, path: []const u8, data: []const u8, opts: EmbeddedOptions, middlewares: []const Middleware(Ctx)) void {
+        fn addEmbedded(self: *Self, path: []const u8, data: []const u8, opts: EmbeddedOptions, middlewares: []const Middleware(App)) void {
             const alloc = self.arena.allocator();
             const file = alloc.create(Embedded) catch @panic("OOM");
             file.* = Embedded.init(alloc, path, data, opts) catch @panic("OOM");
@@ -408,28 +408,28 @@ pub fn Router(comptime Ctx: type) type {
 
         const staticAction = wrap(Static.handle);
 
-        const CtxPtr = if (Ctx == void) void else *Ctx;
+        const AppPtr = if (App == void) void else *App;
 
         fn wrap(comptime handler: anytype) Handler {
             const F = @TypeOf(handler);
             const returns_error = inject.returnsError(F, "handler " ++ @typeName(F), true);
             if (returns_error and std.meta.ArgsTuple(F) == std.meta.ArgsTuple(Handler)) return handler;
             const H = struct {
-                fn call(ctx: CtxPtr, req: *Request, res: *Response) anyerror!void {
-                    return @call(.auto, handler, inject.args(Ctx, F, ctx, req, res, {}));
+                fn call(app: AppPtr, req: *Request, res: *Response) anyerror!void {
+                    return @call(.auto, handler, inject.args(App, F, app, req, res, {}));
                 }
 
                 fn callVoid(req: *Request, res: *Response) anyerror!void {
                     return call({}, req, res);
                 }
             };
-            return if (Ctx == void) H.callVoid else H.call;
+            return if (App == void) H.callVoid else H.call;
         }
 
         /// Routes registered on the group get `prefix` in front of their
         /// path and run `middlewares` after the router's. A null or "/"
         /// prefix adds nothing, and trailing slashes are dropped.
-        pub fn group(self: *Self, prefix: ?[]const u8, middlewares: []const Middleware(Ctx)) Group {
+        pub fn group(self: *Self, prefix: ?[]const u8, middlewares: []const Middleware(App)) Group {
             return .{ .router = self, .prefix = trimPrefix(prefix), .middlewares = middlewares };
         }
 
@@ -437,10 +437,10 @@ pub fn Router(comptime Ctx: type) type {
             return std.mem.trimEnd(u8, prefix orelse "", "/");
         }
 
-        fn concatMiddlewares(self: *Self, a: []const Middleware(Ctx), b: []const Middleware(Ctx)) []const Middleware(Ctx) {
+        fn concatMiddlewares(self: *Self, a: []const Middleware(App), b: []const Middleware(App)) []const Middleware(App) {
             if (a.len == 0) return b;
             if (b.len == 0) return a;
-            const merged = self.arena.allocator().alloc(Middleware(Ctx), a.len + b.len) catch @panic("OOM");
+            const merged = self.arena.allocator().alloc(Middleware(App), a.len + b.len) catch @panic("OOM");
             @memcpy(merged[0..a.len], a);
             @memcpy(merged[a.len..], b);
             return merged;
@@ -451,11 +451,11 @@ pub fn Router(comptime Ctx: type) type {
             prefix: []const u8,
             /// The group's own and its parents', not the router's, which
             /// are added at registration.
-            middlewares: []const Middleware(Ctx),
+            middlewares: []const Middleware(App),
 
             /// A group inside this one: the prefixes join, and its
             /// middlewares run after this group's.
-            pub fn group(g: Group, prefix: ?[]const u8, middlewares: []const Middleware(Ctx)) Group {
+            pub fn group(g: Group, prefix: ?[]const u8, middlewares: []const Middleware(App)) Group {
                 return .{
                     .router = g.router,
                     .prefix = g.concatPath(trimPrefix(prefix)),
@@ -463,7 +463,7 @@ pub fn Router(comptime Ctx: type) type {
                 };
             }
 
-            fn mergeMiddlewares(g: Group) []const Middleware(Ctx) {
+            fn mergeMiddlewares(g: Group) []const Middleware(App) {
                 return g.router.concatMiddlewares(g.router.middlewares, g.middlewares);
             }
 
@@ -598,22 +598,22 @@ fn decodedByte(s: []const u8, i: *usize) u8 {
 }
 
 // Tests
-const TestRouter = Router(TestContext);
+const TestRouter = Router(TestApp);
 
-const TestContext = struct {
+const TestApp = struct {
     called: bool = false,
 };
 
-fn testHandler(ctx: *TestContext, req: *Request, res: *Response) !void {
+fn testHandler(app: *TestApp, req: *Request, res: *Response) !void {
     _ = req;
     _ = res;
-    ctx.called = true;
+    app.called = true;
 }
 
-fn testHandler2(ctx: *TestContext, req: *Request, res: *Response) !void {
+fn testHandler2(app: *TestApp, req: *Request, res: *Response) !void {
     _ = req;
     _ = res;
-    _ = ctx;
+    _ = app;
 }
 
 fn split(req: *Request) !*Request {

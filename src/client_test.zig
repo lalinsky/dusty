@@ -226,7 +226,7 @@ test "Client: pool evicts dead connection after server goes away" {
 test "Client: redirect failing after connection release does not double-release" {
     const io = std.testing.io;
 
-    const Ctx = struct {
+    const App = struct {
         location: []const u8,
     };
 
@@ -242,15 +242,15 @@ test "Client: redirect failing after connection release does not double-release"
     };
 
     var location_buf: [64]u8 = undefined;
-    var ctx: Ctx = .{
+    var app: App = .{
         .location = try std.fmt.bufPrint(&location_buf, "http://127.0.0.1:{d}/", .{dead_port}),
     };
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    var server = dusty.Server(App).init(std.testing.allocator, io, .{ .listeners = loopback }, &app);
     defer server.deinit();
 
     server.router.get("/redirect", struct {
-        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handle(c: *App, req: *dusty.Request, res: *dusty.Response) !void {
             _ = req;
             res.status = .found;
             try res.header("Location", c.location);
@@ -258,7 +258,7 @@ test "Client: redirect failing after connection release does not double-release"
     }.handle);
 
     server.router.get("/ok", struct {
-        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handle(c: *App, req: *dusty.Request, res: *dusty.Response) !void {
             _ = c;
             _ = req;
             res.body = "OK";
@@ -266,7 +266,7 @@ test "Client: redirect failing after connection release does not double-release"
     }.handle);
 
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(Ctx)) !void {
+        fn run(s: *dusty.Server(App)) !void {
             try s.run();
         }
     }.run, .{&server});

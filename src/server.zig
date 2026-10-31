@@ -416,9 +416,9 @@ fn setRequestTimeout(context: *anyopaque, io: std.Io, timeout: std.Io.Timeout) v
     timer.set(io, timeout);
 }
 
-pub fn Server(comptime Ctx: type) type {
+pub fn Server(comptime App: type) type {
     const MiddlewareItem = struct {
-        middleware: Middleware(Ctx),
+        middleware: Middleware(App),
         node: std.SinglyLinkedList.Node = .{},
     };
 
@@ -427,8 +427,8 @@ pub fn Server(comptime Ctx: type) type {
 
         allocator: std.mem.Allocator,
         io: std.Io,
-        router: Router(Ctx),
-        ctx: if (Ctx == void) void else *Ctx,
+        router: Router(App),
+        app: if (App == void) void else *App,
         config: ServerConfig,
         active_connections: std.atomic.Value(u32),
         /// What the drain waits on: connections with a request in flight,
@@ -496,12 +496,12 @@ pub fn Server(comptime Ctx: type) type {
             draining: bool = false,
         };
 
-        pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, ctx: if (Ctx == void) void else *Ctx) Self {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, app: if (App == void) void else *App) Self {
             return .{
                 .allocator = allocator,
                 .io = io,
-                .router = Router(Ctx).init(allocator),
-                .ctx = ctx,
+                .router = Router(App).init(allocator),
+                .app = app,
                 .config = config,
                 .active_connections = std.atomic.Value(u32).init(0),
                 .busy = .init(.{}),
@@ -527,7 +527,7 @@ pub fn Server(comptime Ctx: type) type {
         /// Creates a middleware instance managed by the server.
         /// The middleware is allocated on the router's arena and will be freed when the server is deinit'd.
         /// Supports middlewares with init(Config) or init(Config, MiddlewareConfig) signatures.
-        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(Ctx) {
+        pub fn middleware(self: *Self, comptime M: type, config: M.Config) !Middleware(App) {
             const arena = self.router.arena.allocator();
             const m = try arena.create(M);
             const init_info = @typeInfo(@TypeOf(M.init)).@"fn";
@@ -542,7 +542,7 @@ pub fn Server(comptime Ctx: type) type {
                 else => @compileError(@typeName(M) ++ ".init must accept 1 or 2 parameters"),
             };
 
-            const mw = Middleware(Ctx).init(m);
+            const mw = Middleware(App).init(m);
 
             // Register for cleanup on deinit
             const item = try arena.create(MiddlewareItem);
@@ -1314,15 +1314,15 @@ pub fn Server(comptime Ctx: type) type {
                     },
                     else => |e| return e,
                 };
-                var executor = Executor(Ctx){
+                var executor = Executor(App){
                     .req = &request,
                     .res = &response,
-                    .ctx = self.ctx,
+                    .app = self.app,
                     .action = if (found) |r| r.action else null,
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
                 };
-                executor.attachState();
-                defer executor.detachState();
+                executor.attachCtx();
+                defer executor.detachCtx();
                 executor.run() catch |err| switch (err) {
                     error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
                     error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,

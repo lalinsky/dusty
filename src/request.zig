@@ -14,40 +14,40 @@ pub const Cookie = @import("cookie.zig").Cookie;
 
 const placeholder_listener: Listener = .{ .address = .{ .ip = .{ .ip4 = .unspecified(0) } } };
 
-/// The per-request state an app declares as `App.RequestState`, or an
+/// The per-request data an app declares as `App.RequestContext`, or an
 /// empty struct when it declares none.
-pub fn RequestState(comptime App: type) type {
-    if (App == void or !@hasDecl(App, "RequestState")) return struct {};
-    const S = App.RequestState;
-    if (@typeInfo(S) != .@"struct") @compileError(@typeName(App) ++ ".RequestState must be a struct");
+pub fn RequestContext(comptime App: type) type {
+    if (App == void or !@hasDecl(App, "RequestContext")) return struct {};
+    const S = App.RequestContext;
+    if (@typeInfo(S) != .@"struct") @compileError(@typeName(App) ++ ".RequestContext must be a struct");
     const info = @typeInfo(S).@"struct";
     // Zig 0.17 split `fields` into parallel arrays.
     if (@hasField(@TypeOf(info), "fields")) {
         for (info.fields) |f| {
-            if (f.default_value_ptr == null) @compileError(@typeName(App) ++ ".RequestState." ++ f.name ++ " needs a default value");
+            if (f.default_value_ptr == null) @compileError(@typeName(App) ++ ".RequestContext." ++ f.name ++ " needs a default value");
         }
     } else {
         for (info.field_names, info.field_attrs) |name, attrs| {
-            if (attrs.default_value_ptr == null) @compileError(@typeName(App) ++ ".RequestState." ++ name ++ " needs a default value");
+            if (attrs.default_value_ptr == null) @compileError(@typeName(App) ++ ".RequestContext." ++ name ++ " needs a default value");
         }
     }
     return S;
 }
 
-const StatePtr = struct {
+const ContextPtr = struct {
     ptr: ?*anyopaque,
     tag: if (std.debug.runtime_safety) ?*const anyopaque else void,
 
-    pub const empty: StatePtr = .{ .ptr = null, .tag = if (std.debug.runtime_safety) null else {} };
+    pub const empty: ContextPtr = .{ .ptr = null, .tag = if (std.debug.runtime_safety) null else {} };
 
-    pub fn init(comptime T: type, ptr: *T) StatePtr {
+    pub fn init(comptime T: type, ptr: *T) ContextPtr {
         return .{ .ptr = ptr, .tag = if (std.debug.runtime_safety) tagOf(T) else {} };
     }
 
-    pub inline fn get(self: StatePtr, comptime T: type) *T {
-        const ptr = self.ptr orelse @panic("request has no state attached");
+    pub inline fn get(self: ContextPtr, comptime T: type) *T {
+        const ptr = self.ptr orelse @panic("request has no context attached");
         if (std.debug.runtime_safety and self.tag != tagOf(T)) {
-            @panic("request state read as " ++ @typeName(T) ++ ", which is not the server's");
+            @panic("request context read as " ++ @typeName(T) ++ ", which is not the server's");
         }
         return @ptrCast(@alignCast(ptr));
     }
@@ -134,9 +134,9 @@ pub const Request = struct {
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
     _mfd_read: bool = false,
-    // The executor's `RequestState`, attached by the server until the
+    // The executor's `RequestContext`, attached by the server until the
     // response is written.
-    _state: StatePtr = .empty,
+    _ctx: ContextPtr = .empty,
 
     // 100-continue support
     response: ?*Response = null,
@@ -171,10 +171,10 @@ pub const Request = struct {
         };
     }
 
-    /// The `RequestState` of this request, as middleware sees it through
-    /// `executor.state`. Valid until the response has been written.
-    pub fn state(self: *const Request, comptime App: type) *RequestState(App) {
-        return self._state.get(RequestState(App));
+    /// The `RequestContext` of this request, as middleware sees it through
+    /// `executor.ctx`. Valid until the response has been written.
+    pub fn ctx(self: *const Request, comptime App: type) *RequestContext(App) {
+        return self._ctx.get(RequestContext(App));
     }
 
     /// Replaces the deadline for this request. A duration starts now, a

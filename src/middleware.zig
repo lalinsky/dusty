@@ -1,6 +1,6 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
-const RequestState = @import("request.zig").RequestState;
+const RequestContext = @import("request.zig").RequestContext;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
 const inject = @import("inject.zig");
@@ -15,7 +15,7 @@ pub const MiddlewareConfig = struct {
     allocator: std.mem.Allocator,
 };
 
-pub fn Middleware(comptime Ctx: type) type {
+pub fn Middleware(comptime App: type) type {
     return struct {
         const Self = @This();
 
@@ -24,7 +24,7 @@ pub fn Middleware(comptime Ctx: type) type {
             ptr: *anyopaque,
             req: *Request,
             res: *Response,
-            executor: *Executor(Ctx),
+            executor: *Executor(App),
         ) anyerror!void,
         deinitFn: ?*const fn (ptr: *anyopaque) void,
 
@@ -33,7 +33,7 @@ pub fn Middleware(comptime Ctx: type) type {
             const Impl = @typeInfo(Ptr).pointer.child;
 
             const gen = struct {
-                fn execute(ptr: *anyopaque, req: *Request, res: *Response, executor: *Executor(Ctx)) anyerror!void {
+                fn execute(ptr: *anyopaque, req: *Request, res: *Response, executor: *Executor(App)) anyerror!void {
                     const self: Ptr = @ptrCast(@alignCast(ptr));
                     return self.execute(req, res, executor);
                 }
@@ -51,7 +51,7 @@ pub fn Middleware(comptime Ctx: type) type {
             };
         }
 
-        pub fn execute(self: Self, req: *Request, res: *Response, executor: *Executor(Ctx)) !void {
+        pub fn execute(self: Self, req: *Request, res: *Response, executor: *Executor(App)) !void {
             return self.executeFn(self.ptr, req, res, executor);
         }
 
@@ -63,26 +63,26 @@ pub fn Middleware(comptime Ctx: type) type {
     };
 }
 
-pub fn Executor(comptime Ctx: type) type {
+pub fn Executor(comptime App: type) type {
     return struct {
         const Self = @This();
 
         index: usize = 0,
         req: *Request,
         res: *Response,
-        ctx: if (Ctx == void) void else *Ctx,
-        action: ?Action(Ctx),
-        middlewares: []const Middleware(Ctx),
-        /// The app's `RequestState` for this request, also reachable as
-        /// `req.state(Ctx)` between `attachState` and `detachState`.
-        state: RequestState(Ctx) = .{},
+        app: if (App == void) void else *App,
+        action: ?Action(App),
+        middlewares: []const Middleware(App),
+        /// The app's `RequestContext` for this request, also reachable as
+        /// `req.ctx(App)` between `attachCtx` and `detachCtx`.
+        ctx: RequestContext(App) = .{},
 
-        pub fn attachState(self: *Self) void {
-            self.req._state = .init(RequestState(Ctx), &self.state);
+        pub fn attachCtx(self: *Self) void {
+            self.req._ctx = .init(RequestContext(App), &self.ctx);
         }
 
-        pub fn detachState(self: *Self) void {
-            self.req._state = .empty;
+        pub fn detachCtx(self: *Self) void {
+            self.req._ctx = .empty;
         }
 
         pub fn run(self: *Self) !void {
@@ -144,12 +144,12 @@ pub fn Executor(comptime Ctx: type) type {
 
             // All middlewares executed, call dispatcher or handler
             const action = self.action orelse return self.handleNotFound();
-            const result = if (comptime Ctx != void and @hasDecl(Ctx, "dispatch"))
-                self.ctx.dispatch(action, self.req, self.res)
-            else if (comptime Ctx == void)
+            const result = if (comptime App != void and @hasDecl(App, "dispatch"))
+                self.app.dispatch(action, self.req, self.res)
+            else if (comptime App == void)
                 action(self.req, self.res)
             else
-                action(self.ctx, self.req, self.res);
+                action(self.app, self.req, self.res);
             // A handler that finds nothing to answer with answers as if no
             // route had matched.
             result catch |err| switch (err) {
@@ -165,9 +165,9 @@ pub fn Executor(comptime Ctx: type) type {
             // headers yet: a middleware that started streaming has already
             // committed the framing, so there is nothing to replace.
             if (!self.res.headers_written) self.res.resetBody();
-            if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
-                _ = inject.returnsError(@TypeOf(Ctx.notFound), @typeName(Ctx) ++ ".notFound", true);
-                return @call(.auto, Ctx.notFound, inject.args(Ctx, @TypeOf(Ctx.notFound), self.ctx, self.req, self.res, {}));
+            if (comptime App != void and @hasDecl(App, "notFound")) {
+                _ = inject.returnsError(@TypeOf(App.notFound), @typeName(App) ++ ".notFound", true);
+                return @call(.auto, App.notFound, inject.args(App, @TypeOf(App.notFound), self.app, self.req, self.res, {}));
             } else {
                 self.res.status = .not_found;
                 self.res.content_type = .text;
@@ -181,9 +181,9 @@ pub fn Executor(comptime Ctx: type) type {
             // error response. The caller has already checked that the
             // headers are still open.
             self.res.resetBody();
-            if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
-                _ = inject.returnsError(@TypeOf(Ctx.uncaughtError), @typeName(Ctx) ++ ".uncaughtError", false);
-                @call(.auto, Ctx.uncaughtError, inject.args(Ctx, @TypeOf(Ctx.uncaughtError), self.ctx, self.req, self.res, err));
+            if (comptime App != void and @hasDecl(App, "uncaughtError")) {
+                _ = inject.returnsError(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError", false);
+                @call(.auto, App.uncaughtError, inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err));
             } else if (self.req.bodyErrorStatus(err)) |status| {
                 self.res.status = status;
                 self.res.content_type = .text;
@@ -284,7 +284,7 @@ test "Middleware: single middleware executes before handler" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = testHandler,
         .middlewares = &middlewares,
     };
@@ -317,7 +317,7 @@ test "Middleware: multiple middlewares execute in order" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = testHandler,
         .middlewares = &middlewares,
     };
@@ -352,7 +352,7 @@ test "Middleware: short-circuit prevents handler execution" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = testHandler,
         .middlewares = &middlewares,
     };
@@ -375,7 +375,7 @@ test "Middleware: no middlewares calls handler directly" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = testHandler,
         .middlewares = &.{},
     };
@@ -394,7 +394,7 @@ test "Executor: a handler returning NotFound gets the 404" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = struct {
             fn handle(_: *Request, r: *Response) !void {
                 r.body = "partial";
@@ -423,7 +423,7 @@ test "Middleware: no action returns 404" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = null,
         .middlewares = &middlewares,
     };
@@ -448,7 +448,7 @@ test "Executor: default 500 handler on action error" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = errorHandler,
         .middlewares = &.{},
     };
@@ -472,7 +472,7 @@ test "Executor: a departed peer is not the handler's fault" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = goneHandler,
         .middlewares = &.{},
     };
@@ -495,7 +495,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = goneHandler,
         .middlewares = &.{},
     };
@@ -518,7 +518,7 @@ test "Executor: error after headers written propagates instead of rewriting the 
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = errorHandler,
         .middlewares = &.{},
     };
@@ -531,135 +531,135 @@ test "Executor: error after headers written propagates instead of rewriting the 
     try std.testing.expectEqualStrings("", res.body);
 }
 
-const CustomCtx = struct {
+const CustomApp = struct {
     not_found_called: bool = false,
     uncaught_error_called: bool = false,
     dispatch_called: bool = false,
     last_error: ?anyerror = null,
 
-    pub fn notFound(self: *CustomCtx, _: *Request, res: *Response) !void {
+    pub fn notFound(self: *CustomApp, _: *Request, res: *Response) !void {
         self.not_found_called = true;
         res.status = .not_found;
         res.body = "custom 404";
     }
 
-    pub fn uncaughtError(self: *CustomCtx, err: anyerror, res: *Response) void {
+    pub fn uncaughtError(self: *CustomApp, err: anyerror, res: *Response) void {
         self.uncaught_error_called = true;
         self.last_error = err;
         res.status = .internal_server_error;
         res.body = "custom 500";
     }
 
-    pub fn dispatch(self: *CustomCtx, action: Action(CustomCtx), req: *Request, res: *Response) !void {
+    pub fn dispatch(self: *CustomApp, action: Action(CustomApp), req: *Request, res: *Response) !void {
         self.dispatch_called = true;
         res.body = "before dispatch | ";
         try action(self, req, res);
     }
 };
 
-fn customCtxHandler(ctx: *CustomCtx, _: *Request, res: *Response) !void {
-    _ = ctx;
+fn customAppHandler(app: *CustomApp, _: *Request, res: *Response) !void {
+    _ = app;
     res.body = "custom handler";
 }
 
-fn customCtxErrorHandler(_: *CustomCtx, _: *Request, _: *Response) !void {
+fn customAppErrorHandler(_: *CustomApp, _: *Request, _: *Response) !void {
     return error.CustomError;
 }
 
 const ErrorMiddleware = struct {
-    pub fn execute(_: *const ErrorMiddleware, _: *Request, _: *Response, _: *Executor(CustomCtx)) !void {
+    pub fn execute(_: *const ErrorMiddleware, _: *Request, _: *Response, _: *Executor(CustomApp)) !void {
         return error.MiddlewareError;
     }
 };
 
 test "Executor: custom notFound handler" {
-    var ctx = CustomCtx{};
+    var app: CustomApp = .{};
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(CustomCtx){
+    var executor = Executor(CustomApp){
         .req = &req,
         .res = &res,
-        .ctx = &ctx,
+        .app = &app,
         .action = null,
         .middlewares = &.{},
     };
 
     executor.run() catch {};
 
-    try std.testing.expect(ctx.not_found_called);
+    try std.testing.expect(app.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
     try std.testing.expectEqualStrings("custom 404", res.body);
 }
 
 test "Executor: custom uncaughtError handler" {
-    var ctx = CustomCtx{};
+    var app: CustomApp = .{};
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(CustomCtx){
+    var executor = Executor(CustomApp){
         .req = &req,
         .res = &res,
-        .ctx = &ctx,
-        .action = customCtxErrorHandler,
+        .app = &app,
+        .action = customAppErrorHandler,
         .middlewares = &.{},
     };
 
     executor.run() catch {};
 
-    try std.testing.expect(ctx.uncaught_error_called);
-    try std.testing.expectEqual(error.CustomError, ctx.last_error.?);
+    try std.testing.expect(app.uncaught_error_called);
+    try std.testing.expectEqual(error.CustomError, app.last_error.?);
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("custom 500", res.body);
 }
 
 test "Executor: custom dispatch method" {
-    var ctx = CustomCtx{};
+    var app: CustomApp = .{};
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
-    var executor = Executor(CustomCtx){
+    var executor = Executor(CustomApp){
         .req = &req,
         .res = &res,
-        .ctx = &ctx,
-        .action = customCtxHandler,
+        .app = &app,
+        .action = customAppHandler,
         .middlewares = &.{},
     };
 
     try executor.run();
 
-    try std.testing.expect(ctx.dispatch_called);
+    try std.testing.expect(app.dispatch_called);
     try std.testing.expectEqualStrings("custom handler", res.body);
 }
 
 test "Executor: middleware error triggers custom uncaughtError" {
-    var ctx = CustomCtx{};
+    var app: CustomApp = .{};
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
     var mw = ErrorMiddleware{};
-    const middlewares = [_]Middleware(CustomCtx){Middleware(CustomCtx).init(&mw)};
+    const middlewares = [_]Middleware(CustomApp){Middleware(CustomApp).init(&mw)};
 
-    var executor = Executor(CustomCtx){
+    var executor = Executor(CustomApp){
         .req = &req,
         .res = &res,
-        .ctx = &ctx,
-        .action = customCtxHandler,
+        .app = &app,
+        .action = customAppHandler,
         .middlewares = &middlewares,
     };
 
     executor.run() catch {};
 
-    try std.testing.expect(ctx.uncaught_error_called);
-    try std.testing.expectEqual(error.MiddlewareError, ctx.last_error.?);
+    try std.testing.expect(app.uncaught_error_called);
+    try std.testing.expectEqual(error.MiddlewareError, app.last_error.?);
     try std.testing.expectEqual(.internal_server_error, res.status);
     try std.testing.expectEqualStrings("custom 500", res.body);
 }
@@ -679,7 +679,7 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         .action = struct {
             fn handle(_: *Request, r: *Response) !void {
                 r.content_type = .json;
@@ -731,7 +731,7 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     var executor = Executor(void){
         .req = &req,
         .res = &res,
-        .ctx = {},
+        .app = {},
         // No route matched, so the executor falls through to the 404.
         .action = null,
         .middlewares = &middlewares,
@@ -747,40 +747,40 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     try std.testing.expect(std.mem.endsWith(u8, written, "404 Not Found\n"));
 }
 
-test "Executor: middleware passes request state to the handler" {
-    const StateCtx = struct {
-        pub const RequestState = struct {
+test "Executor: middleware passes the request context to the handler" {
+    const AuthApp = struct {
+        pub const RequestContext = struct {
             user: ?[]const u8 = null,
         };
     };
 
     const AuthMiddleware = struct {
         pub fn execute(_: *const @This(), _: *Request, _: *Response, executor: anytype) !void {
-            executor.state.user = "alice";
+            executor.ctx.user = "alice";
             return executor.next();
         }
     };
 
-    var ctx: StateCtx = .{};
+    var app: AuthApp = .{};
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
     var res = makeTestResponse(&connection);
 
     var mw: AuthMiddleware = .{};
-    const middlewares = [_]Middleware(StateCtx){.init(&mw)};
-    var executor: Executor(StateCtx) = .{
+    const middlewares = [_]Middleware(AuthApp){.init(&mw)};
+    var executor: Executor(AuthApp) = .{
         .req = &req,
         .res = &res,
-        .ctx = &ctx,
+        .app = &app,
         .action = struct {
-            fn handle(_: *StateCtx, r: *Request, rs: *Response) !void {
-                rs.body = r.state(StateCtx).user orelse "nobody";
+            fn handle(_: *AuthApp, r: *Request, rs: *Response) !void {
+                rs.body = r.ctx(AuthApp).user orelse "nobody";
             }
         }.handle,
         .middlewares = &middlewares,
     };
-    executor.attachState();
+    executor.attachCtx();
 
     try executor.run();
     try std.testing.expectEqualStrings("alice", res.body);

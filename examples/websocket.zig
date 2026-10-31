@@ -1,13 +1,13 @@
 const std = @import("std");
 const http = @import("dusty");
 
-const AppContext = struct {};
+const App = struct {};
 
 const websocket_idle_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromSeconds(60), .clock = .awake },
 };
 
-fn handleWebSocket(_: *AppContext, req: *http.Request, res: *http.Response) !void {
+fn handleWebSocket(_: *App, req: *http.Request, res: *http.Response) !void {
     var ws = try res.upgradeWebSocket(req) orelse {
         res.status = .bad_request;
         res.body = "Expected WebSocket upgrade\n";
@@ -47,7 +47,7 @@ fn handleWebSocket(_: *AppContext, req: *http.Request, res: *http.Response) !voi
     try ws.close(.normal, "goodbye");
 }
 
-fn handleIndex(_: *AppContext, _: *http.Request, res: *http.Response) !void {
+fn handleIndex(_: *App, _: *http.Request, res: *http.Response) !void {
     try res.header("Content-Type", "text/html");
     res.body =
         \\<!DOCTYPE html>
@@ -76,12 +76,12 @@ fn handleIndex(_: *AppContext, _: *http.Request, res: *http.Response) !void {
 }
 
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
-    var ctx: AppContext = .{};
+    var app: App = .{};
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    var server = http.Server(AppContext).init(allocator, io, .{
+    var server = http.Server(App).init(allocator, io, .{
         .listeners = &.{.{ .address = addr }},
-    }, &ctx);
+    }, &app);
     defer server.deinit();
 
     server.router.get("/", handleIndex);

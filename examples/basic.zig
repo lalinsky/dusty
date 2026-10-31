@@ -1,17 +1,17 @@
 const std = @import("std");
 const http = @import("dusty");
 
-const AppContext = struct {
+const App = struct {
     counter: usize = 0,
 
-    pub fn uncaughtError(self: *AppContext, req: *http.Request, res: *http.Response, err: anyerror) void {
+    pub fn uncaughtError(self: *App, req: *http.Request, res: *http.Response, err: anyerror) void {
         _ = self;
         std.log.err("Uncaught error for {s}: {}", .{ req.url, err });
         res.status = .internal_server_error;
         res.body = std.fmt.allocPrint(res.arena, "Error: {s}\n", .{@errorName(err)}) catch "500 Internal Server Error\n";
     }
 
-    pub fn notFound(self: *AppContext, req: *http.Request, res: *http.Response) !void {
+    pub fn notFound(self: *App, req: *http.Request, res: *http.Response) !void {
         _ = self;
         std.log.warn("Route not found: {s}", .{req.url});
         res.status = .not_found;
@@ -19,25 +19,25 @@ const AppContext = struct {
     }
 };
 
-fn handleSlow(_: *AppContext, req: *http.Request, res: *http.Response) !void {
+fn handleSlow(_: *App, req: *http.Request, res: *http.Response) !void {
     try req.io.sleep(.fromMilliseconds(10), .real);
     res.body = "Hello World!\n";
 }
 
-fn handleRoot(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
+fn handleRoot(app: *App, req: *http.Request, res: *http.Response) !void {
+    _ = app;
     _ = req;
     res.body = "Hello World!\n";
 }
 
-fn handleUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
+fn handleUser(app: *App, req: *http.Request, res: *http.Response) !void {
+    _ = app;
     const id = req.params.get("id") orelse "unknown";
     res.body = try std.fmt.allocPrint(req.arena, "Hello User {s}\n", .{id});
 }
 
-fn handlePost(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    ctx.counter += 1;
+fn handlePost(app: *App, req: *http.Request, res: *http.Response) !void {
+    app.counter += 1;
 
     // Read the request body
     var read_buf: [1024]u8 = undefined;
@@ -46,21 +46,21 @@ fn handlePost(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
 
     if (body.len > 0) {
         std.log.info("Received body ({d} bytes): {s}", .{ body.len, body });
-        res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}, Received {d} bytes: {s}\n", .{ ctx.counter, body.len, body });
+        res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}, Received {d} bytes: {s}\n", .{ app.counter, body.len, body });
     } else {
-        res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}\n", .{ctx.counter});
+        res.body = try std.fmt.allocPrint(req.arena, "Counter: {d}\n", .{app.counter});
     }
 }
 
-fn handleError(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
+fn handleError(app: *App, req: *http.Request, res: *http.Response) !void {
+    _ = app;
     _ = req;
     _ = res;
     return error.TestError;
 }
 
-fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response) !void {
-    _ = ctx;
+fn handleChunked(app: *App, req: *const http.Request, res: *http.Response) !void {
+    _ = app;
 
     // Set custom headers before first chunk
     try res.header("X-Demo", "Chunked-Response");
@@ -83,13 +83,13 @@ fn handleChunked(ctx: *AppContext, req: *const http.Request, res: *http.Response
     try body.end();
 }
 
-fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+fn handleJson(app: *App, req: *http.Request, res: *http.Response) !void {
 
     // Return a JSON response
     res.status = .ok;
     try res.json(.{
         .message = "Hello from Dusty!",
-        .counter = ctx.counter,
+        .counter = app.counter,
         .timestamp = std.Io.Timestamp.now(req.io, .real).toSeconds(),
         .server = "dusty-http",
         .data = .{
@@ -99,8 +99,8 @@ fn handleJson(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
     }, .{});
 }
 
-fn handleApiUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
+fn handleApiUser(app: *App, req: *http.Request, res: *http.Response) !void {
+    _ = app;
     const id = req.params.get("id") orelse "unknown";
     const name = req.query.get("name") orelse "Anonymous";
 
@@ -113,8 +113,8 @@ fn handleApiUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !voi
     }, .{});
 }
 
-fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
-    _ = ctx;
+fn handleCreateUser(app: *App, req: *http.Request, res: *http.Response) !void {
+    _ = app;
 
     // Define the expected request body structure
     const CreateUserRequest = struct {
@@ -144,13 +144,13 @@ fn handleCreateUser(ctx: *AppContext, req: *http.Request, res: *http.Response) !
 }
 
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
-    var ctx: AppContext = .{};
-    const AppServer = http.Server(AppContext);
+    var app: App = .{};
+    const AppServer = http.Server(App);
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
     var server = AppServer.init(allocator, io, .{
         .listeners = &.{.{ .address = addr }},
-    }, &ctx);
+    }, &app);
     defer server.deinit();
 
     const cors = try server.middleware(http.middleware.Cors, .{
