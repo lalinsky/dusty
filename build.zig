@@ -194,6 +194,7 @@ pub fn build(b: *std.Build) void {
         "handlers",
         "hello_world",
         "proxy",
+        "requests",
         "routing",
         "sse",
         "tls_server",
