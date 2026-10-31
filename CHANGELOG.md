@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+This release changes how handlers are written: they take only the parameters they need, including typed path, query and header values. Middleware gets per-request context and hooks around sending the response. HTTP/1.1 handling is stricter and follows RFC 9110 and RFC 9112 more closely, after an audit with HTTP Garden. Dusty also has a documentation site now, at https://lalinsky.github.io/dusty/.
+
+### Highlights
+
+- Handlers take only the parameters they need, in any order: `*App`, `*Request`, `*Response`, `*App.RequestContext`, and typed values from the request. `fn index(res: *http.Response) !void` is a valid handler. `notFound` and `uncaughtError` take their parameters the same way.
+- `http.Param("id", u64)` reads a path parameter as an integer, enum, bool, string, or your own type with `parseParam`. The name is checked against the route path at compile time. A value that doesn't parse doesn't match the route, and routing moves on to the next one.
+- `http.Query` and `http.Header` read a query parameter or header the same way. A missing or malformed value is answered with a 400. Use `?T` for an optional one.
+- `App.RequestContext` declares per-request data that middleware can fill in for handlers, such as the logged-in user. Middleware uses `executor.ctx`. Handlers take `*App.RequestContext` or call `req.ctx(App)`.
+- Middleware can declare `onHeaders`, which runs just before the response headers are sent, and `onComplete`, which runs after the response is sent or fails.
+- Groups can be nested with `group.group(...)`, and a group can have no prefix. The outer group's middleware runs before the inner group's.
+
+### Routing
+
+- Routes are matched against the decoded path, one segment at a time. `/a%2Fb` is the single segment `a/b`, and route paths are decoded the same way. `req.path` holds the decoded path and `req.query_string` the raw query.
+- A malformed percent escape in the path is answered with a 400. In the query string and form bodies, a `%` that doesn't start an escape is now kept as a literal `%`.
+- A route on the same path as `router.static` takes precedence over the directory's index, regardless of registration order.
+- `StaticOptions.cache_control` sets `Cache-Control` on files served with `router.static`.
+
+### HTTP conformance
+
+- The server now sends an error response (400, 414, 431, 501 or 505) before closing the connection on a request it can't accept. Requests for a later HTTP/1.x version are served as HTTP/1.1.
+- HTTP/1.1 requests must have one valid `Host` header; a missing, duplicate or malformed one gets a 400. An absolute-form request target is routed by its path, and its authority is used as the host. Malformed request targets get a 400.
+- Client errors, such as a missing `Query` value, a body over `max_body_size` or broken chunked framing, are now answered with a 400, 413 or 415 even when the app declares `uncaughtError`. This happens whatever error the handler returns. A body over the limit always closes the connection.
+- Chunk extensions, trailers and chunk-size lines are limited to 16 KiB, in both the server and the client.
+- Trailing whitespace is trimmed from header values.
+- A connection is closed after an HTTP/1.0 message with `Transfer-Encoding`, in both the server and the client.
+- Every response carries a `Date` header, unless the handler set one.
+- llhttp is updated to 9.4.3.
+
+### HTTP client
+
+- A CONNECT request now uses `host:port` as its request target.
+- A response whose `Transfer-Encoding` is anything other than `chunked` now fails with `error.UnsupportedTransferEncoding`.
+
+### Other changes
+
+- The `Session` middleware now also sets the session cookie on streamed responses.
+- Added `ContentType.cbor` (`application/cbor`).
+- `ServerConfig.request.max_header_count` now defaults to 64 instead of 32.
+- `zig build docs` builds the API reference.
+
+### Upgrade notes
+
+- `Server.ctx` is renamed to `Server.app`. In middleware, `executor.ctx` is now the request context; the app is `executor.app`.
+- Declaring `App.dispatch` is now a compile error. Use a middleware instead.
+- The `Session` middleware keeps the session in the request context, so the app must declare `pub const RequestContext = struct { session: http.SessionData = .{} };`. `req.session` is removed; use `ctx.session`.
+- The path and handler passed to `get`, `post` and the other route methods must be known at compile time.
+- `Router.Group` is now a function of the prefix, `Router.Group(prefix)`. Code that names the type should use `@TypeOf(router.group(...))` instead.
+- Registering two routes for the same method and path now panics, instead of the second one replacing the first. So does naming the same parameter differently in two routes, such as `/users/:id` and `/users/:name/posts`.
+- Values in `req.params` are now percent-decoded.
+- An HTTP/1.1 request without `Host` is answered with a 400.
+- `uncaughtError` no longer receives the 400, 413 and 415 client errors. To handle them yourself, for example as JSON, set `ServerConfig.request.answer_client_errors = false`; `req.clientErrorStatus()` returns the status the server would have sent.
+- `res.stream()`, `res.startEventStream()` and `res.upgradeWebSocket()` can return `error.HeadersHookFailed` when a middleware's `onHeaders` fails. Nothing has been sent at that point. If the handler returns it, `uncaughtError` receives the hook's original error.
+- A `Request` built by hand, for example in tests, needs `req.splitTarget()` before it is passed to `Router.findHandler`.
+
 ## [0.5.0] - 2026-10-25
 
 This release adds file and asset serving, more ways to produce a response body, and a more reliable HTTP client, while making TLS, compression and memory use cheaper per connection.
