@@ -1,11 +1,11 @@
 const std = @import("std");
 const http = @import("dusty");
 
-const AppContext = struct {
+const App = struct {
     counter: std.atomic.Value(u64),
 };
 
-fn handleEvents(ctx: *AppContext, req: *http.Request, res: *http.Response) !void {
+fn handleEvents(app: *App, req: *http.Request, res: *http.Response) !void {
     var event_buf: [4096]u8 = undefined;
     var stream = try res.startEventStream(&event_buf);
 
@@ -13,7 +13,7 @@ fn handleEvents(ctx: *AppContext, req: *http.Request, res: *http.Response) !void
 
     var last_seen: u64 = 0;
     while (true) {
-        const current = ctx.counter.load(.acquire);
+        const current = app.counter.load(.acquire);
         if (current != last_seen) {
             last_seen = current;
             var buf: [64]u8 = undefined;
@@ -25,12 +25,12 @@ fn handleEvents(ctx: *AppContext, req: *http.Request, res: *http.Response) !void
 }
 
 pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
-    var ctx: AppContext = .{ .counter = std.atomic.Value(u64).init(0) };
+    var app: App = .{ .counter = std.atomic.Value(u64).init(0) };
 
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    var server = http.Server(AppContext).init(allocator, io, .{
+    var server = http.Server(App).init(allocator, io, .{
         .listeners = &.{.{ .address = addr }},
-    }, &ctx);
+    }, &app);
     defer server.deinit();
 
     server.router.get("/events", handleEvents);
@@ -46,7 +46,7 @@ pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
                 _ = counter.fetchAdd(1, .release);
             }
         }
-    }.run, .{ &ctx.counter, io });
+    }.run, .{ &app.counter, io });
     defer ticker_future.cancel(io) catch {};
 
     try server.run();

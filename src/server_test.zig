@@ -3,14 +3,14 @@ const dusty = @import("root.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
 
-fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
+fn testClientServer(comptime App: type, app: *App) !void {
     const io = std.testing.io;
-    const TestServer = dusty.Server(Ctx);
+    const TestServer = dusty.Server(App);
 
-    var server = TestServer.init(std.testing.allocator, io, .{ .listeners = loopback }, ctx);
+    var server = TestServer.init(std.testing.allocator, io, .{ .listeners = loopback }, app);
     defer server.deinit();
 
-    try ctx.setup(&server);
+    try app.setup(&server);
 
     var server_future = try io.concurrent(struct {
         fn run(s: *TestServer) !void {
@@ -20,7 +20,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *TestServer, test_ctx: *Ctx, _io: std.Io) !void {
+        fn run(s: *TestServer, test_app: *App, _io: std.Io) !void {
             try s.ready.wait(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
@@ -30,7 +30,7 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
             var write_buf: [1024]u8 = undefined;
             var writer = stream.writer(_io, &write_buf);
 
-            try test_ctx.makeRequest(&writer.interface);
+            try test_app.makeRequest(&writer.interface);
 
             var read_buf: [1024]u8 = undefined;
             var reader = stream.reader(_io, &read_buf);
@@ -38,57 +38,57 @@ fn testClientServer(comptime Ctx: type, ctx: *Ctx) !void {
 
             std.log.info("Response: {s}", .{response});
         }
-    }.run, .{ &server, ctx, io });
+    }.run, .{ &server, app, io });
 
     try client_future.await(io);
 }
 
 test "Server: POST with body" {
-    const TestContext = struct {
+    const TestApp = struct {
         const Self = @This();
 
         body_received: bool = false,
         received_body: [256]u8 = undefined,
         received_len: usize = 0,
 
-        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
-            _ = ctx;
+        pub fn setup(app: *Self, server: *dusty.Server(Self)) !void {
+            _ = app;
             server.router.post("/test", handlePost);
         }
 
-        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
-            _ = ctx;
+        pub fn makeRequest(app: *Self, writer: *std.Io.Writer) !void {
+            _ = app;
             const request_body = "Hello from test!";
             try writer.print("POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}", .{ request_body.len, request_body });
             try writer.flush();
         }
 
-        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handlePost(app: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var read_buf: [1024]u8 = undefined;
             var reader = try req.reader(&read_buf);
 
-            var writer = std.Io.Writer.fixed(&ctx.received_body);
+            var writer = std.Io.Writer.fixed(&app.received_body);
             const n = try reader.interface.streamRemaining(&writer);
 
-            ctx.body_received = true;
-            ctx.received_len = n;
+            app.body_received = true;
+            app.received_len = n;
 
-            std.log.info("Received body: {s}", .{ctx.received_body[0..n]});
+            std.log.info("Received body: {s}", .{app.received_body[0..n]});
 
             res.body = "OK\n";
         }
     };
 
-    var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+    var app: TestApp = .{};
+    try testClientServer(TestApp, &app);
 
-    try std.testing.expect(ctx.body_received);
-    try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
+    try std.testing.expect(app.body_received);
+    try std.testing.expectEqualStrings("Hello from test!", app.received_body[0..app.received_len]);
 }
 
 test "Server: a gzip request body reaches the handler decoded" {
     if (!@import("build_options").use_zlib) return error.SkipZigTest;
-    const TestContext = struct {
+    const TestApp = struct {
         const Self = @This();
 
         // "Hello from test!", gzip compressed.
@@ -98,13 +98,13 @@ test "Server: a gzip request body reaches the handler decoded" {
         received_body: [256]u8 = undefined,
         received_len: usize = 0,
 
-        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
-            _ = ctx;
+        pub fn setup(app: *Self, server: *dusty.Server(Self)) !void {
+            _ = app;
             server.router.post("/gzip", handlePost);
         }
 
-        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
-            _ = ctx;
+        pub fn makeRequest(app: *Self, writer: *std.Io.Writer) !void {
+            _ = app;
             try writer.print(
                 "POST /gzip HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n{s}",
                 .{ gzip_body.len, gzip_body },
@@ -112,36 +112,36 @@ test "Server: a gzip request body reaches the handler decoded" {
             try writer.flush();
         }
 
-        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handlePost(app: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var read_buf: [1024]u8 = undefined;
             var reader = try req.reader(&read_buf);
-            var writer = std.Io.Writer.fixed(&ctx.received_body);
-            ctx.received_len = try reader.interface.streamRemaining(&writer);
+            var writer = std.Io.Writer.fixed(&app.received_body);
+            app.received_len = try reader.interface.streamRemaining(&writer);
             res.body = "OK\n";
         }
     };
 
-    var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+    var app: TestApp = .{};
+    try testClientServer(TestApp, &app);
 
-    try std.testing.expectEqualStrings("Hello from test!", ctx.received_body[0..ctx.received_len]);
+    try std.testing.expectEqualStrings("Hello from test!", app.received_body[0..app.received_len]);
 }
 
 test "Server: POST with chunked encoding" {
-    const TestContext = struct {
+    const TestApp = struct {
         const Self = @This();
 
         body_received: bool = false,
         received_body: [256]u8 = undefined,
         received_len: usize = 0,
 
-        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
-            _ = ctx;
+        pub fn setup(app: *Self, server: *dusty.Server(Self)) !void {
+            _ = app;
             server.router.post("/chunked", handlePost);
         }
 
-        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
-            _ = ctx;
+        pub fn makeRequest(app: *Self, writer: *std.Io.Writer) !void {
+            _ = app;
             try writer.writeAll("POST /chunked HTTP/1.1\r\n");
             try writer.writeAll("Host: localhost\r\n");
             try writer.writeAll("Transfer-Encoding: chunked\r\n");
@@ -165,48 +165,48 @@ test "Server: POST with chunked encoding" {
             try writer.flush();
         }
 
-        fn handlePost(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handlePost(app: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var read_buf: [1024]u8 = undefined;
             var reader = try req.reader(&read_buf);
 
-            var writer = std.Io.Writer.fixed(&ctx.received_body);
+            var writer = std.Io.Writer.fixed(&app.received_body);
             const n = try reader.interface.streamRemaining(&writer);
 
-            ctx.body_received = true;
-            ctx.received_len = n;
+            app.body_received = true;
+            app.received_len = n;
 
-            std.log.info("Received chunked body: {s}", .{ctx.received_body[0..n]});
+            std.log.info("Received chunked body: {s}", .{app.received_body[0..n]});
 
             res.body = "OK\n";
         }
     };
 
-    var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+    var app: TestApp = .{};
+    try testClientServer(TestApp, &app);
 
-    try std.testing.expect(ctx.body_received);
-    try std.testing.expectEqualStrings("Hello from chunked test!", ctx.received_body[0..ctx.received_len]);
+    try std.testing.expect(app.body_received);
+    try std.testing.expectEqualStrings("Hello from chunked test!", app.received_body[0..app.received_len]);
 }
 
 test "Server: GET with no body" {
-    const TestContext = struct {
+    const TestApp = struct {
         const Self = @This();
 
         reader_tested: bool = false,
         read_len: usize = 0,
 
-        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
-            _ = ctx;
+        pub fn setup(app: *Self, server: *dusty.Server(Self)) !void {
+            _ = app;
             server.router.get("/test", handleGet);
         }
 
-        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
-            _ = ctx;
+        pub fn makeRequest(app: *Self, writer: *std.Io.Writer) !void {
+            _ = app;
             try writer.writeAll("GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n");
             try writer.flush();
         }
 
-        fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handleGet(app: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var read_buf: [1024]u8 = undefined;
             var reader = try req.reader(&read_buf);
 
@@ -217,8 +217,8 @@ test "Server: GET with no body" {
                 return err;
             };
 
-            ctx.reader_tested = true;
-            ctx.read_len = n;
+            app.reader_tested = true;
+            app.read_len = n;
 
             std.log.info("Read {d} bytes from GET request body", .{n});
 
@@ -226,47 +226,47 @@ test "Server: GET with no body" {
         }
     };
 
-    var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+    var app: TestApp = .{};
+    try testClientServer(TestApp, &app);
 
-    try std.testing.expect(ctx.reader_tested);
-    try std.testing.expectEqual(0, ctx.read_len);
+    try std.testing.expect(app.reader_tested);
+    try std.testing.expectEqual(0, app.read_len);
 }
 
 test "Server: HTTP/1.0 GET request" {
-    const TestContext = struct {
+    const TestApp = struct {
         const Self = @This();
 
         request_handled: bool = false,
         version_major: u16 = 0,
         version_minor: u16 = 0,
 
-        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
-            _ = ctx;
+        pub fn setup(app: *Self, server: *dusty.Server(Self)) !void {
+            _ = app;
             server.router.get("/http10", handleGet);
         }
 
-        pub fn makeRequest(ctx: *Self, writer: *std.Io.Writer) !void {
-            _ = ctx;
+        pub fn makeRequest(app: *Self, writer: *std.Io.Writer) !void {
+            _ = app;
             try writer.writeAll("GET /http10 HTTP/1.0\r\n\r\n");
             try writer.flush();
         }
 
-        fn handleGet(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
-            ctx.request_handled = true;
-            ctx.version_major = req.version_major;
-            ctx.version_minor = req.version_minor;
+        fn handleGet(app: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+            app.request_handled = true;
+            app.version_major = req.version_major;
+            app.version_minor = req.version_minor;
 
             res.body = "HTTP/1.0 OK\n";
         }
     };
 
-    var ctx: TestContext = .{};
-    try testClientServer(TestContext, &ctx);
+    var app: TestApp = .{};
+    try testClientServer(TestApp, &app);
 
-    try std.testing.expect(ctx.request_handled);
-    try std.testing.expectEqual(1, ctx.version_major);
-    try std.testing.expectEqual(0, ctx.version_minor);
+    try std.testing.expect(app.request_handled);
+    try std.testing.expectEqual(1, app.version_major);
+    try std.testing.expectEqual(0, app.version_minor);
 }
 
 test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
@@ -320,7 +320,7 @@ test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
 test "Server: WebSocket echo" {
     const io = std.testing.io;
 
-    const TestContext = struct {
+    const TestApp = struct {
         const Self = @This();
 
         ws_upgraded: bool = false,
@@ -328,18 +328,18 @@ test "Server: WebSocket echo" {
         received_msg: [256]u8 = undefined,
         received_len: usize = 0,
 
-        pub fn setup(ctx: *Self, server: *dusty.Server(Self)) !void {
-            _ = ctx;
+        pub fn setup(app: *Self, server: *dusty.Server(Self)) !void {
+            _ = app;
             server.router.get("/ws", handleWebSocket);
         }
 
-        fn handleWebSocket(ctx: *Self, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handleWebSocket(app: *Self, req: *dusty.Request, res: *dusty.Response) !void {
             var ws = try res.upgradeWebSocket(req) orelse {
                 res.status = .bad_request;
                 return;
             };
 
-            ctx.ws_upgraded = true;
+            app.ws_upgraded = true;
 
             try ws.send(.text, "Welcome!");
 
@@ -349,30 +349,30 @@ test "Server: WebSocket echo" {
             };
 
             if (msg.type == .text) {
-                ctx.message_received = true;
-                ctx.received_len = @min(msg.data.len, ctx.received_msg.len);
-                @memcpy(ctx.received_msg[0..ctx.received_len], msg.data[0..ctx.received_len]);
+                app.message_received = true;
+                app.received_len = @min(msg.data.len, app.received_msg.len);
+                @memcpy(app.received_msg[0..app.received_len], msg.data[0..app.received_len]);
                 try ws.send(.text, msg.data);
             }
         }
     };
 
-    var ctx: TestContext = .{};
+    var app: TestApp = .{};
 
-    var server = dusty.Server(TestContext).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    var server = dusty.Server(TestApp).init(std.testing.allocator, io, .{ .listeners = loopback }, &app);
     defer server.deinit();
 
-    try ctx.setup(&server);
+    try app.setup(&server);
 
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(TestContext)) !void {
+        fn run(s: *dusty.Server(TestApp)) !void {
             try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(TestContext), _io: std.Io) !void {
+        fn run(s: *dusty.Server(TestApp), _io: std.Io) !void {
             try s.ready.wait(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
@@ -476,12 +476,12 @@ test "Server: WebSocket echo" {
 
     try client_future.await(io);
 
-    try std.testing.expect(ctx.ws_upgraded);
-    try std.testing.expect(ctx.message_received);
-    try std.testing.expectEqualStrings("Hello", ctx.received_msg[0..ctx.received_len]);
+    try std.testing.expect(app.ws_upgraded);
+    try std.testing.expect(app.message_received);
+    try std.testing.expectEqualStrings("Hello", app.received_msg[0..app.received_len]);
 }
 
-test "Server: void context handlers" {
+test "Server: void app handlers" {
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
@@ -489,7 +489,7 @@ test "Server: void context handlers" {
 
     server.router.get("/test", struct {
         fn handle(res: *dusty.Response) void {
-            res.body = "Hello from void context!\n";
+            res.body = "Hello from void app!\n";
         }
     }.handle);
 
@@ -535,18 +535,18 @@ test "Server: void context handlers" {
     try client_future.await(io);
 }
 
-test "Server: middleware hands request state to the handler, fresh for each request" {
+test "Server: middleware hands the request context to the handler, fresh for each request" {
     const io = std.testing.io;
 
     const App = struct {
-        pub const RequestState = struct {
+        pub const RequestContext = struct {
             user: ?[]const u8 = null,
         };
     };
 
     const Auth = struct {
         pub fn execute(_: *const @This(), req: *dusty.Request, _: *dusty.Response, executor: anytype) !void {
-            if (req.headers.get("X-User")) |user| executor.state.user = user;
+            if (req.headers.get("X-User")) |user| executor.ctx.user = user;
             return executor.next();
         }
     };
@@ -559,8 +559,8 @@ test "Server: middleware hands request state to the handler, fresh for each requ
     const middlewares = [_]dusty.Middleware(App){.init(&auth)};
     server.router.middlewares = &middlewares;
     server.router.get("/whoami", struct {
-        fn handle(res: *dusty.Response, state: *App.RequestState) void {
-            res.body = state.user orelse "nobody";
+        fn handle(res: *dusty.Response, ctx: *App.RequestContext) void {
+            res.body = ctx.user orelse "nobody";
         }
     }.handle);
 
@@ -1821,32 +1821,32 @@ test "Server: an unread chunked body is not answered with a reset" {
 fn chunkedPost(chunks: []const u8, status: []const u8) !?anyerror {
     const io = std.testing.io;
 
-    const Ctx = struct {
+    const App = struct {
         err: ?anyerror = null,
 
-        fn handle(ctx: *@This(), req: *dusty.Request, res: *dusty.Response) !void {
+        fn handle(app: *@This(), req: *dusty.Request, res: *dusty.Response) !void {
             _ = req.body() catch |err| {
-                ctx.err = err;
+                app.err = err;
                 return err;
             };
             res.body = "OK";
         }
     };
-    var ctx: Ctx = .{};
+    var app: App = .{};
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    var server = dusty.Server(App).init(std.testing.allocator, io, .{ .listeners = loopback }, &app);
     defer server.deinit();
-    server.router.post("/", Ctx.handle);
+    server.router.post("/", App.handle);
 
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(Ctx)) !void {
+        fn run(s: *dusty.Server(App)) !void {
             try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(Ctx), _io: std.Io, body: []const u8, expected_status: []const u8) !void {
+        fn run(s: *dusty.Server(App), _io: std.Io, body: []const u8, expected_status: []const u8) !void {
             try s.ready.wait(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
@@ -1868,7 +1868,7 @@ fn chunkedPost(chunks: []const u8, status: []const u8) !?anyerror {
     }.run, .{ &server, io, chunks, status });
 
     try client_future.await(io);
-    return ctx.err;
+    return app.err;
 }
 
 test "Server: chunk extensions past the limit fail the body read" {
@@ -2492,17 +2492,17 @@ test "Server: graceful shutdown closes idle connections with no deadlines config
 test "Server: request resolves the client through a trusted proxy" {
     const io = std.testing.io;
 
-    const Ctx = struct {
+    const App = struct {
         seen: [2]?std.Io.net.IpAddress = @splat(null),
         count: usize = 0,
     };
-    var ctx: Ctx = .{};
+    var app: App = .{};
 
-    var server = dusty.Server(Ctx).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, &ctx);
+    var server = dusty.Server(App).init(std.testing.allocator, io, .{ .listeners = loopback, .trusted_proxy_hops = 1 }, &app);
     defer server.deinit();
 
     server.router.get("/whoami", struct {
-        fn handle(c: *Ctx, req: *dusty.Request, res: *dusty.Response) !void {
+        fn handle(c: *App, req: *dusty.Request, res: *dusty.Response) !void {
             if (c.count < c.seen.len) c.seen[c.count] = req.remote_address;
             c.count += 1;
             res.body = "OK\n";
@@ -2510,14 +2510,14 @@ test "Server: request resolves the client through a trusted proxy" {
     }.handle);
 
     var server_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(Ctx)) !void {
+        fn run(s: *dusty.Server(App)) !void {
             try s.run();
         }
     }.run, .{&server});
     defer server_future.cancel(io) catch {};
 
     var client_future = try io.concurrent(struct {
-        fn run(s: *dusty.Server(Ctx), _io: std.Io) !void {
+        fn run(s: *dusty.Server(App), _io: std.Io) !void {
             try s.ready.wait(_io);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
@@ -2561,13 +2561,13 @@ test "Server: request resolves the client through a trusted proxy" {
 
     try client_future.await(io);
 
-    try std.testing.expectEqual(@as(usize, 2), ctx.count);
-    const peer = ctx.seen[0] orelse return error.HandlerNeverRan;
+    try std.testing.expectEqual(@as(usize, 2), app.count);
+    const peer = app.seen[0] orelse return error.HandlerNeverRan;
     try std.testing.expect(peer == .ip4);
     try std.testing.expectEqual([4]u8{ 127, 0, 0, 1 }, peer.ip4.bytes);
     try std.testing.expect(peer.ip4.port != 0);
 
-    const forwarded = ctx.seen[1] orelse return error.HandlerNeverRan;
+    const forwarded = app.seen[1] orelse return error.HandlerNeverRan;
     try std.testing.expect(forwarded == .ip4);
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 25 }, forwarded.ip4.bytes);
     try std.testing.expectEqual(@as(u16, 0), forwarded.ip4.port);
@@ -2913,14 +2913,14 @@ test "Server: a head that just fits is still served" {
 
 /// What the handler saw, so a test can tell a head that was accepted from
 /// one that was accepted and then could not read its body.
-const HeadBoundaryCtx = struct {
+const HeadBoundaryApp = struct {
     body: [16]u8 = undefined,
     body_len: usize = 0,
 
-    pub fn handle(ctx: *HeadBoundaryCtx, req: *dusty.Request, res: *dusty.Response) !void {
+    pub fn handle(app: *HeadBoundaryApp, req: *dusty.Request, res: *dusty.Response) !void {
         const b = (try req.body()) orelse "";
-        ctx.body_len = @min(b.len, ctx.body.len);
-        @memcpy(ctx.body[0..ctx.body_len], b[0..ctx.body_len]);
+        app.body_len = @min(b.len, app.body.len);
+        @memcpy(app.body[0..app.body_len], b[0..app.body_len]);
         res.body = "OK";
     }
 };
@@ -2938,12 +2938,12 @@ fn expectStatusForHeadOfLength(
     expected_body: ?[]const u8,
 ) !void {
     const io = std.testing.io;
-    const S = dusty.Server(HeadBoundaryCtx);
+    const S = dusty.Server(HeadBoundaryApp);
 
-    var ctx: HeadBoundaryCtx = .{};
-    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback }, &ctx);
+    var app: HeadBoundaryApp = .{};
+    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback }, &app);
     defer server.deinit();
-    server.router.post("/", HeadBoundaryCtx.handle);
+    server.router.post("/", HeadBoundaryApp.handle);
 
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
@@ -2984,7 +2984,7 @@ fn expectStatusForHeadOfLength(
     try client_future.await(io);
 
     if (expected_body) |want| {
-        try std.testing.expectEqualStrings(want, ctx.body[0..ctx.body_len]);
+        try std.testing.expectEqualStrings(want, app.body[0..app.body_len]);
     }
 }
 
@@ -3011,33 +3011,33 @@ test "Server: a head ending exactly at the buffer end gets 431, not a panic" {
 
 /// Counts how many handlers are in flight at once, so a test can see whether
 /// the cap held.
-const ConcurrencyCtx = struct {
+const ConcurrencyApp = struct {
     active: std.atomic.Value(u32) = .init(0),
     peak: std.atomic.Value(u32) = .init(0),
     served: std.atomic.Value(u32) = .init(0),
 
-    pub fn handle(ctx: *ConcurrencyCtx, req: *dusty.Request, res: *dusty.Response) !void {
-        const now = ctx.active.fetchAdd(1, .acq_rel) + 1;
-        _ = ctx.peak.fetchMax(now, .acq_rel);
+    pub fn handle(app: *ConcurrencyApp, req: *dusty.Request, res: *dusty.Response) !void {
+        const now = app.active.fetchAdd(1, .acq_rel) + 1;
+        _ = app.peak.fetchMax(now, .acq_rel);
         // Long enough that the others are all waiting, so the cap is what
         // limits overlap rather than the handlers being too brief to overlap.
         try req.io.sleep(.fromMilliseconds(30), .awake);
-        _ = ctx.active.fetchSub(1, .acq_rel);
-        _ = ctx.served.fetchAdd(1, .acq_rel);
+        _ = app.active.fetchSub(1, .acq_rel);
+        _ = app.served.fetchAdd(1, .acq_rel);
         res.body = "OK";
     }
 };
 
 test "Server: max_connections caps overlap without dropping anyone" {
     const io = std.testing.io;
-    const S = dusty.Server(ConcurrencyCtx);
+    const S = dusty.Server(ConcurrencyApp);
     const clients = 8;
     const cap = 2;
 
-    var ctx: ConcurrencyCtx = .{};
-    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback, .max_connections = cap }, &ctx);
+    var app: ConcurrencyApp = .{};
+    var server = S.init(std.testing.allocator, io, .{ .listeners = loopback, .max_connections = cap }, &app);
     defer server.deinit();
-    server.router.get("/", ConcurrencyCtx.handle);
+    server.router.get("/", ConcurrencyApp.handle);
 
     var server_future = try io.concurrent(struct {
         fn run(s: *S) !void {
@@ -3077,9 +3077,9 @@ test "Server: max_connections caps overlap without dropping anyone" {
     };
     if (first_err) |err| return err;
 
-    try std.testing.expectEqual(@as(u32, clients), ctx.served.load(.acquire));
+    try std.testing.expectEqual(@as(u32, clients), app.served.load(.acquire));
     // Equality rather than <=, so this cannot pass by nothing overlapping.
-    try std.testing.expectEqual(@as(u32, cap), ctx.peak.load(.acquire));
+    try std.testing.expectEqual(@as(u32, cap), app.peak.load(.acquire));
 }
 
 test "Server: a slot freed on one listener reaches a connection waiting on another" {

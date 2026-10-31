@@ -83,16 +83,16 @@ pub fn init(config: Config) !Session {
     return .{ .config = config };
 }
 
-/// Keeps the session in the app's request state, which has to declare it:
+/// Keeps the session in the app's request context, which has to declare it:
 ///
-///     pub const RequestState = struct {
+///     pub const RequestContext = struct {
 ///         session: dusty.SessionData = .{},
 ///     };
 pub fn execute(self: *const Session, req: *Request, res: *Response, executor: anytype) !void {
-    if (comptime !@hasField(@TypeOf(executor.state), "session")) {
-        @compileError("the Session middleware needs `session: dusty.SessionData = .{}` in the app's RequestState");
+    if (comptime !@hasField(@TypeOf(executor.ctx), "session")) {
+        @compileError("the Session middleware needs `session: dusty.SessionData = .{}` in the app's RequestContext");
     }
-    const session = &executor.state.session;
+    const session = &executor.ctx.session;
 
     const cookie_value = req.cookies().get(self.config.cookie_name);
     if (cookie_value) |raw| {
@@ -444,13 +444,13 @@ test "SessionData: clear" {
     try testing.expect(s.get("a") == null);
 }
 
-test "Session: the handler reads and writes the session in the request state" {
+test "Session: the handler reads and writes the session in the request context" {
     const Executor = @import("../middleware.zig").Executor;
     const Middleware = @import("../middleware.zig").Middleware;
     const Connection = @import("../server.zig").Connection;
 
     const App = struct {
-        pub const RequestState = struct {
+        pub const RequestContext = struct {
             session: SessionData = .{},
         };
     };
@@ -475,17 +475,17 @@ test "Session: the handler reads and writes the session in the request state" {
     var executor: Executor(App) = .{
         .req = &req,
         .res = &res,
-        .ctx = &app,
+        .app = &app,
         .action = struct {
             fn handle(_: *App, r: *Request, rs: *Response) !void {
-                const state = r.state(App);
-                rs.body = state.session.get("user_id") orelse "none";
-                try state.session.set("role", "admin");
+                const ctx = r.ctx(App);
+                rs.body = ctx.session.get("user_id") orelse "none";
+                try ctx.session.set("role", "admin");
             }
         }.handle,
         .middlewares = &middlewares,
     };
-    executor.attachState();
+    executor.attachCtx();
     try executor.run();
 
     try testing.expectEqualStrings("42", res.body);

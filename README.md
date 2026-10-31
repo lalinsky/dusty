@@ -98,8 +98,8 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-A handler takes only the parameters it needs, in any order: the app context, `*http.Request`,
-`*http.Response`, and the app's `RequestState`. So do the app's `notFound` and `uncaughtError`
+A handler takes only the parameters it needs, in any order: the app (`*App`), `*http.Request`,
+`*http.Response`, and the app's `RequestContext`. So do the app's `notFound` and `uncaughtError`
 hooks, which don't need `self` either, and `uncaughtError` can also take the error as `anyerror`.
 
 `listeners` takes any number of listeners, each with its own TLS, so one server
