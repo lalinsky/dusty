@@ -3,6 +3,7 @@ const Request = @import("request.zig").Request;
 const inject = @import("inject.zig");
 const Response = @import("response.zig").Response;
 const Method = @import("http.zig").Method;
+const Params = @import("http.zig").Params;
 const Middleware = @import("middleware.zig").Middleware;
 const Static = @import("server/static.zig").Static;
 const StaticOptions = @import("server/static.zig").StaticOptions;
@@ -26,6 +27,19 @@ const NodeKind = enum {
     wildcard,
 };
 
+/// The first 7 bytes of a segment, zero padded, with its length (up to
+/// 255) in the top byte. Equal keys mean equal segments for up to 7 bytes.
+fn segmentKey(segment: []const u8) u64 {
+    const len: u64 = @min(segment.len, 255);
+    if (segment.len >= 8) {
+        const head = std.mem.readInt(u64, segment[0..8], .little);
+        return (head & 0x00ff_ffff_ffff_ffff) | len << 56;
+    }
+    var key: u64 = len << 56;
+    for (segment, 0..) |c, i| key |= @as(u64, c) << @intCast(i * 8);
+    return key;
+}
+
 const Node = struct {
     // Compressed path segment
     segment: []const u8,
@@ -43,6 +57,11 @@ const Node = struct {
 
     // For linked list of siblings (only used in static_children)
     next_sibling: ?*Node,
+
+    // The static children again, as matching looks them up: by
+    // `segmentKey`, in one array, before comparing the rest.
+    static_keys: []const u64 = &.{},
+    static_nodes: []const *Node = &.{},
 
     // Route (opaque pointer to Route) - only set on terminal nodes
     route: ?*const anyopaque,
@@ -252,6 +271,15 @@ pub fn Router(comptime App: type) type {
                             // Prepend to static_children linked list
                             new_node.next_sibling = current.static_children;
                             current.static_children = new_node;
+                            const n = current.static_keys.len;
+                            const keys = try alloc.alloc(u64, n + 1);
+                            @memcpy(keys[0..n], current.static_keys);
+                            keys[n] = segmentKey(new_node.segment);
+                            current.static_keys = keys;
+                            const nodes = try alloc.alloc(*Node, n + 1);
+                            @memcpy(nodes[0..n], current.static_nodes);
+                            nodes[n] = new_node;
+                            current.static_nodes = nodes;
                         },
                         .param => current.param_child = new_node,
                         .wildcard => current.wildcard_child = new_node,
@@ -306,14 +334,15 @@ pub fn Router(comptime App: type) type {
 
             // Check children in precedence order: static > param > wildcard
 
-            // 1. Try static children first (highest precedence)
-            var static_child = node.static_children;
-            while (static_child) |c| {
-                if (std.mem.eql(u8, c.segment, current_segment)) {
-                    const result = matchRecursive(c, req, index + 1);
-                    if (result != null) return result;
-                }
-                static_child = c.next_sibling;
+            // 1. Try static children first (highest precedence). At most
+            // one can equal the segment.
+            const key = segmentKey(current_segment);
+            for (node.static_keys, 0..) |k, i| {
+                if (k != key) continue;
+                const c = node.static_nodes[i];
+                if (current_segment.len > 7 and !std.mem.eql(u8, c.segment, current_segment)) continue;
+                if (matchRecursive(c, req, index + 1)) |result| return result;
+                break;
             }
 
             // 2. Try param child (medium precedence)
@@ -336,23 +365,25 @@ pub fn Router(comptime App: type) type {
         fn bindRoute(node: *const Node, req: *Request) bool {
             const opaque_route = node.route orelse return false;
             const route: *const Route = @ptrCast(@alignCast(opaque_route));
-            req.params.map.clearRetainingCapacity();
+            req.params.len = 0;
             for (route.params) |p| {
                 const segment = req._segments[p.index];
                 const value = if (p.rest) req.path[@intFromPtr(segment.ptr) - @intFromPtr(req.path.ptr) ..] else segment;
-                req.params.map.putAssumeCapacity(p.name, value);
+                req.params.putNewAssumeCapacity(p.name, value);
             }
             const f = route.accepts orelse return true;
             if (f(req)) return true;
-            req.params.map.clearRetainingCapacity();
+            req.params.len = 0;
             return false;
         }
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
             req.route = null;
-            req.params.map.clearRetainingCapacity();
-            try req.params.map.ensureTotalCapacity(req.arena, self.max_params);
-            req.query.map.clearRetainingCapacity();
+            req.params = .{ .buf = if (self.max_params <= req._param_buf.len)
+                &req._param_buf
+            else
+                try req.arena.alloc(Params.Entry, self.max_params) };
+            req.query = .{};
             try parseQueryString(req, req.query_string);
 
             const route = self.matchIn(req.method, req) orelse
@@ -595,33 +626,41 @@ pub fn Router(comptime App: type) type {
             };
         }
 
+        /// One pass over the query string. A repeated key keeps its first
+        /// place and takes the last value.
         fn parseQueryString(req: *Request, query_string: []const u8) !void {
             if (query_string.len == 0) return;
+            req.query.buf = &req._query_buf;
 
-            // Count '&' to estimate capacity (upper bound on number of key-value pairs)
-            // Number of segments = ampersands + 1
-            const ampersand_count = std.mem.count(u8, query_string, "&");
-            const max_params = @min(ampersand_count + 1, req.config.max_query_count);
-
-            // Pre-allocate capacity for the query hashmap
-            try req.query.map.ensureTotalCapacity(req.arena, @intCast(max_params));
-
-            var it = std.mem.splitScalar(u8, query_string, '&');
-            while (it.next()) |pair| {
-                if (pair.len == 0) continue;
-
-                // Check query count limit
-                if (req.query.count() >= req.config.max_query_count) {
-                    return error.TooManyQueryParams;
-                }
-
-                if (std.mem.indexOfScalar(u8, pair, '=')) |sep| {
-                    const key = try Request.urlUnescape(req.arena, pair[0..sep]);
-                    const value = try Request.urlUnescape(req.arena, pair[sep + 1 ..]);
-                    req.query.map.putAssumeCapacity(key, value);
-                } else {
-                    const key = try Request.urlUnescape(req.arena, pair);
-                    req.query.map.putAssumeCapacity(key, "");
+            var start: usize = 0;
+            var sep: ?usize = null;
+            var escaped = false;
+            for (0..query_string.len + 1) |i| {
+                const c = if (i < query_string.len) query_string[i] else '&';
+                switch (c) {
+                    '&' => {
+                        if (i > start) {
+                            if (req.query.count() >= req.config.max_query_count) {
+                                return error.TooManyQueryParams;
+                            }
+                            const end = sep orelse i;
+                            var key = query_string[start..end];
+                            var value: []const u8 = if (sep) |e| query_string[e + 1 .. i] else "";
+                            if (escaped) {
+                                key = try Request.urlUnescape(req.arena, key);
+                                value = try Request.urlUnescape(req.arena, value);
+                            }
+                            try req.query.put(req.arena, key, value);
+                        }
+                        start = i + 1;
+                        sep = null;
+                        escaped = false;
+                    },
+                    '=' => {
+                        if (sep == null) sep = i;
+                    },
+                    '%', '+' => escaped = true,
+                    else => {},
                 }
             }
         }
