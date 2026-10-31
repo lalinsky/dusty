@@ -32,7 +32,7 @@ jobs:
           python-version: '3.x'
 
       - name: Install MkDocs
-        run: pip install mkdocs-material pygments
+        run: pip install "mkdocs-material==9.*" "mkdocs<2" pygments
 
       - name: Build API docs
         run: zig build docs
