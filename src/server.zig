@@ -1323,10 +1323,14 @@ pub fn Server(comptime App: type) type {
                 };
                 executor.attachCtx();
                 defer executor.detachCtx();
-                executor.run() catch |err| switch (err) {
-                    error.ReadFailed => return connection.getReadError() orelse error.Unexpected,
-                    error.WriteFailed => return connection.getWriteError() orelse error.Unexpected,
-                    else => |e| return e,
+                executor.run() catch |err| {
+                    const cause = switch (err) {
+                        error.ReadFailed => connection.getReadError() orelse error.Unexpected,
+                        error.WriteFailed => connection.getWriteError() orelse error.Unexpected,
+                        else => err,
+                    };
+                    executor.complete(cause);
+                    return cause;
                 };
 
                 // A body over `max_body_size` closes the connection even when
@@ -1362,7 +1366,10 @@ pub fn Server(comptime App: type) type {
                         } else |_| {
                             // A cancel is the request timing out, not a body
                             // worth giving up on quietly.
-                            if (body_reader.err) |e| if (e == error.Canceled) return error.Canceled;
+                            if (body_reader.err) |e| if (e == error.Canceled) {
+                                executor.complete(error.Canceled);
+                                return error.Canceled;
+                            };
                             response.keepalive = false;
                         }
                     } else {
@@ -1374,7 +1381,11 @@ pub fn Server(comptime App: type) type {
                     response.keepalive = false;
                 }
 
-                try response.write();
+                response.write() catch |err| {
+                    executor.complete(err);
+                    return err;
+                };
+                executor.complete(null);
 
                 if (!response.keepalive) {
                     // Input after a 101 belongs to the upgraded protocol.
