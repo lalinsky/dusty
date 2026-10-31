@@ -18,8 +18,7 @@ request smuggling. And on [HttpArena](https://http-arena.com/), it's among the f
 
 - Router with path parameters, wildcards, groups and per-group middleware
 - HTTP/1.0 and HTTP/1.1, with chunked transfer encoding in both directions
-- Transparent gzip/deflate decoding of request and response bodies
-- Opt-in gzip compression of responses
+- gzip and deflate decoding of request and response bodies, and gzip compression of responses
 - Server-Sent Events, and WebSocket on both the server and the client
 - Static files with conditional and range requests, and assets embedded at build time
 - HTTP and HTTPS client with connection pooling, and Unix socket support
