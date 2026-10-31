@@ -59,14 +59,14 @@ See [`http.Listener`](../../apidocs/#http.Listener) for the other listener optio
 
 | Field | Default | Description |
 |---|---|---|
-| `max_connections` | 10,000 | Connections open at once |
-| `request.max_body_size` | 1 MiB | Request body size |
-| `request.buffer_size` | 16 KiB | Request line and headers together |
-| `request.max_header_count` | 64 | Headers |
-| `request.max_param_count` | 8 | Path parameters |
-| `request.max_query_count` | 32 | Query parameters |
-| `request.max_form_count` | 32 | Form fields |
-| `request.max_multiform_count` | 32 | Multipart fields |
+| `max_connections` | 10,000 | Most connections open at once |
+| `request.max_body_size` | 1 MiB | Largest request body |
+| `request.buffer_size` | 16 KiB | Largest request line and headers, together |
+| `request.max_header_count` | 64 | Most headers in a request |
+| `request.max_param_count` | 8 | Most path parameters |
+| `request.max_query_count` | 32 | Most query parameters |
+| `request.max_form_count` | 32 | Most form fields |
+| `request.max_multiform_count` | 32 | Most multipart fields |
 
 A body over `max_body_size` gets 413. A request with too many headers, or a head that doesn't fit in
 `buffer_size`, gets 431. At `max_connections`, the server stops accepting connections until one
