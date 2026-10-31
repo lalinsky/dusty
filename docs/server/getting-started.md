@@ -43,7 +43,8 @@ $ curl http://127.0.0.1:8080/hello/zig
 Hello, zig!
 ```
 
-Both routes go to `hello`. On `/` there is no `name` parameter, and it falls back to `world`.
+A handler only takes the parameters it needs. `hello` takes the `:name` part of the path as an
+`http.Param`, and `index` doesn't need the request at all.
 `http.Server(void)` means the server has no app state of its own; with a type there, handlers can
 take a pointer to it.
 
