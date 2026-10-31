@@ -268,6 +268,7 @@ pub fn Executor(comptime App: type) type {
             // committed the framing, so there is nothing to replace.
             if (!self.res.headers_written) self.res.resetBody();
             if (comptime App != void and @hasDecl(App, "notFound")) {
+                comptime inject.noParams(@TypeOf(App.notFound), @typeName(App) ++ ".notFound");
                 _ = inject.returnsError(@TypeOf(App.notFound), @typeName(App) ++ ".notFound", true);
                 return @call(.auto, App.notFound, inject.args(App, @TypeOf(App.notFound), self.app, self.req, self.res, {}));
             } else {
@@ -284,6 +285,7 @@ pub fn Executor(comptime App: type) type {
             // headers are still open.
             self.res.resetBody();
             if (comptime App != void and @hasDecl(App, "uncaughtError")) {
+                comptime inject.noParams(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError");
                 _ = inject.returnsError(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError", false);
                 @call(.auto, App.uncaughtError, inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err));
             } else if (self.req.bodyErrorStatus(err)) |status| {
