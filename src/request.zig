@@ -280,8 +280,9 @@ pub const Request = struct {
     /// or a coding this server can't undo. Set where the failure happens,
     /// whatever error the handler then returns.
     pub fn clientErrorStatus(self: *const Request) ?http.Status {
-        if (self._extract_failed) return .bad_request;
-        return self.bodyClientErrorStatus();
+        // A custom extractor can fail on the body, which has the more
+        // specific status.
+        return self.bodyClientErrorStatus() orelse if (self._extract_failed) .bad_request else null;
     }
 
     /// `clientErrorStatus`, for the body alone.

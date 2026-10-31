@@ -242,9 +242,9 @@ pub fn Executor(comptime App: type) type {
             else
                 action(self.app, self.req, self.res);
             // A handler that finds nothing to answer with answers as if no
-            // route had matched.
+            // route had matched, unless the client got something wrong.
             result catch |err| switch (err) {
-                error.NotFound => return self.handleNotFound(),
+                error.NotFound => if (self.req.clientErrorStatus() == null) return self.handleNotFound() else return err,
                 else => return err,
             };
         }
