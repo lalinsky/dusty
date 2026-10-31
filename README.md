@@ -101,26 +101,13 @@ pub fn main(init: std.process.Init) !void {
 A handler takes only the parameters it needs, in any order: the app (`*App`), `*http.Request`,
 `*http.Response`, and the app's `RequestContext`. So do the app's `notFound` and `uncaughtError`
 hooks, which don't need `self` either, and `uncaughtError` can also take the error as `anyerror`.
-Neither takes a `Param`, and `uncaughtError` can't fail, so it can't take `Query` or `Header`
-either.
 
-A handler can also take a path parameter, parsed:
-
-```zig
-fn handlePage(page: http.Param("page", u32), res: *http.Response) !void {
-    try res.print(.text, "Page {d}\n", .{page.value});
-}
-
-server.router.get("/page/:page", handlePage);
-```
-
-A value that doesn't parse, such as `/page/abc`, makes the route not match, so the request
-gets a 404 unless another route matches it. A `Param` the path doesn't have is a compile error.
-
-`http.Query` and `http.Header` take a query parameter or a header the same way:
+A handler can also take values from the request, parsed: `http.Param` for a path parameter,
+`http.Query` for a query parameter and `http.Header` for a header.
 
 ```zig
 fn handleList(
+    user_id: http.Param("id", u64),
     page: http.Query("page", u32),
     sort: http.Query("sort", ?enum { asc, desc }),
     trace: http.Header("X-Request-Id", ?[]const u8),
@@ -128,10 +115,15 @@ fn handleList(
 ) !void {
     ...
 }
+
+server.router.get("/users/:id/posts", handleList);
 ```
 
-A missing value is a 400, or null when the type is optional, and a value that doesn't parse is
-always a 400.
+A path parameter that doesn't parse, such as `/users/abc/posts`, makes the route not match, so
+the request gets a 404 unless another route matches it, and one the path doesn't have is a compile
+error. A missing query parameter or header is a 400, or null when the type is optional, and one
+that doesn't parse is a 400. `notFound` can take query parameters and headers too, but not path
+parameters, and `uncaughtError` takes none of them, since it can't fail.
 
 An app can add parameter types of its own the same way, with `pub fn extract(scope: anytype)
 !@This()`, where `scope` has `app`, `req`, `res` and `ctx`. Returning `error.MissingValue` or
