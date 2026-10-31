@@ -34,8 +34,8 @@ A message can be up to 16 MiB. A bigger one fails `receive` with `error.MessageT
 
 A client can send several messages without waiting for the answers. `ws.receiveMany()` waits for
 the next message, like `receive`, but returns it together with every other message that has
-already arrived. With `ws.autoflush = false`, `send` only buffers the message, and `ws.flush()`
-sends the answers to the whole batch in one write:
+already arrived. With `ws.autoflush = false`, `send` holds the messages until `ws.flush()`, which
+sends the answers together:
 
 ```zig
 --8<-- "examples/websocket.zig:batch"

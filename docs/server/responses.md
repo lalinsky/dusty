@@ -7,8 +7,8 @@ body:
 --8<-- "examples/responses.zig:basic"
 ```
 
-The status is `.ok` unless the handler sets another one. Nothing is sent until the handler returns.
-Middleware that runs after the handler can still change the response.
+The status is `.ok` unless the handler sets another one. For a response like this, nothing is sent
+until the handler returns. Middleware that runs after the handler can still change the response.
 
 [`res.print`](../../apidocs/#http.Response.print) formats the body. Its first argument is the
 content type, from [`http.ContentType`](../../apidocs/#http.ContentType): `.text`, `.html`, `.json`

@@ -10,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
 
     // --8<-- [start:static]
-    var dir = try std.Io.Dir.cwd().openDir(init.io, "static", .{});
+    var dir = try std.Io.Dir.cwd().openDir(init.io, "examples/static", .{});
     defer dir.close(init.io);
 
     server.router.static("/static", dir, .{
