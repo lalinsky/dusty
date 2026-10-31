@@ -648,8 +648,13 @@ pub const Response = struct {
 
     pub const HeadersHook = struct {
         ptr: *anyopaque,
-        call: *const fn (ptr: *anyopaque) anyerror!void,
+        call: *const fn (ptr: *anyopaque) HeadersHookError!void,
     };
+
+    /// A middleware's `onHeaders` failed, so the headers were not sent.
+    /// The executor kept the hook's own error, and reports that one if the
+    /// handler returns this.
+    pub const HeadersHookError = error{ HeadersHookFailed, Canceled };
 
     pub const BodyFile = struct {
         handle: std.Io.File,
@@ -764,10 +769,6 @@ pub const Response = struct {
     /// them afterwards. Call `end` on the result before returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
         try self.runHeadersHook();
-        return self.startStream(buf);
-    }
-
-    fn startStream(self: *Response, buf: []u8) !StreamingBodyWriter {
         self.startBody();
         // Everything that can fail comes before anything is committed: a
         // handler that gets an error from here still has open headers,
@@ -807,12 +808,9 @@ pub const Response = struct {
         return .init(self, buf, compressor);
     }
 
-    fn runHeadersHook(self: *Response) anyerror!void {
+    fn runHeadersHook(self: *Response) HeadersHookError!void {
         const hook = self.headers_hook orelse return;
-        hook.call(hook.ptr) catch |err| switch (err) {
-            error.WriteFailed => return self.conn.getWriteError() orelse error.Unexpected,
-            else => return err,
-        };
+        return hook.call(hook.ptr);
     }
 
     fn startBody(self: *Response) void {
@@ -1985,9 +1983,9 @@ test "Response: no std.Io.Writer sentinel escapes the public write API" {
         Response.WriteError,
         ErrorSetOf(Response.writeHeader),
         ErrorSetOf(Response.write),
-        // `stream`, `startEventStream` and `upgradeWebSocket` also return
-        // whatever the middlewares' `onHeaders` do, so only this is fixed.
-        ErrorSetOf(Response.startStream),
+        ErrorSetOf(Response.stream),
+        ErrorSetOf(Response.startEventStream),
+        ErrorSetOf(Response.upgradeWebSocket),
         EventStream.Error,
         EventWriter.Error,
     }) |Set| {
