@@ -420,6 +420,7 @@ pub fn Router(comptime App: type) type {
             const files = alloc.create(Static) catch @panic("OOM");
             files.* = .{ .dir = dir, .options = opts };
             if (opts.index) |index| files.options.index = alloc.dupe(u8, index) catch @panic("OOM");
+            if (opts.cache_control) |c| files.options.cache_control = alloc.dupe(u8, c) catch @panic("OOM");
             files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
             const base = std.mem.trimEnd(u8, prefix, "/");
             // The directory itself, for its index.

@@ -148,6 +148,25 @@ test "static: missing files and escapes from the directory are 404s" {
     }
 }
 
+test "static: cache_control is sent with a 200 and a 304, not with a 404" {
+    var tmp = try testDir();
+    defer tmp.cleanup();
+
+    const opts: dusty.StaticOptions = .{ .cache_control = "public, max-age=60" };
+    var out: [4096]u8 = undefined;
+    const ok = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200"));
+    try std.testing.expectEqualStrings("public, max-age=60", header(ok, "Cache-Control").?);
+
+    const not_modified = try exchange(tmp.dir, "/", opts, "GET /style.css HTTP/1.1\r\nHost: x\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, not_modified, "HTTP/1.1 304"));
+    try std.testing.expectEqualStrings("public, max-age=60", header(not_modified, "Cache-Control").?);
+
+    const missing = try exchange(tmp.dir, "/", opts, "GET /nope.css HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", &out);
+    try std.testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 404"));
+    try std.testing.expect(header(missing, "Cache-Control") == null);
+}
+
 /// A GET of `/style.css` with `headers` added, on its own connection.
 fn getStyle(dir: std.Io.Dir, headers: []const u8, out: []u8) ![]const u8 {
     var request_buf: [512]u8 = undefined;
