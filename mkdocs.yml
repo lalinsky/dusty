@@ -7,7 +7,7 @@ repo_name: lalinsky/dusty
 theme:
   name: material
   icon:
-    logo: material/web
+    logo: material/weather-dust
   palette:
     - scheme: default
       primary: brown
