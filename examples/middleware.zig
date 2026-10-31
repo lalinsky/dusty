@@ -23,7 +23,7 @@ const Timing = struct {
         try executor.next();
         const took = start.durationTo(std.Io.Timestamp.now(req.io, .awake));
         const text = try std.fmt.allocPrint(req.arena, "{d}us", .{took.toMicroseconds()});
-        try res.header("X-Response-Time", text);
+        if (!res.headers_written) try res.header("X-Response-Time", text);
     }
 };
 // --8<-- [end:timing]
@@ -34,15 +34,20 @@ const Auth = struct {
         token: []const u8,
     };
 
-    token: []const u8,
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    token_hash: [Sha256.digest_length]u8,
 
     pub fn init(config: Config) !Auth {
-        return .{ .token = config.token };
+        var auth: Auth = undefined;
+        Sha256.hash(config.token, &auth.token_hash, .{});
+        return auth;
     }
 
     pub fn execute(self: *const Auth, req: *http.Request, res: *http.Response, executor: anytype) !void {
-        const header = req.headers.get("Authorization") orelse "";
-        if (!std.mem.eql(u8, header, self.token)) {
+        var header_hash: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(req.headers.get("Authorization") orelse "", &header_hash, .{});
+        if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, header_hash, self.token_hash)) {
             res.status = .unauthorized;
             return res.print(.text, "Unauthorized\n", .{});
         }

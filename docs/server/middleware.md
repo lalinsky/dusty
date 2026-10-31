@@ -33,7 +33,8 @@ doesn't run:
 --8<-- "examples/middleware.zig:auth"
 ```
 
-A request to `/admin/` without the right `Authorization` header gets a 401.
+A request to `/admin/` without the right `Authorization` header gets a 401. `Auth` compares hashes
+with `std.crypto.timing_safe.eql`, so the time the check takes doesn't give the token away.
 
 ## Passing Values to Handlers
 

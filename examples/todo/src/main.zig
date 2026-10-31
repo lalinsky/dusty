@@ -131,9 +131,8 @@ fn create(app: *App, req: *http.Request, res: *http.Response) !void {
     try renderList(app, req, res);
 }
 
-fn toggle(app: *App, req: *http.Request, res: *http.Response) !void {
-    const id = req.params.getInt(i32, "id") orelse return notFound(res);
-    const todo = try app.queryTodo(req.arena, "UPDATE todos SET done = NOT done WHERE id = $1 RETURNING id, title, done", .{id}) orelse return notFound(res);
+fn toggle(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Response) !void {
+    const todo = try app.queryTodo(req.arena, "UPDATE todos SET done = NOT done WHERE id = $1 RETURNING id, title, done", .{id.value}) orelse return error.NotFound;
     try res.render(.html, templates.TodoItemWithCount, .{ todo, try app.countActive() });
 }
 
@@ -144,22 +143,20 @@ fn edit(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Res
 }
 // --8<-- [end:edit]
 
-fn update(app: *App, req: *http.Request, res: *http.Response) !void {
-    const id = req.params.getInt(i32, "id") orelse return notFound(res);
+fn update(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Response) !void {
     const form = try req.formData();
     const title = std.mem.trim(u8, form.get("title") orelse "", &std.ascii.whitespace);
 
     // An emptied title keeps the old one.
-    _ = try app.pool.exec("UPDATE todos SET title = COALESCE(NULLIF($2, ''), title) WHERE id = $1", .{ id, title });
+    _ = try app.pool.exec("UPDATE todos SET title = COALESCE(NULLIF($2, ''), title) WHERE id = $1", .{ id.value, title });
     // The whole list, since changes from other tabs are not reloaded while
     // editing. It's also right when the item was deleted meanwhile.
     try renderList(app, req, res);
 }
 
-fn delete(app: *App, req: *http.Request, res: *http.Response) !void {
-    const id = req.params.getInt(i32, "id") orelse return notFound(res);
-    const deleted = try app.pool.exec("DELETE FROM todos WHERE id = $1", .{id});
-    if (deleted != 1) return notFound(res);
+fn delete(app: *App, id: http.Param("id", i32), res: *http.Response) !void {
+    const deleted = try app.pool.exec("DELETE FROM todos WHERE id = $1", .{id.value});
+    if (deleted != 1) return error.NotFound;
     try res.render(.html, templates.Count, .{ try app.countActive(), true });
 }
 
@@ -220,10 +217,6 @@ fn listParams(req: *http.Request) !struct { Filter, []const u8 } {
     return .{ std.meta.stringToEnum(Filter, filter orelse "") orelse .all, q orelse "" };
 }
 
-fn notFound(res: *http.Response) void {
-    res.status = .not_found;
-}
-
 /// Bumps `app.changes` on every Postgres notification, reconnecting when the
 /// listening connection is lost.
 fn listen(app: *App, io: std.Io) !void {
@@ -274,6 +267,8 @@ pub fn main(init: std.process.Init) !void {
     const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
     var server = http.Server(App).init(init.gpa, io, .{
         .listeners = &.{.{ .address = addr }},
+        // Every open tab holds an event stream, which only ends at this timeout.
+        .timeout = .{ .shutdown = .fromSeconds(2) },
     }, &app);
     defer server.deinit();
 

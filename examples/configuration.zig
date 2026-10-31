@@ -22,6 +22,12 @@ fn runBasic(init: std.process.Init) !void {
 }
 
 fn runListeners(init: std.process.Init) !void {
+    // A socket file left from an earlier run would make the listen fail.
+    std.Io.Dir.cwd().deleteFile(init.io, "/tmp/app.sock") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
     // --8<-- [start:listeners]
     var server = http.Server(void).init(init.gpa, init.io, .{
         .listeners = &.{
