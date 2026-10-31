@@ -284,7 +284,9 @@ pub fn main(init: std.process.Init) !void {
     server.router.delete("/todos/:id", delete);
     server.router.get("/events", events);
     server.router.get("/api/todos", api);
+    // --8<-- [start:register]
     assets.register(&server.router);
+    // --8<-- [end:register]
 
     var listen_task = try io.concurrent(listen, .{ &app, io });
     defer listen_task.cancel(io) catch {};

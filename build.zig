@@ -199,6 +199,7 @@ pub fn build(b: *std.Build) void {
         "responses",
         "routing",
         "sse",
+        "static_files",
         "tls_server",
         "websocket",
     };

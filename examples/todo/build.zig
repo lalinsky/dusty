@@ -49,7 +49,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("json", json.module("json"));
     exe.root_module.addImport("pg", pg.module("pg"));
     exe.root_module.addImport("zt", zt_dep.module("zt"));
+    // --8<-- [start:assets]
     exe.root_module.addImport("assets", dusty.addAssets(b, dusty_dep, .{ .dir = b.path("assets") }));
+    // --8<-- [end:assets]
     exe.step.dependOn(templates);
 
     b.installArtifact(exe);
