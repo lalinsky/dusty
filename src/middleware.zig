@@ -175,6 +175,8 @@ pub fn Executor(comptime App: type) type {
                     }
                     if (self.req.bodyErrorStatus(err) != null) {
                         log.debug("request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                    } else if (self.req.extractErrorStatus(err) != null) {
+                        log.debug("request parameter rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     } else {
                         log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                     }
@@ -270,7 +272,7 @@ pub fn Executor(comptime App: type) type {
             if (comptime App != void and @hasDecl(App, "notFound")) {
                 comptime inject.noParams(@TypeOf(App.notFound), @typeName(App) ++ ".notFound");
                 _ = inject.returnsError(@TypeOf(App.notFound), @typeName(App) ++ ".notFound", true);
-                return @call(.auto, App.notFound, inject.args(App, @TypeOf(App.notFound), self.app, self.req, self.res, {}));
+                return @call(.auto, App.notFound, try inject.args(App, @TypeOf(App.notFound), self.app, self.req, self.res, {}));
             } else {
                 self.res.status = .not_found;
                 self.res.content_type = .text;
@@ -285,10 +287,11 @@ pub fn Executor(comptime App: type) type {
             // headers are still open.
             self.res.resetBody();
             if (comptime App != void and @hasDecl(App, "uncaughtError")) {
-                comptime inject.noParams(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError");
+                comptime inject.noExtractors(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError");
                 _ = inject.returnsError(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError", false);
-                @call(.auto, App.uncaughtError, inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err));
-            } else if (self.req.bodyErrorStatus(err)) |status| {
+                const call_args = inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err) catch |e| switch (e) {};
+                @call(.auto, App.uncaughtError, call_args);
+            } else if (self.req.bodyErrorStatus(err) orelse self.req.extractErrorStatus(err)) |status| {
                 self.res.status = status;
                 self.res.content_type = .text;
                 self.res.body = switch (status) {

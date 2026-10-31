@@ -1741,6 +1741,55 @@ test "Server: the path is matched segment by segment, each one decoded" {
     });
 }
 
+test "Server: Query and Header extractors, and a 400 for a missing or bad value" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+    server.router.get("/list", struct {
+        fn handle(page: dusty.Query("page", u32), sort: dusty.Query("sort", ?enum { asc, desc }), trace: dusty.Header("X-Trace", ?[]const u8), res: *dusty.Response) !void {
+            try res.print(.text, "page={d} sort={s} trace={s}", .{ page.value, if (sort.value) |v| @tagName(v) else "-", trace.value orelse "-" });
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("GET /list?page=2&sort=desc HTTP/1.1\r\nHost: x\r\nx-trace: abc\r\n\r\n" ++
+        "GET /list?page=3 HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "GET /list HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "GET /list?page=two HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        // A value that is there but doesn't parse is a 400 even for an optional one.
+        "GET /list?page=1&sort=up HTTP/1.1\r\nHost: x\r\n\r\n");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "200", "page=2 sort=desc trace=abc" },
+        .{ "200", "page=3 sort=- trace=-" },
+        .{ "400", "400 Bad Request\n" },
+        .{ "400", "400 Bad Request\n" },
+        .{ "400", "400 Bad Request\n" },
+    }) |want| {
+        var status: [64]u8 = undefined;
+        var body: [64]u8 = undefined;
+        const resp = try readResponse(&reader.interface, &status, &body);
+        try std.testing.expect(std.mem.indexOf(u8, resp.status, want[0]) != null);
+        try std.testing.expectEqualStrings(want[1], resp.body);
+    }
+}
+
 /// Sends `head`, then `body_len` bytes of body the server will not read, and
 /// returns the status line of the answer. The rest of the answer must end
 /// with a FIN: a close with the body unread would be a reset, and the peer
