@@ -115,6 +115,25 @@ server.router.get("/page/:page", handlePage);
 A value that doesn't parse, such as `/page/abc`, makes the route not match, so the request
 gets a 404 unless another route matches it. A `Param` the path doesn't have is a compile error.
 
+`http.Query` and `http.Header` take a query parameter or a header the same way:
+
+```zig
+fn handleList(
+    page: http.Query("page", u32),
+    sort: http.Query("sort", ?enum { asc, desc }),
+    trace: http.Header("X-Request-Id", ?[]const u8),
+    res: *http.Response,
+) !void {
+    ...
+}
+```
+
+A missing value is a 400, or null when the type is optional, and a value that doesn't parse is
+always a 400. These are extractors: types with `pub fn extract(scope: anytype) !@This()`, where
+`scope` has `app`, `req`, `res` and `ctx`. An app can write its own the same way. One that returns
+`error.MissingValue` or `error.InvalidValue` gets a 400, and any other error is handled like one
+from the handler.
+
 `listeners` takes any number of listeners, each with its own TLS, so one server
 can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 

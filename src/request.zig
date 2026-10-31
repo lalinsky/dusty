@@ -128,6 +128,8 @@ pub const Request = struct {
     // What the last failed body read failed with, so an error coming out of
     // a handler can be told apart from one of the same name it made itself.
     _body_err: ?anyerror = null,
+    // What the extractor that failed returned, for the same reason.
+    _extract_err: ?anyerror = null,
     // The non-empty segments of `path`, each a slice of it.
     _segments: []const []const u8 = &.{},
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
@@ -292,6 +294,18 @@ pub const Request = struct {
             error.IncompleteBody,
             error.CorruptInput,
             => .bad_request,
+            else => null,
+        };
+    }
+
+    /// 400 when `err` is the `error.MissingValue` or `error.InvalidValue`
+    /// an extractor such as `http.Query` failed with for this request, null
+    /// for any other error, including one of the same name from elsewhere.
+    pub fn extractErrorStatus(self: *const Request, err: anyerror) ?http.Status {
+        const cause = self._extract_err orelse return null;
+        if (cause != err) return null;
+        return switch (err) {
+            error.MissingValue, error.InvalidValue => .bad_request,
             else => null,
         };
     }

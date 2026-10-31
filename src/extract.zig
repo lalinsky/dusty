@@ -1,21 +1,27 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
 
-/// A path parameter of the route, parsed as `T`, for a handler to take as
-/// an argument:
+/// Extractors are types a handler takes as parameters, each filled from
+/// the request by its `extract(scope: anytype)`. `scope` has the `app`,
+/// `req`, `res` and `ctx` fields middleware sees on its executor. An
+/// extractor returns `error.MissingValue` for a value the request doesn't
+/// have and `error.InvalidValue` for one that doesn't parse, which are
+/// answered with a 400; anything else it returns goes through the usual
+/// error handling.
+/// A path parameter of the route, parsed as `T`:
 ///
-///     fn getUser(id: dusty.Param("id", u64), res: *dusty.Response) !void
+///     fn getUser(id: http.Param("id", u64), res: *http.Response) !void
 ///
 /// The route path must have `:name` or `*name`, which is checked at compile
 /// time. A value that does not parse as `T` makes the route not match, so
 /// the router tries the others and answers 404 if none does.
 ///
 /// `T` is an integer (decimal digits with no leading zero, and a leading
-/// `-` if signed), an
-/// enum (a tag name), `bool` (`true` or `false`), `[]const u8` (as it
-/// is), or a type declaring `pub fn parseParam([]const u8) ?T`.
+/// `-` if signed), an enum (a tag name), `bool` (`true` or `false`),
+/// `[]const u8` (as it is), or a type declaring
+/// `pub fn parseParam([]const u8) ?T`.
 pub fn Param(comptime name: []const u8, comptime T: type) type {
-    comptime checkType(T);
+    comptime checkType(T, "http.Param");
     return struct {
         value: T,
 
@@ -24,8 +30,8 @@ pub fn Param(comptime name: []const u8, comptime T: type) type {
 
         /// Only called for a route the router matched, which it does only
         /// once the value has parsed.
-        pub fn fromRequest(req: *const Request) @This() {
-            const raw = req.params.get(name) orelse unreachable;
+        pub fn extract(scope: anytype) @This() {
+            const raw = scope.req.params.get(name) orelse unreachable;
             return .{ .value = parse(T, raw) orelse unreachable };
         }
 
@@ -36,12 +42,62 @@ pub fn Param(comptime name: []const u8, comptime T: type) type {
     };
 }
 
+/// A query string parameter, parsed as `T` the way `Param` parses it. A
+/// `?T` is null when the parameter is missing; a value that is there but
+/// doesn't parse is a 400 either way.
+pub fn Query(comptime name: []const u8, comptime T: type) type {
+    return Value(name, T, "http.Query", struct {
+        fn get(req: *const Request) ?[]const u8 {
+            return req.query.get(name);
+        }
+    }.get);
+}
+
+/// A request header, found by its name in any case, and parsed as `T`
+/// like `Query`. The first one counts when there are several.
+pub fn Header(comptime name: []const u8, comptime T: type) type {
+    return Value(name, T, "http.Header", struct {
+        fn get(req: *const Request) ?[]const u8 {
+            return req.headers.get(name);
+        }
+    }.get);
+}
+
+fn Value(
+    comptime name: []const u8,
+    comptime T: type,
+    comptime what: []const u8,
+    comptime get: fn (*const Request) ?[]const u8,
+) type {
+    const optional = @typeInfo(T) == .optional;
+    const Inner = if (optional) @typeInfo(T).optional.child else T;
+    comptime checkType(Inner, what);
+    return struct {
+        value: T,
+
+        pub const value_name = name;
+
+        pub fn extract(scope: anytype) error{ MissingValue, InvalidValue }!@This() {
+            const raw = get(scope.req) orelse {
+                if (optional) return .{ .value = null };
+                return error.MissingValue;
+            };
+            return .{ .value = parse(Inner, raw) orelse return error.InvalidValue };
+        }
+    };
+}
+
 /// Whether `P` is a `Param`.
 pub fn isParam(comptime P: type) bool {
     return @typeInfo(P) == .@"struct" and @hasDecl(P, "param_name") and @hasDecl(P, "Value") and P == Param(P.param_name, P.Value);
 }
 
-fn checkType(comptime T: type) void {
+/// Whether a handler parameter of type `P` is filled by its `extract`.
+pub fn isExtractor(comptime P: type) bool {
+    return @typeInfo(P) == .@"struct" and @hasDecl(P, "extract");
+}
+
+fn checkType(comptime T: type, comptime what: []const u8) void {
     if (T == []const u8) return;
     switch (@typeInfo(T)) {
         .@"struct", .@"union", .@"enum", .@"opaque" => if (@hasDecl(T, "parseParam")) {
@@ -52,7 +108,7 @@ fn checkType(comptime T: type) void {
     }
     switch (@typeInfo(T)) {
         .int, .@"enum", .bool => {},
-        else => @compileError("dusty.Param can't parse " ++ @typeName(T) ++ "; give it a `pub fn parseParam([]const u8) ?" ++ @typeName(T) ++ "`"),
+        else => @compileError(what ++ " can't parse " ++ @typeName(T) ++ "; give it a `pub fn parseParam([]const u8) ?" ++ @typeName(T) ++ "`"),
     }
 }
 

@@ -2,11 +2,21 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const RequestContext = @import("request.zig").RequestContext;
 const Response = @import("response.zig").Response;
-const param = @import("param.zig");
+const extract = @import("extract.zig");
+
+/// What an extractor's `extract` gets.
+pub fn Scope(comptime App: type) type {
+    return struct {
+        app: if (App == void) void else *App,
+        req: *Request,
+        res: *Response,
+        ctx: *RequestContext(App),
+    };
+}
 
 /// Arguments for calling `F`, each filled by its type: `*App`, `*Request`,
-/// `*Response`, `*App.RequestContext`, a `Param`, and `anyerror` when
-/// `err` is one.
+/// `*Response`, `*App.RequestContext`, an extractor, and `anyerror` when
+/// `err` is one. An extractor that fails is recorded on `req`.
 pub fn args(
     comptime App: type,
     comptime F: type,
@@ -14,9 +24,12 @@ pub fn args(
     req: *Request,
     res: *Response,
     err: anytype,
-) std.meta.ArgsTuple(F) {
+) !std.meta.ArgsTuple(F) {
     var result: std.meta.ArgsTuple(F) = undefined;
-    inline for (0..result.len) |i| result[i] = arg(@TypeOf(result[i]), App, F, app, req, res, err);
+    inline for (0..result.len) |i| {
+        const P = @TypeOf(result[i]);
+        result[i] = if (comptime P == anyerror and @TypeOf(err) == anyerror) err else try arg(P, App, F, app, req, res);
+    }
     return result;
 }
 
@@ -37,14 +50,20 @@ fn arg(
     app: if (App == void) void else *App,
     req: *Request,
     res: *Response,
-    err: anytype,
-) P {
+) !P {
     if (comptime pointsTo(P, Request)) return req;
     if (comptime pointsTo(P, Response)) return res;
     if (comptime App != void and pointsTo(P, App)) return app;
     if (comptime pointsTo(P, RequestContext(App))) return req.ctx(App);
-    if (comptime param.isParam(P)) return P.fromRequest(req);
-    if (comptime P == anyerror and @TypeOf(err) == anyerror) return err;
+    if (comptime extract.isExtractor(P)) {
+        const scope: Scope(App) = .{ .app = app, .req = req, .res = res, .ctx = req.ctx(App) };
+        const result = P.extract(scope);
+        if (@typeInfo(@TypeOf(result)) != .error_union) return result;
+        return result catch |e| {
+            req._extract_err = e;
+            return e;
+        };
+    }
     @compileError("can't inject a parameter of type " ++ @typeName(P) ++ " into " ++ @typeName(F));
 }
 
@@ -58,7 +77,7 @@ pub fn params(comptime F: type) []const type {
         const a: std.meta.ArgsTuple(F) = undefined;
         var result: []const type = &.{};
         for (0..a.len) |i| {
-            if (param.isParam(@TypeOf(a[i]))) result = result ++ .{@TypeOf(a[i])};
+            if (extract.isParam(@TypeOf(a[i]))) result = result ++ .{@TypeOf(a[i])};
         }
         return result;
     }
@@ -69,4 +88,13 @@ pub fn params(comptime F: type) []const type {
 pub fn noParams(comptime F: type, comptime name: []const u8) void {
     const found = params(F);
     if (found.len > 0) @compileError(name ++ " can't take dusty.Param(\"" ++ found[0].param_name ++ "\", ...): it isn't called for a route");
+}
+
+/// A compile error if `F` takes an extractor, for functions that can't
+/// fail.
+pub fn noExtractors(comptime F: type, comptime name: []const u8) void {
+    const a: std.meta.ArgsTuple(F) = undefined;
+    inline for (0..a.len) |i| {
+        if (extract.isExtractor(@TypeOf(a[i]))) @compileError(name ++ " can't take " ++ @typeName(@TypeOf(a[i])) ++ ": it can't fail");
+    }
 }
