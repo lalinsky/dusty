@@ -1,18 +1,47 @@
 # WebSocket
 
-!!! warning "Draft"
+A handler turns a request into a WebSocket connection with
+[`res.upgradeWebSocket`](../../apidocs/#http.Response.upgradeWebSocket). This one sends every text
+and binary message back:
 
-    This page is a draft. Still to cover:
+```zig
+--8<-- "examples/websocket.zig:echo"
+```
 
-    - Compiled echo example
-    - Message types, `receiveMany`, `tryReceive`, ping and pong, close codes
-    - Sending from another task while one is receiving
-    - Timeouts for long-lived connections
-    - Message size limits
+```zig
+server.router.get("/ws", echo);
+```
 
-`res.upgradeWebSocket(req)` turns a request into a WebSocket connection. It returns null if the
-request isn't a valid upgrade request, and the handler can answer it as a normal request.
+`res.upgradeWebSocket(req)` sends the response that accepts the upgrade and returns an
+[`http.WebSocket`](../../apidocs/#http.WebSocket). If the request isn't a WebSocket upgrade, it
+returns null. The handler can then answer it like any other request. Call `ws.deinit()` when you're
+done with the connection.
 
-After the upgrade, the handler reads messages with `ws.receive()` and sends them with
-`ws.send(.text, data)`. When the other side closes the connection, `receive` returns a message of
-type `.close`. Call `ws.deinit()` when you're done. The client side is `http.WebSocketClient`.
+## Messages
+
+`ws.receive()` waits for the next message. A message has a `type`, such as `.text` or `.binary`, and
+its `data`. The data is only valid until the next call to `receive`.
+
+`ws.send(.text, data)` sends a message. One task can receive while other tasks send on the same
+connection.
+
+`receive` answers pings for you. `ws.ping(data)` sends a ping of your own.
+
+## Closing
+
+When the client closes the connection, `receive` answers the close and returns a message of type
+`.close`. `error.EndOfStream` means the connection ended without a close message.
+
+To close it from the server, call `ws.close(.normal, "bye")` with a close code and a reason.
+
+## Timeouts
+
+The WebSocket runs inside the handler, so the request timeout covers it. That timeout is 30 seconds
+by default. The example calls `req.setTimeout` before every `receive`, so the connection closes
+after the client has been quiet for 60 seconds. `req.setTimeout(.none)` turns it off.
+
+## Next Steps
+
+- [WebSocket](../client/websocket.md) in the client section covers connecting to a WebSocket
+  server.
+- [Server-Sent Events](sse.md) covers sending events to a browser over a normal response.

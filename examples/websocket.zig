@@ -1,96 +1,60 @@
 const std = @import("std");
 const http = @import("dusty");
 
-const App = struct {};
-
-const websocket_idle_timeout: std.Io.Timeout = .{
+// --8<-- [start:echo]
+const idle_timeout: std.Io.Timeout = .{
     .duration = .{ .raw = .fromSeconds(60), .clock = .awake },
 };
 
-fn handleWebSocket(_: *App, req: *http.Request, res: *http.Response) !void {
+fn echo(req: *http.Request, res: *http.Response) !void {
     var ws = try res.upgradeWebSocket(req) orelse {
         res.status = .bad_request;
-        res.body = "Expected WebSocket upgrade\n";
-        return;
+        return res.print(.text, "Expected a WebSocket upgrade\n", .{});
     };
-    errdefer ws.close(.internal_error, "handler error") catch {};
-
-    try ws.send(.text, "Welcome to the WebSocket echo server!");
+    defer ws.deinit();
 
     while (true) {
-        // Treat the request timeout as a WebSocket inactivity timeout by
-        // restarting it before every receive.
-        req.setTimeout(websocket_idle_timeout);
+        req.setTimeout(idle_timeout);
         const msg = ws.receive() catch |err| switch (err) {
-            error.EndOfStream => break,
+            error.EndOfStream => return,
             else => return err,
         };
-
         switch (msg.type) {
-            .text => {
-                // Echo the message back
-                std.log.info("Received: {s}", .{msg.data});
-                try ws.send(.text, msg.data);
-            },
-            .binary => {
-                std.log.info("Received binary: {d} bytes", .{msg.data.len});
-                try ws.send(.binary, msg.data);
-            },
-            .close => {
-                std.log.info("Client closed connection", .{});
-                break;
-            },
+            .text, .binary => try ws.send(msg.type, msg.data),
+            .close => return,
             else => {},
         }
     }
-
-    try ws.close(.normal, "goodbye");
 }
+// --8<-- [end:echo]
 
-fn handleIndex(_: *App, _: *http.Request, res: *http.Response) !void {
-    try res.header("Content-Type", "text/html");
-    res.body =
+fn index(res: *http.Response) !void {
+    try res.print(.html,
         \\<!DOCTYPE html>
         \\<html>
-        \\<head><title>WebSocket Echo</title></head>
         \\<body>
-        \\  <h1>WebSocket Echo Server</h1>
-        \\  <p>Open your browser console and run:</p>
-        \\  <pre>
-        \\const ws = new WebSocket("ws://localhost:8080/ws");
-        \\ws.onmessage = (e) => console.log("Received:", e.data);
-        \\ws.onopen = () => ws.send("Hello!");
-        \\  </pre>
+        \\  <p>Open the browser console to see the messages.</p>
         \\  <script>
-        \\    const ws = new WebSocket("ws://localhost:8080/ws");
+        \\    const ws = new WebSocket("ws://" + location.host + "/ws");
         \\    ws.onmessage = (e) => console.log("Received:", e.data);
-        \\    ws.onopen = () => {
-        \\      console.log("Connected!");
-        \\      ws.send("Hello from browser!");
-        \\    };
-        \\    ws.onclose = () => console.log("Disconnected");
+        \\    ws.onopen = () => ws.send("Hello from the browser!");
         \\  </script>
         \\</body>
         \\</html>
-    ;
-}
-
-pub fn runServer(allocator: std.mem.Allocator, io: std.Io) !void {
-    var app: App = .{};
-
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    var server = http.Server(App).init(allocator, io, .{
-        .listeners = &.{.{ .address = addr }},
-    }, &app);
-    defer server.deinit();
-
-    server.router.get("/", handleIndex);
-    server.router.get("/ws", handleWebSocket);
-
-    std.log.info("WebSocket echo server running at http://127.0.0.1:8080", .{});
-    try server.run();
+        \\
+    , .{});
 }
 
 pub fn main(init: std.process.Init) !void {
-    try runServer(init.gpa, init.io);
+    var server = http.Server(void).init(init.gpa, init.io, .{
+        .listeners = &.{.{
+            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) },
+        }},
+    }, {});
+    defer server.deinit();
+
+    server.router.get("/", index);
+    server.router.get("/ws", echo);
+
+    try server.run();
 }
