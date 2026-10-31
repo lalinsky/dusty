@@ -162,10 +162,12 @@ fn delete(app: *App, req: *http.Request, res: *http.Response) !void {
     try res.render(.html, templates.Count, .{ try app.countActive(), true });
 }
 
+// --8<-- [start:api]
 fn api(app: *App, req: *http.Request, res: *http.Response) !void {
     const todos = try app.queryTodos(req.arena, "SELECT id, title, done FROM todos ORDER BY id", .{});
     try res.encode(.json, json.encode, todos);
 }
+// --8<-- [end:api]
 
 fn events(app: *App, req: *http.Request, res: *http.Response) !void {
     req.setTimeout(.none);
