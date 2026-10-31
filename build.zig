@@ -171,12 +171,27 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(assets_gen);
 
+    const lib = b.addLibrary(.{
+        .name = "dusty",
+        .root_module = mod,
+        .linkage = .static,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = lib.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    const docs_step = b.step("docs", "Install API docs into zig-out/docs");
+    docs_step.dependOn(&install_docs.step);
+
     // Examples
     const examples_step = b.step("examples", "Build all examples");
 
     const example_files = [_][]const u8{
         "basic",
         "client",
+        "fetch",
+        "hello_world",
         "proxy",
         "sse",
         "tls_server",
