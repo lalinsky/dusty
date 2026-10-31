@@ -105,8 +105,8 @@ const App = struct {
 ```
 
 The `secret_key` in its config, set in the [example above](#attaching-middleware), signs the
-cookie. Keep it secret and make it at least 32 random bytes. The handler reads and writes the session through the
-context:
+cookie. Keep it secret and make it at least 32 random bytes. The handler reads and writes the
+session through the context:
 
 ```zig
 --8<-- "examples/middleware.zig:session"
