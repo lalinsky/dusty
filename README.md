@@ -3,289 +3,98 @@
 [![CI](https://github.com/lalinsky/dusty/actions/workflows/test.yml/badge.svg)](https://github.com/lalinsky/dusty/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/zig-0.17.0-orange.svg)](https://ziglang.org/download/)
+[![Documentation](https://img.shields.io/badge/docs-online-green.svg)](https://lalinsky.github.io/dusty/)
 [![HTTP Arena H1](https://img.shields.io/endpoint?url=https://http-arena.com/badge/dusty/h1.json)](https://http-arena.com/#type=emerging,flagship&tuned=0)
 [![HTTP Arena WebSocket](https://img.shields.io/endpoint?url=https://http-arena.com/badge/dusty/ws.json)](https://http-arena.com/#scope=ws&type=emerging,flagship&tuned=0)
 
-Dusty is a HTTP client/server library built on top of Zig's standard library I/O interface (`std.Io`) and [llhttp](https://github.com/nodejs/llhttp) (HTTP parser from NodeJS).
+Dusty is an HTTP client and server library for Zig. It's built on the standard library's
+[`std.Io`](https://ziglang.org/documentation/0.16.0/std/#std.Io) interface, and parses HTTP with
+[llhttp](https://github.com/nodejs/llhttp), the parser from Node.js.
 
-The library was originally written for [zio](https://github.com/lalinsky/zio), and later ported to `std.Io`. It's still recommended to use it with zio's
-implementation of the `std.Io` interface, especially if you need to communicate with other services over the network in your HTTP request handlers,
-or if you are using WebSocket. However, it's usable with any implementation, like `std.Io.Threaded`, or even the simulated implementation from [Marionette](https://github.com/sb2bg/marionette).
+It runs on any `std.Io` implementation that supports networking, including `std.Io.Threaded` from
+the standard library, or even the simulated one from [Marionette](https://github.com/sb2bg/marionette).
+It was originally written for [zio](https://github.com/lalinsky/zio) though, and zio is still what
+we recommend for production, especially if your handlers call other services over the network or
+you use WebSocket.
+
+A lot of work has gone into making Dusty both reliable and fast. Timeouts and connection limits are
+on by default, and they work on every `std.Io` implementation. The HTTP parsing has been checked
+with [HTTP Garden](https://github.com/narfindustries/http-garden) for differences that could lead to
+request smuggling. And on [HttpArena](https://http-arena.com/), it's among the fastest servers.
+
+See the [documentation](https://lalinsky.github.io/dusty/) for the full guide.
 
 ## Features
-- Router with support for parameters and wildcards
-- Supports HTTP/1.0 and HTTP/1.1
-- Supports chunked transfer encoding in both request/response bodies
-- Transparent gzip/deflate decoding of request and response bodies
-- gzip compression of response bodies, opt-in per response with `res.compress = true`
-- Server-Sent Events (SSE) for streaming responses
-- Static file serving with conditional and range requests, and precompressed files
-- Assets embedded in the binary at build time, with cache-busting URLs
-- WebSocket support (RFC 6455)
-- HTTP/HTTPS client with connection pooling
-- Unix domain socket support for client connections
-- Optional TLS support in both client and server, including mTLS for authentication (via [tls.zig](https://github.com/ianic/tls.zig))
+
+- Router with path parameters, wildcards, groups and per-group middleware
+- HTTP/1.0 and HTTP/1.1, with chunked transfer encoding in both directions
+- Transparent gzip and deflate decoding of request and response bodies, and optional gzip compression of responses
+- Server-Sent Events, and WebSocket on both the server and the client
+- Static files with conditional and range requests, and assets embedded at build time
+- HTTP and HTTPS client with connection pooling, and Unix socket support
+- TLS on both sides, including client certificates, through [tls.zig](https://github.com/lalinsky/tls.zig)
 
 ## Installation
 
 Requires Zig 0.16 or 0.17.
 
+1) Add Dusty as a dependency in your `build.zig.zon`:
+
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/dusty#v0.5.0"
+zig fetch --save "git+https://github.com/lalinsky/dusty"
 ```
 
-Then in your `build.zig`, add the module as a dependency:
+2) In your `build.zig`, add the `dusty` module as a dependency to your program:
 
 ```zig
 const dusty_dep = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
 });
+
 exe.root_module.addImport("dusty", dusty_dep.module("dusty"));
 ```
 
-### Using a custom tls.zig
-
-TLS is enabled with Dusty's pinned tls.zig dependency by default. To inject a
-different compatible version without fetching or compiling the bundled one,
-disable only the bundled provider and replace the `tls` import:
-
-```zig
-const dusty_dep = b.dependency("dusty", .{
-    .target = target,
-    .optimize = optimize,
-    .use_tls = true,
-    .use_bundled_tls = false,
-});
-const custom_tls = b.dependency("custom_tls", .{
-    .target = target,
-    .optimize = optimize,
-});
-
-const dusty_mod = dusty_dep.module("dusty");
-dusty_mod.addImport("tls", custom_tls.module("tls"));
-exe.root_module.addImport("dusty", dusty_mod);
-```
-
-The application declares `custom_tls` in its own `build.zig.zon`, so it can
-point to another commit, fork, or local path. Omitting the injected module is a
-compile error. Use `.use_tls = false` instead when TLS should be compiled out.
+See [Build Options](https://lalinsky.github.io/dusty/build-options/) for how to configure the package.
 
 ## Usage
 
-### Server Example
+A server with two routes:
 
 ```zig
 const std = @import("std");
 const http = @import("dusty");
 
-fn handleUser(req: *http.Request, res: *http.Response) !void {
-    const user_id = req.params.get("id") orelse "guest";
-    try req.io.sleep(.fromMilliseconds(10), .real);
-    try res.print(.text, "Hello, user {s}!\n", .{user_id});
+const App = struct {
+    greeting: []const u8,
+};
+
+fn index(app: *App, res: *http.Response) !void {
+    try res.print(.text, "{s}, world!\n", .{app.greeting});
+}
+
+fn hello(app: *App, name: http.Param("name", []const u8), res: *http.Response) !void {
+    try res.print(.text, "{s}, {s}!\n", .{ app.greeting, name.value });
 }
 
 pub fn main(init: std.process.Init) !void {
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
-    var server = http.Server(void).init(init.gpa, init.io, .{
-        .listeners = &.{.{ .address = addr }},
-    }, {});
+    var app: App = .{ .greeting = "Hello" };
+
+    var server = http.Server(App).init(init.gpa, init.io, .{
+        .listeners = &.{.{
+            .address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) },
+        }},
+    }, &app);
     defer server.deinit();
 
-    server.router.get("/user/:id", handleUser);
+    server.router.get("/", index);
+    server.router.get("/hello/:name", hello);
 
     try server.run();
 }
 ```
 
-A handler takes only the parameters it needs, in any order: the app (`*App`), `*http.Request`,
-`*http.Response`, and the app's `RequestContext`. So do the app's `notFound` and `uncaughtError`
-hooks, which don't need `self` either, and `uncaughtError` can also take the error as `anyerror`.
-
-A handler can also take values from the request, parsed: `http.Param` for a path parameter,
-`http.Query` for a query parameter and `http.Header` for a header.
-
-```zig
-fn handleList(
-    user_id: http.Param("id", u64),
-    page: http.Query("page", u32),
-    sort: http.Query("sort", ?enum { asc, desc }),
-    trace: http.Header("X-Request-Id", ?[]const u8),
-    res: *http.Response,
-) !void {
-    ...
-}
-
-server.router.get("/users/:id/posts", handleList);
-```
-
-A path parameter that doesn't parse, such as `/users/abc/posts`, makes the route not match, so
-the request gets a 404 unless another route matches it, and one the path doesn't have is a compile
-error. A missing query parameter or header is a 400, or null when the type is optional, and one
-that doesn't parse is a 400. `notFound` can take query parameters and headers too, but not path
-parameters, and `uncaughtError` takes none of them, since it can't fail.
-
-An app can add parameter types of its own the same way, with `pub fn extract(scope: anytype)
-!@This()`, where `scope` has `app`, `req`, `res` and `ctx`. Returning `error.MissingValue` or
-`error.InvalidValue` from it gives a 400, and any other error is handled like one from the
-handler. An app with `uncaughtError` gets these errors too, and `req.extractErrorStatus(err)`
-tells it which ones to answer with a 400.
-
-`listeners` takes any number of listeners, each with its own TLS, so one server
-can serve HTTPS on 443 and plain HTTP on 80 with the same router:
-
-```zig
-.listeners = &.{
-    .{ .address = addr443, .tls = .{ .certificate = .{ .file = .{
-        .cert_path = "server.pem",
-        .key_path = "server.key",
-    } } } },
-    .{ .address = addr80 },
-},
-```
-
-A TLS listener offers protocols through ALPN when given a list in preference
-order, for example `.tls = .{ ..., .alpn_protocols = &.{"http/1.1"} }`.
-
-When `listeners` is omitted or empty, the server listens on `127.0.0.1:8080`.
-
-A handler can tell them apart through `req.listener` and `req.secure`, and
-`server.addresses` has each listener's bound address once `server.ready` is set.
-
-### Templating
-
-Dusty has no templating system of its own. We recommend [zt](https://github.com/lalinsky/zt),
-which compiles templates to Zig at build time. A template in `src/templates/pages.zt`:
-
-```zig
-pub templ UserPage(name: []const u8, admin: bool) {
-    <html>
-        <body>
-            <h1>Hello, {name}</h1>
-            if (admin) {
-                <p>You are an admin.</p>
-            }
-        </body>
-    </html>
-}
-```
-
-`res.render` writes it into the response with the given content type:
-
-```zig
-const pages = @import("templates/pages.zig");
-
-fn handleUser(req: *http.Request, res: *http.Response) !void {
-    const name = req.params.get("name") orelse "guest";
-    try res.render(.html, pages.UserPage, .{ name, false });
-}
-```
-
-`res.render` also takes a plain function whose last parameter is the `*std.Io.Writer`.
-For something small, `res.print(.html, "<p>Hello, {s}</p>", .{name})` formats the body directly.
-
-[examples/todo](examples/todo) is a complete app built with zt, [pg.zig](https://github.com/lalinsky/pg.zig)
-and [htmx](https://htmx.org), with live updates across browser tabs over Server-Sent Events.
-
-### Serialization
-
-`res.encode` writes a value with a serializer's write-to-writer function, telling its parameters
-apart by type, so libraries plug in as they are. We recommend
-[json.zig](https://github.com/lalinsky/json.zig) for JSON and
-[msgpack.zig](https://github.com/lalinsky/msgpack.zig) for MessagePack, both specialized to your
-types at compile time.
-
-```zig
-const json = @import("json");
-const msgpack = @import("msgpack");
-
-fn handleUser(req: *http.Request, res: *http.Response) !void {
-    const input = try json.decodeFromSliceLeaky(UserInput, req.arena, try req.body() orelse "", .{});
-    const user = try updateUser(input);
-    try res.encode(.json, json.encode, user);
-}
-
-fn handleUserMsgpack(req: *http.Request, res: *http.Response) !void {
-    const user = try loadUser(req.params.get("id").?);
-    try res.encode(.msgpack, msgpack.encode, user);
-}
-```
-
-Other serializers fit the same way, [serde.zig](https://github.com/OrlovEvgeny/serde.zig)'s `toWriter` for one. Unlike `std.json`, json.zig
-leaves out optional fields that are null, unless the type says otherwise.
-
-`res.json` and `req.json` are there for convenience. They use `std.json`, so they take any type,
-`std.json.Value` included, but json.zig is considerably faster at both encoding and decoding.
-
-### Static Files
-
-`router.static` serves a directory under a prefix:
-
-```zig
-var public = try std.Io.Dir.cwd().openDir(io, "public", .{});
-defer public.close(io);
-
-server.router.static("/assets", public, .{
-    // Serve style.css.br or style.css.gz in place of style.css when the client accepts them.
-    .precompressed = &.{ .br, .gzip },
-});
-```
-
-Responses carry `ETag` and `Last-Modified`, and the conditional and `Range` headers that use
-them are honored. A directory serves its `index.html`; paths with `..` are 404s, and so are
-dotfiles unless `.hide_dotfiles = false`. Symlinks are followed unless `.resolve_beneath = true`,
-which depends on the platform. `.cache_control`, such as `"public, max-age=3600"`, is sent as
-`Cache-Control` with the files.
-
-`router.embedded` serves a single file compiled into the binary:
-
-```zig
-server.router.embedded("/assets/app.css", @embedFile("assets/app.css"), .{
-    // Optional compressed copies, served to clients that accept them.
-    .br = @embedFile("assets/app.css.br"),
-});
-```
-
-The content type comes from the path's extension unless `.content_type` is set. The `ETag` is
-a hash of the content, and there is no `Last-Modified`.
-
-#### Embedded Assets
-
-`addAssets` in `build.zig` embeds a whole directory into the binary, as a module:
-
-```zig
-const dusty = @import("dusty");
-
-exe.root_module.addImport("assets", dusty.addAssets(b, dusty_dep, .{
-    .dir = b.path("assets"),
-    .prefix = "/assets", // the default
-}));
-```
-
-Templates link to the files with `assets.url`, which adds a hash of the content, such as
-`/assets/app.css?v=6ec8ea7d`. An unknown name is a compile error.
-
-```zig
-const assets = @import("assets");
-
-pub templ Layout(title: []const u8) {
-    <link rel="stylesheet" href={assets.url("app.css")} />
-    ...
-}
-```
-
-`assets.register` serves them:
-
-```zig
-assets.register(&server.router);
-```
-
-A request with the current hash is cached for good (`immutable`); anything else is answered with
-the current file and `no-cache`, so a page still open from before a deploy gets the new file
-rather than a 404. A compressed copy next to a file, `app.css.br`, is served to clients that
-accept it, and dotfiles are left out.
-
-### Client Example
+And a client that calls it:
 
 ```zig
 const std = @import("std");
@@ -295,175 +104,32 @@ pub fn main(init: std.process.Init) !void {
     var client = http.Client.init(init.gpa, init.io, .{});
     defer client.deinit();
 
-    var response = try client.fetch("http://httpbin.org/get", .{});
+    var response = try client.fetch("http://127.0.0.1:8080/hello/zig", .{});
     defer response.deinit();
 
-    std.debug.print("Status: {any}\n", .{response.status()});
-
-    if (try response.body()) |body| {
-        std.debug.print("Body: {s}\n", .{body});
-    }
+    const body = try response.body() orelse "";
+    std.debug.print("{d}: {s}", .{ @intFromEnum(response.status()), body });
 }
 ```
 
-### HTTPS and Client Certificates
+The documentation covers the rest:
 
-By default the client verifies servers against the system trust store. `ClientConfig.tls`
-overrides that, and adds a client certificate for servers that require mutual TLS:
+- [Getting Started](https://lalinsky.github.io/dusty/getting-started/)
+- Server: [routing](https://lalinsky.github.io/dusty/server/routing/),
+  [handlers](https://lalinsky.github.io/dusty/server/handlers/),
+  [middleware](https://lalinsky.github.io/dusty/server/middleware/),
+  [templating](https://lalinsky.github.io/dusty/server/templating/),
+  [static files](https://lalinsky.github.io/dusty/server/static-files/),
+  [WebSocket](https://lalinsky.github.io/dusty/server/websocket/),
+  [deployment on zio](https://lalinsky.github.io/dusty/server/deployment/)
+- Client: [making requests](https://lalinsky.github.io/dusty/client/requests/),
+  [streaming](https://lalinsky.github.io/dusty/client/streaming/),
+  [WebSocket](https://lalinsky.github.io/dusty/client/websocket/)
+- [API reference](https://lalinsky.github.io/dusty/apidocs/)
 
-```zig
-var client = http.Client.init(init.gpa, init.io, .{
-    .tls = .{
-        // .system (default), .{ .file = ... }, .{ .dir = ... }, .{ .bytes = ... }, or .none
-        .ca = .{ .file = .{ .path = "ca.pem" } },
-        // Presented when the server asks the client to authenticate itself.
-        .client_certificate = .{ .file = .{ .cert_path = "client.pem", .key_path = "client.key" } },
-    },
-});
-```
-
-The key must be an unencrypted PKCS#8 (`BEGIN PRIVATE KEY`) or SEC1 (`BEGIN EC PRIVATE KEY`) PEM file.
-A certificate and key already in memory, such as from a secret store, go in as
-`.{ .bytes = .{ .cert = cert_pem, .key = key_pem } }`, here and on a listener.
-
-These settings apply to every connection a client makes; connections are pooled and reused
-across requests, so they cannot be varied per request. Use a separate `Client` per identity.
-
-The server side is symmetric. TLS is configured per listener, and `client_auth`
-makes it ask connecting clients for a certificate:
-
-```zig
-.listeners = &.{.{
-    .address = addr,
-    .tls = .{
-        .certificate = .{ .file = .{ .cert_path = "server.pem", .key_path = "server.key" } },
-        .client_auth = .{
-            .ca = .{ .file = .{ .path = "client-ca.pem" } },
-            // .require (default) rejects a client that sends no certificate;
-            // .request asks for one but accepts an empty reply.
-            .mode = .require,
-        },
-    },
-}},
-```
-
-### Unix Socket Client Example
-
-For communicating with services like Docker Engine:
-
-```zig
-var response = try client.fetch("http://localhost/v1.41/info", .{
-    .unix_socket_path = "/var/run/docker.sock",
-});
-defer response.deinit();
-```
-
-## Timeouts
-
-Servers use finite timeouts by default so stalled or idle clients eventually
-release their connection slots:
-
-- `timeout.request` defaults to 30 seconds. It covers an entire request,
-  including handler work and writing the response; a TLS handshake gets its own
-  deadline of the same length.
-- `timeout.keepalive` defaults to 30 seconds between requests on a persistent
-  connection.
-- `timeout.shutdown` defaults to 30 seconds for a graceful shutdown drain.
-
-Set a configured timeout to `null` to disable it. A handler can also replace
-its current request deadline with `Request.setTimeout`. It accepts
-`std.Io.Timeout`, so the handler can use a relative duration, provide an exact
-deadline, or disable the deadline with `.none`:
-
-```zig
-req.setTimeout(.{
-    .duration = .{ .raw = .fromSeconds(60), .clock = .awake },
-});
-req.setTimeout(.{ .deadline = deadline });
-req.setTimeout(.none);
-```
-
-Long-lived handlers can use this as an inactivity timeout by re-arming it
-before each WebSocket message or event, without disabling the resilient server
-default for ordinary requests.
-
-The client bounds each request the same way. `ClientConfig.timeout` defaults
-to 30 seconds and covers the whole of `fetch`: connecting, the TLS handshake,
-sending the request, every redirect, and the response through the end of its
-body, which `fetch` reads before returning. A request that runs past it fails
-with `error.Timeout`. `FetchOptions.timeout` replaces the default for one
-request:
-
-```zig
-var client = http.Client.init(gpa, io, .{ .timeout = .fromSeconds(5) });
-
-// Inherits the five seconds.
-var a = try client.fetch(url, .{});
-// Its own limit, counted from this call.
-var b = try client.fetch(url, .{
-    .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } },
-});
-// An absolute deadline, such as one shared with other work.
-var c = try client.fetch(url, .{ .timeout = .{ .deadline = deadline } });
-// No limit at all.
-var d = try client.fetch(url, .{ .timeout = .none });
-```
-
-A request with `.stream = true` leaves the body on the wire for the caller to
-read through `ClientResponse.reader`. The deadline then covers `fetch` through
-the end of the head, and the body reads are not bounded at all.
-
-On zio, deadlines cancel the connection task directly, which needs a zio new
-enough to have `AutoCancel.setClock`. Other I/O backends use a watchdog task;
-with `std.Io.Threaded`, that means a second OS thread for each connection while
-either request or keepalive timeouts are enabled, and on the client side a
-second thread for each `fetch` while a timeout is set.
-
-## Selecting the I/O Backend
-
-The examples above use `init.io`, the threaded I/O implementation from the stdlib. This is suitable for development or small servers.
-
-For production use, it's recommended to use [zio](https://github.com/lalinsky/zio), which provides a coroutine-based async I/O runtime.
-This allows you to serve many more requests using just a few OS threads. This is especially important if you need to wait on other
-network services inside your request handlers. In the future, you can also use `std.Io.Evented`, but that implementation is not finished yet,
-it's missing any networking functionality, so use zio for now.
-
-Add it as a dependency:
-
-```sh
-zig fetch --save "git+https://github.com/lalinsky/zio"
-```
-
-In `build.zig`, add the zio module:
-
-```zig
-const zio = b.dependency("zio", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("zio", zio.module("zio"));
-dusty_dep.module("dusty").addImport("zio", zio.module("zio"));
-```
-
-Then initialize zio's runtime and pass it to dusty:
-
-```zig
-const std = @import("std");
-const zio = @import("zio");
-const http = @import("dusty");
-
-pub fn main(init: std.process.Init) !void {
-    var rt = try zio.Runtime.init(init.gpa, .{});
-    defer rt.deinit();
-
-    var server = http.Server(void).init(init.gpa, rt.io(), .{
-        .listeners = &.{.{ .address = addr }},
-    }, {});
-    defer server.deinit();
-
-    // ... continue as before ...
-}
-```
+[examples/todo](examples/todo) is a complete app built with [zt](https://github.com/lalinsky/zt),
+[pg.zig](https://github.com/lalinsky/pg.zig) and [htmx](https://htmx.org), with live updates
+across browser tabs over Server-Sent Events.
 
 ## Recommended libraries
 
@@ -490,3 +156,21 @@ Templating:
 Others:
 
 - [xsync.zig](https://github.com/lalinsky/xsync.zig) - Synchronization primitives that work across multiple `std.Io` implementations
+
+## Development
+
+Format the code and run the tests:
+
+```sh
+./check.sh
+```
+
+Build the examples:
+
+```sh
+zig build examples
+```
+
+## License
+
+This project is licensed under the [MIT license](LICENSE).
