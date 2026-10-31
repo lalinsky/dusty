@@ -63,7 +63,6 @@ See [`http.Listener`](../../apidocs/#http.Listener) for the other listener optio
 | `request.max_body_size` | 1 MiB | Largest request body |
 | `request.buffer_size` | 16 KiB | Largest request line and headers, together |
 | `request.max_header_count` | 64 | Most headers in a request |
-| `request.max_param_count` | 8 | Most path parameters |
 | `request.max_query_count` | 32 | Most query parameters |
 | `request.max_form_count` | 32 | Most form fields |
 | `request.max_multiform_count` | 32 | Most multipart fields |

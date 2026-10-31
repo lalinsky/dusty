@@ -33,9 +33,6 @@ const Node = struct {
     // Type of this segment
     kind: NodeKind,
 
-    // For param/wildcard nodes, the parameter name (without ':' or '*')
-    param_name: ?[]const u8,
-
     // Children organized by type for proper precedence:
     // 1. Static children (checked first) - linked list
     static_children: ?*Node,
@@ -78,6 +75,17 @@ pub fn Router(comptime App: type) type {
             /// Registered by `static` for its directory index, and replaced
             /// by a route registered for the same path.
             yields: bool = false,
+            /// The route's own names for the segments it captures. Routes
+            /// share the nodes of the tree, so the names can't be on those.
+            params: []const RouteParam = &.{},
+        };
+
+        const RouteParam = struct {
+            /// Which of the request's segments the value starts at.
+            index: usize,
+            name: []const u8,
+            /// A wildcard, which captures the rest of the path.
+            rest: bool,
         };
 
         arena: std.heap.ArenaAllocator,
@@ -85,6 +93,9 @@ pub fn Router(comptime App: type) type {
         trees: [256]?*Node,
         // Routes registered with `any`, tried after the method's own tree
         any_tree: ?*Node = null,
+        // The most parameters any route has, reserved in `req.params` so
+        // matching doesn't allocate.
+        max_params: u32 = 0,
         // Global middlewares applied to all routes
         middlewares: []const Middleware(App) = &.{},
 
@@ -177,7 +188,6 @@ pub fn Router(comptime App: type) type {
                 root.* = Node{
                     .segment = "",
                     .kind = .static,
-                    .param_name = null,
                     .static_children = null,
                     .param_child = null,
                     .wildcard_child = null,
@@ -188,10 +198,14 @@ pub fn Router(comptime App: type) type {
             }
 
             var current = slot.*.?;
+            const alloc = self.arena.allocator();
+            var params: std.ArrayList(RouteParam) = .empty;
+            var index: usize = 0;
 
             var iter = std.mem.splitScalar(u8, path, '/');
             while (iter.next()) |segment| {
                 if (segment.len == 0) continue;
+                defer index += 1;
                 // Determine segment kind
                 const kind: NodeKind = if (segment[0] == '*')
                     .wildcard
@@ -200,10 +214,10 @@ pub fn Router(comptime App: type) type {
                 else
                     .static;
 
-                const param_name = if (kind == .param or kind == .wildcard)
-                    segment[1..]
-                else
-                    null;
+                // An unnamed parameter or wildcard captures nothing.
+                if (kind != .static and segment.len > 1) {
+                    try params.append(alloc, .{ .index = index, .name = try alloc.dupe(u8, segment[1..]), .rest = kind == .wildcard });
+                }
 
                 // Matched against the decoded segments of a request, so
                 // `/a%2Fb` is the one segment `a/b`, as in Go's ServeMux.
@@ -216,19 +230,11 @@ pub fn Router(comptime App: type) type {
 
                 // Find or create child
                 var child = findChild(current, static_segment, kind);
-                if (child) |existing| {
-                    // One node captures under one name, and a route reading
-                    // another would never find its value.
-                    if (kind != .static and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
-                        std.debug.panic("route {s} names the parameter {s}{s}, where another route names it {s}{s}", .{ path, segment[0..1], param_name.?, segment[0..1], existing.param_name.? });
-                    }
-                }
                 if (child == null) {
                     const new_node = try self.arena.allocator().create(Node);
                     new_node.* = Node{
                         .segment = try self.arena.allocator().dupe(u8, static_segment),
                         .kind = kind,
-                        .param_name = if (param_name) |name| try self.arena.allocator().dupe(u8, name) else null,
                         .static_children = null,
                         .param_child = null,
                         .wildcard_child = null,
@@ -262,7 +268,6 @@ pub fn Router(comptime App: type) type {
             }
 
             // Create and store route
-            const alloc = self.arena.allocator();
             const route = try alloc.create(Route);
             route.* = .{
                 .info = .{ .path = try alloc.dupe(u8, path), .data = data },
@@ -270,14 +275,16 @@ pub fn Router(comptime App: type) type {
                 .middlewares = middlewares,
                 .accepts = accepts,
                 .yields = yields,
+                .params = params.items,
             };
             current.route = @ptrCast(route);
+            self.max_params = @max(self.max_params, @as(u32, @intCast(params.items.len)));
         }
 
-        fn matchRecursive(node: *Node, req: *Request, index: usize) !?*Node {
+        fn matchRecursive(node: *Node, req: *Request, index: usize) ?*Node {
             // Terminal case: consumed all segments
             if (index >= req._segments.len) {
-                if (!routeAccepts(node, req)) return null;
+                if (!bindRoute(node, req)) return null;
                 return node;
             }
 
@@ -289,7 +296,7 @@ pub fn Router(comptime App: type) type {
             var static_child = node.static_children;
             while (static_child) |c| {
                 if (std.mem.eql(u8, c.segment, current_segment)) {
-                    const result = try matchRecursive(c, req, index + 1);
+                    const result = matchRecursive(c, req, index + 1);
                     if (result != null) return result;
                 }
                 static_child = c.next_sibling;
@@ -297,51 +304,49 @@ pub fn Router(comptime App: type) type {
 
             // 2. Try param child (medium precedence)
             if (node.param_child) |c| {
-                if (req.params.count() >= req.config.max_param_count) {
-                    return error.TooManyParams;
-                }
-                try req.params.map.put(req.arena, c.param_name.?, current_segment);
-                const result = try matchRecursive(c, req, index + 1);
+                const result = matchRecursive(c, req, index + 1);
                 if (result != null) return result;
-                _ = req.params.map.remove(c.param_name.?); // backtrack
             }
 
             // 3. Try wildcard child (lowest precedence)
             if (node.wildcard_child) |c| {
-                if (req.params.count() >= req.config.max_param_count) {
-                    return error.TooManyParams;
-                }
-                // Capture remaining path (without query parameters)
-                const start = @intFromPtr(current_segment.ptr) - @intFromPtr(req.path.ptr);
-                const remaining = req.path[start..];
-                try req.params.map.put(req.arena, c.param_name.?, remaining);
-                if (routeAccepts(c, req)) return c;
-                _ = req.params.map.remove(c.param_name.?);
+                if (bindRoute(c, req)) return c;
             }
 
             return null;
         }
 
         /// Whether `node` has a route, and the request's params parse as
-        /// its handler takes them.
-        fn routeAccepts(node: *const Node, req: *const Request) bool {
+        /// its handler takes them. Fills `req.params` under the route's
+        /// names, and leaves it empty when the route doesn't match.
+        fn bindRoute(node: *const Node, req: *Request) bool {
             const opaque_route = node.route orelse return false;
             const route: *const Route = @ptrCast(@alignCast(opaque_route));
+            req.params.map.clearRetainingCapacity();
+            for (route.params) |p| {
+                const segment = req._segments[p.index];
+                const value = if (p.rest) req.path[@intFromPtr(segment.ptr) - @intFromPtr(req.path.ptr) ..] else segment;
+                req.params.map.putAssumeCapacity(p.name, value);
+            }
             const f = route.accepts orelse return true;
-            return f(req);
+            if (f(req)) return true;
+            req.params.map.clearRetainingCapacity();
+            return false;
         }
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
             req.route = null;
+            req.params.map.clearRetainingCapacity();
+            try req.params.map.ensureTotalCapacity(req.arena, self.max_params);
             req.query.map.clearRetainingCapacity();
             try parseQueryString(req, req.query_string);
 
-            const route = try self.matchIn(req.method, req) orelse
+            const route = self.matchIn(req.method, req) orelse
                 // A HEAD response is the GET response without the body, so a
                 // HEAD with no route of its own is answered by the GET one.
                 // Second, so a route registered with `head` still wins.
-                (if (req.method == .head) try self.matchIn(.get, req) else null) orelse
-                try self.matchIn(null, req);
+                (if (req.method == .head) self.matchIn(.get, req) else null) orelse
+                self.matchIn(null, req);
             if (route) |r| {
                 req.route = &r.info;
                 return r.*;
@@ -349,9 +354,9 @@ pub fn Router(comptime App: type) type {
             return null;
         }
 
-        fn matchIn(self: *const Self, method: ?Method, req: *Request) !?*const Route {
+        fn matchIn(self: *const Self, method: ?Method, req: *Request) ?*const Route {
             const root = (if (method) |m| self.trees[@intFromEnum(m)] else self.any_tree) orelse return null;
-            const node = try matchRecursive(root, req, 0) orelse return null;
+            const node = matchRecursive(root, req, 0) orelse return null;
             const opaque_route = node.route orelse return null;
             return @ptrCast(@alignCast(opaque_route));
         }
@@ -1983,4 +1988,33 @@ test "Router: a route of its own replaces the static directory index" {
         var file = testRequest(arena.allocator(), "/app.css");
         try std.testing.expect((try router.findHandler(try split(&file))).?.info.data != null);
     }
+}
+
+test "Router: routes sharing a node name their parameters each their own way" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = Router(void).init(std.testing.allocator);
+    defer router.deinit();
+    const H = struct {
+        fn handle(_: *Response) void {}
+    };
+    router.get("/users/:id", H.handle);
+    router.get("/users/:name/posts", H.handle);
+    router.get("/users/:user/files/*path", H.handle);
+
+    var by_id = testRequest(arena.allocator(), "/users/42");
+    try std.testing.expectEqualStrings("/users/:id", (try router.findHandler(try split(&by_id))).?.info.path);
+    try std.testing.expectEqualStrings("42", by_id.params.get("id").?);
+    try std.testing.expectEqual(1, by_id.params.count());
+
+    var posts = testRequest(arena.allocator(), "/users/alice/posts");
+    try std.testing.expectEqualStrings("/users/:name/posts", (try router.findHandler(try split(&posts))).?.info.path);
+    try std.testing.expectEqualStrings("alice", posts.params.get("name").?);
+    try std.testing.expectEqual(1, posts.params.count());
+
+    var files = testRequest(arena.allocator(), "/users/bob/files/a/b.txt");
+    try std.testing.expectEqualStrings("/users/:user/files/*path", (try router.findHandler(try split(&files))).?.info.path);
+    try std.testing.expectEqualStrings("bob", files.params.get("user").?);
+    try std.testing.expectEqualStrings("a/b.txt", files.params.get("path").?);
 }

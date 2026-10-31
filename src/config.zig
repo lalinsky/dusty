@@ -319,8 +319,6 @@ pub const ServerConfig = struct {
         /// response can carry. Each one counts for 33 bytes of the arena,
         /// twice per request, whether it is used or not.
         max_header_count: usize = 64,
-        /// Maximum number of route parameters (e.g., /user/:id/:action)
-        max_param_count: usize = 8,
         /// Maximum number of query string parameters
         max_query_count: usize = 32,
         /// Maximum number of form fields (application/x-www-form-urlencoded)
