@@ -193,6 +193,7 @@ pub fn build(b: *std.Build) void {
         "fetch",
         "handlers",
         "hello_world",
+        "middleware",
         "proxy",
         "requests",
         "responses",
