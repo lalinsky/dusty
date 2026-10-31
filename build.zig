@@ -191,6 +191,7 @@ pub fn build(b: *std.Build) void {
         "basic",
         "client",
         "fetch",
+        "handlers",
         "hello_world",
         "proxy",
         "routing",
