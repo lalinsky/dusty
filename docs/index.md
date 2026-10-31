@@ -51,7 +51,7 @@ Dusty works with Zig 0.16 and 0.17. Both are tested on Linux, macOS and Windows.
 The code in these docs comes from the programs in the
 [examples](https://github.com/lalinsky/dusty/tree/main/examples) directory.
 [examples/todo](https://github.com/lalinsky/dusty/tree/main/examples/todo) is a complete app, with
-templates, a PostgreSQL database and live updates over Server-Sent Events. It still needs Zig 0.16.
+templates, a PostgreSQL database and live updates over Server-Sent Events.
 
 ## License
 
