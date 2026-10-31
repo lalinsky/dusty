@@ -11,8 +11,12 @@ Create the project and add Dusty as a dependency:
 
 ```sh
 $ zig init
-$ zig fetch --save "git+https://github.com/lalinsky/dusty#v0.5.0"
+$ zig fetch --save "git+https://github.com/lalinsky/dusty"
 ```
+
+!!! warning "TODO"
+
+    This installs Dusty from the main branch. Switch to a release tag once the next version is out.
 
 Then open `build.zig` and add the module to your executable, after the `exe` definition:
 
