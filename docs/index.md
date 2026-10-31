@@ -10,8 +10,8 @@ and zio is still what we recommend for production, especially if your handlers c
 over the network or you use WebSocket.
 
 A lot of work has gone into making Dusty both reliable and fast. Timeouts and connection limits are
-on by default, and they work on every `std.Io` implementation. Its parsing has been checked with
-[HTTP Garden](https://github.com/narfindustries/http-garden) for differences that could lead to
+on by default, and they work on every `std.Io` implementation. The HTTP parsing has been checked
+with [HTTP Garden](https://github.com/narfindustries/http-garden) for differences that could lead to
 request smuggling. On [HttpArena](https://http-arena.com/), it's among the fastest servers.
 
 ## Features
