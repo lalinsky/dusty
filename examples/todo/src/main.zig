@@ -138,9 +138,8 @@ fn toggle(app: *App, req: *http.Request, res: *http.Response) !void {
 }
 
 // --8<-- [start:edit]
-fn edit(app: *App, req: *http.Request, res: *http.Response) !void {
-    const id = req.params.getInt(i32, "id") orelse return notFound(res);
-    const todo = try app.queryTodo(req.arena, "SELECT id, title, done FROM todos WHERE id = $1", .{id}) orelse return notFound(res);
+fn edit(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Response) !void {
+    const todo = try app.queryTodo(req.arena, "SELECT id, title, done FROM todos WHERE id = $1", .{id.value}) orelse return error.NotFound;
     try res.render(.html, templates.TodoEdit, .{todo});
 }
 // --8<-- [end:edit]

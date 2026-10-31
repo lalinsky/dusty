@@ -64,6 +64,8 @@ example with an atomic or a mutex:
 --8<-- "examples/handlers.zig:visits"
 ```
 
+An app with no state uses `http.Server(void)`, and passes `{}` in place of `&app`.
+
 ## Errors
 
 When a handler returns an error, the server answers with a 500 and logs the error. Some errors are
@@ -80,7 +82,7 @@ A handler that returns `error.NotFound` gets the same 404 as a request with no r
 --8<-- "examples/handlers.zig:not_found"
 ```
 
-Whatever the handler wrote to the response before the error is thrown away. If the handler has
+The body the handler wrote before the error is thrown away. If the handler has
 already started sending the response, for example with `res.stream`, the server can't replace it
 and closes the connection.
 

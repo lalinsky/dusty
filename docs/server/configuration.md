@@ -68,9 +68,8 @@ See [`http.Listener`](../../apidocs/#http.Listener) for the other listener optio
 | `request.max_form_count` | 32 | Most form fields |
 | `request.max_multiform_count` | 32 | Most multipart fields |
 
-A body over `max_body_size` gets 413. A request with too many headers, or a head that doesn't fit in
-`buffer_size`, gets 431. At `max_connections`, the server stops accepting connections until one
-closes.
+A body over `max_body_size` gets 413. A request with too many headers gets 431. At
+`max_connections`, the server stops accepting connections until one closes.
 
 ## Behind a Proxy
 

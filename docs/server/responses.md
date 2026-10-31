@@ -60,7 +60,8 @@ For events sent to a browser as they happen, see [Server-Sent Events](sse.md).
 ```
 
 The file is opened when `sendFile` is called, so a missing file is an error the handler can still
-turn into a 404. It's sent after the handler returns.
+turn into a 404. It's sent after the handler returns. `sendFile` doesn't set a content type, so set
+`res.content_type` yourself.
 
 `router.static` serves files named by the request path, and checks that the path stays inside the
 directory. See [Static Files and Assets](static-files.md).
@@ -81,7 +82,8 @@ With `res.compress = true`, the body is sent gzipped to clients that accept it:
 --8<-- "examples/responses.zig:cookie"
 ```
 
-The options are in [`http.CookieOpts`](../../apidocs/#http.CookieOpts). To read cookies, see
+The options are in [`http.CookieOpts`](../../apidocs/#http.CookieOpts). To delete a cookie, set it
+again with `.max_age = .zero`, and the same `.path`. To read cookies, see
 [Requests](requests.md#cookies).
 
 ## Next Steps

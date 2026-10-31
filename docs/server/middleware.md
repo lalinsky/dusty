@@ -114,6 +114,9 @@ session through the context:
 --8<-- "examples/middleware.zig:session"
 ```
 
+`ctx.session.remove(key)` removes one value, and `ctx.session.clear()` removes them all, for
+example when the user logs out. A session with nothing in it deletes the cookie.
+
 The session doesn't copy the values you give it. They have to live until the response is sent, so
 allocate them with `req.arena`. The cookie is sent with `Secure` by default, so browsers only send
 it back over HTTPS. `cookie_opts` in the config changes that.

@@ -33,7 +33,8 @@ The second argument to `fetch` sets the method, the headers and the body:
 --8<-- "examples/fetch.zig:post"
 ```
 
-A non-2xx status isn't an error, so check the status yourself.
+`http.Headers.init` takes the number of headers it has room for. A non-2xx status isn't an error,
+so check the status yourself.
 
 To send JSON, encode it with [json.zig](../server/serialization.md) or `std.json` into a buffer
 first, and pass that as the body.
@@ -62,7 +63,15 @@ get the body as it was sent. `response.contentEncoding()` tells you how it was e
 
 A request has 30 seconds to finish by default. That covers connecting, the TLS handshake, every
 redirect and the whole body. `.timeout` replaces it for one request, and `.timeout = .none` turns it
-off. A request that runs out of time fails with `error.Timeout`.
+off:
+
+```zig
+var response = try client.fetch(url, .{
+    .timeout = .{ .duration = .{ .raw = .fromSeconds(120), .clock = .awake } },
+});
+```
+
+A request that runs out of time fails with `error.Timeout`.
 
 A body over 10 MiB fails with `error.ResponseTooLarge`. `max_response_size` in the
 [client configuration](configuration.md) changes the limit. For bigger bodies,

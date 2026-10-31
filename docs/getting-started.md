@@ -17,12 +17,12 @@ $ zig fetch --save "git+https://github.com/lalinsky/dusty#v0.5.0"
 Then open `build.zig` and add the module to your executable, after the `exe` definition:
 
 ```zig
-const dusty = b.dependency("dusty", .{
+const dusty_dep = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
 });
 
-exe.root_module.addImport("dusty", dusty.module("dusty"));
+exe.root_module.addImport("dusty", dusty_dep.module("dusty"));
 ```
 
 See [Build Options](build-options.md) for how to configure the package.
@@ -51,8 +51,7 @@ $ curl http://127.0.0.1:8080/hello/zig
 Hello, zig!
 ```
 
-In a debug build, the server also logs each request it gets. If another program is already using
-port 8080, `run` fails with `error.AddressInUse`.
+In a debug build, the server also logs each request it gets.
 
 Here is what the code does:
 

@@ -70,8 +70,9 @@ Then it passes a template and its arguments, as a tuple, to `res.render`:
 --8<-- "examples/todo/src/main.zig:edit"
 ```
 
-The first argument is the content type. If the template returns an error, its output is thrown away.
-The handler can still send a different response.
+`app.queryTodo` loads the to-do from the database. The first argument to `res.render` is the
+content type. If the template returns an error, its output is thrown away. The handler can still
+send a different response.
 
 `res.render` works with any function whose last parameter is a `*std.Io.Writer`. It calls the
 function with the arguments from the tuple, followed by the writer. A type with a

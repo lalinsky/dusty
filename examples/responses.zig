@@ -53,6 +53,7 @@ fn download(app: *App, res: *http.Response) !void {
         error.FileNotFound => return error.NotFound,
         else => return err,
     };
+    res.content_type = .pdf;
     try res.header("Content-Disposition", "attachment");
 }
 // --8<-- [end:file]

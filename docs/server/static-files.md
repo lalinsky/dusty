@@ -72,5 +72,5 @@ styles. A compressed copy next to a file, like `app.css.br`, is served to client
 
 ## Next Steps
 
-- [Templating](templating.md) covers the templates that link to the assets.
+- [WebSocket](websocket.md) covers keeping a connection open for messages.
 - [Deployment](deployment.md) covers running the server in production.

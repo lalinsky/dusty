@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
     defer rt.deinit();
     const io = rt.io();
 
+    var app: App = .{};
     var server = http.Server(App).init(init.gpa, io, .{}, &app);
     defer server.deinit();
 
@@ -65,7 +66,7 @@ service:
 
 The server waits up to `timeout.shutdown`, 30 seconds by default, and then cancels the requests that
 are still running. WebSocket and event stream handlers run until the connection closes, so they keep
-the shutdown waiting until then. Docker kills the process 10 seconds after `SIGTERM` by default, so
+the shutdown waiting until the timeout. Docker kills the process 10 seconds after `SIGTERM` by default, so
 raise its `stop_grace_period` or lower `timeout.shutdown`. If the server stops on its own, `main`
 returns its error.
 
@@ -77,6 +78,17 @@ Build with optimizations for production:
 $ zig build -Doptimize=ReleaseSafe
 ```
 
+## Logging
+
+Dusty logs under the `.dusty` scope. To change how much it logs, set a level for that scope in
+`std_options`:
+
+```zig
+pub const std_options: std.Options = .{
+    .log_scope_levels = &.{.{ .scope = .dusty, .level = .warn }},
+};
+```
+
 ## Behind a Reverse Proxy
 
 When the server runs behind nginx or a load balancer, set `trusted_proxy_hops`, so
@@ -86,3 +98,4 @@ When the server runs behind nginx or a load balancer, set `trusted_proxy_hops`, 
 ## Next Steps
 
 - [Configuration](configuration.md) covers the timeouts and limits.
+- [Making Requests](../client/requests.md) covers the HTTP client.
