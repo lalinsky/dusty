@@ -53,12 +53,14 @@ A handler gets it by taking `*App.RequestContext`:
 
 ## Hooks
 
-Middleware can also declare `onHeaders` and `onComplete`. They run for every middleware whose
-`execute` was called:
+Code after `executor.next()` runs when the handler returns. For a response the handler streams,
+like a file download or [Server-Sent Events](sse.md), the headers are already sent by then, and
+the body may be too. For those responses, middleware can declare `onHeaders` and `onComplete`.
+They run for every middleware whose `execute` was called:
 
-- `onHeaders(self, req, res, ctx)` runs right before the response headers are sent. That includes
-  responses the handler streams, where code after `executor.next()` would be too late to add a
-  header. It can return an error, which on a buffered response becomes the error response.
+- `onHeaders(self, req, res, ctx)` runs right before the response headers are sent, so it can
+  still add a header. It can return an error, which on a buffered response becomes the error
+  response.
 - `onComplete(self, req, res, ctx, err)` runs after the response has been sent, or failed to.
   `err` is the error, if there was one. It can't return an error.
 
