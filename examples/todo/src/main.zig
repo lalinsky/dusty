@@ -67,6 +67,7 @@ const App = struct {
     pool: *pg.Pool,
     changes: Changes,
 
+    // --8<-- [start:query]
     fn queryTodos(self: *App, arena: std.mem.Allocator, sql: []const u8, args: anytype) ![]Todo {
         var result = try self.pool.query(sql, args);
         defer result.deinit();
@@ -81,6 +82,7 @@ const App = struct {
         }
         return list.items;
     }
+    // --8<-- [end:query]
 
     fn queryTodo(self: *App, arena: std.mem.Allocator, sql: []const u8, args: anytype) !?Todo {
         const list = try self.queryTodos(arena, sql, args);
@@ -154,11 +156,13 @@ fn update(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.R
     try renderList(app, req, res);
 }
 
+// --8<-- [start:exec]
 fn delete(app: *App, id: http.Param("id", i32), res: *http.Response) !void {
     const deleted = try app.pool.exec("DELETE FROM todos WHERE id = $1", .{id.value});
     if (deleted != 1) return error.NotFound;
     try res.render(.html, templates.Count, .{ try app.countActive(), true });
 }
+// --8<-- [end:exec]
 
 // --8<-- [start:api]
 fn api(app: *App, req: *http.Request, res: *http.Response) !void {
@@ -254,9 +258,11 @@ pub fn main(init: std.process.Init) !void {
     defer rt.deinit();
     const io = rt.io();
 
+    // --8<-- [start:pool]
     const url = init.environ_map.get("DATABASE_URL") orelse "postgres://todo:todo@127.0.0.1:5432/todo";
     const pool = try pg.Pool.initUri(io, init.gpa, try std.Uri.parse(url), .{ .size = 16 });
     defer pool.deinit();
+    // --8<-- [end:pool]
 
     for (schema) |sql| {
         _ = try pool.exec(sql, .{});

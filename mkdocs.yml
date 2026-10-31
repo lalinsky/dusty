@@ -46,6 +46,7 @@ nav:
     - Responses: server/responses.md
     - Templating: server/templating.md
     - Serialization: server/serialization.md
+    - Databases: server/databases.md
     - Middleware: server/middleware.md
     - Static Files and Assets: server/static-files.md
     - WebSocket: server/websocket.md
@@ -66,6 +67,7 @@ markdown_extensions:
   - pymdownx.inlinehilite
   - pymdownx.snippets:
       check_paths: true
+      dedent_subsections: true
   - pymdownx.superfences
   - admonition
   - pymdownx.details
