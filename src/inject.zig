@@ -18,6 +18,16 @@ pub fn args(
     return result;
 }
 
+/// Whether `F` returns `!void`; a compile error unless it returns that or
+/// `void`, or only `void` when `fallible` is false.
+pub fn returnsError(comptime F: type, comptime name: []const u8, comptime fallible: bool) bool {
+    if (@typeInfo(F) != .@"fn") @compileError("expected a function for " ++ name ++ ", found " ++ @typeName(F));
+    const R = @typeInfo(F).@"fn".return_type orelse @compileError(name ++ " has a generic return type");
+    if (R == void) return false;
+    if (fallible and @typeInfo(R) == .error_union and @typeInfo(R).error_union.payload == void) return true;
+    @compileError(name ++ " must return " ++ (if (fallible) "void or !void" else "void"));
+}
+
 fn arg(
     comptime P: type,
     comptime Ctx: type,

@@ -166,10 +166,7 @@ pub fn Executor(comptime Ctx: type) type {
             // committed the framing, so there is nothing to replace.
             if (!self.res.headers_written) self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
-                const R = @typeInfo(@TypeOf(Ctx.notFound)).@"fn".return_type.?;
-                if (R != void and !(@typeInfo(R) == .error_union and @typeInfo(R).error_union.payload == void)) {
-                    @compileError(@typeName(Ctx) ++ ".notFound must return void or !void");
-                }
+                _ = inject.returnsError(@TypeOf(Ctx.notFound), @typeName(Ctx) ++ ".notFound", true);
                 return @call(.auto, Ctx.notFound, inject.args(Ctx, @TypeOf(Ctx.notFound), self.ctx, self.req, self.res, {}));
             } else {
                 self.res.status = .not_found;
@@ -185,9 +182,7 @@ pub fn Executor(comptime Ctx: type) type {
             // headers are still open.
             self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
-                if (@typeInfo(@TypeOf(Ctx.uncaughtError)).@"fn".return_type != void) {
-                    @compileError(@typeName(Ctx) ++ ".uncaughtError must return void");
-                }
+                _ = inject.returnsError(@TypeOf(Ctx.uncaughtError), @typeName(Ctx) ++ ".uncaughtError", false);
                 @call(.auto, Ctx.uncaughtError, inject.args(Ctx, @TypeOf(Ctx.uncaughtError), self.ctx, self.req, self.res, err));
             } else if (self.req.bodyErrorStatus(err)) |status| {
                 self.res.status = status;
@@ -542,7 +537,7 @@ const CustomCtx = struct {
     dispatch_called: bool = false,
     last_error: ?anyerror = null,
 
-    pub fn notFound(self: *CustomCtx, res: *Response) void {
+    pub fn notFound(self: *CustomCtx, _: *Request, res: *Response) !void {
         self.not_found_called = true;
         res.status = .not_found;
         res.body = "custom 404";

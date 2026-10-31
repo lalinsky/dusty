@@ -412,10 +412,7 @@ pub fn Router(comptime Ctx: type) type {
 
         fn wrap(comptime handler: anytype) Handler {
             const F = @TypeOf(handler);
-            if (@typeInfo(F) != .@"fn") @compileError("expected a handler function, found " ++ @typeName(F));
-            const R = @typeInfo(F).@"fn".return_type orelse @compileError("handler " ++ @typeName(F) ++ " has a generic return type");
-            const returns_error = @typeInfo(R) == .error_union and @typeInfo(R).error_union.payload == void;
-            if (R != void and !returns_error) @compileError("handler " ++ @typeName(F) ++ " must return void or !void");
+            const returns_error = inject.returnsError(F, "handler " ++ @typeName(F), true);
             if (returns_error and std.meta.ArgsTuple(F) == std.meta.ArgsTuple(Handler)) return handler;
             const H = struct {
                 fn call(ctx: CtxPtr, req: *Request, res: *Response) anyerror!void {
