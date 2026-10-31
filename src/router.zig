@@ -1,6 +1,6 @@
 const std = @import("std");
 const Request = @import("request.zig").Request;
-const RequestState = @import("request.zig").RequestState;
+const inject = @import("inject.zig");
 const Response = @import("response.zig").Response;
 const Method = @import("http.zig").Method;
 const Middleware = @import("middleware.zig").Middleware;
@@ -419,9 +419,7 @@ pub fn Router(comptime Ctx: type) type {
             if (returns_error and std.meta.ArgsTuple(F) == std.meta.ArgsTuple(Handler)) return handler;
             const H = struct {
                 fn call(ctx: CtxPtr, req: *Request, res: *Response) anyerror!void {
-                    var args: std.meta.ArgsTuple(F) = undefined;
-                    inline for (0..args.len) |i| args[i] = inject(@TypeOf(args[i]), ctx, req, res);
-                    return @call(.auto, handler, args);
+                    return @call(.auto, handler, inject.args(Ctx, F, ctx, req, res, {}));
                 }
 
                 fn callVoid(req: *Request, res: *Response) anyerror!void {
@@ -429,18 +427,6 @@ pub fn Router(comptime Ctx: type) type {
                 }
             };
             return if (Ctx == void) H.callVoid else H.call;
-        }
-
-        fn inject(comptime P: type, ctx: CtxPtr, req: *Request, res: *Response) P {
-            if (comptime pointsTo(P, Request)) return req;
-            if (comptime pointsTo(P, Response)) return res;
-            if (comptime Ctx != void and pointsTo(P, Ctx)) return ctx;
-            if (comptime pointsTo(P, RequestState(Ctx))) return req.state(Ctx);
-            @compileError("can't inject a handler parameter of type " ++ @typeName(P));
-        }
-
-        fn pointsTo(comptime P: type, comptime T: type) bool {
-            return P == *T or P == *const T;
         }
 
         /// Routes registered on the group get `prefix` in front of their

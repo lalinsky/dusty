@@ -3,6 +3,7 @@ const Request = @import("request.zig").Request;
 const RequestState = @import("request.zig").RequestState;
 const Response = @import("response.zig").Response;
 const Action = @import("router.zig").Action;
+const inject = @import("inject.zig");
 const Connection = @import("server.zig").Connection;
 
 const log = std.log.scoped(.dusty);
@@ -165,7 +166,11 @@ pub fn Executor(comptime Ctx: type) type {
             // committed the framing, so there is nothing to replace.
             if (!self.res.headers_written) self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "notFound")) {
-                try self.ctx.notFound(self.req, self.res);
+                const R = @typeInfo(@TypeOf(Ctx.notFound)).@"fn".return_type.?;
+                if (R != void and !(@typeInfo(R) == .error_union and @typeInfo(R).error_union.payload == void)) {
+                    @compileError(@typeName(Ctx) ++ ".notFound must return void or !void");
+                }
+                return @call(.auto, Ctx.notFound, inject.args(Ctx, @TypeOf(Ctx.notFound), self.ctx, self.req, self.res, {}));
             } else {
                 self.res.status = .not_found;
                 self.res.content_type = .text;
@@ -180,7 +185,10 @@ pub fn Executor(comptime Ctx: type) type {
             // headers are still open.
             self.res.resetBody();
             if (comptime Ctx != void and @hasDecl(Ctx, "uncaughtError")) {
-                self.ctx.uncaughtError(self.req, self.res, err);
+                if (@typeInfo(@TypeOf(Ctx.uncaughtError)).@"fn".return_type != void) {
+                    @compileError(@typeName(Ctx) ++ ".uncaughtError must return void");
+                }
+                @call(.auto, Ctx.uncaughtError, inject.args(Ctx, @TypeOf(Ctx.uncaughtError), self.ctx, self.req, self.res, err));
             } else if (self.req.bodyErrorStatus(err)) |status| {
                 self.res.status = status;
                 self.res.content_type = .text;
@@ -534,13 +542,13 @@ const CustomCtx = struct {
     dispatch_called: bool = false,
     last_error: ?anyerror = null,
 
-    pub fn notFound(self: *CustomCtx, _: *Request, res: *Response) !void {
+    pub fn notFound(self: *CustomCtx, res: *Response) void {
         self.not_found_called = true;
         res.status = .not_found;
         res.body = "custom 404";
     }
 
-    pub fn uncaughtError(self: *CustomCtx, _: *Request, res: *Response, err: anyerror) void {
+    pub fn uncaughtError(self: *CustomCtx, err: anyerror, res: *Response) void {
         self.uncaught_error_called = true;
         self.last_error = err;
         res.status = .internal_server_error;
