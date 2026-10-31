@@ -22,6 +22,10 @@ done with the connection.
 `ws.receive()` waits for the next message. A message has a `type`, such as `.text` or `.binary`, and
 its `data`. The data is only valid until the next call to `receive`.
 
+`ws.receiveMany()` also waits for the next message, but returns it together with every other
+message that has already arrived. To send the answers to a batch in one write, set
+`ws.autoflush = false` and call `ws.flush()` after the batch.
+
 `ws.send(.text, data)` sends a message. One task can receive while other tasks send on the same
 connection.
 
