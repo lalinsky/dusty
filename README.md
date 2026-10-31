@@ -218,7 +218,8 @@ server.router.static("/assets", public, .{
 Responses carry `ETag` and `Last-Modified`, and the conditional and `Range` headers that use
 them are honored. A directory serves its `index.html`; paths with `..` are 404s, and so are
 dotfiles unless `.hide_dotfiles = false`. Symlinks are followed unless `.resolve_beneath = true`,
-which depends on the platform.
+which depends on the platform. `.cache_control`, such as `"public, max-age=3600"`, is sent as
+`Cache-Control` with the files.
 
 `router.embedded` serves a single file compiled into the binary:
 

@@ -25,6 +25,8 @@ pub const StaticOptions = struct {
     /// such open flag, and zio, stricter, fails the open where it cannot
     /// guarantee it. Without it, symlinks are followed wherever they lead.
     resolve_beneath: bool = false,
+    /// Sent as `Cache-Control` with a 200, 206 or 304.
+    cache_control: ?[]const u8 = null,
 };
 
 pub const Precompressed = enum {
@@ -124,6 +126,7 @@ pub const Static = struct {
         }
         if (encoding) |e| try res.header("Content-Encoding", e.name());
         try finish(req, res, try formatEtag(req.arena, stat, encoding), mtimeSeconds(stat));
+        try addCacheControl(res, self.options.cache_control);
         return true;
     }
 };
@@ -216,11 +219,7 @@ pub const Embedded = struct {
         res.content_type = self.content_type;
         res.body = variant.data;
         try finish(req, res, variant.etag, null);
-        // Not on a 412 or 416, which a cache could otherwise keep for good.
-        switch (res.status) {
-            .ok, .partial_content, .not_modified => if (self.cacheControl(req)) |c| try res.header("Cache-Control", c),
-            else => {},
-        }
+        try addCacheControl(res, self.cacheControl(req));
     }
 
     fn cacheControl(self: *const Embedded, req: *const Request) ?[]const u8 {
@@ -229,6 +228,15 @@ pub const Embedded = struct {
         return if (std.mem.eql(u8, requested, version)) immutable else self.cache_control;
     }
 };
+
+/// Not on a 412 or 416, which a cache could otherwise keep for good.
+fn addCacheControl(res: *Response, value: ?[]const u8) !void {
+    const v = value orelse return;
+    switch (res.status) {
+        .ok, .partial_content, .not_modified => try res.header("Cache-Control", v),
+        else => {},
+    }
+}
 
 /// The validators, then the conditional and `Range` headers, for a body
 /// already set, from a file or from memory. `mtime` is null when there is
