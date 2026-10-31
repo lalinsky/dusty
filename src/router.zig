@@ -61,7 +61,8 @@ pub fn Router(comptime App: type) type {
 
         /// What the router calls. A handler registered with `get`, `post`
         /// and the like can instead take any of `*App`, `*Request`,
-        /// `*Response` and `*App.RequestContext`, in any order.
+        /// `*Response`, `*App.RequestContext` and `Param`s of its path, in
+        /// any order.
         pub const Handler = if (App == void)
             fn (*Request, *Response) anyerror!void
         else
@@ -71,6 +72,12 @@ pub fn Router(comptime App: type) type {
             info: RouteInfo,
             action: *const Handler,
             middlewares: []const Middleware(App),
+            /// Whether the handler's `Param`s parse. If they don't, the
+            /// route does not match.
+            accepts: ?*const fn (req: *const Request) bool = null,
+            /// Registered by `static` for its directory index, and replaced
+            /// by a route registered for the same path.
+            yields: bool = false,
         };
 
         arena: std.heap.ArenaAllocator,
@@ -155,6 +162,8 @@ pub fn Router(comptime App: type) type {
             handler: *const Handler,
             middlewares: []const Middleware(App),
             data: ?*const anyopaque,
+            accepts: ?*const fn (req: *const Request) bool,
+            yields: bool,
         ) !void {
             if (self.findConflict(path, method)) |c| {
                 std.debug.panic("route {s} {s} conflicts with any() route {s}: both match some paths, but {s} is not more specific", .{ c.method.name(), c.method_path, c.any_path, c.method_path });
@@ -208,10 +217,10 @@ pub fn Router(comptime App: type) type {
                 // Find or create child
                 var child = findChild(current, static_segment, kind);
                 if (child) |existing| {
-                    // One wildcard node captures under one name, and a route
-                    // reading another would never find its value.
-                    if (kind == .wildcard and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
-                        @panic("wildcard registered under two names");
+                    // One node captures under one name, and a route reading
+                    // another would never find its value.
+                    if (kind != .static and !std.mem.eql(u8, existing.param_name.?, param_name.?)) {
+                        std.debug.panic("route {s} names the parameter {s}{s}, where another route names it {s}{s}", .{ path, segment[0..1], param_name.?, segment[0..1], existing.param_name.? });
                     }
                 }
                 if (child == null) {
@@ -244,6 +253,14 @@ pub fn Router(comptime App: type) type {
                 current = child.?;
             }
 
+            if (current.route) |opaque_route| {
+                const other: *const Route = @ptrCast(@alignCast(opaque_route));
+                if (yields) return;
+                if (!other.yields) {
+                    std.debug.panic("route {s} {s} conflicts with {s}, which matches the same paths", .{ if (method) |m| m.name() else "ANY", path, other.info.path });
+                }
+            }
+
             // Create and store route
             const alloc = self.arena.allocator();
             const route = try alloc.create(Route);
@@ -251,6 +268,8 @@ pub fn Router(comptime App: type) type {
                 .info = .{ .path = try alloc.dupe(u8, path), .data = data },
                 .action = handler,
                 .middlewares = middlewares,
+                .accepts = accepts,
+                .yields = yields,
             };
             current.route = @ptrCast(route);
         }
@@ -258,8 +277,7 @@ pub fn Router(comptime App: type) type {
         fn matchRecursive(node: *Node, req: *Request, index: usize) !?*Node {
             // Terminal case: consumed all segments
             if (index >= req._segments.len) {
-                // Only return node if it has a route registered
-                if (node.route == null) return null;
+                if (!routeAccepts(node, req)) return null;
                 return node;
             }
 
@@ -297,10 +315,20 @@ pub fn Router(comptime App: type) type {
                 const start = @intFromPtr(current_segment.ptr) - @intFromPtr(req.path.ptr);
                 const remaining = req.path[start..];
                 try req.params.map.put(req.arena, c.param_name.?, remaining);
-                return c;
+                if (routeAccepts(c, req)) return c;
+                _ = req.params.map.remove(c.param_name.?);
             }
 
             return null;
+        }
+
+        /// Whether `node` has a route, and the request's params parse as
+        /// its handler takes them.
+        fn routeAccepts(node: *const Node, req: *const Request) bool {
+            const opaque_route = node.route orelse return false;
+            const route: *const Route = @ptrCast(@alignCast(opaque_route));
+            const f = route.accepts orelse return true;
+            return f(req);
         }
 
         pub fn findHandler(self: *const Self, req: *Request) !?Route {
@@ -328,36 +356,36 @@ pub fn Router(comptime App: type) type {
             return @ptrCast(@alignCast(opaque_route));
         }
 
-        pub fn get(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .get, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn get(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.get, path, handler, self.middlewares);
         }
 
-        pub fn head(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .head, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn head(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.head, path, handler, self.middlewares);
         }
 
-        pub fn post(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .post, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn post(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.post, path, handler, self.middlewares);
         }
 
-        pub fn put(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .put, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn put(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.put, path, handler, self.middlewares);
         }
 
-        pub fn delete(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .delete, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn delete(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.delete, path, handler, self.middlewares);
         }
 
-        pub fn patch(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .patch, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn patch(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.patch, path, handler, self.middlewares);
         }
 
-        pub fn options(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .options, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn options(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.options, path, handler, self.middlewares);
         }
 
-        pub fn query(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, .query, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn query(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(.query, path, handler, self.middlewares);
         }
 
         /// Matches every method, for requests that no route of their own
@@ -365,8 +393,14 @@ pub fn Router(comptime App: type) type {
         /// conflicts with an `any` route when both match some path and its
         /// own path is not more specific, and registering the second of the
         /// two panics.
-        pub fn any(self: *Self, path: []const u8, comptime handler: anytype) void {
-            self.insertRoute(path, null, wrap(handler), self.middlewares, null) catch @panic("OOM");
+        pub fn any(self: *Self, comptime path: []const u8, comptime handler: anytype) void {
+            self.add(null, path, handler, self.middlewares);
+        }
+
+        fn add(self: *Self, method: ?Method, comptime path: []const u8, comptime handler: anytype, middlewares: []const Middleware(App)) void {
+            const F = @TypeOf(handler);
+            comptime checkParams(path, F);
+            self.insertRoute(path, method, wrap(handler), middlewares, null, acceptsFn(F), false) catch @panic("OOM");
         }
 
         /// Serves the files under `dir` at `prefix`: `GET prefix/a/b.css` is
@@ -374,6 +408,9 @@ pub fn Router(comptime App: type) type {
         /// the body. A path that leaves `dir` with `..` is a 404, and so is
         /// one naming nothing to serve. `dir` must stay open while the
         /// router is in use.
+        ///
+        /// `GET prefix` itself serves the directory's index, unless a route
+        /// of its own is registered for it, before or after.
         pub fn static(self: *Self, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
             self.addStatic(prefix, dir, opts, self.middlewares);
         }
@@ -386,9 +423,9 @@ pub fn Router(comptime App: type) type {
             files.options.precompressed = alloc.dupe(Precompressed, opts.precompressed) catch @panic("OOM");
             const base = std.mem.trimEnd(u8, prefix, "/");
             // The directory itself, for its index.
-            self.insertRoute(if (base.len == 0) "/" else base, .get, staticAction, middlewares, files) catch @panic("OOM");
+            self.insertRoute(if (base.len == 0) "/" else base, .get, staticAction, middlewares, files, null, true) catch @panic("OOM");
             const files_path = std.fmt.allocPrint(alloc, "{s}/*" ++ Static.param, .{base}) catch @panic("OOM");
-            self.insertRoute(files_path, .get, staticAction, middlewares, files) catch @panic("OOM");
+            self.insertRoute(files_path, .get, staticAction, middlewares, files, null, false) catch @panic("OOM");
         }
 
         /// Serves `data` at `path`, usually a file embedded with
@@ -403,7 +440,7 @@ pub fn Router(comptime App: type) type {
             const alloc = self.arena.allocator();
             const file = alloc.create(Embedded) catch @panic("OOM");
             file.* = Embedded.init(alloc, path, data, opts) catch @panic("OOM");
-            self.insertRoute(path, .get, wrap(Embedded.handle), middlewares, file) catch @panic("OOM");
+            self.insertRoute(path, .get, wrap(Embedded.handle), middlewares, file, null, false) catch @panic("OOM");
         }
 
         const staticAction = wrap(Static.handle);
@@ -426,15 +463,30 @@ pub fn Router(comptime App: type) type {
             return if (App == void) H.callVoid else H.call;
         }
 
+        fn acceptsFn(comptime F: type) ?*const fn (req: *const Request) bool {
+            const params = comptime inject.params(F);
+            if (params.len == 0) return null;
+            return struct {
+                fn f(req: *const Request) bool {
+                    inline for (params) |P| if (!P.accepts(req)) return false;
+                    return true;
+                }
+            }.f;
+        }
+
         /// Routes registered on the group get `prefix` in front of their
         /// path and run `middlewares` after the router's. A null or "/"
         /// prefix adds nothing, and trailing slashes are dropped.
-        pub fn group(self: *Self, prefix: ?[]const u8, middlewares: []const Middleware(App)) Group {
-            return .{ .router = self, .prefix = trimPrefix(prefix), .middlewares = middlewares };
+        pub fn group(self: *Self, comptime prefix: ?[]const u8, middlewares: []const Middleware(App)) Group(trimPrefix(prefix)) {
+            return .{ .router = self, .middlewares = middlewares };
         }
 
-        fn trimPrefix(prefix: ?[]const u8) []const u8 {
-            return std.mem.trimEnd(u8, prefix orelse "", "/");
+        fn trimPrefix(comptime prefix: ?[]const u8) []const u8 {
+            return comptime std.mem.trimEnd(u8, prefix orelse "", "/");
+        }
+
+        fn joinPath(comptime prefix: []const u8, comptime path: []const u8) []const u8 {
+            return prefix ++ (if (path.len > 0 and path[0] != '/') "/" else "") ++ path;
         }
 
         fn concatMiddlewares(self: *Self, a: []const Middleware(App), b: []const Middleware(App)) []const Middleware(App) {
@@ -446,80 +498,82 @@ pub fn Router(comptime App: type) type {
             return merged;
         }
 
-        pub const Group = struct {
-            router: *Self,
-            prefix: []const u8,
-            /// The group's own and its parents', not the router's, which
-            /// are added at registration.
-            middlewares: []const Middleware(App),
+        pub fn Group(comptime prefix: []const u8) type {
+            return struct {
+                const G = @This();
 
-            /// A group inside this one: the prefixes join, and its
-            /// middlewares run after this group's.
-            pub fn group(g: Group, prefix: ?[]const u8, middlewares: []const Middleware(App)) Group {
-                return .{
-                    .router = g.router,
-                    .prefix = g.concatPath(trimPrefix(prefix)),
-                    .middlewares = g.router.concatMiddlewares(g.middlewares, middlewares),
-                };
-            }
+                router: *Self,
+                /// The group's own and its parents', not the router's, which
+                /// are added at registration.
+                middlewares: []const Middleware(App),
 
-            fn mergeMiddlewares(g: Group) []const Middleware(App) {
-                return g.router.concatMiddlewares(g.router.middlewares, g.middlewares);
-            }
+                /// A group inside this one: the prefixes join, and its
+                /// middlewares run after this group's.
+                pub fn group(g: G, comptime inner: ?[]const u8, middlewares: []const Middleware(App)) Group(joinPath(prefix, trimPrefix(inner))) {
+                    return .{
+                        .router = g.router,
+                        .middlewares = g.router.concatMiddlewares(g.middlewares, middlewares),
+                    };
+                }
 
-            fn concatPath(g: Group, path: []const u8) []const u8 {
-                const sep = if (path.len > 0 and path[0] != '/') "/" else "";
-                return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}{s}", .{ g.prefix, sep, path }) catch @panic("OOM");
-            }
+                fn mergeMiddlewares(g: G) []const Middleware(App) {
+                    return g.router.concatMiddlewares(g.router.middlewares, g.middlewares);
+                }
 
-            fn register(g: Group, method: ?Method, path: []const u8, handler: *const Handler) void {
-                g.router.insertRoute(g.concatPath(path), method, handler, g.mergeMiddlewares(), null) catch @panic("OOM");
-            }
+                fn concatPath(g: G, path: []const u8) []const u8 {
+                    const sep = if (path.len > 0 and path[0] != '/') "/" else "";
+                    return std.fmt.allocPrint(g.router.arena.allocator(), "{s}{s}{s}", .{ prefix, sep, path }) catch @panic("OOM");
+                }
 
-            pub fn get(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.get, path, wrap(handler));
-            }
+                fn register(g: G, method: ?Method, comptime path: []const u8, comptime handler: anytype) void {
+                    g.router.add(method, joinPath(prefix, path), handler, g.mergeMiddlewares());
+                }
 
-            pub fn head(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.head, path, wrap(handler));
-            }
+                pub fn get(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.get, path, handler);
+                }
 
-            pub fn post(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.post, path, wrap(handler));
-            }
+                pub fn head(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.head, path, handler);
+                }
 
-            pub fn put(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.put, path, wrap(handler));
-            }
+                pub fn post(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.post, path, handler);
+                }
 
-            pub fn delete(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.delete, path, wrap(handler));
-            }
+                pub fn put(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.put, path, handler);
+                }
 
-            pub fn patch(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.patch, path, wrap(handler));
-            }
+                pub fn delete(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.delete, path, handler);
+                }
 
-            pub fn options(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.options, path, wrap(handler));
-            }
+                pub fn patch(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.patch, path, handler);
+                }
 
-            pub fn query(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(.query, path, wrap(handler));
-            }
+                pub fn options(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.options, path, handler);
+                }
 
-            pub fn any(g: Group, path: []const u8, comptime handler: anytype) void {
-                g.register(null, path, wrap(handler));
-            }
+                pub fn query(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(.query, path, handler);
+                }
 
-            pub fn static(g: Group, prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
-                g.router.addStatic(g.concatPath(prefix), dir, opts, g.mergeMiddlewares());
-            }
+                pub fn any(g: G, comptime path: []const u8, comptime handler: anytype) void {
+                    g.register(null, path, handler);
+                }
 
-            pub fn embedded(g: Group, path: []const u8, data: []const u8, opts: EmbeddedOptions) void {
-                g.router.addEmbedded(g.concatPath(path), data, opts, g.mergeMiddlewares());
-            }
-        };
+                pub fn static(g: G, path_prefix: []const u8, dir: std.Io.Dir, opts: StaticOptions) void {
+                    g.router.addStatic(g.concatPath(path_prefix), dir, opts, g.mergeMiddlewares());
+                }
+
+                pub fn embedded(g: G, path: []const u8, data: []const u8, opts: EmbeddedOptions) void {
+                    g.router.addEmbedded(g.concatPath(path), data, opts, g.mergeMiddlewares());
+                }
+            };
+        }
 
         fn parseQueryString(req: *Request, query_string: []const u8) !void {
             if (query_string.len == 0) return;
@@ -552,6 +606,45 @@ pub fn Router(comptime App: type) type {
             }
         }
     };
+}
+
+/// The names of the `:param` and `*wildcard` segments of a route path. A
+/// compile error for a `:` with no name, a repeated name, or a wildcard
+/// that is not the last segment. A wildcard can go unnamed.
+fn pathParams(comptime path: []const u8) []const []const u8 {
+    comptime {
+        var names: []const []const u8 = &.{};
+        var it = std.mem.tokenizeScalar(u8, path, '/');
+        while (it.next()) |segment| {
+            if (segment[0] != ':' and segment[0] != '*') continue;
+            const name = segment[1..];
+            if (segment[0] == '*' and it.peek() != null) @compileError("route " ++ path ++ " has segments after its wildcard " ++ segment);
+            if (name.len == 0) {
+                if (segment[0] == ':') @compileError("route " ++ path ++ " has a parameter with no name");
+                continue;
+            }
+            for (names) |other| {
+                if (std.mem.eql(u8, other, name)) @compileError("route " ++ path ++ " has two parameters named " ++ name);
+            }
+            names = names ++ .{name};
+        }
+        return names;
+    }
+}
+
+/// A compile error unless every `Param` of `F` names a parameter of
+/// `path`, and no two name the same one.
+fn checkParams(comptime path: []const u8, comptime F: type) void {
+    const names = pathParams(path);
+    const params = inject.params(F);
+    for (params, 0..) |P, i| {
+        for (params[0..i]) |Q| {
+            if (std.mem.eql(u8, P.param_name, Q.param_name)) @compileError("handler for route " ++ path ++ " takes the parameter " ++ P.param_name ++ " twice");
+        }
+        for (names) |name| {
+            if (std.mem.eql(u8, name, P.param_name)) break;
+        } else @compileError("handler for route " ++ path ++ " takes dusty.Param(\"" ++ P.param_name ++ "\", " ++ @typeName(P.Value) ++ "), but the path has no :" ++ P.param_name);
+    }
 }
 
 /// Whether some request path matches both, and `method_path` matches some
@@ -1786,4 +1879,104 @@ test "Router: a route's path is decoded segment by segment, like a request's" {
     try std.testing.expect(try router.findHandler(try split(&req)) == null);
     req.url = "/c d";
     try std.testing.expectEqual(&testHandler2, (try router.findHandler(try split(&req))).?.action);
+}
+
+const Param = @import("param.zig").Param;
+
+fn testRequest(arena: std.mem.Allocator, url: []const u8) Request {
+    return .{ .method = .get, .url = url, .arena = arena, .parser = undefined, .transport = undefined };
+}
+
+test "Router: a Param that does not parse makes the route not match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const App = struct {
+        page: u32 = 0,
+
+        fn handle(app: *@This(), page: Param("page", u32)) void {
+            app.page = page.value;
+        }
+    };
+    var router = Router(App).init(std.testing.allocator);
+    defer router.deinit();
+    router.get("/page/:page", App.handle);
+
+    var req = testRequest(arena.allocator(), "/page/12");
+    const route = (try router.findHandler(try split(&req))).?;
+    var app: App = .{};
+    try route.action(&app, &req, undefined);
+    try std.testing.expectEqual(@as(u32, 12), app.page);
+
+    var bad = testRequest(arena.allocator(), "/page/abc");
+    try std.testing.expect(try router.findHandler(try split(&bad)) == null);
+    var negative = testRequest(arena.allocator(), "/page/-1");
+    try std.testing.expect(try router.findHandler(try split(&negative)) == null);
+}
+
+test "Router: a route its Param rejects falls through to the next match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = Router(void).init(std.testing.allocator);
+    defer router.deinit();
+    const H = struct {
+        fn byId(_: Param("id", u64)) void {}
+        fn rest(_: *Response) void {}
+    };
+    router.get("/users/:id", H.byId);
+    router.get("/users/*rest", H.rest);
+
+    var numeric = testRequest(arena.allocator(), "/users/5");
+    try std.testing.expectEqualStrings("/users/:id", (try router.findHandler(try split(&numeric))).?.info.path);
+    try std.testing.expectEqualStrings("5", numeric.params.get("id").?);
+
+    var name = testRequest(arena.allocator(), "/users/alice");
+    try std.testing.expectEqualStrings("/users/*rest", (try router.findHandler(try split(&name))).?.info.path);
+    try std.testing.expect(name.params.get("id") == null);
+    try std.testing.expectEqualStrings("alice", name.params.get("rest").?);
+}
+
+test "Router: an enum Param in a group prefix filters the values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const Lang = enum { en, de };
+    var router = Router(void).init(std.testing.allocator);
+    defer router.deinit();
+    const localized = router.group("/:lang", &.{});
+    localized.get("/page", struct {
+        fn handle(_: Param("lang", Lang)) void {}
+    }.handle);
+
+    var de = testRequest(arena.allocator(), "/de/page");
+    try std.testing.expect(try router.findHandler(try split(&de)) != null);
+    var fr = testRequest(arena.allocator(), "/fr/page");
+    try std.testing.expect(try router.findHandler(try split(&fr)) == null);
+}
+
+test "Router: a route of its own replaces the static directory index" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const H = struct {
+        fn home(_: *Response) void {}
+    };
+    var before = Router(void).init(std.testing.allocator);
+    defer before.deinit();
+    before.get("/", H.home);
+    before.static("/", undefined, .{});
+
+    var after = Router(void).init(std.testing.allocator);
+    defer after.deinit();
+    after.static("/", undefined, .{});
+    after.get("/", H.home);
+
+    for ([_]*Router(void){ &before, &after }) |router| {
+        var req = testRequest(arena.allocator(), "/");
+        const route = (try router.findHandler(try split(&req))).?;
+        try std.testing.expect(route.info.data == null);
+        var file = testRequest(arena.allocator(), "/app.css");
+        try std.testing.expect((try router.findHandler(try split(&file))).?.info.data != null);
+    }
 }

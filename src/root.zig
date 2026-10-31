@@ -21,6 +21,7 @@ pub const Method = @import("http.zig").Method;
 pub const Status = @import("http.zig").Status;
 pub const Headers = @import("http.zig").Headers;
 pub const Params = @import("http.zig").Params;
+pub const Param = @import("param.zig").Param;
 pub const ContentType = @import("http.zig").ContentType;
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
@@ -57,6 +58,7 @@ comptime {
     _ = @import("client.zig");
     _ = @import("client_test.zig");
     _ = @import("deadline.zig");
+    _ = @import("param.zig");
     _ = @import("cgroup.zig");
     _ = @import("somaxconn.zig");
     _ = @import("config.zig");

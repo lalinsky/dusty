@@ -2,9 +2,11 @@ const std = @import("std");
 const Request = @import("request.zig").Request;
 const RequestContext = @import("request.zig").RequestContext;
 const Response = @import("response.zig").Response;
+const param = @import("param.zig");
 
 /// Arguments for calling `F`, each filled by its type: `*App`, `*Request`,
-/// `*Response`, `*App.RequestContext`, and `anyerror` when `err` is one.
+/// `*Response`, `*App.RequestContext`, a `Param`, and `anyerror` when
+/// `err` is one.
 pub fn args(
     comptime App: type,
     comptime F: type,
@@ -41,10 +43,30 @@ fn arg(
     if (comptime pointsTo(P, Response)) return res;
     if (comptime App != void and pointsTo(P, App)) return app;
     if (comptime pointsTo(P, RequestContext(App))) return req.ctx(App);
+    if (comptime param.isParam(P)) return P.fromRequest(req);
     if (comptime P == anyerror and @TypeOf(err) == anyerror) return err;
     @compileError("can't inject a parameter of type " ++ @typeName(P) ++ " into " ++ @typeName(F));
 }
 
 fn pointsTo(comptime P: type, comptime T: type) bool {
     return P == *T or P == *const T;
+}
+
+/// The `Param` types among `F`'s parameters.
+pub fn params(comptime F: type) []const type {
+    comptime {
+        const a: std.meta.ArgsTuple(F) = undefined;
+        var result: []const type = &.{};
+        for (0..a.len) |i| {
+            if (param.isParam(@TypeOf(a[i]))) result = result ++ .{@TypeOf(a[i])};
+        }
+        return result;
+    }
+}
+
+/// A compile error if `F` takes a `Param`, for functions that are not
+/// called for a route.
+pub fn noParams(comptime F: type, comptime name: []const u8) void {
+    const found = params(F);
+    if (found.len > 0) @compileError(name ++ " can't take dusty.Param(\"" ++ found[0].param_name ++ "\", ...): it isn't called for a route");
 }

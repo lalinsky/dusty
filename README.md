@@ -102,6 +102,19 @@ A handler takes only the parameters it needs, in any order: the app (`*App`), `*
 `*http.Response`, and the app's `RequestContext`. So do the app's `notFound` and `uncaughtError`
 hooks, which don't need `self` either, and `uncaughtError` can also take the error as `anyerror`.
 
+A handler can also take a path parameter, parsed:
+
+```zig
+fn handlePage(page: http.Param("page", u32), res: *http.Response) !void {
+    try res.print(.text, "Page {d}\n", .{page.value});
+}
+
+server.router.get("/page/:page", handlePage);
+```
+
+A value that doesn't parse, such as `/page/abc`, makes the route not match, so the request
+gets a 404 unless another route matches it. A `Param` the path doesn't have is a compile error.
+
 `listeners` takes any number of listeners, each with its own TLS, so one server
 can serve HTTPS on 443 and plain HTTP on 80 with the same router:
 
