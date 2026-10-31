@@ -1,8 +1,11 @@
 # WebSocket
 
-[`client.connectWebSocket`](../../apidocs/#http.Client.connectWebSocket) connects to a WebSocket
-server and returns an [`http.WebSocketClient`](../../apidocs/#http.WebSocketClient). This talks to
-the [echo server](../server/websocket.md) from the server docs:
+The client can also open WebSocket connections, with the same `http.Client` you use for other
+requests. Pass a `ws://` URL to
+[`client.connectWebSocket`](../../apidocs/#http.Client.connectWebSocket), and you get back an
+[`http.WebSocketClient`](../../apidocs/#http.WebSocketClient) to send and receive messages on.
+
+This example talks to the [echo server](../server/websocket.md) from the server docs:
 
 ```zig
 --8<-- "examples/websocket_client.zig:connect"
