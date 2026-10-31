@@ -193,6 +193,7 @@ pub fn build(b: *std.Build) void {
         "fetch",
         "hello_world",
         "proxy",
+        "routing",
         "sse",
         "tls_server",
         "websocket",
