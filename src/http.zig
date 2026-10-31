@@ -613,6 +613,7 @@ pub const ContentType = enum(u32) {
     xml,
     json,
     msgpack,
+    cbor,
     yaml,
     png,
     jpeg,
@@ -670,6 +671,7 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/xml")) and std.mem.eql(u8, main, "application/xml")) return .xml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/json")) and std.mem.eql(u8, main, "application/json")) return .json;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/vnd.msgpack")) and std.mem.eql(u8, main, "application/vnd.msgpack")) return .msgpack;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("application/cbor")) and std.mem.eql(u8, main, "application/cbor")) return .cbor;
         if ((hash == comptime std.hash.Fnv1a_32.hash("application/yaml")) and std.mem.eql(u8, main, "application/yaml")) return .yaml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/png")) and std.mem.eql(u8, main, "image/png")) return .png;
         if ((hash == comptime std.hash.Fnv1a_32.hash("image/jpeg")) and std.mem.eql(u8, main, "image/jpeg")) return .jpeg;
@@ -714,6 +716,7 @@ pub const ContentType = enum(u32) {
         if ((hash == comptime std.hash.Fnv1a_32.hash("mjs")) and std.mem.eql(u8, name, "mjs")) return .js;
         if ((hash == comptime std.hash.Fnv1a_32.hash("xml")) and std.mem.eql(u8, name, "xml")) return .xml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("json")) and std.mem.eql(u8, name, "json")) return .json;
+        if ((hash == comptime std.hash.Fnv1a_32.hash("cbor")) and std.mem.eql(u8, name, "cbor")) return .cbor;
         if ((hash == comptime std.hash.Fnv1a_32.hash("yaml")) and std.mem.eql(u8, name, "yaml")) return .yaml;
         if ((hash == comptime std.hash.Fnv1a_32.hash("png")) and std.mem.eql(u8, name, "png")) return .png;
         if ((hash == comptime std.hash.Fnv1a_32.hash("jpg")) and std.mem.eql(u8, name, "jpg")) return .jpeg;
@@ -745,6 +748,7 @@ pub const ContentType = enum(u32) {
             .xml => "application/xml; charset=UTF-8",
             .json => "application/json; charset=UTF-8",
             .msgpack => "application/vnd.msgpack",
+            .cbor => "application/cbor",
             .yaml => "application/yaml; charset=UTF-8",
             .png => "image/png",
             .jpeg => "image/jpeg",
