@@ -11,11 +11,7 @@ const App = struct {
     }
 
     pub fn uncaughtError(req: *http.Request, res: *http.Response, err: anyerror) void {
-        if (req.bodyErrorStatus(err) orelse req.extractErrorStatus(err)) |status| {
-            res.status = status;
-            res.print(.text, "Bad request: {t}\n", .{err}) catch {};
-            return;
-        }
+        std.log.err("{s} failed: {t}", .{ req.path, err });
         res.status = .internal_server_error;
         res.print(.text, "Something went wrong\n", .{}) catch {};
     }

@@ -16,7 +16,8 @@ pub fn Scope(comptime App: type) type {
 
 /// Arguments for calling `F`, each filled by its type: `*App`, `*Request`,
 /// `*Response`, `*App.RequestContext`, an extractor, and `anyerror` when
-/// `err` is one. An extractor that fails is recorded on `req`.
+/// `err` is one. An extractor missing its value or failing to parse it is
+/// recorded on `req`.
 pub fn args(
     comptime App: type,
     comptime F: type,
@@ -60,7 +61,7 @@ fn arg(
         const result = P.extract(scope);
         if (@typeInfo(@TypeOf(result)) != .error_union) return result;
         return result catch |e| {
-            req._extract_err = e;
+            if (e == error.MissingValue or e == error.InvalidValue) req._extract_failed = true;
             return e;
         };
     }
