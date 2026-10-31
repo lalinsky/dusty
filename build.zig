@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(assets_gen);
 
     const lib = b.addLibrary(.{
-        .name = "dusty",
+        .name = "http",
         .root_module = mod,
         .linkage = .static,
     });
