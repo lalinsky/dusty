@@ -25,6 +25,8 @@ const dusty = b.dependency("dusty", .{
 exe.root_module.addImport("dusty", dusty.module("dusty"));
 ```
 
+See [Build Options](build-options.md) for how to configure the package.
+
 ## Hello World
 
 Put this into `src/main.zig`:
