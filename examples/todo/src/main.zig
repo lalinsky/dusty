@@ -6,6 +6,8 @@ const pg = @import("pg");
 const assets = @import("assets");
 const templates = @import("templates/todo.zig");
 
+pub const std_options_debug_io = zio.debug_io;
+
 const Todo = templates.Todo;
 const Filter = templates.Filter;
 

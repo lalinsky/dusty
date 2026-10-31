@@ -29,6 +29,8 @@ Then create the zio runtime in `main`, and pass its `io` to the server instead o
 ```zig
 const zio = @import("zio");
 
+pub const std_options_debug_io = zio.debug_io;
+
 pub fn main(init: std.process.Init) !void {
     var rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
     defer rt.deinit();
@@ -43,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
 
 `.executors = .auto` runs one executor thread per CPU. Without it, zio runs everything on the main
 thread.
+
+`std_options_debug_io` makes logging and `std.debug.print` go through zio too. Without it, a task
+writing a log line can block a whole executor thread while it waits for stderr.
 
 Pass the same `io` to anything else that does I/O, like a database client, so it runs on zio too.
 
