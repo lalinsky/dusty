@@ -4,14 +4,15 @@ Dusty is an HTTP client and server library for Zig. It's built on the standard l
 [`std.Io`](https://ziglang.org/documentation/0.16.0/std/#std.Io) interface, and parses HTTP with
 [llhttp](https://github.com/nodejs/llhttp), the parser from Node.js.
 
-It runs on any `std.Io` implementation that supports networking, including `std.Io.Threaded` from the standard library. It was
-originally written for [zio](https://lalinsky.github.io/zio/) though, and zio is still what we recommend
-for production, especially if your handlers call other services over the network or you use WebSocket.
+It runs on any `std.Io` implementation that supports networking, including `std.Io.Threaded` from
+the standard library. It was originally written for [zio](https://lalinsky.github.io/zio/) though,
+and zio is still what we recommend for production, especially if your handlers call other services
+over the network or you use WebSocket.
 
-Dusty is written to run real services. It has been audited with
-[HTTP Garden](https://github.com/narfindustries/http-garden) for parsing differences that could lead
-to request smuggling, it has timeouts and connection limits on by default that work on every
-`std.Io` implementation, and it's among the fastest servers on [HttpArena](https://http-arena.com/).
+A lot of work has gone into making Dusty both reliable and fast. Its parsing has been checked with
+[HTTP Garden](https://github.com/narfindustries/http-garden) for differences that could lead to
+request smuggling. Timeouts and connection limits are on by default, and they work on every
+`std.Io` implementation. On [HttpArena](https://http-arena.com/), it's among the fastest servers.
 
 ## Features
 
@@ -22,7 +23,7 @@ to request smuggling, it has timeouts and connection limits on by default that w
 - Server-Sent Events, and WebSocket on both the server and the client
 - Static files with conditional and range requests, and assets embedded at build time
 - HTTP and HTTPS client with connection pooling, and Unix socket support
-- TLS on both sides, including client certificates, through [tls.zig](https://github.com/ianic/tls.zig)
+- TLS on both sides, including client certificates, through [tls.zig](https://github.com/lalinsky/tls.zig)
 
 ## Quick Example
 
