@@ -8,6 +8,11 @@ It runs on any `std.Io` implementation that supports networking, including `std.
 originally written for [zio](https://lalinsky.github.io/zio/) though, and zio is still what we recommend
 for production, especially if your handlers call other services over the network or you use WebSocket.
 
+Dusty is written to run real services. It has been audited with
+[HTTP Garden](https://github.com/narfindustries/http-garden) for parsing differences that could lead
+to request smuggling, it has timeouts and connection limits on by default that work on every
+`std.Io` implementation, and it's among the fastest servers on [HttpArena](https://http-arena.com/).
+
 ## Features
 
 - Router with path parameters, wildcards, groups and per-group middleware
