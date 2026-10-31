@@ -41,7 +41,15 @@ const App = struct {
 
     /// Answers a handler that failed. Returns void, so there is nothing to
     /// report a failure of its own to -- `fail` has to be infallible.
-    pub fn uncaughtError(_: *App, _: *Request, res: *Response, err: anyerror) void {
+    ///
+    /// Also answers what the client got wrong, since the server is told not
+    /// to, so those come back as JSON too.
+    pub fn uncaughtError(_: *App, req: *Request, res: *Response, err: anyerror) void {
+        if (req.clientErrorStatus()) |status| return switch (status) {
+            .payload_too_large => fail(res, status, "Content Too Large"),
+            .unsupported_media_type => fail(res, status, "Unsupported Media Type"),
+            else => fail(res, status, "Bad Request"),
+        };
         // The name goes to the log rather than the response: it names an
         // internal failure, and the client can do nothing with it.
         std.log.err("unhandled error: {t}", .{err});
@@ -415,6 +423,7 @@ pub fn main(init: std.process.Init) !void {
     var server = http.Server(App).init(init.gpa, rt.io(), .{
         .listeners = &.{.{ .address = .{ .ip = opts.listen } }},
         .trusted_proxy_hops = opts.trusted_proxy_hops,
+        .request = .{ .answer_client_errors = false },
         .timeout = .{
             .request = request_timeout,
             .keepalive = keepalive_timeout,

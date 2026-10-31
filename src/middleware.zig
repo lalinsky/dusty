@@ -1,4 +1,5 @@
 const std = @import("std");
+const http = @import("http.zig");
 const Request = @import("request.zig").Request;
 const RequestContext = @import("request.zig").RequestContext;
 const Response = @import("response.zig").Response;
@@ -139,7 +140,7 @@ pub fn Executor(comptime App: type) type {
         pub fn run(self: *Self) !void {
             self.res.headers_hook = .{ .ptr = self, .call = callHeadersHooks };
             defer self.res.headers_hook = null;
-            self.handle() catch |err| return self.recover(err);
+            self.next() catch |err| return self.recover(err);
             // A buffered response: its headers go out after this returns,
             // and a hook that fails can still turn it into an error response.
             if (!self.res.headers_written) self.headersHooks() catch |err| return self.recover(err);
@@ -147,44 +148,42 @@ pub fn Executor(comptime App: type) type {
 
         fn recover(self: *Self, returned: anyerror) !void {
             const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
+            const client_status = self.req.clientErrorStatus();
             switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
-                error.ReadFailed, error.WriteFailed, error.Canceled => return err,
-                // Handler/middleware errors: prepare an error response (500, or
-                // the app's uncaughtError) and return normally so the server
-                // writes it, instead of tearing down the connection with no
-                // reply.
-                else => {
-                    // Unless the peer is what went away. `Response` resolves
-                    // its writes now, so a disconnect arrives here as
-                    // `ConnectionResetByPeer` rather than `WriteFailed` --
-                    // just as fatal, and just as much not the handler's
-                    // fault, so it is neither a 500 nor worth an error log.
-                    // The connection is asked, not the error: a handler
-                    // can return an `EndOfStream` of its own.
-                    if (self.res.conn.peerGone()) return err;
-                    if (self.res.headers_written) {
-                        // The response already started (e.g. streaming/chunked
-                        // body or a WebSocket upgrade), so headers were sent
-                        // with framing that doesn't account for an error body.
-                        // We can't safely rewrite it as a 500; abort the
-                        // connection instead of corrupting the response.
-                        log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
-                        return err;
-                    }
-                    if (self.req.bodyErrorStatus(err) != null) {
-                        log.debug("request body rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
-                    } else if (self.req.extractErrorStatus(err) != null) {
-                        log.debug("request parameter rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
-                    } else {
-                        log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
-                    }
-                    self.failure = err;
-                    self.headers_hooks_ran = true;
-                    self.handleError(err);
-                },
+                error.WriteFailed, error.Canceled => return err,
+                // Unless the read failed on what the client sent, which a
+                // handler streaming the body sees as `ReadFailed`.
+                error.ReadFailed => if (self.req.bodyClientErrorStatus() == null) return err,
+                else => {},
             }
+            // Unless the peer is what went away. `Response` resolves its
+            // writes now, so a disconnect arrives here as
+            // `ConnectionResetByPeer` rather than `WriteFailed` -- just as
+            // fatal, and just as much not the handler's fault, so it is
+            // neither a 500 nor worth an error log. The connection is asked,
+            // not the error: a handler can return an `EndOfStream` of its own.
+            if (self.res.conn.peerGone()) return err;
+            if (self.res.headers_written) {
+                // The response already started (e.g. streaming/chunked
+                // body or a WebSocket upgrade), so headers were sent
+                // with framing that doesn't account for an error body.
+                // We can't safely rewrite it as a 500; abort the
+                // connection instead of corrupting the response.
+                log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                return err;
+            }
+            if (client_status != null) {
+                log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+            } else {
+                log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+            }
+            // Prepare an error response and return normally so the server
+            // writes it, instead of tearing down the connection with no reply.
+            self.failure = err;
+            self.headers_hooks_ran = true;
+            self.handleError(err, client_status);
         }
 
         fn callHeadersHooks(ptr: *anyopaque) Response.HeadersHookError!void {
@@ -226,19 +225,6 @@ pub fn Executor(comptime App: type) type {
             }
         }
 
-        /// A handler streaming the body sees the reader's failure as
-        /// `ReadFailed`; the request kept the cause.
-        fn handle(self: *Self) anyerror!void {
-            self.next() catch |err| {
-                if (err == error.ReadFailed) {
-                    if (self.req._body_err) |cause| {
-                        if (self.req.bodyErrorStatus(cause) != null) return cause;
-                    }
-                }
-                return err;
-            };
-        }
-
         pub fn next(self: *Self) anyerror!void {
             if (self.index < self.middlewares.len) {
                 const mw = self.middlewares[self.index];
@@ -256,9 +242,9 @@ pub fn Executor(comptime App: type) type {
             else
                 action(self.app, self.req, self.res);
             // A handler that finds nothing to answer with answers as if no
-            // route had matched.
+            // route had matched, unless the client got something wrong.
             result catch |err| switch (err) {
-                error.NotFound => return self.handleNotFound(),
+                error.NotFound => if (self.req.clientErrorStatus() == null) return self.handleNotFound() else return err,
                 else => return err,
             };
         }
@@ -281,25 +267,29 @@ pub fn Executor(comptime App: type) type {
             }
         }
 
-        fn handleError(self: *Self, err: anyerror) void {
+        fn handleError(self: *Self, err: anyerror, client_status: ?http.Status) void {
             // Whatever the handler managed to write is half of something
             // it did not finish, and `write` would send it in place of the
             // error response. The caller has already checked that the
             // headers are still open.
             self.res.resetBody();
+            if (client_status) |status| {
+                if (self.req.config.answer_client_errors) {
+                    self.res.status = status;
+                    self.res.content_type = .text;
+                    self.res.body = switch (status) {
+                        .payload_too_large => "413 Content Too Large\n",
+                        .unsupported_media_type => "415 Unsupported Media Type\n",
+                        else => "400 Bad Request\n",
+                    };
+                    return;
+                }
+            }
             if (comptime App != void and @hasDecl(App, "uncaughtError")) {
                 comptime inject.noExtractors(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError");
                 _ = inject.returnsError(@TypeOf(App.uncaughtError), @typeName(App) ++ ".uncaughtError", false);
                 const call_args = inject.args(App, @TypeOf(App.uncaughtError), self.app, self.req, self.res, err) catch |e| switch (e) {};
                 @call(.auto, App.uncaughtError, call_args);
-            } else if (self.req.bodyErrorStatus(err) orelse self.req.extractErrorStatus(err)) |status| {
-                self.res.status = status;
-                self.res.content_type = .text;
-                self.res.body = switch (status) {
-                    .payload_too_large => "413 Content Too Large\n",
-                    .unsupported_media_type => "415 Unsupported Media Type\n",
-                    else => "400 Bad Request\n",
-                };
             } else {
                 self.res.status = .internal_server_error;
                 self.res.content_type = .text;

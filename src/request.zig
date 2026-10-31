@@ -125,11 +125,10 @@ pub const Request = struct {
     // second `reader()` does not build a second decoder over the same body.
     _decode: ?*RequestBodyReader.Decode = null,
     _body_reader_taken: bool = false,
-    // What the last failed body read failed with, so an error coming out of
-    // a handler can be told apart from one of the same name it made itself.
+    // What the last failed body read failed with.
     _body_err: ?anyerror = null,
-    // What a failed `extract` of a handler parameter returned, for the same reason.
-    _extract_err: ?anyerror = null,
+    // A handler parameter such as `http.Query` was missing or did not parse.
+    _extract_failed: bool = false,
     // The non-empty segments of `path`, each a slice of it.
     _segments: []const []const u8 = &.{},
     _fd: std.StringHashMapUnmanaged([]const u8) = .{},
@@ -275,15 +274,21 @@ pub const Request = struct {
         return result;
     }
 
-    /// The status to answer with when `err` is what reading this request's
-    /// body failed with, and the client is the one at fault: a body over
-    /// `max_body_size`, broken framing or coding, or a coding this server
-    /// cannot undo. Null for any other error, including one of the same name
-    /// that did not come from the body.
-    pub fn bodyErrorStatus(self: *const Request, err: anyerror) ?http.Status {
+    /// The 4xx status for what the client got wrong, or null if it got
+    /// nothing wrong: a parameter such as `http.Query` that is missing or
+    /// doesn't parse, a body over `max_body_size`, broken framing or coding,
+    /// or a coding this server can't undo. Set where the failure happens,
+    /// whatever error the handler then returns.
+    pub fn clientErrorStatus(self: *const Request) ?http.Status {
+        // A custom extractor can fail on the body, which has the more
+        // specific status.
+        return self.bodyClientErrorStatus() orelse if (self._extract_failed) .bad_request else null;
+    }
+
+    /// `clientErrorStatus`, for the body alone.
+    pub fn bodyClientErrorStatus(self: *const Request) ?http.Status {
         const cause = self._body_err orelse return null;
-        if (cause != err) return null;
-        return switch (err) {
+        return switch (cause) {
             error.BodyTooBig => .payload_too_large,
             // RFC 9110 15.5.16 names this status for an unsupported content coding.
             error.UnsupportedContentEncoding => .unsupported_media_type,
@@ -294,18 +299,6 @@ pub const Request = struct {
             error.IncompleteBody,
             error.CorruptInput,
             => .bad_request,
-            else => null,
-        };
-    }
-
-    /// 400 when `err` is the `error.MissingValue` or `error.InvalidValue`
-    /// a handler parameter such as `http.Query` failed with for this request, null
-    /// for any other error, including one of the same name from elsewhere.
-    pub fn extractErrorStatus(self: *const Request, err: anyerror) ?http.Status {
-        const cause = self._extract_err orelse return null;
-        if (cause != err) return null;
-        return switch (err) {
-            error.MissingValue, error.InvalidValue => .bad_request,
             else => null,
         };
     }
@@ -1507,22 +1500,18 @@ test "Request.formData: entry with no value" {
     try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
 
-test "Request.bodyErrorStatus: only the body read's own error is mapped" {
+test "Request.clientErrorStatus: set by a failed body read or parameter" {
     var req: Request = undefined;
     req._body_err = null;
-    try std.testing.expectEqual(null, req.bodyErrorStatus(error.IncompleteBody));
-    req._body_err = error.IncompleteBody;
-    try std.testing.expectEqual(.bad_request, req.bodyErrorStatus(error.IncompleteBody).?);
-    try std.testing.expectEqual(null, req.bodyErrorStatus(error.CorruptInput));
-}
-
-test "Request.extractErrorStatus: only an extractor's own error is mapped" {
-    var req: Request = undefined;
-    req._extract_err = null;
-    try std.testing.expectEqual(null, req.extractErrorStatus(error.MissingValue));
-    req._extract_err = error.MissingValue;
-    try std.testing.expectEqual(.bad_request, req.extractErrorStatus(error.MissingValue).?);
-    try std.testing.expectEqual(null, req.extractErrorStatus(error.InvalidValue));
+    req._extract_failed = false;
+    try std.testing.expectEqual(null, req.clientErrorStatus());
+    req._body_err = error.Canceled;
+    try std.testing.expectEqual(null, req.clientErrorStatus());
+    req._body_err = error.BodyTooBig;
+    try std.testing.expectEqual(.payload_too_large, req.clientErrorStatus().?);
+    req._body_err = null;
+    req._extract_failed = true;
+    try std.testing.expectEqual(.bad_request, req.clientErrorStatus().?);
 }
 
 test "Request.multiFormData: basic key and value" {

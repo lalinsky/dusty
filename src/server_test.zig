@@ -1790,6 +1790,77 @@ test "Server: Query and Header extractors, and a 400 for a missing or bad value"
     }
 }
 
+const ClientErrorApp = struct {
+    pub fn uncaughtError(req: *dusty.Request, res: *dusty.Response, err: anyerror) void {
+        const status = req.clientErrorStatus() orelse .internal_server_error;
+        res.status = status;
+        res.print(.text, "app {d} {t}", .{ @intFromEnum(status), err }) catch {};
+    }
+
+    fn list(_: dusty.Query("page", u32), res: *dusty.Response) void {
+        res.body = "OK";
+    }
+
+    fn upload(req: *dusty.Request) !void {
+        _ = req.body() catch return error.Mine;
+    }
+};
+
+fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !void {
+    const io = std.testing.io;
+    var app: ClientErrorApp = .{};
+    var server = dusty.Server(ClientErrorApp).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .request = .{ .max_body_size = 4, .answer_client_errors = answer_client_errors },
+    }, &app);
+    defer server.deinit();
+    server.router.get("/list", ClientErrorApp.list);
+    server.router.post("/upload", ClientErrorApp.upload);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(ClientErrorApp)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("GET /list?page=x HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        // The handler turns the failed read into an error of its own.
+        "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\n12345678");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    for (want) |w| {
+        var status: [64]u8 = undefined;
+        var body: [64]u8 = undefined;
+        const resp = try readResponse(&reader.interface, &status, &body);
+        try std.testing.expect(std.mem.indexOf(u8, resp.status, w[0]) != null);
+        try std.testing.expectEqualStrings(w[1], resp.body);
+    }
+}
+
+test "Server: what the client got wrong is answered by the server, whatever error the handler returns" {
+    try expectClientErrors(true, &.{
+        .{ "400", "400 Bad Request\n" },
+        .{ "413", "413 Content Too Large\n" },
+    });
+}
+
+test "Server: with answer_client_errors off, uncaughtError answers what the client got wrong" {
+    try expectClientErrors(false, &.{
+        .{ "400", "app 400 InvalidValue" },
+        .{ "413", "app 413 Mine" },
+    });
+}
+
 /// Sends `head`, then `body_len` bytes of body the server will not read, and
 /// returns the status line of the answer. The rest of the answer must end
 /// with a FIN: a close with the body unread would be a reset, and the peer

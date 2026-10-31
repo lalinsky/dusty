@@ -99,9 +99,17 @@ The app can replace the default 404 and error responses by declaring `notFound` 
 route. `uncaughtError` returns `void`, so it can't fail. It can take the error as `anyerror`, but not
 `http.Param`, `http.Query`, `http.Header` or your own types.
 
-`uncaughtError` also gets the errors the server would answer with a 400, 413 or 415. [`req.bodyErrorStatus(err)`](../../apidocs/#http.Request.bodyErrorStatus) and
-[`req.extractErrorStatus(err)`](../../apidocs/#http.Request.extractErrorStatus) return that status
-for those errors, and null for the others.
+The 400, 413 and 415 for what the client got wrong don't go through `uncaughtError`. To answer
+those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request
+settings:
+
+```zig
+.request = .{ .answer_client_errors = false },
+```
+
+`uncaughtError` then gets them as well, and
+[`req.clientErrorStatus()`](../../apidocs/#http.Request.clientErrorStatus) gives the status the
+server would have used, or null when the client got nothing wrong.
 
 ## Timeouts
 
