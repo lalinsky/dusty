@@ -1,34 +1,84 @@
 # Configuration
 
-!!! warning "Draft"
-
-    This page is a draft. Still to cover:
-
-    - TLS listener setup: certificates, keys, client certificates
-    - Unix socket listeners (`Address.unix`)
-    - `kernel_backlog`, `reuse_address`, `acceptors`
-    - All request limits: params, query, form fields
-    - Response buffer sizes, `timeout.request_count`
-    - Link to `ServerConfig` in the API reference
-
-The third argument to `http.Server(App).init` is an `http.ServerConfig`:
+The third argument to `http.Server(App).init` is an
+[`http.ServerConfig`](../../apidocs/#http.ServerConfig). Every field has a default, so you only set
+the ones you want to change:
 
 ```zig
-var server = http.Server(void).init(gpa, io, .{
-    .listeners = &.{.{
-        .address = .{ .ip = try std.Io.net.IpAddress.parse("0.0.0.0", 8080) },
-    }},
-    .timeout = .{ .request = .fromSeconds(60) },
-}, {});
+--8<-- "examples/configuration.zig:config"
 ```
 
-`listeners` is the list of addresses to listen on. Each one has its own optional `tls` settings, and
-one server can have a TLS listener and a plain one at the same time. With no listeners, it listens
-on `127.0.0.1:8080`.
+This server listens on port 8080 on all interfaces, gives each request 60 seconds, and accepts
+bodies up to 10 MiB.
 
-By default, a request has 30 seconds to complete, an idle keep-alive connection is closed after 30
-seconds, and a graceful shutdown waits up to 30 seconds. These are `timeout.request`,
-`timeout.keepalive` and `timeout.shutdown`, and `null` turns one off.
+## Listeners
 
-Requests are limited to 64 headers and a 1 MiB body, and the server accepts at most 10,000
-connections at once (`request.max_header_count`, `request.max_body_size`, `max_connections`).
+`listeners` is the list of addresses the server accepts connections on. If you don't set it, the
+server listens on `127.0.0.1:8080`. One server can listen on several addresses, with TLS on some of
+them:
+
+```zig
+--8<-- "examples/configuration.zig:listeners"
+```
+
+This server accepts HTTPS on port 8443, plain HTTP on port 8080, and plain HTTP on a Unix socket.
+`req.secure` tells a handler whether the request came over TLS.
+
+### TLS
+
+A listener with `.tls` set serves only TLS. The certificate and key are PEM files, with the
+certificate chain leaf first. The key has to be PKCS#8 or an EC key, and it can't have a passphrase.
+They are loaded when the server starts. `.bytes` instead of `.file` takes them from memory.
+
+`.client_auth` asks clients for a certificate and checks it against the authorities in `.ca`:
+
+```zig
+.tls = .{
+    .certificate = .{ .file = .{ .cert_path = "cert.pem", .key_path = "key.pem" } },
+    .client_auth = .{ .ca = .{ .file = .{ .path = "clients-ca.pem" } } },
+},
+```
+
+Clients without a valid certificate can't connect. With `.mode = .request`, clients that don't send
+one are let in too.
+
+See [`http.Listener`](../../apidocs/#http.Listener) for the other listener options.
+
+## Timeouts
+
+| Field | Default | Description |
+|---|---|---|
+| `timeout.request` | 30 s | Time to read the request and send the response, handler included |
+| `timeout.keepalive` | 30 s | How long an idle connection is kept open |
+| `timeout.request_count` | none | How many requests one connection can make |
+| `timeout.shutdown` | 30 s | How long a graceful shutdown waits for open connections |
+
+`null` turns a timeout off. A handler can change its own request timeout with `req.setTimeout`.
+
+## Limits
+
+| Field | Default | Description |
+|---|---|---|
+| `max_connections` | 10,000 | Connections open at once |
+| `request.max_body_size` | 1 MiB | Request body size |
+| `request.buffer_size` | 16 KiB | Request line and headers together |
+| `request.max_header_count` | 64 | Headers |
+| `request.max_param_count` | 8 | Path parameters |
+| `request.max_query_count` | 32 | Query parameters |
+| `request.max_form_count` | 32 | Form fields |
+| `request.max_multiform_count` | 32 | Multipart fields |
+
+A body over `max_body_size` gets 413. A request with too many headers, or a head that doesn't fit in
+`buffer_size`, gets 431. At `max_connections`, the server stops accepting connections until one
+closes.
+
+## Behind a Proxy
+
+Behind a reverse proxy, the socket peer is the proxy. Set `trusted_proxy_hops` to the number of
+proxies in front of the server. `req.remote_address` then comes from the `X-Forwarded-For` header.
+Only set it when clients can't reach the server except through the proxies. Otherwise they can put
+any address they want in the header.
+
+## Next Steps
+
+- [Deployment](deployment.md) covers running the server in production.
