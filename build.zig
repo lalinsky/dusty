@@ -194,6 +194,7 @@ pub fn build(b: *std.Build) void {
         "configuration",
         "fetch",
         "handlers",
+        "hello_client",
         "hello_world",
         "middleware",
         "proxy",

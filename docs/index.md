@@ -33,8 +33,14 @@ A server with two routes:
 --8<-- "examples/hello_world.zig"
 ```
 
-See [Getting Started](getting-started.md) for how to set up a project and run it, and
-[Making Requests](client/requests.md) for the client.
+And a client that calls it:
+
+```zig
+--8<-- "examples/hello_client.zig"
+```
+
+See [Getting Started](getting-started.md) for how to set up a project and run the server, and
+[Making Requests](client/requests.md) for more about the client.
 
 ## Zig Versions
 
