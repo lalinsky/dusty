@@ -73,8 +73,15 @@ Then it passes a template and its arguments, as a tuple, to `res.render`:
 The first argument is the content type. If the template returns an error, its output is thrown away.
 The handler can still send a different response.
 
-A plain function passed to `res.render` takes the `*std.Io.Writer` as its last parameter. For a
-small piece of HTML, use `res.print(.html, "<p>Hello, {s}</p>", .{name})`. It doesn't escape
+`res.render` works with any function whose last parameter is a `*std.Io.Writer`. It calls the
+function with the arguments from the tuple, followed by the writer. A type with a
+`render(args, writer)` function works too. So you can also write templates by hand, or use another
+template library that writes to a `std.Io.Writer`.
+
+[zmpl](https://github.com/jetzig-framework/zmpl) renders a template into a slice instead. Send its
+output with `res.print(.html, "{s}", .{output})`.
+
+For a small piece of HTML, use `res.print(.html, "<p>Hello, {s}</p>", .{name})`. It doesn't escape
 anything, so only pass it text you trust.
 
 ## Next Steps
