@@ -13,6 +13,7 @@ const htmx_config =
     \\{"noSwap": [204, 304, "5xx"]}
 ;
 
+// --8<-- [start:layout]
 pub templ Layout(title: []const u8) {
     <!DOCTYPE html>
     <html lang="en">
@@ -31,6 +32,7 @@ pub templ Layout(title: []const u8) {
         </body>
     </html>
 }
+// --8<-- [end:layout]
 
 pub templ Page(filter: Filter, q: []const u8, todos: []const Todo, left: i64, version: u32) {
     @Layout("Todos") {
@@ -67,6 +69,7 @@ pub templ TodoList(todos: []const Todo, left: i64) {
     @Count(left, true)
 }
 
+// --8<-- [start:items]
 pub templ TodoItems(todos: []const Todo) {
     for (todos) |todo| {
         @TodoItem(todo)
@@ -80,6 +83,7 @@ pub templ TodoItem(todo: Todo) {
         <button class="destroy" hx-delete="/todos/{todo.id}" hx-target="closest li" hx-swap="delete" aria-label="Delete">×</button>
     </li>
 }
+// --8<-- [end:items]
 
 pub templ TodoItemWithCount(todo: Todo, left: i64) {
     @TodoItem(todo)
