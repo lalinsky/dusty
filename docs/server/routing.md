@@ -142,8 +142,6 @@ Some combinations of routes can't be told apart, and registering the second rout
 pair panics:
 
 - Two routes for the same method that match the same paths, like `/users/:id` registered twice.
-- Parameters with different names in the same position of routes for the same method, like
-  `GET /users/:id` and `GET /users/:user_id/posts`. The router keeps one name per position.
 - A route for one method and an `any` route that both match some path, when the method's route is
   not the more specific one. `GET /users/:id` and `any("/users/me")` can't be registered together.
   `/users/me` matches both, and the `GET` route is the less specific one.

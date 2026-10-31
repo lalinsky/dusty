@@ -19,6 +19,7 @@ This release changes how handlers are written: they take only the parameters the
 
 - Routes are matched against the decoded path, one segment at a time. `/a%2Fb` is the single segment `a/b`, and route paths are decoded the same way. `req.path` holds the decoded path and `req.query_string` the raw query.
 - A malformed percent escape in the path is answered with a 400. In the query string and form bodies, a `%` that doesn't start an escape is now kept as a literal `%`.
+- Routes can name a parameter at the same position differently, such as `/users/:id` and `/users/:name/posts`. The second route used to get its value under the first route's name.
 - A route on the same path as `router.static` takes precedence over the directory's index, regardless of registration order.
 - `StaticOptions.cache_control` sets `Cache-Control` on files served with `router.static`.
 
@@ -52,8 +53,9 @@ This release changes how handlers are written: they take only the parameters the
 - The `Session` middleware keeps the session in the request context, so the app must declare `pub const RequestContext = struct { session: http.SessionData = .{} };`. `req.session` is removed; use `ctx.session`.
 - The path and handler passed to `get`, `post` and the other route methods must be known at compile time.
 - `Router.Group` is now a function of the prefix, `Router.Group(prefix)`. Code that names the type should use `@TypeOf(router.group(...))` instead.
-- Registering two routes for the same method and path now panics, instead of the second one replacing the first. So does naming the same parameter differently in two routes, such as `/users/:id` and `/users/:name/posts`.
+- Registering two routes for the same method and path now panics, instead of the second one replacing the first.
 - Values in `req.params` are now percent-decoded.
+- `ServerConfig.request.max_param_count` is removed. A request gets only the parameters its route declares, so there is nothing to limit.
 - An HTTP/1.1 request without `Host` is answered with a 400.
 - `uncaughtError` no longer receives the 400, 413 and 415 client errors. To handle them yourself, for example as JSON, set `ServerConfig.request.answer_client_errors = false`; `req.clientErrorStatus()` returns the status the server would have sent.
 - `res.stream()`, `res.startEventStream()` and `res.upgradeWebSocket()` can return `error.HeadersHookFailed` when a middleware's `onHeaders` fails. Nothing has been sent at that point. If the handler returns it, `uncaughtError` receives the hook's original error.
