@@ -91,9 +91,20 @@ pub const std_options: std.Options = .{
 
 ## Behind a Reverse Proxy
 
-When the server runs behind nginx or a load balancer, set `trusted_proxy_hops`, so
-`req.remote_address` is the client's address instead of the proxy's. See
-[Configuration](configuration.md#behind-a-proxy).
+Timeouts and connection limits are on by default, and the server can run without a proxy. For public
+traffic, we still recommend running it behind a reverse proxy or an HTTP load balancer, like nginx,
+HAProxy or the one from your cloud provider. The proxy can take care of TLS, and it deals with the
+common attacks before they reach the server, like floods of connections or clients that send their
+requests very slowly. Most proxies also have rate limiting and circuit breaking, which stops sending
+requests to a server that's failing or overloaded.
+
+See the [nginx](https://docs.nginx.com/nginx/admin-guide/web-server/reverse-proxy/) and
+[Caddy](https://caddyserver.com/docs/quick-starts/reverse-proxy) guides for how to set one up. nginx
+needs a few more lines for [WebSocket](https://nginx.org/en/docs/http/websocket.html), and
+`proxy_buffering off` for event streams.
+
+Behind a proxy, set `trusted_proxy_hops`, so `req.remote_address` is the client's address instead of
+the proxy's. See [Configuration](configuration.md#behind-a-proxy).
 
 ## Next Steps
 
