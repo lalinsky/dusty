@@ -387,42 +387,86 @@ pub const Headers = struct {
 /// Path parameters and query string values. A string map, with typed
 /// lookups for the values that are meant to be numbers.
 pub const Params = struct {
-    map: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// Room for the entries, of which the first `len` are set, in the
+    /// order they were set. Keys are unique: `put` replaces the value of a
+    /// key that is already there.
+    buf: []Entry = &.{},
+    len: usize = 0,
 
-    pub fn get(self: Params, name: []const u8) ?[]const u8 {
-        return self.map.get(name);
+    pub const Entry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn entries(self: *const Params) []const Entry {
+        return self.buf[0..self.len];
     }
 
-    pub fn count(self: Params) usize {
-        return self.map.count();
+    pub fn get(self: *const Params, name: []const u8) ?[]const u8 {
+        for (self.entries()) |entry| {
+            if (std.mem.eql(u8, entry.key, name)) return entry.value;
+        }
+        return null;
+    }
+
+    pub fn count(self: *const Params) usize {
+        return self.len;
+    }
+
+    /// Room that runs out is replaced with twice as much from `arena`.
+    /// The old room is not freed: it belongs to the request's arena, or
+    /// to the request itself.
+    pub fn put(self: *Params, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+        if (self.replace(key, value)) return;
+        if (self.len == self.buf.len) {
+            const buf = try arena.alloc(Entry, @max(8, self.len * 2));
+            @memcpy(buf[0..self.len], self.entries());
+            self.buf = buf;
+        }
+        self.putNewAssumeCapacity(key, value);
+    }
+
+    /// Whether `key` was there, and now has `value`.
+    pub fn replace(self: *Params, key: []const u8, value: []const u8) bool {
+        for (self.buf[0..self.len]) |*entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                entry.value = value;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn putNewAssumeCapacity(self: *Params, key: []const u8, value: []const u8) void {
+        self.buf[self.len] = .{ .key = key, .value = value };
+        self.len += 1;
     }
 
     /// Null when the value is missing, or is not a `T`.
-    pub fn getInt(self: Params, comptime T: type, name: []const u8) ?T {
+    pub fn getInt(self: *const Params, comptime T: type, name: []const u8) ?T {
         const raw = self.get(name) orelse return null;
         return std.fmt.parseInt(T, raw, 10) catch null;
     }
 
     /// Null when the value is missing, is not a `T`, or is not finite:
     /// `parseFloat` reads "nan" and "inf", which are not quantities.
-    pub fn getFloat(self: Params, comptime T: type, name: []const u8) ?T {
+    pub fn getFloat(self: *const Params, comptime T: type, name: []const u8) ?T {
         const raw = self.get(name) orelse return null;
         const value = std.fmt.parseFloat(T, raw) catch return null;
         return if (std.math.isFinite(value)) value else null;
     }
 
     pub fn iterator(self: *const Params) Iterator {
-        return .{ .inner = self.map.iterator() };
+        return .{ .entries = self.entries() };
     }
 
     /// Serializes as a JSON object. Keys are unique here, so unlike
     /// `Headers` every value is a plain string.
     pub fn jsonStringify(self: Params, jw: anytype) !void {
         try jw.beginObject();
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            try jw.objectField(entry.key_ptr.*);
-            try jw.write(entry.value_ptr.*);
+        for (self.entries()) |entry| {
+            try jw.objectField(entry.key);
+            try jw.write(entry.value);
         }
         try jw.endObject();
     }
@@ -430,28 +474,28 @@ pub const Params = struct {
     /// Yields the same `Entry` shape as `Headers.Iterator`, so a loop over
     /// either reads the same.
     pub const Iterator = struct {
-        inner: std.StringHashMapUnmanaged([]const u8).Iterator,
+        entries: []const Params.Entry,
+        index: usize = 0,
 
-        pub const Entry = struct {
-            key: []const u8,
-            value: []const u8,
-        };
+        pub const Entry = Params.Entry;
 
-        pub fn next(self: *Iterator) ?Entry {
-            const entry = self.inner.next() orelse return null;
-            return .{ .key = entry.key_ptr.*, .value = entry.value_ptr.* };
+        pub fn next(self: *Iterator) ?Params.Entry {
+            if (self.index >= self.entries.len) return null;
+            defer self.index += 1;
+            return self.entries[self.index];
         }
     };
 };
 
 test "Params: getInt" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     var params: Params = .{};
-    defer params.map.deinit(std.testing.allocator);
-    try params.map.put(std.testing.allocator, "n", "42");
-    try params.map.put(std.testing.allocator, "neg", "-1");
-    try params.map.put(std.testing.allocator, "big", "300");
-    try params.map.put(std.testing.allocator, "junk", "12abc");
-    try params.map.put(std.testing.allocator, "empty", "");
+    try params.put(arena.allocator(), "n", "42");
+    try params.put(arena.allocator(), "neg", "-1");
+    try params.put(arena.allocator(), "big", "300");
+    try params.put(arena.allocator(), "junk", "12abc");
+    try params.put(arena.allocator(), "empty", "");
 
     try std.testing.expectEqual(@as(?u16, 42), params.getInt(u16, "n"));
     try std.testing.expectEqual(@as(?i32, -1), params.getInt(i32, "neg"));
@@ -465,12 +509,13 @@ test "Params: getInt" {
 }
 
 test "Params: getFloat" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     var params: Params = .{};
-    defer params.map.deinit(std.testing.allocator);
-    try params.map.put(std.testing.allocator, "half", "0.5");
-    try params.map.put(std.testing.allocator, "nan", "nan");
-    try params.map.put(std.testing.allocator, "inf", "inf");
-    try params.map.put(std.testing.allocator, "junk", "abc");
+    try params.put(arena.allocator(), "half", "0.5");
+    try params.put(arena.allocator(), "nan", "nan");
+    try params.put(arena.allocator(), "inf", "inf");
+    try params.put(arena.allocator(), "junk", "abc");
 
     try std.testing.expectEqual(@as(?f64, 0.5), params.getFloat(f64, "half"));
     try std.testing.expectEqual(@as(?f64, null), params.getFloat(f64, "nan"));
@@ -480,9 +525,10 @@ test "Params: getFloat" {
 }
 
 test "Params: iterator yields the same shape as Headers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     var params: Params = .{};
-    defer params.map.deinit(std.testing.allocator);
-    try params.map.put(std.testing.allocator, "a", "1");
+    try params.put(arena.allocator(), "a", "1");
 
     var it = params.iterator();
     const entry = it.next().?;
@@ -984,9 +1030,10 @@ test "Headers: jsonStringify of an empty map" {
 }
 
 test "Params: jsonStringify" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
     var params: Params = .{};
-    defer params.map.deinit(std.testing.allocator);
-    try params.map.put(std.testing.allocator, "a", "1");
+    try params.put(arena.allocator(), "a", "1");
     try expectJson(
         \\{"a":"1"}
     , params);

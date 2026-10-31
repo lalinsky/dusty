@@ -146,7 +146,7 @@ fn describe(req: *Request, res: *Response, opts: Describe) !Description {
     };
     if (opts.body) |data| {
         desc.data = data;
-        desc.form = if (req.content_type == .form) .{ .map = (try req.formData()).* } else .{};
+        desc.form = if (req.content_type == .form) (try req.formData()).* else .{};
         // Present but null when the body was not JSON, which is what a
         // client checks to see whether its POST round-tripped.
         desc.json = parseJson(res.arena, req, data) orelse .null;

@@ -131,7 +131,13 @@ pub const Request = struct {
     _extract_failed: bool = false,
     // The non-empty segments of `path`, each a slice of it.
     _segments: []const []const u8 = &.{},
-    _fd: std.StringHashMapUnmanaged([]const u8) = .{},
+    // Room for what routing a typical request needs, so it takes nothing
+    // from the arena. `_segments`, `params` and `query` point into it, so a
+    // request must not be moved while it is being served.
+    _segment_buf: [16][]const u8 = undefined,
+    _param_buf: [8]http.Params.Entry = undefined,
+    _query_buf: [16]http.Params.Entry = undefined,
+    _fd: http.Params = .{},
     _fd_read: bool = false,
     _mfd: std.StringHashMapUnmanaged(MultipartForm.Entry) = .{},
     _mfd_read: bool = false,
@@ -333,7 +339,7 @@ pub const Request = struct {
     }
 
     /// Parse the body as a form (application/x-www-form-urlencoded)
-    pub fn formData(self: *Request) !*std.StringHashMapUnmanaged([]const u8) {
+    pub fn formData(self: *Request) !*http.Params {
         if (self._fd_read) {
             return &self._fd;
         }
@@ -465,29 +471,75 @@ pub const Request = struct {
     /// calls this for every request; a request built by hand needs it before
     /// routing.
     pub fn splitTarget(self: *Request) error{ InvalidUrl, OutOfMemory }!void {
-        const query_start = std.mem.indexOfScalar(u8, self.url, '?');
-        const raw = self.url[0 .. query_start orelse self.url.len];
-        self.query_string = if (query_start) |q| self.url[q + 1 ..] else "";
-
-        const segments = try self.arena.alloc([]const u8, std.mem.count(u8, raw, "/") + 1);
-        const decode = std.mem.indexOfScalar(u8, raw, '%') != null;
-        // Decoding only shrinks, so this is enough.
-        const buf: []u8 = if (decode) try self.arena.alloc(u8, raw.len) else &.{};
-        const path: []const u8 = if (decode) buf else raw;
-
+        // A plain path is split in the pass that finds its end. These paths
+        // are short, and the SIMD searches in `std.mem` cost more to set up
+        // than they save.
+        var end = self.url.len;
+        var slashes: usize = 0;
+        var decode = false;
         var len: usize = 0;
+        var start: usize = 0;
+        for (self.url, 0..) |c, i| {
+            switch (c) {
+                '/' => {
+                    if (i > start and len < self._segment_buf.len) {
+                        self._segment_buf[len] = self.url[start..i];
+                        len += 1;
+                    }
+                    start = i + 1;
+                    slashes += 1;
+                },
+                '%' => decode = true,
+                '?' => {
+                    end = i;
+                    break;
+                },
+                else => {},
+            }
+        }
+        const raw = self.url[0..end];
+        self.query_string = if (end < self.url.len) self.url[end + 1 ..] else "";
+
+        if (!decode and slashes < self._segment_buf.len) {
+            if (end > start) {
+                self._segment_buf[len] = raw[start..];
+                len += 1;
+            }
+            self.path = raw;
+            self._segments = self._segment_buf[0..len];
+            return;
+        }
+
+        const segments = if (slashes < self._segment_buf.len)
+            self._segment_buf[0 .. slashes + 1]
+        else
+            try self.arena.alloc([]const u8, slashes + 1);
+        len = 0;
+        if (!decode) {
+            var it = std.mem.tokenizeScalar(u8, raw, '/');
+            while (it.next()) |segment| {
+                segments[len] = segment;
+                len += 1;
+            }
+            self.path = raw;
+            self._segments = segments[0..len];
+            return;
+        }
+
+        // Decoding only shrinks, so this is enough.
+        const buf = try self.arena.alloc(u8, raw.len);
         var out: usize = 0;
         var it = std.mem.splitScalar(u8, raw, '/');
         while (it.next()) |segment| : (out += 1) {
-            const start = out;
-            out += if (decode) try unescapeSegment(buf[out..], segment) else segment.len;
-            if (out > start) {
-                segments[len] = path[start..out];
+            const from = out;
+            out += try unescapeSegment(buf[out..], segment);
+            if (out > from) {
+                segments[len] = buf[from..out];
                 len += 1;
             }
-            if (decode and it.index != null) buf[out] = '/';
+            if (it.index != null) buf[out] = '/';
         }
-        self.path = path[0 .. out - 1];
+        self.path = buf[0 .. out - 1];
         self._segments = segments[0..len];
     }
 
@@ -822,6 +874,20 @@ fn fixedMessageReader(gpa: std.mem.Allocator, raw: []const u8) !std.Io.Reader {
     var r: std.Io.Reader = .fixed(backing);
     r.end = raw.len;
     return r;
+}
+
+test "Request.splitTarget: more segments than fit in the request" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var req: Request = .{ .arena = arena.allocator(), .parser = undefined, .transport = undefined, .url = "/0/1/2/3/4/5/6/7/8/9/10/11/12/13/14/15/16/17//18/19?x" };
+    try req.splitTarget();
+
+    try std.testing.expectEqualStrings("x", req.query_string);
+    try std.testing.expectEqual(20, req._segments.len);
+    for (req._segments, 0..) |segment, i| {
+        var buf: [2]u8 = undefined;
+        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{i}), segment);
+    }
 }
 
 test "Request.splitTarget: segments are split at a literal '/' and decoded in place" {
