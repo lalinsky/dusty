@@ -36,6 +36,7 @@ theme:
 nav:
   - Overview: index.md
   - Getting Started: getting-started.md
+  - Build Options: build-options.md
   - API Reference: apidocs/
   - Changelog: changelog.md
   - Server:
