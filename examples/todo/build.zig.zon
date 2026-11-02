@@ -2,14 +2,14 @@
     .name = .dusty_todo_example,
     .fingerprint = 0xcb1f73001f6b3a8c,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .dusty = .{
             .path = "../..",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.19.1#4daa0c0a9522a37c4d28e3dcec2515cc955abe71",
-            .hash = "zio-0.19.1-xHbVVJXzKwAKLRAABWeDvQG9Dg1kf9FM3haWG0YqtScn",
+            .url = "git+https://github.com/lalinsky/zio#d606d6d011bc8d8e2a02305b5201fd843f6fa0ad",
+            .hash = "zio-0.19.0-xHbVVLceLgCAbKRqorvYHNTHbdnD1NV8loV-RwQlh9gs",
         },
         .json = .{
             .url = "git+https://github.com/lalinsky/json.zig?ref=v0.2.0#9d3d4d951507a73732ae2f49275ad8fefd4a3cf8",
