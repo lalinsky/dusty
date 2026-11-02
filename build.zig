@@ -171,6 +171,16 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(assets_gen);
 
+    // Restarts a server whenever it's rebuilt, for `addRunServer`.
+    const run_server = b.addExecutable(.{
+        .name = "dusty-run-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dev/run_server.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    b.installArtifact(run_server);
+
     const lib = b.addLibrary(.{
         .name = "http",
         .root_module = mod,
@@ -296,6 +306,37 @@ pub const AssetsOptions = struct {
 /// all.
 pub fn addAssets(b: *std.Build, dusty_dep: *std.Build.Dependency, opts: AssetsOptions) *std.Build.Module {
     return bundle(b, dusty_dep.artifact("dusty-assets"), dusty_dep.path("src/assets/root.zig"), opts);
+}
+
+/// Runs the installed `exe` and restarts it whenever a new build of it is
+/// installed, however that happens, `zig build --watch` or `zig build` by
+/// hand:
+///
+/// ```zig
+/// const run_server = dusty.addRunServer(b, dusty_dep, exe);
+/// b.step("run-server", "Run the server, restarting it on every build").dependOn(&run_server.step);
+/// ```
+///
+/// The step doesn't build `exe`, it waits for the first build to be
+/// installed. A server that exits or crashes is started again on the next
+/// one. The server sees `DUSTY_DEV` set, which turns `http.dev` on.
+///
+/// It looks in its own install prefix, so a build installed with `-p` needs
+/// the same `-p` here.
+pub fn addRunServer(b: *std.Build, dusty_dep: *std.Build.Dependency, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
+    const run = b.addRunArtifact(dusty_dep.artifact("dusty-run-server"));
+    // Zig 0.17 knows the install directory only once the build runs.
+    if (@hasDecl(std.Build, "getInstallPath")) {
+        run.addArg(b.getInstallPath(.bin, exe.out_filename));
+    } else {
+        run.addFileArg(b.graph.path(.install_bin, exe.out_filename));
+    }
+    if (@hasDecl(std.Build.Step.Run, "addPassthruArgs")) {
+        run.addPassthruArgs();
+    } else if (b.args) |args| {
+        run.addArgs(args);
+    }
+    return run;
 }
 
 fn bundle(b: *std.Build, gen: *std.Build.Step.Compile, root: std.Build.LazyPath, opts: AssetsOptions) *std.Build.Module {

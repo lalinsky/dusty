@@ -1,3 +1,4 @@
+const http = @import("dusty");
 const assets = @import("assets");
 
 pub const Todo = struct {
@@ -29,6 +30,7 @@ pub templ Layout(title: []const u8) {
         </head>
         <body hx-boost:inherited="true">
             @children
+            {!http.dev.script()}
         </body>
     </html>
 }

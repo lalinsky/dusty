@@ -52,6 +52,7 @@ nav:
     - WebSocket: server/websocket.md
     - Server-Sent Events: server/sse.md
     - Configuration: server/configuration.md
+    - Development: server/development.md
     - Deployment: server/deployment.md
   - Client:
     - Making Requests: client/requests.md
