@@ -11,14 +11,26 @@ stream that tells htmx to reload the list.
 
 ## Running
 
+With Zig 0.17:
+
 ```sh
 docker compose up -d
 zig build run
 ```
 
-Then open http://127.0.0.1:8080 in two windows. The server connects to
-`postgres://todo:todo@127.0.0.1:5432/todo` unless `DATABASE_URL` says otherwise, and creates
-its table on startup, which needs Postgres 14 or newer.
+Then open http://127.0.0.1:8080 in two windows, or the port given with `--port`. The server
+connects to `postgres://todo:todo@127.0.0.1:5432/todo` unless `DATABASE_URL` says otherwise, and
+creates its table on startup, which needs Postgres 14 or newer.
+
+While working on it, run the build in watch mode in one terminal and the server in another:
+
+```sh
+zig build --watch -fincremental
+zig build run-server
+```
+
+Every change to the code, the templates or the stylesheet is rebuilt, the server restarts,
+and the open pages reload.
 
 ## What it shows
 
@@ -31,3 +43,5 @@ its table on startup, which needs Postgres 14 or newer.
   with `assets.url`, under URLs that change with their content.
 - `res.startEventStream` waiting on a change counter that the `LISTEN` task bumps.
 - `res.encode` with json.zig for `GET /api/todos`.
+- `addRunServer` for the `run-server` step, and `http.dev` for reloading the pages after a
+  restart.

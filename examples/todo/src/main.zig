@@ -253,14 +253,29 @@ fn watch(app: *App, io: std.Io) !void {
     };
 }
 
+/// `--port <port>`, or 8080 without it.
+fn parsePort(args: []const [:0]const u8) !u16 {
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (!std.mem.eql(u8, args[i], "--port")) continue;
+        if (i + 1 == args.len) return error.MissingPort;
+        return std.fmt.parseInt(u16, args[i + 1], 10);
+    }
+    return 8080;
+}
+
 pub fn main(init: std.process.Init) !void {
+    const port = try parsePort(try init.minimal.args.toSlice(init.arena.allocator()));
+
     var rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
     defer rt.deinit();
     const io = rt.io();
 
     // --8<-- [start:pool]
     const url = init.environ_map.get("DATABASE_URL") orelse "postgres://todo:todo@127.0.0.1:5432/todo";
-    const pool = try pg.Pool.initUri(io, init.gpa, try std.Uri.parse(url), .{ .size = 16 });
+    // One connection keeps a debug build quick to start. Size it for the load
+    // in a real app.
+    const pool = try pg.Pool.initUri(io, init.gpa, try std.Uri.parse(url), .{ .size = 1 });
     defer pool.deinit();
     // --8<-- [end:pool]
 
@@ -270,7 +285,7 @@ pub fn main(init: std.process.Init) !void {
 
     var app: App = .{ .pool = pool, .changes = .init(io) };
 
-    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", 8080) };
+    const addr: http.Address = .{ .ip = try std.Io.net.IpAddress.parse("127.0.0.1", port) };
     var server = http.Server(App).init(init.gpa, io, .{
         .listeners = &.{.{ .address = addr }},
         // Every open tab holds an event stream, which only ends at this timeout.
@@ -289,11 +304,15 @@ pub fn main(init: std.process.Init) !void {
     // --8<-- [start:register]
     assets.register(&server.router);
     // --8<-- [end:register]
+    // --8<-- [start:dev]
+    http.dev.init(io, init.environ_map);
+    http.dev.register(&server.router);
+    // --8<-- [end:dev]
 
     var listen_task = try io.concurrent(listen, .{ &app, io });
     defer listen_task.cancel(io) catch {};
 
-    std.log.info("Todo app running at http://127.0.0.1:8080", .{});
+    std.log.info("Todo app running at http://127.0.0.1:{d}", .{port});
 
     // --8<-- [start:shutdown]
     var interrupt = try zio.Signal.init(.interrupt);

@@ -60,4 +60,12 @@ pub fn build(b: *std.Build) void {
     run.addPassthruArgs();
     const run_step = b.step("run", "Run the server");
     run_step.dependOn(&run.step);
+
+    // `zig build --watch` in one terminal and this in another restarts the
+    // server on every change.
+    // --8<-- [start:run_server]
+    const run_server = dusty.addRunServer(b, dusty_dep, exe);
+    const run_server_step = b.step("run-server", "Run the server, restarting it on every build");
+    run_server_step.dependOn(&run_server.step);
+    // --8<-- [end:run_server]
 }
