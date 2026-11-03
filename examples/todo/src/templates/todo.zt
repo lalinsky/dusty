@@ -30,7 +30,7 @@ pub templ Layout(title: []const u8) {
         </head>
         <body hx-boost:inherited="true">
             @children
-            {!http.dev.script()}
+            {http.dev.script(.{})}
         </body>
     </html>
 }
