@@ -54,9 +54,7 @@ A layout puts other content inside it with `@children`:
 ```
 
 A page wraps its content in `@Layout("Todos") { ... }`. What's in the braces goes where `@children`
-is. `{!...}` writes a value without escaping it, here the script that reloads the page during
-[development](development.md#reloading-the-browser). See the
-[zt documentation](https://github.com/lalinsky/zt) for the rest of the language.
+is. See the [zt documentation](https://github.com/lalinsky/zt) for the rest of the language.
 
 ## Rendering
 

@@ -52,15 +52,29 @@ server:
 --8<-- "examples/todo/src/main.zig:dev"
 ```
 
-Then put [`http.dev.script()`](../../apidocs/#http.dev.script) at the end of `<body>` in your pages.
-With [zt](templating.md), that's `{!http.dev.script()}` in the layout.
+Then put [`http.dev.script`](../../apidocs/#http.dev.script) at the end of `<body>` in your pages.
+With [zt](templating.md), that's `{http.dev.script(.{})}` in the layout. Outside a template, write
+it with `{f}`.
 
-The script connects to an event stream at `/_dusty/reload`. When the server restarts, the stream
-reconnects to the new process, and the page reloads.
+The script loads from `/_dusty/reload.js` and connects to an event stream at `/_dusty/reload`. When
+the server restarts, the stream reconnects to the new process, and the page reloads.
 
 This only happens under `run-server`, which sets the `DUSTY_DEV` environment variable for the
-server. Without it, `register` adds no route and the script is empty, so the same code can stay in
-a production build.
+server. Without it, `register` adds no routes and the script tag is empty, so the same code can
+stay in a production build.
+
+### Content Security Policy
+
+If your pages send a `Content-Security-Policy`, the script needs to be allowed by `script-src`,
+and the event stream by `connect-src`. A policy that allows `'self'` for both needs nothing more.
+If scripts are allowed by nonce instead, pass the nonce of the page:
+
+```zig
+<body>
+    @children
+    {http.dev.script(.{ .nonce = nonce })}
+</body>
+```
 
 ## Next Steps
 
