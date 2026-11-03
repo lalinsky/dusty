@@ -1,5 +1,9 @@
-//! Writes the table of an asset bundle for `addAssets` in build.zig:
-//! `gen <output.zig> <prefix> <dir>`, for every file under `dir`.
+//! Writes the module of an asset bundle for `addAssets` in build.zig:
+//! `gen <out_dir> <root.zig> <prefix> <dir>`, for every file under `dir`.
+//!
+//! The build runs it every time, into the same `out_dir`, and it only
+//! writes the files that changed. A compiler that `zig build --watch
+//! -fincremental` keeps running never sees a new path, only new content.
 
 const std = @import("std");
 
@@ -17,13 +21,15 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 4) {
-        std.debug.print("usage: {s} <output.zig> <prefix> <dir>\n", .{args[0]});
+    if (args.len != 5) {
+        std.debug.print("usage: {s} <out_dir> <root.zig> <prefix> <dir>\n", .{args[0]});
         std.process.exit(1);
     }
-    const output = args[1];
-    const prefix = std.mem.trimEnd(u8, args[2], "/");
-    var dir = try std.Io.Dir.cwd().openDir(io, args[3], .{ .iterate = true });
+    var out_dir = try std.Io.Dir.cwd().createDirPathOpen(io, args[1], .{});
+    defer out_dir.close(io);
+    const root = try std.Io.Dir.cwd().readFileAlloc(io, args[2], arena, .unlimited);
+    const prefix = std.mem.trimEnd(u8, args[3], "/");
+    var dir = try std.Io.Dir.cwd().openDir(io, args[4], .{ .iterate = true });
     defer dir.close(io);
 
     var names: std.StringArrayHashMapUnmanaged(void) = .empty;
@@ -46,6 +52,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }{ .keys = names.keys() });
 
+    try removeStale(io, arena, out_dir, &names);
+
     var assets: std.ArrayList(Asset) = .empty;
     for (names.keys()) |name| {
         // A compressed copy goes with its plain file, when there is one.
@@ -53,10 +61,14 @@ pub fn main(init: std.process.Init) !void {
             if (names.contains(copy.of)) continue;
         }
         const data = try dir.readFileAlloc(io, name, arena, .unlimited);
+        try update(io, arena, out_dir, try copyPath(arena, name), data);
         var asset: Asset = .{ .name = name, .version = version(data) };
         for (std.enums.values(Precompressed)) |encoding| {
             const copy = try std.mem.concat(arena, u8, &.{ name, extension(encoding) });
-            if (names.contains(copy)) asset.compressed[@intFromEnum(encoding)] = copy;
+            if (!names.contains(copy)) continue;
+            asset.compressed[@intFromEnum(encoding)] = copy;
+            const copy_data = try dir.readFileAlloc(io, copy, arena, .unlimited);
+            try update(io, arena, out_dir, try copyPath(arena, copy), copy_data);
         }
         try assets.append(arena, asset);
     }
@@ -69,23 +81,75 @@ pub fn main(init: std.process.Init) !void {
     try w.writeAll("pub const files = [_]File{\n");
     for (assets.items) |asset| {
         const path = try std.fmt.allocPrint(arena, "{s}/{f}", .{ prefix, fmtPath(asset.name) });
-        try w.print("    .{{ .name = \"{f}\", .path = \"{f}\", .version = \"{s}\", .url = \"{f}?v={s}\", .data = @embedFile(\"files/{f}\")", .{
+        try w.print("    .{{ .name = \"{f}\", .path = \"{f}\", .version = \"{s}\", .url = \"{f}?v={s}\", .data = @embedFile(\"{f}\")", .{
             std.zig.fmtString(asset.name),
             std.zig.fmtString(path),
             asset.version,
             std.zig.fmtString(path),
             asset.version,
-            std.zig.fmtString(asset.name),
+            std.zig.fmtString(try copyPath(arena, asset.name)),
         });
         for (std.enums.values(Precompressed), asset.compressed) |encoding, copy| {
             const c = copy orelse continue;
-            try w.print(", .{s} = @embedFile(\"files/{f}\")", .{ @tagName(encoding), std.zig.fmtString(c) });
+            try w.print(", .{s} = @embedFile(\"{f}\")", .{ @tagName(encoding), std.zig.fmtString(try copyPath(arena, c)) });
         }
         try w.writeAll(" },\n");
     }
     try w.writeAll("};\n");
 
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = out.written() });
+    try update(io, arena, out_dir, "files.zig", out.written());
+    try update(io, arena, out_dir, "root.zig", root);
+}
+
+/// Writes `data` to `sub_path`, unless it's there already.
+fn update(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8, data: []const u8) !void {
+    if (dir.readFileAlloc(io, sub_path, arena, .limited(data.len + 1))) |old| {
+        if (std.mem.eql(u8, old, data)) return;
+    } else |err| switch (err) {
+        error.Canceled => return err,
+        else => {},
+    }
+    // Replaced rather than rewritten, since a build running at the same
+    // time can be reading it.
+    var file = try dir.createFileAtomic(io, sub_path, .{ .make_path = true, .replace = true });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, data);
+    try file.replace(io);
+}
+
+/// Where the copy of an asset goes in the module. All of them sit directly
+/// in `files/`, with `/` in the name encoded: an asset that's replaced by a
+/// directory of the same name, or the other way around, would otherwise
+/// turn a file the last build read into a directory, which Zig 0.16 fails
+/// to check its cache against.
+fn copyPath(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, "files/");
+    for (name) |c| switch (c) {
+        '/' => try out.appendSlice(arena, "%2F"),
+        '%' => try out.appendSlice(arena, "%25"),
+        else => try out.append(arena, c),
+    };
+    return out.items;
+}
+
+/// Deletes the copies of assets that are gone.
+fn removeStale(io: std.Io, arena: std.mem.Allocator, out_dir: std.Io.Dir, names: *const std.StringArrayHashMapUnmanaged(void)) !void {
+    var files = out_dir.openDir(io, "files", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer files.close(io);
+
+    var keep: std.StringHashMapUnmanaged(void) = .empty;
+    for (names.keys()) |name| try keep.put(arena, (try copyPath(arena, name))["files/".len..], {});
+
+    var stale: std.ArrayList([]const u8) = .empty;
+    var it = files.iterate();
+    while (try it.next(io)) |entry| {
+        if (!keep.contains(entry.name)) try stale.append(arena, try arena.dupe(u8, entry.name));
+    }
+    for (stale.items) |name| try files.deleteTree(io, name);
 }
 
 fn extension(encoding: Precompressed) []const u8 {
