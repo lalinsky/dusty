@@ -340,18 +340,19 @@ pub fn addRunServer(b: *std.Build, dusty_dep: *std.Build.Dependency, exe: *std.B
 }
 
 fn bundle(b: *std.Build, gen: *std.Build.Step.Compile, root: std.Build.LazyPath, opts: AssetsOptions) *std.Build.Module {
-    // Copied first, so the tool gets a directory whose path changes with
-    // its contents.
-    const copy = b.addWriteFiles().addCopyDirectory(opts.dir, "", .{});
-
     const run = b.addRunArtifact(gen);
-    const table = run.addOutputFileArg("files.zig");
+    // Run every time, into an output directory whose path depends only on
+    // the arguments, so the module's path stays the same as the assets
+    // change.
+    run.has_side_effects = true;
+    const out = run.addOutputDirectoryArg("module");
+    run.addFileArg(root);
     run.addArg(opts.prefix);
-    run.addDirectoryArg(copy);
-
-    const module = b.addWriteFiles();
-    _ = module.addCopyDirectory(copy, "files", .{});
-    _ = module.addCopyFile(table, "files.zig");
-    _ = module.addCopyFile(root, "root.zig");
-    return b.createModule(.{ .root_source_file = module.getDirectory().path(b, "root.zig") });
+    run.addDirectoryArg(opts.dir);
+    // Only so that `zig build --watch` watches the directory and runs this
+    // again when something in it changes.
+    const watch = b.addWriteFiles();
+    _ = watch.addCopyDirectory(opts.dir, "", .{});
+    run.step.dependOn(&watch.step);
+    return b.createModule(.{ .root_source_file = out.path(b, "root.zig") });
 }
