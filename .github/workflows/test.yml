@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        zig-version: ['0.16.0', '0.17.0']
+        zig-version: ['0.16.0', '0.17.0', '0.17.1']
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -53,7 +53,7 @@ jobs:
       run: zig build
       working-directory: examples/todo
       # It pins a zio that needs Zig 0.17.
-      if: matrix.zig-version == '0.17.0'
+      if: startsWith(matrix.zig-version, '0.17.')
       timeout-minutes: 5
 
     - name: Build httpbin example with injected TLS
