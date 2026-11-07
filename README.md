@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/lalinsky/dusty/actions/workflows/test.yml/badge.svg)](https://github.com/lalinsky/dusty/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Zig](https://img.shields.io/badge/zig-0.17.0-orange.svg)](https://ziglang.org/download/)
+[![Zig](https://img.shields.io/badge/zig-0.17.1-orange.svg)](https://ziglang.org/download/)
 [![Documentation](https://img.shields.io/badge/docs-online-green.svg)](https://lalinsky.github.io/dusty/)
 [![HTTP Arena H1](https://img.shields.io/endpoint?url=https://http-arena.com/badge/dusty/h1.json)](https://http-arena.com/#type=emerging,flagship&tuned=0)
 [![HTTP Arena WebSocket](https://img.shields.io/endpoint?url=https://http-arena.com/badge/dusty/ws.json)](https://http-arena.com/#scope=ws&type=emerging,flagship&tuned=0)
