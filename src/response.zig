@@ -1377,9 +1377,14 @@ pub const Response = struct {
 
     fn sendFileBody(self: *Response, body: BodyFile) WriteError!void {
         if (body.size == 0) return;
-        // Unbuffered: without a sendfile of its own, the `Io` reads the
-        // file straight into the connection's write buffer.
-        var reader = body.handle.reader(self.conn.io, &.{});
+        // The file reader borrows the free end of the read buffer, which
+        // nothing reads into while a response is written. An `Io` that
+        // sends a file by copying it may copy through this buffer, in
+        // chunks of its size, so what is buffered moves to the front first.
+        // Without the move it gets whatever is free, which can be less.
+        const read = self.conn.reader;
+        read.rebase(read.buffer.len) catch {};
+        var reader = body.handle.reader(self.conn.io, read.buffer[read.end..]);
         reader.seekTo(body.offset) catch unreachable; // a new reader is positional
         const sent = self.conn.writer.sendFileAll(&reader, .limited(body.size)) catch |err| switch (err) {
             error.WriteFailed => {
