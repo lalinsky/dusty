@@ -134,6 +134,8 @@ pub const Connection = struct {
     /// headers are slices into it, and what a head does not use is what the
     /// body reader reads into, so the reader's view of it shrinks as a
     /// request is parsed; `rewindReader` restores it for the next one.
+    /// While a file is sent as a response body, the file reader borrows
+    /// what the reader has free past its buffered bytes.
     read_buffer: []u8,
 
     tcp_reader: std.Io.net.Stream.Reader = undefined,
