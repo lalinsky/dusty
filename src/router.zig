@@ -399,6 +399,40 @@ pub fn Router(comptime App: type) type {
             return null;
         }
 
+        /// For a request `findHandler` found no route for, the methods that
+        /// do have one for its path, as an `Allow` value: `GET, HEAD, POST`.
+        /// Null when no method has one, which is a 404 rather than a 405.
+        pub fn allowedMethods(self: *const Self, req: *Request) !?[]const u8 {
+            var allowed: [256]bool = @splat(false);
+            var found = false;
+            for (self.trees, 0..) |tree, i| {
+                if (tree == null or self.matchIn(@enumFromInt(i), req) == null) continue;
+                allowed[i] = true;
+                found = true;
+            }
+            req.params.len = 0;
+            if (!found) return null;
+            if (allowed[@intFromEnum(Method.get)]) allowed[@intFromEnum(Method.head)] = true;
+
+            var len: usize = 0;
+            for (allowed, 0..) |set, i| {
+                if (set) len += Method.name(@enumFromInt(i)).len + 2;
+            }
+            const buf = try req.arena.alloc(u8, len - 2);
+            var pos: usize = 0;
+            for (allowed, 0..) |set, i| {
+                if (!set) continue;
+                if (pos > 0) {
+                    @memcpy(buf[pos..][0..2], ", ");
+                    pos += 2;
+                }
+                const name = Method.name(@enumFromInt(i));
+                @memcpy(buf[pos..][0..name.len], name);
+                pos += name.len;
+            }
+            return buf;
+        }
+
         fn matchIn(self: *const Self, method: ?Method, req: *Request) ?*const Route {
             const root = (if (method) |m| self.trees[@intFromEnum(m)] else self.any_tree) orelse return null;
             const node = matchRecursive(root, req, 0) orelse return null;
@@ -1850,6 +1884,38 @@ test "Router: a GET route answers HEAD" {
     req.url = "/nothing";
     req.method = .head;
     try std.testing.expect(try router.findHandler(try split(&req)) == null);
+}
+
+test "Router: allowedMethods lists the methods with a route for the path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var router = TestRouter.init(std.testing.allocator);
+    defer router.deinit();
+
+    router.get("/users/:id", testHandler);
+    router.delete("/users/:id", testHandler);
+    router.post("/users/me", testHandler);
+    router.put("/other", testHandler);
+
+    var req = Request{
+        .method = .patch,
+        .url = "/users/12",
+        .arena = arena.allocator(),
+        .parser = undefined,
+        .transport = undefined,
+    };
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
+    try std.testing.expectEqualStrings("DELETE, GET, HEAD", (try router.allowedMethods(&req)).?);
+    try std.testing.expectEqual(0, req.params.len);
+
+    req.url = "/users/me";
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
+    try std.testing.expectEqualStrings("DELETE, GET, HEAD, POST", (try router.allowedMethods(&req)).?);
+
+    req.url = "/nothing";
+    try std.testing.expect(try router.findHandler(try split(&req)) == null);
+    try std.testing.expect(try router.allowedMethods(&req) == null);
 }
 
 test "Router: an explicit HEAD route wins over the GET one" {

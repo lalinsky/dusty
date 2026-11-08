@@ -14,9 +14,9 @@ The handlers for these routes:
 ```
 
 There is a function for each method: `get`, `head`, `post`, `put`, `delete`, `patch`, `options` and
-`query`. A request whose method has no route for its path gets a 404, even if other methods have
-routes there. An [`any` route](#other-routes) can answer it instead. A `HEAD` request with no route
-of its own is answered by the `GET` route, without the body.
+`query`. A request whose method has no route for its path, when other methods do have one, gets a
+405 with an `Allow` header listing them. An [`any` route](#other-routes) can answer it instead. A
+`HEAD` request with no route of its own is answered by the `GET` route, without the body.
 
 Empty segments in the request path are skipped, so `/users/` and `//users` both match `/users`.
 

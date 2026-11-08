@@ -119,6 +119,10 @@ pub fn Executor(comptime App: type) type {
         app: if (App == void) void else *App,
         action: ?Action(App),
         middlewares: []const Middleware(App),
+        /// With no action, the methods that have a route for the path, as
+        /// `Allow` sends them, which makes the response a 405 instead of
+        /// a 404.
+        allow: ?[]const u8 = null,
         /// The app's `RequestContext` for this request, also reachable as
         /// `req.ctx(App)` between `attachCtx` and `detachCtx`.
         ctx: RequestContext(App) = .{},
@@ -236,7 +240,10 @@ pub fn Executor(comptime App: type) type {
             if (comptime App != void and @hasDecl(App, "dispatch")) {
                 @compileError(@typeName(App) ++ ".dispatch is no longer supported; wrap the handlers in a middleware instead");
             }
-            const action = self.action orelse return self.handleNotFound();
+            const action = self.action orelse {
+                if (self.allow) |allow| return self.handleMethodNotAllowed(allow);
+                return self.handleNotFound();
+            };
             const result = if (comptime App == void)
                 action(self.req, self.res)
             else
@@ -264,6 +271,22 @@ pub fn Executor(comptime App: type) type {
                 self.res.status = .not_found;
                 self.res.content_type = .text;
                 self.res.body = "404 Not Found\n";
+            }
+        }
+
+        fn handleMethodNotAllowed(self: *Self, allow: []const u8) !void {
+            if (!self.res.headers_written) {
+                self.res.resetBody();
+                try self.res.header("Allow", allow);
+            }
+            self.res.status = .method_not_allowed;
+            if (comptime App != void and @hasDecl(App, "methodNotAllowed")) {
+                comptime inject.noParams(@TypeOf(App.methodNotAllowed), @typeName(App) ++ ".methodNotAllowed");
+                _ = inject.returnsError(@TypeOf(App.methodNotAllowed), @typeName(App) ++ ".methodNotAllowed", true);
+                return @call(.auto, App.methodNotAllowed, try inject.args(App, @TypeOf(App.methodNotAllowed), self.app, self.req, self.res, {}));
+            } else {
+                self.res.content_type = .text;
+                self.res.body = "405 Method Not Allowed\n";
             }
         }
 
@@ -508,6 +531,31 @@ test "Executor: a handler returning NotFound gets the 404" {
     try std.testing.expectEqualStrings("404 Not Found\n", res.body);
 }
 
+test "Executor: no action with allowed methods gets the 405" {
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    res.headers = try http.Headers.init(arena.allocator(), 4);
+
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .app = {},
+        .action = null,
+        .middlewares = &.{},
+        .allow = "GET, HEAD",
+    };
+
+    try executor.run();
+
+    try std.testing.expectEqual(.method_not_allowed, res.status);
+    try std.testing.expectEqualStrings("GET, HEAD", res.headers.get("Allow").?);
+    try std.testing.expectEqualStrings("405 Method Not Allowed\n", res.body);
+}
+
 test "Middleware: no action returns 404" {
     var tracker = CallTracker{};
     var mw = TestMiddleware{ .tracker = &tracker, .id = 1 };
@@ -640,6 +688,10 @@ const CustomApp = struct {
         res.body = "custom 404";
     }
 
+    pub fn methodNotAllowed(_: *CustomApp, res: *Response) !void {
+        res.body = "custom 405";
+    }
+
     pub fn uncaughtError(self: *CustomApp, err: anyerror, res: *Response) void {
         self.uncaught_error_called = true;
         self.last_error = err;
@@ -683,6 +735,32 @@ test "Executor: custom notFound handler" {
     try std.testing.expect(app.not_found_called);
     try std.testing.expectEqual(.not_found, res.status);
     try std.testing.expectEqualStrings("custom 404", res.body);
+}
+
+test "Executor: custom methodNotAllowed handler" {
+    var app: CustomApp = .{};
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    res.headers = try http.Headers.init(arena.allocator(), 4);
+
+    var executor = Executor(CustomApp){
+        .req = &req,
+        .res = &res,
+        .app = &app,
+        .action = null,
+        .middlewares = &.{},
+        .allow = "GET, HEAD",
+    };
+
+    try executor.run();
+
+    try std.testing.expectEqual(.method_not_allowed, res.status);
+    try std.testing.expectEqualStrings("GET, HEAD", res.headers.get("Allow").?);
+    try std.testing.expectEqualStrings("custom 405", res.body);
 }
 
 test "Executor: custom uncaughtError handler" {
