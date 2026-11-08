@@ -1,5 +1,5 @@
 const std = @import("std");
-const tls = @import("tls");
+const tls = @import("tls.zig");
 const build_options = @import("build_options");
 
 const Router = @import("router.zig").Router;
@@ -90,11 +90,9 @@ fn remoteAddress(peer: std.Io.net.IpAddress, headers: *const Headers, trusted_pr
 }
 
 /// Borrowed view of the client-certificate settings, handed to each accepted
-/// connection. The bundle is owned by the Server and outlives every connection.
-const ClientAuthRef = struct {
-    bundle: *std.crypto.Certificate.Bundle,
-    mode: ServerConfig.Tls.ClientAuth.Mode,
-};
+/// connection. The trust store is owned by the Server and outlives every
+/// connection.
+const ClientAuthRef = tls.ClientAuth;
 
 /// Primed into each pooled request arena, so an ordinary request is served
 /// without growing it. A request that needs more grows it once, and the
@@ -195,7 +193,7 @@ pub const Connection = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         stream: std.Io.net.Stream,
-        auth: *tls.config.CertKeyPair,
+        auth: *tls.CertKeyPair,
         client_auth: ?ClientAuthRef,
         alpn_protocols: []const []const u8,
     ) !void {
@@ -209,17 +207,10 @@ pub const Connection = struct {
         self.tcp_writer = stream.writer(io, tcp_write_buffer);
         self.tls_rng = .{ .io = io };
         self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
+            .allocator = allocator,
+            .io = io,
             .auth = auth,
-            // Built here rather than passed in as a tls.config.ClientAuth, so
-            // stubs/tls.zig does not have to mirror the type.
-            .client_auth = if (client_auth) |ca| .{
-                .root_ca = ca.bundle.*,
-                .auth_type = switch (ca.mode) {
-                    .request => .request,
-                    .require => .require,
-                },
-            } else null,
-            .now = std.Io.Clock.real.now(io),
+            .client_auth = client_auth,
             .rng = self.tls_rng.interface(),
             .alpn_protocols = alpn_protocols,
         });
@@ -459,8 +450,8 @@ pub fn Server(comptime App: type) type {
             config: *const Listener,
             address: Address,
             server: std.Io.net.Server,
-            tls_auth: ?tls.config.CertKeyPair = null,
-            tls_client_ca: ?std.crypto.Certificate.Bundle = null,
+            tls_auth: ?tls.CertKeyPair = null,
+            tls_client_ca: ?tls.Trust = null,
             client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
 
             fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
@@ -469,8 +460,8 @@ pub fn Server(comptime App: type) type {
                         auth.deinit(allocator);
                         l.tls_auth = null;
                     }
-                    if (l.tls_client_ca) |*bundle| {
-                        bundle.deinit(allocator);
+                    if (l.tls_client_ca) |*trust| {
+                        trust.deinit(allocator);
                         l.tls_client_ca = null;
                     }
                 }
@@ -1074,8 +1065,8 @@ pub fn Server(comptime App: type) type {
                         defer timer.clear(self.io);
                         self.armTimer(&timer, self.config.timeout.request);
 
-                        const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*bundle| .{
-                            .bundle = bundle,
+                        const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*trust| .{
+                            .trust = trust,
                             .mode = l.client_auth_mode,
                         } else null;
 
@@ -1461,7 +1452,7 @@ test "trusted proxy hops select X-Forwarded-For from the right" {
 fn testTlsConnection() Connection {
     var conn: Connection = undefined;
     conn.initWriterForTesting(undefined);
-    conn.tls_conn = .{ .input = undefined, .output = undefined, .cipher = undefined };
+    conn.tls_conn = @as(tls.Connection, undefined);
     conn.tls_reader.err = null;
     conn.tls_writer.err = null;
     return conn;

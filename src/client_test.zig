@@ -768,7 +768,7 @@ test "Client: HTTPS with a custom CA file" {
 
 test "Server: tls.alpn_protocols is offered to the client through ALPN" {
     if (!build_options.use_tls) return error.SkipZigTest;
-    const tls = @import("tls");
+    const tls = @import("tls.zig");
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{
@@ -790,8 +790,8 @@ test "Server: tls.alpn_protocols is offered to the client through ALPN" {
         fn run(s: *dusty.Server(void), _io: std.Io) !void {
             try s.ready.wait(_io);
             const ca: dusty.TlsCa = .{ .file = .{ .path = test_cert_path } };
-            var bundle = try ca.load(std.testing.allocator, _io);
-            defer bundle.deinit(std.testing.allocator);
+            var trust = try ca.load(std.testing.allocator, _io);
+            defer trust.deinit(std.testing.allocator);
 
             const stream = try s.address.ip.connect(_io, .{ .mode = .stream });
             defer stream.close(_io);
@@ -802,13 +802,15 @@ test "Server: tls.alpn_protocols is offered to the client through ALPN" {
             var rng: std.Random.IoSource = .{ .io = _io };
 
             // The client prefers h2; the server only lists http/1.1.
-            const conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+            var conn = try tls.client(&tcp_reader.interface, &tcp_writer.interface, .{
+                .allocator = std.testing.allocator,
+                .io = _io,
                 .host = "localhost",
-                .root_ca = bundle,
-                .now = std.Io.Clock.real.now(_io),
+                .trust = &trust,
                 .rng = rng.interface(),
                 .alpn_protocols = &.{ "h2", "http/1.1" },
             });
+            defer if (@hasDecl(tls.Connection, "deinit")) conn.deinit();
             try std.testing.expectEqualStrings("http/1.1", conn.alpn_protocol orelse return error.NoAlpn);
         }
     }.run, .{ &server, io });

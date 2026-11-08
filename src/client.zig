@@ -1,6 +1,6 @@
 const std = @import("std");
 const Uri = std.Uri;
-const tls = @import("tls");
+const tls = @import("tls.zig");
 const build_options = @import("build_options");
 
 const unix_path_max = 108;
@@ -221,9 +221,9 @@ pub const WebSocketClient = struct {
 /// connection. The pointers reference storage owned by the `Client`, which
 /// outlives every connection it hands them to.
 const TlsRef = struct {
-    ca_bundle: *std.crypto.Certificate.Bundle,
+    trust: *const tls.Trust,
     /// Client certificate for mutual TLS, null when none is configured.
-    client_cert: ?*tls.config.CertKeyPair,
+    client_cert: ?*tls.CertKeyPair,
     insecure_skip_verify: bool,
 };
 
@@ -577,11 +577,12 @@ pub const Connection = struct {
                 &self.tcp_reader.interface,
                 &self.tcp_writer.interface,
                 .{
+                    .allocator = allocator,
+                    .io = self.io,
                     .host = remote_host,
-                    .root_ca = tls_cfg.ca_bundle.*,
+                    .trust = tls_cfg.trust,
                     .insecure_skip_verify = tls_cfg.insecure_skip_verify,
                     .auth = tls_cfg.client_cert,
-                    .now = std.Io.Clock.real.now(self.io),
                     .rng = self.tls_rng.interface(),
                     .alpn_protocols = alpn_protocols,
                 },
@@ -951,8 +952,8 @@ pub const Client = struct {
     /// and deriving the client key are expensive, so both are loaded once on
     /// the first HTTPS request and reused afterwards.
     const TlsState = struct {
-        ca_bundle: std.crypto.Certificate.Bundle = .empty,
-        client_cert: ?tls.config.CertKeyPair = null,
+        trust: ?tls.Trust = null,
+        client_cert: ?tls.CertKeyPair = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ClientConfig) Client {
@@ -977,34 +978,34 @@ pub const Client = struct {
             }
         }
         return .{
-            .ca_bundle = &self.tls_state.ca_bundle,
+            .trust = &self.tls_state.trust.?,
             .client_cert = if (self.tls_state.client_cert) |*pair| pair else null,
             .insecure_skip_verify = self.config.tls.insecure_skip_verify,
         };
     }
 
-    /// Builds the CA bundle and client certificate into locals and only commits
-    /// them once both succeed, so a failure leaves `tls_state` empty and a later
-    /// retry starts from a clean bundle instead of appending to a half-built one.
+    /// Builds the trust store and client certificate into locals and only
+    /// commits them once both succeed, so a failure leaves `tls_state` empty
+    /// and a later retry starts from scratch instead of a half-built store.
     fn loadTlsState(self: *Client) !void {
         const cfg = self.config.tls;
         if (cfg.ca == .none and !cfg.insecure_skip_verify) return error.NoCertificateAuthority;
 
-        var ca_bundle = try cfg.ca.load(self.allocator, self.io);
-        errdefer ca_bundle.deinit(self.allocator);
+        var trust = try cfg.ca.load(self.allocator, self.io);
+        errdefer trust.deinit(self.allocator);
 
-        var client_cert: ?tls.config.CertKeyPair = null;
+        var client_cert: ?tls.CertKeyPair = null;
         errdefer if (client_cert) |*pair| pair.deinit(self.allocator);
         if (cfg.client_certificate) |cc| {
             client_cert = try cc.load(self.allocator, self.io);
         }
 
-        self.tls_state = .{ .ca_bundle = ca_bundle, .client_cert = client_cert };
+        self.tls_state = .{ .trust = trust, .client_cert = client_cert };
     }
 
     pub fn deinit(self: *Client) void {
         self.pool.deinit();
-        self.tls_state.ca_bundle.deinit(self.allocator);
+        if (self.tls_state.trust) |*trust| trust.deinit(self.allocator);
         if (self.tls_state.client_cert) |*pair| pair.deinit(self.allocator);
     }
 
