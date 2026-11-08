@@ -96,7 +96,9 @@ The app can replace the default 404 and error responses by declaring `notFound` 
 ```
 
 `notFound` takes parameters the same way a handler does, except path parameters, since there is no
-route. `uncaughtError` returns `void`, so it can't fail. It can take the error as `anyerror`, but not
+route. The 405 for a method with no route on the path goes through `methodNotAllowed` the same way,
+which gets the response with the status and the `Allow` header already set. `uncaughtError` returns
+`void`, so it can't fail. It can take the error as `anyerror`, but not
 `http.Param`, `http.Query`, `http.Header` or your own types.
 
 The 400, 413 and 415 for what the client got wrong don't go through `uncaughtError`. To answer

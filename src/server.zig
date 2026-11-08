@@ -1322,6 +1322,7 @@ pub fn Server(comptime App: type) type {
                     .app = self.app,
                     .action = if (found) |r| r.action else null,
                     .middlewares = if (found) |r| r.middlewares else self.router.middlewares,
+                    .allow = if (found == null) try self.router.allowedMethods(&request) else null,
                 };
                 executor.attachCtx();
                 defer executor.detachCtx();
