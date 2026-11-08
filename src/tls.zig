@@ -40,22 +40,22 @@ const StoreTrust = struct {
     }
 
     pub fn addSystem(self: *Trust, allocator: std.mem.Allocator, io: std.Io) !void {
-        _ = try self.store.addSystemBundle(allocator, io);
+        try self.store.addSystemBundle(allocator, io);
     }
 
     pub fn addFile(self: *Trust, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
-        _ = try self.store.addPemFile(allocator, io, dir, path);
+        try self.store.addPemFile(allocator, io, dir, path);
     }
 
     pub fn addDir(self: *Trust, allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !void {
         var sub_dir = try dir.openDir(io, path, .{ .iterate = true });
         defer sub_dir.close(io);
-        _ = try self.store.addPemDir(allocator, io, sub_dir);
+        try self.store.addPemDir(allocator, io, sub_dir);
     }
 
     pub fn addPem(self: *Trust, allocator: std.mem.Allocator, io: std.Io, pem: []const u8) !void {
         _ = io;
-        _ = try self.store.addPem(allocator, pem);
+        try self.store.addPem(allocator, pem);
     }
 };
 
