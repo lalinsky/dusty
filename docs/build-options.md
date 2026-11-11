@@ -22,7 +22,8 @@ const dusty_dep = b.dependency("dusty", .{
   server with a TLS listener fails to start.
 - `ztls` uses [ztls](https://github.com/lalinsky/ztls), which does its cryptography with AWS-LC.
   AWS-LC is C, compiled along with your program, so the first build takes a while.
-- `tls_zig` uses [tls.zig](https://github.com/lalinsky/tls.zig), which is written in Zig.
+- `tls_zig` uses [tls.zig](https://github.com/lalinsky/tls.zig), which does its cryptography with
+  Zig's `std.crypto`.
 - `custom` uses a module you provide, see below.
 
 Both libraries support everything Dusty does with TLS, client certificates included.
