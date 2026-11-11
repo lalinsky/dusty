@@ -73,7 +73,7 @@ fn index(app: *App, res: *http.Response) !void {
     try res.print(.text, "{s}, world!\n", .{app.greeting});
 }
 
-fn hello(app: *App, name: http.Param("name", []const u8), res: *http.Response) !void {
+fn hello(app: *App, name: http.Path("name", []const u8), res: *http.Response) !void {
     try res.print(.text, "{s}, {s}!\n", .{ app.greeting, name.value });
 }
 

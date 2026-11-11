@@ -50,7 +50,7 @@ const UserInput = struct {
     email: ?[]const u8 = null,
 };
 
-fn updateUser(id: http.Param("id", u64), req: *http.Request, res: *http.Response) !void {
+fn updateUser(id: http.Path("id", u64), req: *http.Request, res: *http.Response) !void {
     const body = try req.body() orelse "";
     const input = json.decodeFromSliceLeaky(UserInput, req.arena, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -73,7 +73,7 @@ A handler can pick the format from the request's `Accept` header:
 
 ```zig
 fn getUser(
-    id: http.Param("id", u64),
+    id: http.Path("id", u64),
     accept: http.Header("Accept", ?[]const u8),
     res: *http.Response,
 ) !void {

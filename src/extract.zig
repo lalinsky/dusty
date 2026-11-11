@@ -11,7 +11,7 @@ const Request = @import("request.zig").Request;
 
 /// A path parameter of the route, parsed as `T`:
 ///
-///     fn getUser(id: http.Param("id", u64), res: *http.Response) !void
+///     fn getUser(id: http.Path("id", u64), res: *http.Response) !void
 ///
 /// The route path must have `:name` or `*name`, which is checked at compile
 /// time. A value that does not parse as `T` makes the route not match, so
@@ -21,8 +21,8 @@ const Request = @import("request.zig").Request;
 /// `-` if signed), an enum (a tag name), `bool` (`true` or `false`),
 /// `[]const u8` (as it is), or a type declaring
 /// `pub fn parseParam([]const u8) ?T`.
-pub fn Param(comptime name: []const u8, comptime T: type) type {
-    comptime checkType(T, "http.Param");
+pub fn Path(comptime name: []const u8, comptime T: type) type {
+    comptime checkType(T, "http.Path");
     return struct {
         value: T,
 
@@ -43,7 +43,7 @@ pub fn Param(comptime name: []const u8, comptime T: type) type {
     };
 }
 
-/// A query string parameter, parsed as `T` the way `Param` parses it. A
+/// A query string parameter, parsed as `T` the way `Path` parses it. A
 /// `?T` is null when the parameter is missing; a value that is there but
 /// doesn't parse is a 400 either way.
 pub fn Query(comptime name: []const u8, comptime T: type) type {
@@ -85,9 +85,9 @@ fn Value(
     };
 }
 
-/// Whether `P` is a `Param`.
-pub fn isParam(comptime P: type) bool {
-    return @typeInfo(P) == .@"struct" and @hasDecl(P, "param_name") and @hasDecl(P, "Value") and P == Param(P.param_name, P.Value);
+/// Whether `P` is a `Path`.
+pub fn isPath(comptime P: type) bool {
+    return @typeInfo(P) == .@"struct" and @hasDecl(P, "param_name") and @hasDecl(P, "Value") and P == Path(P.param_name, P.Value);
 }
 
 /// Whether a handler parameter of type `P` is filled by its `extract`.

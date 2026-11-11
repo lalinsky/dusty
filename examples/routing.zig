@@ -11,7 +11,7 @@ fn createUser(res: *http.Response) !void {
     try res.print(.text, "Created\n", .{});
 }
 
-fn getUser(id: http.Param("id", u64), res: *http.Response) !void {
+fn getUser(id: http.Path("id", u64), res: *http.Response) !void {
     try res.print(.text, "User {d}\n", .{id.value});
 }
 
@@ -30,7 +30,7 @@ fn getOrder(req: *http.Request, res: *http.Response) !void {
 // --8<-- [start:enum]
 const Lang = enum { en, de, sk };
 
-fn getDocs(lang: http.Param("lang", Lang), res: *http.Response) !void {
+fn getDocs(lang: http.Path("lang", Lang), res: *http.Response) !void {
     try res.print(.text, "Docs in {t}\n", .{lang.value});
 }
 // --8<-- [end:enum]
@@ -48,13 +48,13 @@ const Slug = struct {
     }
 };
 
-fn getPost(slug: http.Param("slug", Slug), res: *http.Response) !void {
+fn getPost(slug: http.Path("slug", Slug), res: *http.Response) !void {
     try res.print(.text, "Post {s}\n", .{slug.value.text});
 }
 // --8<-- [end:slug]
 
 // --8<-- [start:wildcard]
-fn getFile(path: http.Param("path", []const u8), res: *http.Response) !void {
+fn getFile(path: http.Path("path", []const u8), res: *http.Response) !void {
     try res.print(.text, "File {s}\n", .{path.value});
 }
 // --8<-- [end:wildcard]
