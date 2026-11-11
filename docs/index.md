@@ -22,7 +22,7 @@ request smuggling. And on [HttpArena](https://http-arena.com/), it's among the f
 - Server-Sent Events, and WebSocket on both the server and the client
 - Static files with conditional and range requests, and assets embedded at build time
 - HTTP and HTTPS client with connection pooling, and Unix socket support
-- TLS on both sides, including client certificates, through [tls.zig](https://github.com/lalinsky/tls.zig)
+- TLS on both sides, including client certificates, through [ztls](https://github.com/lalinsky/ztls) or [tls.zig](https://github.com/lalinsky/tls.zig)
 
 ## Quick Example
 

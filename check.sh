@@ -10,10 +10,11 @@ TEST_FAIL_FIRST="false"
 TEST_VERBOSE="true"
 CI_MODE=false
 ZIO_BACKEND=""
+TLS="ztls"
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--test-filter \"test name\"] [--test-log-capture true|false] [--test-fail-first true|false] [--test-verbose true|false] [--ci] [--zio-backend epoll|io_uring|kqueue|poll]"
+  echo "Usage: $0 [--test-filter \"test name\"] [--test-log-capture true|false] [--test-fail-first true|false] [--test-verbose true|false] [--ci] [--zio-backend epoll|io_uring|kqueue|poll] [--tls none|tls_zig|ztls]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -44,6 +45,10 @@ while [[ $# -gt 0 ]]; do
         --zio-backend)
             [[ $# -ge 2 ]] || { echo "--zio-backend requires an argument"; usage; exit 1; }
             ZIO_BACKEND="$2"; shift 2
+            ;;
+        --tls)
+            [[ $# -ge 2 ]] || { echo "--tls requires an argument"; usage; exit 1; }
+            TLS="$2"; shift 2
             ;;
         *)
             echo "Unknown option: $1"
@@ -78,7 +83,7 @@ export TEST_LOG_CAPTURE="$TEST_LOG_CAPTURE"
 export TEST_FAIL_FIRST="$TEST_FAIL_FIRST" 
 export TEST_VERBOSE="$TEST_VERBOSE"
 
-BUILD_ARGS=()
+BUILD_ARGS=("-Dtls=$TLS")
 if [ -n "$ZIO_BACKEND" ]; then
     BUILD_ARGS+=("-Dzio_backend=$ZIO_BACKEND")
 fi

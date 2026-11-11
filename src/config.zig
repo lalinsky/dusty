@@ -102,9 +102,8 @@ pub const Address = union(enum) {
 /// HTTP on 80.
 pub const Listener = struct {
     address: Address,
-    /// When set, every connection accepted here is TLS. Requires the
-    /// `use_tls` build option (enabled by default); with TLS compiled out,
-    /// setting this fails `Server.run`.
+    /// When set, every connection accepted here is TLS. Requires the `tls`
+    /// build option; with TLS compiled out, setting this fails `Server.run`.
     tls: ?ServerConfig.Tls = null,
     /// How many connections the kernel accepts on the server's behalf
     /// while it is not accepting itself. Past this, Linux drops the

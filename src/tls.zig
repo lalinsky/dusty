@@ -11,10 +11,19 @@ const backend = @import("tls");
 /// Which of the two APIs the injected module has.
 pub const is_ztls = @hasDecl(backend, "is_ztls");
 
-pub const input_buffer_len = backend.input_buffer_len;
-pub const output_buffer_len = backend.output_buffer_len;
+pub const input_buffer_len: usize = backend.input_buffer_len;
+pub const output_buffer_len: usize = backend.output_buffer_len;
 pub const Connection = backend.Connection;
 pub const CertKeyPair = backend.config.CertKeyPair;
+
+/// ztls and newer tls.zig call it `writerInPlace`, older tls.zig
+/// `inPlaceWriter`; a custom module may have neither.
+pub const has_writer_in_place = @hasDecl(Connection, "writerInPlace") or @hasDecl(Connection, "inPlaceWriter");
+
+pub fn writerInPlace(conn: *Connection) Connection.Writer {
+    if (@hasDecl(Connection, "writerInPlace")) return conn.writerInPlace();
+    return conn.inPlaceWriter();
+}
 
 /// `CertKeyPair.fromSlice`.
 pub fn certKeyPairFromSlice(allocator: std.mem.Allocator, io: std.Io, cert_pem: []const u8, key_pem: []const u8) !CertKeyPair {

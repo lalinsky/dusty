@@ -8,7 +8,7 @@ Build a static release binary for the architecture on which the container will r
 
 ```sh
 cd examples/httpbin
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Duse_tls=false --prefix zig-out/container
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out/container
 docker build -t dusty-httpbin:0.5.0 .
 ```
 

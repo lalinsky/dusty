@@ -1,19 +1,24 @@
 const std = @import("std");
 
+const TlsOption = enum { none, tls_zig, ztls, custom };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const use_tls = b.option(bool, "use_tls", "Build with TLS/HTTPS support via tls.zig") orelse true;
-    const use_bundled_tls = b.option(
-        bool,
-        "use_bundled_tls",
-        "Use Dusty's pinned tls.zig dependency; disable to inject a compatible 'tls' module",
-    ) orelse true;
-    // HTTP/2 support is gated behind this option (like use_tls) because it links
+    const tls_option = b.option(
+        TlsOption,
+        "tls",
+        "TLS library: none (default), tls_zig, ztls, or custom to inject a 'tls' module",
+    ) orelse .none;
+    const use_tls = tls_option != .none;
+    // HTTP/2 support is gated behind this option (like TLS) because it links
     // the nghttp2 C library. Defaults off until the implementation lands. Requires
-    // use_tls, since h2 is negotiated via TLS ALPN.
+    // TLS, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
+    if (use_http2 and !use_tls) {
+        std.process.fatal("use_http2 needs TLS: set -Dtls to tls_zig, ztls or custom", .{});
+    }
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
 
     const mod = b.addModule("dusty", .{
@@ -36,25 +41,22 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/stubs/zio.zig"),
     });
 
-    // TLS support is a lazy dependency: only fetched when both TLS and the
-    // bundled provider are enabled (the defaults). Applications can keep TLS
-    // active while injecting a compatible module with:
+    // The TLS libraries are lazy dependencies: only the one selected is
+    // fetched and built. With `custom`, the application injects its own:
     //   dusty_mod.addImport("tls", custom_tls_mod);
-    if (!use_tls) {
-        mod.addAnonymousImport("tls", .{
+    switch (tls_option) {
+        .none => mod.addAnonymousImport("tls", .{
             .root_source_file = b.path("src/stubs/tls.zig"),
-        });
-    } else if (use_bundled_tls) {
-        if (b.lazyDependency("tls", .{
+        }),
+        .tls_zig, .ztls => |lib| if (b.lazyDependency(@tagName(lib), .{
             .target = target,
             .optimize = optimize,
         })) |tls_dep| {
-            mod.addImport("tls", tls_dep.module("tls"));
-        }
-    } else {
-        mod.addAnonymousImport("tls", .{
+            mod.addImport("tls", tls_dep.module(if (lib == .ztls) "ztls" else "tls"));
+        },
+        .custom => mod.addAnonymousImport("tls", .{
             .root_source_file = b.path("src/stubs/tls_injection_required.zig"),
-        });
+        }),
     }
 
     // Content decoding (gzip, deflate) of request and response bodies is a

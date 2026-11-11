@@ -94,7 +94,7 @@ pub const ClientConfig = struct {
     /// its connection torn down.
     buffer_size: usize = 16384,
     /// TLS settings for https:// (and wss://) connections. Requires the
-    /// `use_tls` build option; with TLS compiled out any HTTPS request fails
+    /// `tls` build option; with TLS compiled out any HTTPS request fails
     /// with error.TlsNotConfigured. Applies to every connection the client
     /// makes: connections are pooled and reused across requests, so the trust
     /// settings and client identity cannot be varied per request.

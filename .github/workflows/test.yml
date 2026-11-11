@@ -28,16 +28,21 @@ jobs:
         version: ${{ matrix.zig-version }}
 
     - name: Build
-      run: zig build
+      run: zig build -Dtls=ztls
       # A cold build on 0.17 takes several times longer than on 0.16, and
       # Windows is the slowest runner.
       timeout-minutes: 15
 
     - name: Run tests
-      run: zig build test --summary all
+      run: zig build test --summary all -Dtls=ztls
       timeout-minutes: 5
 
-    - name: Run tests without zlib
+    - name: Run tests with tls.zig
+      if: runner.os == 'Linux'
+      run: zig build test --summary all -Dtls=tls_zig
+      timeout-minutes: 10
+
+    - name: Run tests without TLS and zlib
       if: runner.os == 'Linux'
       run: zig build test --summary all -Duse_zlib=false
       timeout-minutes: 5
@@ -57,7 +62,7 @@ jobs:
       timeout-minutes: 5
 
     - name: Build httpbin example with injected TLS
-      run: zig build -Duse_bundled_tls=false
+      run: zig build -Dtls=custom
       working-directory: examples/httpbin
       # httpbin pins its own zio, which is still on Zig 0.16.
       if: matrix.zig-version == '0.16.0'
@@ -71,7 +76,7 @@ jobs:
       timeout-minutes: 5
 
     - name: Build examples
-      run: zig build examples
+      run: zig build examples -Dtls=ztls
       timeout-minutes: 5
 
     - name: Run client example
@@ -100,7 +105,7 @@ jobs:
         version: 0.16.0
 
     - name: Build static httpbin binary
-      run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -Duse_tls=false --prefix zig-out/container
+      run: zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl --prefix zig-out/container
       working-directory: examples/httpbin
       timeout-minutes: 5
 

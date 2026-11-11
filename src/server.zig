@@ -107,9 +107,9 @@ const request_arena_reserve = 8 * 1024;
 /// of the way into the pooled buffer.
 const idle_read_buffer_len = 1024;
 
-/// An injected TLS module may predate `inPlaceWriter`; its writer then goes
+/// An injected TLS module may have no in-place writer; its writer then goes
 /// through the request write buffer.
-const tls_in_place = build_options.use_tls and @hasDecl(tls.Connection, "inPlaceWriter");
+const tls_in_place = build_options.use_tls and tls.has_writer_in_place;
 
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer) and their buffers for one accepted connection. The buffer a
@@ -215,7 +215,7 @@ pub const Connection = struct {
             .alpn_protocols = alpn_protocols,
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
-        self.tls_writer = if (tls_in_place) self.tls_conn.?.inPlaceWriter() else self.tls_conn.?.writer(&.{});
+        self.tls_writer = if (tls_in_place) tls.writerInPlace(&self.tls_conn.?) else self.tls_conn.?.writer(&.{});
         self.reader = &self.tls_reader.interface;
         self.writer = &self.tls_writer.interface;
     }
@@ -672,7 +672,7 @@ pub fn Server(comptime App: type) type {
 
             if (cfg.tls) |tls_cfg| {
                 if (!build_options.use_tls) {
-                    log.err("tls is set but the library was built with use_tls=false", .{});
+                    log.err("tls is set but the library was built without TLS", .{});
                     return error.TlsNotConfigured;
                 }
                 if (tls_cfg.client_auth) |client_auth| {

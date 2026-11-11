@@ -1,8 +1,8 @@
-//! Stub used when the `use_tls` build option is disabled.
+//! Stub used when the `tls` build option is `none`.
 //!
 //! It mirrors just enough of the tls.zig API surface for `client.zig` to type
 //! check. The bodies are never reached: the HTTPS path in `Connection.init`
-//! returns `error.TlsNotConfigured` up front when `use_tls` is false.
+//! returns `error.TlsNotConfigured` up front when TLS is compiled out.
 
 const std = @import("std");
 
