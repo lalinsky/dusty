@@ -72,23 +72,23 @@ fn pointsTo(comptime P: type, comptime T: type) bool {
     return P == *T or P == *const T;
 }
 
-/// The `Param` types among `F`'s parameters.
+/// The `Path` types among `F`'s parameters.
 pub fn params(comptime F: type) []const type {
     comptime {
         const a: std.meta.ArgsTuple(F) = undefined;
         var result: []const type = &.{};
         for (0..a.len) |i| {
-            if (extract.isParam(@TypeOf(a[i]))) result = result ++ .{@TypeOf(a[i])};
+            if (extract.isPath(@TypeOf(a[i]))) result = result ++ .{@TypeOf(a[i])};
         }
         return result;
     }
 }
 
-/// A compile error if `F` takes a `Param`, for functions that are not
+/// A compile error if `F` takes a `Path`, for functions that are not
 /// called for a route.
 pub fn noParams(comptime F: type, comptime name: []const u8) void {
     const found = params(F);
-    if (found.len > 0) @compileError(name ++ " can't take dusty.Param(\"" ++ found[0].param_name ++ "\", ...): it isn't called for a route");
+    if (found.len > 0) @compileError(name ++ " can't take dusty.Path(\"" ++ found[0].param_name ++ "\", ...): it isn't called for a route");
 }
 
 /// A compile error if `F` takes an extractor, for functions that can't

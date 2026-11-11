@@ -27,7 +27,7 @@ fn index(app: *App, res: *http.Response) !void {
 
 // --8<-- [start:values]
 fn listPosts(
-    user: http.Param("id", u64),
+    user: http.Path("id", u64),
     sort: http.Query("sort", ?enum { new, top }),
     lang: http.Header("Accept-Language", ?[]const u8),
     res: *http.Response,
@@ -61,7 +61,7 @@ fn listComments(page: Page, res: *http.Response) !void {
 // --8<-- [end:page]
 
 // --8<-- [start:not_found]
-fn getPost(id: http.Param("id", u64), res: *http.Response) !void {
+fn getPost(id: http.Path("id", u64), res: *http.Response) !void {
     if (id.value > 100) return error.NotFound;
     try res.print(.text, "Post {d}\n", .{id.value});
 }

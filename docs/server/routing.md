@@ -23,11 +23,11 @@ Empty segments in the request path are skipped, so `/users/` and `//users` both 
 ## Path Parameters
 
 A segment starting with `:` matches any single segment of the request path. To get the value, the
-handler takes an [`http.Param`](../../apidocs/#http.Param) with the parameter's name and the type to parse it as. `getUser` takes
-`http.Param("id", u64)`, and `id.value` is the number. If the value doesn't parse, the route
+handler takes a [`http.Path`](../../apidocs/#http.Path) with the parameter's name and the type to parse it as. `getUser` takes
+`http.Path("id", u64)`, and `id.value` is the number. If the value doesn't parse, the route
 doesn't match, so `/users/abc` gets a 404.
 
-`http.Param` can parse these types:
+`http.Path` can parse these types:
 
 - Integers
 - Enums, from the tag name
@@ -49,7 +49,7 @@ For anything else, write a type with `parseParam`. It returns null for a value i
 --8<-- "examples/routing.zig:slug"
 ```
 
-The name in `http.Param` has to be in the route's path. If it isn't, or a handler takes the same
+The name in `http.Path` has to be in the route's path. If it isn't, or a handler takes the same
 name twice, you get a compile error.
 
 You can also read the parameters from the request, as strings. With
@@ -61,7 +61,7 @@ You can also read the parameters from the request, as strings. With
 
 [`req.params.get`](../../apidocs/#http.Params) returns null for a name the route doesn't have, which is why there is a `.?`.
 Here the route matches any value of `:id`, and the handler gets it without parsing. This is what
-`http.Param` with `[]const u8` gives you too. `req.params` is handy when the code that reads the
+`http.Path` with `[]const u8` gives you too. `req.params` is handy when the code that reads the
 parameter only has the request, like [middleware](middleware.md).
 
 ## Wildcards

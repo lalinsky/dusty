@@ -9,7 +9,7 @@ This release changes how handlers are written: they take only the parameters the
 ### Highlights
 
 - Handlers take only the parameters they need, in any order: `*App`, `*Request`, `*Response`, `*App.RequestContext`, and typed values from the request. `fn index(res: *http.Response) !void` is a valid handler. `notFound` and `uncaughtError` take their parameters the same way.
-- `http.Param("id", u64)` reads a path parameter as an integer, enum, bool, string, or your own type with `parseParam`. The name is checked against the route path at compile time. A value that doesn't parse doesn't match the route, and routing moves on to the next one.
+- `http.Path("id", u64)` reads a path parameter as an integer, enum, bool, string, or your own type with `parseParam`. The name is checked against the route path at compile time. A value that doesn't parse doesn't match the route, and routing moves on to the next one.
 - `http.Query` and `http.Header` read a query parameter or header the same way. A missing or malformed value is answered with a 400. Use `?T` for an optional one.
 - `App.RequestContext` declares per-request data that middleware can fill in for handlers, such as the logged-in user. Middleware uses `executor.ctx`. Handlers take `*App.RequestContext` or call `req.ctx(App)`.
 - Middleware can declare `onHeaders`, which runs just before the response headers are sent, and `onComplete`, which runs after the response is sent or fails.
