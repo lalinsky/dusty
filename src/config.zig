@@ -37,7 +37,8 @@ pub const TlsCa = union(enum) {
 /// server's own certificate, or a client's under mutual TLS.
 ///
 /// The key must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
-/// KEY"); passphrase-protected keys are not supported.
+/// KEY"), or with ztls also PKCS#1 ("BEGIN RSA PRIVATE KEY");
+/// passphrase-protected keys are not supported.
 pub const TlsCertificate = union(enum) {
     /// PEM files: the certificate chain, leaf first, and the private key.
     file: struct {

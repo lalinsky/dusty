@@ -48,6 +48,8 @@ const tls = b.dependency("tls", .{ .target = target, .optimize = optimize });
 dusty_dep.module("dusty").addImport("tls", tls.module("tls"));
 ```
 
+ztls names its module `ztls`, so for it use `tls.module("ztls")`, still imported as `"tls"`.
+
 The module has to be compatible with the version of tls.zig or ztls that Dusty pins. If you forget
 the import, the build fails with an error that tells you what to add.
 
