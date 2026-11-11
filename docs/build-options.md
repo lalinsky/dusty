@@ -21,8 +21,7 @@ const dusty_dep = b.dependency("dusty", .{
 - `none`, the default, builds without TLS. HTTPS requests fail with `error.TlsNotConfigured`, and a
   server with a TLS listener fails to start.
 - `ztls` uses [ztls](https://github.com/lalinsky/ztls), which does its cryptography with AWS-LC.
-  AWS-LC is C, compiled along with your program, so the first build takes a while. On Windows and
-  Intel Macs it's built without its assembly, which makes it slower there.
+  AWS-LC is C, compiled along with your program, so the first build takes a while.
 - `tls_zig` uses [tls.zig](https://github.com/lalinsky/tls.zig), which is written in Zig.
 - `custom` uses a module you provide, see below.
 
