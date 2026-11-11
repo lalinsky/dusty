@@ -26,8 +26,11 @@ This server accepts HTTPS on port 8443, plain HTTP on port 8080, and plain HTTP 
 
 ### TLS
 
-A listener with `.tls` set serves only TLS. The certificate and key are PEM files, with the
-certificate chain leaf first. The key has to be PKCS#8 or an EC key, and it can't have a passphrase.
+A listener with `.tls` set serves only TLS. It needs a TLS library built in, chosen with the
+[`tls` build option](../build-options.md#tls), or the server fails to start.
+
+The certificate and key are PEM files, with the certificate chain leaf first. The key can't have a
+passphrase, and with tls.zig it has to be PKCS#8 or an EC key.
 They are loaded when the server starts. `.bytes` instead of `.file` takes them from memory.
 
 `.client_auth` asks clients for a certificate and checks it against the authorities in `.ca`:

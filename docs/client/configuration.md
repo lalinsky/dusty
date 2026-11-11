@@ -26,7 +26,10 @@ See [`http.ClientConfig`](../../apidocs/#http.ClientConfig) for the other settin
 
 ## TLS
 
-For HTTPS, the client checks the server's certificate against the system's trusted certificates.
+HTTPS needs a TLS library built in, chosen with the [`tls` build option](../build-options.md#tls).
+Without one, HTTPS requests fail with `error.TlsNotConfigured`.
+
+The client checks the server's certificate against the system's trusted certificates.
 `tls.ca` replaces them with certificates you choose. `tls.client_certificate` is the certificate the
 client presents to servers that ask for one:
 

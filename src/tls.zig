@@ -11,8 +11,8 @@ const backend = @import("tls");
 /// Which of the two APIs the injected module has.
 pub const is_ztls = @hasDecl(backend, "is_ztls");
 
-pub const input_buffer_len: usize = backend.input_buffer_len;
-pub const output_buffer_len: usize = backend.output_buffer_len;
+pub const input_buffer_len = backend.input_buffer_len;
+pub const output_buffer_len = backend.output_buffer_len;
 pub const Connection = backend.Connection;
 pub const CertKeyPair = backend.config.CertKeyPair;
 

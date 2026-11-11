@@ -991,7 +991,9 @@ pub const Client = struct {
         const cfg = self.config.tls;
         if (cfg.ca == .none and !cfg.insecure_skip_verify) return error.NoCertificateAuthority;
 
-        var trust = try cfg.ca.load(self.allocator, self.io);
+        // Nothing is verified against it then, and ztls refuses a source
+        // with no certificates, as an image without system roots has.
+        var trust = if (cfg.insecure_skip_verify) try tls.Trust.init() else try cfg.ca.load(self.allocator, self.io);
         errdefer trust.deinit(self.allocator);
 
         var client_cert: ?tls.CertKeyPair = null;

@@ -1010,6 +1010,16 @@ test "Client: rejects a server certificate the configured CA does not cover" {
             var response = try lax.fetch(url, .{});
             defer response.deinit();
             try std.testing.expectEqual(.ok, response.status());
+
+            // Nor does it load the CAs it would not use, which may have no
+            // certificates, as an image without system roots has none.
+            var lax_empty = dusty.Client.init(std.testing.allocator, _io, .{
+                .tls = .{ .ca = .{ .bytes = "" }, .insecure_skip_verify = true },
+            });
+            defer lax_empty.deinit();
+            var response2 = try lax_empty.fetch(url, .{});
+            defer response2.deinit();
+            try std.testing.expectEqual(.ok, response2.status());
         }
     }.run, .{ &server, io });
 
