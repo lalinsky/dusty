@@ -76,7 +76,7 @@ pub const Connection = struct {
         unreachable;
     }
 
-    pub fn inPlaceWriter(self: *Connection) Writer {
+    pub fn writerInPlace(self: *Connection) Writer {
         _ = self;
         unreachable;
     }

@@ -810,7 +810,7 @@ test "Server: tls.alpn_protocols is offered to the client through ALPN" {
                 .rng = rng.interface(),
                 .alpn_protocols = &.{ "h2", "http/1.1" },
             });
-            defer if (@hasDecl(tls.Connection, "deinit")) conn.deinit();
+            defer tls.deinitConnection(&conn);
             try std.testing.expectEqualStrings("http/1.1", conn.alpn_protocol orelse return error.NoAlpn);
         }
     }.run, .{ &server, io });

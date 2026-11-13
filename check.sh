@@ -14,7 +14,7 @@ TLS="ztls"
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--test-filter \"test name\"] [--test-log-capture true|false] [--test-fail-first true|false] [--test-verbose true|false] [--ci] [--zio-backend epoll|io_uring|kqueue|poll] [--tls none|tls_zig|ztls]"
+  echo "Usage: $0 [--test-filter \"test name\"] [--test-log-capture true|false] [--test-fail-first true|false] [--test-verbose true|false] [--ci] [--zio-backend epoll|io_uring|kqueue|poll] [--tls none|ztls|libssl]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in

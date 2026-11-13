@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const TlsOption = enum { none, tls_zig, ztls, custom };
+const TlsOption = enum { none, ztls, libssl, custom };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) void {
     const tls_option = b.option(
         TlsOption,
         "tls",
-        "TLS library: none (default), tls_zig, ztls, or custom to inject a 'tls' module",
+        "TLS: none (default), ztls (native ztls), libssl (ztls on AWS-LC's libssl), or custom to inject a 'tls' module",
     ) orelse .none;
     const use_tls = tls_option != .none;
     // HTTP/2 support is gated behind this option (like TLS) because it links
@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
     // TLS, since h2 is negotiated via TLS ALPN.
     const use_http2 = b.option(bool, "use_http2", "Build with HTTP/2 support via nghttp2") orelse false;
     if (use_http2 and !use_tls) {
-        std.process.fatal("use_http2 needs TLS: set -Dtls to tls_zig, ztls or custom", .{});
+        std.process.fatal("use_http2 needs TLS: set -Dtls to ztls, libssl or custom", .{});
     }
     const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
 
@@ -41,18 +41,20 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/stubs/zio.zig"),
     });
 
-    // The TLS libraries are lazy dependencies: only the one selected is
-    // fetched and built. With `custom`, the application injects its own:
+    // ztls is a lazy dependency, fetched and built only when TLS is on;
+    // `libssl` builds it with its libssl engine. With `custom`, the
+    // application injects its own:
     //   dusty_mod.addImport("tls", custom_tls_mod);
     switch (tls_option) {
         .none => mod.addAnonymousImport("tls", .{
             .root_source_file = b.path("src/stubs/tls.zig"),
         }),
-        .tls_zig, .ztls => |lib| if (b.lazyDependency(@tagName(lib), .{
+        .ztls, .libssl => if (b.lazyDependency("ztls", .{
             .target = target,
             .optimize = optimize,
+            .impl = @as(enum { native, libssl }, if (tls_option == .libssl) .libssl else .native),
         })) |tls_dep| {
-            mod.addImport("tls", tls_dep.module(if (lib == .ztls) "ztls" else "tls"));
+            mod.addImport("tls", tls_dep.module("ztls"));
         },
         .custom => mod.addAnonymousImport("tls", .{
             .root_source_file = b.path("src/stubs/tls_injection_required.zig"),

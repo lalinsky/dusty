@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Tls = enum { none, tls_zig, ztls, custom };
+const Tls = enum { none, ztls, libssl, custom };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});

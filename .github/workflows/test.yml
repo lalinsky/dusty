@@ -37,8 +37,8 @@ jobs:
       run: zig build test --summary all -Dtls=ztls
       timeout-minutes: 5
 
-    - name: Run tests with tls.zig
-      run: zig build test --summary all -Dtls=tls_zig
+    - name: Run tests with ztls on libssl
+      run: zig build test --summary all -Dtls=libssl
       timeout-minutes: 10
 
     - name: Run tests without TLS and zlib

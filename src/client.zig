@@ -660,11 +660,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         if (build_options.use_tls) {
-            // See server.zig `Connection.deinit`: only a TLS module that owns
-            // per-connection state declares `deinit`.
-            if (@hasDecl(tls.Connection, "deinit")) {
-                if (self.tls_conn) |*c| c.deinit();
-            }
+            if (self.tls_conn) |*c| tls.deinitConnection(c);
             self.tls_conn = null;
         }
         self.stream.close(self.io);

@@ -32,19 +32,14 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .tls_zig = .{
-            .url = "git+https://github.com/lalinsky/tls.zig?ref=v2026.10.25.0#e4fbd5bf099a575dbaee8c9d38dc5abd08d5c758",
-            .hash = "tls-0.1.0-ER2e0rknBwAlCJSPZKGoEFqV5vSPdCQLmCGgK9MsJveA",
-            .lazy = true,
-        },
         .zlib = .{
             .url = "git+https://github.com/lalinsky/zlib.zig?ref=v0.1.0#8e7900c5287f0e1c0b2c7ed27b5b0a92912903e1",
             .hash = "zlib-0.1.0-X-kZxmTyEQCJtIUdNRXSe6B4h1r1FGi0GvTcX2pvokom",
             .lazy = true,
         },
         .ztls = .{
-            .url = "git+https://github.com/lalinsky/ztls#2b2a6aef9e5c876f35b33925a7b1167ed822f63f",
-            .hash = "ztls-0.0.0-kXOuzuuuCADLh-fMiLZyjPyZ_drpk40i3c0_g3dh0DEz",
+            .url = "git+https://github.com/lalinsky/ztls#0c31891797295c0c7d7556e6eeb8ef44183f925e",
+            .hash = "ztls-0.1.0-kXOuzgQvCwBvRISo22rrTaAM4vvuynw9YwT81Xn8yjIe",
             .lazy = true,
         },
     },
