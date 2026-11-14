@@ -45,6 +45,9 @@ They are loaded when the server starts. `.bytes` instead of `.file` takes them f
 Clients without a valid certificate can't connect. With `.mode = .request`, clients that don't send
 one are let in too.
 
+`.min_version` is the oldest TLS version a client can connect with. It's TLS 1.2 by default, so
+clients that only speak TLS 1.0 or 1.1 are refused.
+
 See [`http.Listener`](../../apidocs/#http.Listener) for the other listener options.
 
 ## Timeouts

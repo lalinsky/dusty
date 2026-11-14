@@ -213,12 +213,26 @@ pub const ClientAuth = struct {
     mode: ClientAuthMode,
 };
 
+pub const Version = enum { tls_1_0, tls_1_1, tls_1_2, tls_1_3 };
+
+/// `version` as the module's own version type `T`, which may be optional.
+fn backendVersion(comptime T: type, version: Version) T {
+    const E = switch (@typeInfo(T)) {
+        .optional => |o| o.child,
+        else => T,
+    };
+    return switch (version) {
+        inline else => |v| @field(E, @tagName(v)),
+    };
+}
+
 pub const ServerOptions = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     auth: *CertKeyPair,
     client_auth: ?ClientAuth = null,
     alpn_protocols: []const []const u8 = &.{},
+    min_version: Version = .tls_1_2,
     rng: std.Random,
 };
 
@@ -239,6 +253,9 @@ pub fn server(input: *std.Io.Reader, output: *std.Io.Writer, o: ServerOptions) !
             },
         }) else null,
         .alpn_protocols = o.alpn_protocols,
+        .min_version = if (@hasField(Options, "min_version"))
+            backendVersion(@FieldType(Options, "min_version"), o.min_version)
+        else {},
         .rng = o.rng,
     }));
 }

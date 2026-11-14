@@ -202,6 +202,9 @@ pub const ServerConfig = struct {
         /// whose offer shares nothing with a non-empty list is handled by the
         /// TLS module (tls.zig refuses it).
         alpn_protocols: []const []const u8 = &.{},
+        /// The oldest TLS version a client can connect with. A module
+        /// without a version setting ignores it.
+        min_version: tls.Version = .tls_1_2,
 
         pub const ClientAuth = struct {
             /// Certificate authorities used to verify client certificates.
