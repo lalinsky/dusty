@@ -50,7 +50,7 @@
 //! fail at compile time if a sentinel is in one.
 
 const std = @import("std");
-const tls = @import("tls");
+const tls = @import("tls.zig");
 const build_options = @import("build_options");
 
 /// A borrowed view of one connection's reader/writer stack: the interfaces

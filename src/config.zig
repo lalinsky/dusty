@@ -1,5 +1,5 @@
 const std = @import("std");
-const tls = @import("tls");
+const tls = @import("tls.zig");
 
 /// Where a TLS peer's certificate authorities are loaded from. Shared by the
 /// client (verifying server certificates) and the server (verifying client
@@ -18,63 +18,27 @@ pub const TlsCa = union(enum) {
     /// Trust nothing. Rejected unless the side using it says otherwise.
     none,
 
-    /// Reads the certificates into a fresh bundle owned by the caller.
-    pub fn load(self: TlsCa, allocator: std.mem.Allocator, io: std.Io) !std.crypto.Certificate.Bundle {
-        const now = std.Io.Clock.real.now(io);
-
-        var bundle: std.crypto.Certificate.Bundle = .empty;
-        errdefer bundle.deinit(allocator);
+    /// Reads the certificates into a fresh trust store owned by the caller.
+    pub fn load(self: TlsCa, allocator: std.mem.Allocator, io: std.Io) !tls.Trust {
+        var trust = try tls.Trust.init();
+        errdefer trust.deinit(allocator);
         switch (self) {
-            .system => try bundle.rescan(allocator, io, now),
-            .file => |src| try bundle.addCertsFromFilePath(
-                allocator,
-                io,
-                now,
-                src.dir orelse std.Io.Dir.cwd(),
-                src.path,
-            ),
-            .dir => |src| try bundle.addCertsFromDirPath(
-                allocator,
-                io,
-                src.dir orelse std.Io.Dir.cwd(),
-                src.path,
-            ),
-            .bytes => |pem| try addCertsFromPem(&bundle, allocator, pem, now.toSeconds()),
+            .system => try trust.addSystem(allocator, io),
+            .file => |src| try trust.addFile(allocator, io, src.dir orelse std.Io.Dir.cwd(), src.path),
+            .dir => |src| try trust.addDir(allocator, io, src.dir orelse std.Io.Dir.cwd(), src.path),
+            .bytes => |pem| try trust.addPem(allocator, io, pem),
             .none => {},
         }
-        return bundle;
+        return trust;
     }
 };
-
-/// `Bundle.addCertsFromFile` for PEM text already in memory.
-fn addCertsFromPem(bundle: *std.crypto.Certificate.Bundle, allocator: std.mem.Allocator, pem: []const u8, now_sec: i64) !void {
-    const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
-    const begin_marker = "-----BEGIN CERTIFICATE-----";
-    const end_marker = "-----END CERTIFICATE-----";
-
-    const decoded_size_upper_bound = std.math.cast(u32, pem.len / 4 * 3) orelse
-        return error.CertificateAuthorityBundleTooBig;
-    try bundle.bytes.ensureUnusedCapacity(allocator, decoded_size_upper_bound);
-
-    var start_index: usize = 0;
-    while (std.mem.findPos(u8, pem, start_index, begin_marker)) |begin_marker_start| {
-        const cert_start = begin_marker_start + begin_marker.len;
-        const cert_end = std.mem.findPos(u8, pem, cert_start, end_marker) orelse
-            return error.MissingEndCertificateMarker;
-        start_index = cert_end + end_marker.len;
-        const encoded_cert = std.mem.trim(u8, pem[cert_start..cert_end], " \t\r\n");
-        const decoded_start: u32 = @intCast(bundle.bytes.items.len);
-        const dest_buf = bundle.bytes.allocatedSlice()[decoded_start..];
-        bundle.bytes.items.len += try base64.decode(dest_buf, encoded_cert);
-        try bundle.parseCert(allocator, decoded_start, now_sec);
-    }
-}
 
 /// A certificate chain and its private key, presented to the peer: a
 /// server's own certificate, or a client's under mutual TLS.
 ///
 /// The key must be PKCS#8 ("BEGIN PRIVATE KEY") or SEC1 ("BEGIN EC PRIVATE
-/// KEY"); passphrase-protected keys are not supported.
+/// KEY"), or with ztls also PKCS#1 ("BEGIN RSA PRIVATE KEY");
+/// passphrase-protected keys are not supported.
 pub const TlsCertificate = union(enum) {
     /// PEM files: the certificate chain, leaf first, and the private key.
     file: struct {
@@ -94,16 +58,16 @@ pub const TlsCertificate = union(enum) {
     },
 
     /// Reads the certificate chain and key into a pair owned by the caller.
-    pub fn load(self: TlsCertificate, allocator: std.mem.Allocator, io: std.Io) !tls.config.CertKeyPair {
+    pub fn load(self: TlsCertificate, allocator: std.mem.Allocator, io: std.Io) !tls.CertKeyPair {
         return switch (self) {
-            .file => |f| tls.config.CertKeyPair.fromFilePath(
+            .file => |f| tls.CertKeyPair.fromFilePath(
                 allocator,
                 io,
                 f.dir orelse std.Io.Dir.cwd(),
                 f.cert_path,
                 f.key_path,
             ),
-            .bytes => |b| tls.config.CertKeyPair.fromSlice(allocator, io, b.cert, b.key),
+            .bytes => |b| tls.certKeyPairFromSlice(allocator, io, b.cert, b.key),
         };
     }
 };
@@ -139,9 +103,8 @@ pub const Address = union(enum) {
 /// HTTP on 80.
 pub const Listener = struct {
     address: Address,
-    /// When set, every connection accepted here is TLS. Requires the
-    /// `use_tls` build option (enabled by default); with TLS compiled out,
-    /// setting this fails `Server.run`.
+    /// When set, every connection accepted here is TLS. Requires the `tls`
+    /// build option; with TLS compiled out, setting this fails `Server.run`.
     tls: ?ServerConfig.Tls = null,
     /// How many connections the kernel accepts on the server's behalf
     /// while it is not accepting itself. Past this, Linux drops the
@@ -248,7 +211,7 @@ pub const ServerConfig = struct {
             /// `.request` asks for one but accepts an empty reply.
             mode: Mode = .require,
 
-            pub const Mode = enum { request, require };
+            pub const Mode = tls.ClientAuthMode;
         };
     };
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const tls = @import("tls");
+const tls = @import("tls.zig");
 const build_options = @import("build_options");
 
 const Router = @import("router.zig").Router;
@@ -90,11 +90,9 @@ fn remoteAddress(peer: std.Io.net.IpAddress, headers: *const Headers, trusted_pr
 }
 
 /// Borrowed view of the client-certificate settings, handed to each accepted
-/// connection. The bundle is owned by the Server and outlives every connection.
-const ClientAuthRef = struct {
-    bundle: *std.crypto.Certificate.Bundle,
-    mode: ServerConfig.Tls.ClientAuth.Mode,
-};
+/// connection. The trust store is owned by the Server and outlives every
+/// connection.
+const ClientAuthRef = tls.ClientAuth;
 
 /// Primed into each pooled request arena, so an ordinary request is served
 /// without growing it. A request that needs more grows it once, and the
@@ -109,9 +107,9 @@ const request_arena_reserve = 8 * 1024;
 /// of the way into the pooled buffer.
 const idle_read_buffer_len = 1024;
 
-/// An injected TLS module may predate `inPlaceWriter`; its writer then goes
+/// An injected TLS module may have no in-place writer; its writer then goes
 /// through the request write buffer.
-const tls_in_place = build_options.use_tls and @hasDecl(tls.Connection, "inPlaceWriter");
+const tls_in_place = build_options.use_tls and tls.has_writer_in_place;
 
 /// Owns the reader/writer (and, for TLS, the whole TLS + underlying TCP
 /// layer) and their buffers for one accepted connection. The buffer a
@@ -195,7 +193,7 @@ pub const Connection = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         stream: std.Io.net.Stream,
-        auth: *tls.config.CertKeyPair,
+        auth: *tls.CertKeyPair,
         client_auth: ?ClientAuthRef,
         alpn_protocols: []const []const u8,
     ) !void {
@@ -209,22 +207,15 @@ pub const Connection = struct {
         self.tcp_writer = stream.writer(io, tcp_write_buffer);
         self.tls_rng = .{ .io = io };
         self.tls_conn = try tls.server(&self.tcp_reader.interface, &self.tcp_writer.interface, .{
+            .allocator = allocator,
+            .io = io,
             .auth = auth,
-            // Built here rather than passed in as a tls.config.ClientAuth, so
-            // stubs/tls.zig does not have to mirror the type.
-            .client_auth = if (client_auth) |ca| .{
-                .root_ca = ca.bundle.*,
-                .auth_type = switch (ca.mode) {
-                    .request => .request,
-                    .require => .require,
-                },
-            } else null,
-            .now = std.Io.Clock.real.now(io),
+            .client_auth = client_auth,
             .rng = self.tls_rng.interface(),
             .alpn_protocols = alpn_protocols,
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
-        self.tls_writer = if (tls_in_place) self.tls_conn.?.inPlaceWriter() else self.tls_conn.?.writer(&.{});
+        self.tls_writer = if (tls_in_place) self.tls_conn.?.writerInPlace() else self.tls_conn.?.writer(&.{});
         self.reader = &self.tls_reader.interface;
         self.writer = &self.tls_writer.interface;
     }
@@ -308,12 +299,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection) void {
         if (build_options.use_tls) {
-            // tls.zig's Connection owns no memory and has no deinit; a TLS
-            // module backed by a C library (one SSL object per connection)
-            // frees it here.
-            if (@hasDecl(tls.Connection, "deinit")) {
-                if (self.tls_conn) |*c| c.deinit();
-            }
+            if (self.tls_conn) |*c| tls.deinitConnection(c);
             self.tls_conn = null;
         }
         self.allocator.free(self.buffers);
@@ -459,8 +445,8 @@ pub fn Server(comptime App: type) type {
             config: *const Listener,
             address: Address,
             server: std.Io.net.Server,
-            tls_auth: ?tls.config.CertKeyPair = null,
-            tls_client_ca: ?std.crypto.Certificate.Bundle = null,
+            tls_auth: ?tls.CertKeyPair = null,
+            tls_client_ca: ?tls.Trust = null,
             client_auth_mode: ServerConfig.Tls.ClientAuth.Mode = .require,
 
             fn freeTls(l: *ActiveListener, allocator: std.mem.Allocator) void {
@@ -469,8 +455,8 @@ pub fn Server(comptime App: type) type {
                         auth.deinit(allocator);
                         l.tls_auth = null;
                     }
-                    if (l.tls_client_ca) |*bundle| {
-                        bundle.deinit(allocator);
+                    if (l.tls_client_ca) |*trust| {
+                        trust.deinit(allocator);
                         l.tls_client_ca = null;
                     }
                 }
@@ -681,7 +667,7 @@ pub fn Server(comptime App: type) type {
 
             if (cfg.tls) |tls_cfg| {
                 if (!build_options.use_tls) {
-                    log.err("tls is set but the library was built with use_tls=false", .{});
+                    log.err("tls is set but the library was built without TLS", .{});
                     return error.TlsNotConfigured;
                 }
                 if (tls_cfg.client_auth) |client_auth| {
@@ -1082,8 +1068,8 @@ pub fn Server(comptime App: type) type {
                         defer timer.clear(self.io);
                         self.armTimer(&timer, self.config.timeout.request);
 
-                        const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*bundle| .{
-                            .bundle = bundle,
+                        const client_auth: ?ClientAuthRef = if (l.tls_client_ca) |*trust| .{
+                            .trust = trust,
                             .mode = l.client_auth_mode,
                         } else null;
 
@@ -1478,7 +1464,7 @@ test "trusted proxy hops select X-Forwarded-For from the right" {
 fn testTlsConnection() Connection {
     var conn: Connection = undefined;
     conn.initWriterForTesting(undefined);
-    conn.tls_conn = .{ .input = undefined, .output = undefined, .cipher = undefined };
+    conn.tls_conn = @as(tls.Connection, undefined);
     conn.tls_reader.err = null;
     conn.tls_writer.err = null;
     return conn;

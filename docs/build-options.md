@@ -1,45 +1,55 @@
 # Build Options
 
-Dusty uses two external libraries: [tls.zig](https://github.com/lalinsky/tls.zig) for TLS and
-[zlib.zig](https://github.com/lalinsky/zlib.zig) for gzip and deflate. Both are on by default, and
-you can turn either of them off. A library that's turned off isn't downloaded or compiled.
-
 The options go in the `b.dependency` call in `build.zig`:
 
 ```zig
 const dusty_dep = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
-    .use_tls = false,
+    .tls = .ztls,
 });
 ```
 
-## use_tls
+A library that an option turns off isn't downloaded or compiled.
 
-`use_tls` builds in TLS. Without it, HTTPS requests fail with `error.TlsNotConfigured`. A server
-with a TLS listener fails to start.
+## tls
 
-## use_zlib
+TLS is opt-in. By default, `tls` is `none`, so HTTPS requests fail with `error.TlsNotConfigured`,
+and a server with a TLS listener fails to start.
 
-`use_zlib` builds in gzip and deflate. Without it, compressed bodies can't be decoded. Responses are
-sent uncompressed, even when compression is turned on.
+Dusty has two TLS backends built in, both from [ztls](https://github.com/lalinsky/ztls), which is
+built on [AWS-LC](https://github.com/aws/aws-lc). AWS-LC is C, compiled along with your program, so
+the first build takes a while.
 
-## Using Your Own tls.zig
+- `ztls` uses ztls's native engine, which implements the TLS protocol in Zig and uses AWS-LC for
+  cryptography. It's the faster of the two: reading and writing don't share a lock, and records
+  are encrypted and decrypted without extra copies. It's newer, and speaks only the modern parts
+  of TLS: TLS 1.3 as client and server, and TLS 1.2 as client only.
+- `libssl` uses ztls's libssl engine, which wraps AWS-LC's own TLS implementation. It has much more
+  real-world use behind it, and speaks the older versions and cipher suites some peers still need,
+  TLS 1.0 to 1.3 on both sides. It's a little slower, and needs a C++ runtime.
 
-Dusty pins a version of tls.zig. To use a different one, add it to your own `build.zig.zon`, set
-`use_bundled_tls = false` and import its module into Dusty's:
+With `custom`, Dusty uses a TLS module you provide instead, which can be another version of ztls,
+or any library with the same API, such as [tls.zig](https://github.com/ianic/tls.zig). Add it to
+your own `build.zig.zon` and import its module into Dusty's as `"tls"`:
 
 ```zig
 const dusty_dep = b.dependency("dusty", .{
     .target = target,
     .optimize = optimize,
-    .use_bundled_tls = false,
+    .tls = .custom,
 });
 const tls = b.dependency("tls", .{ .target = target, .optimize = optimize });
 dusty_dep.module("dusty").addImport("tls", tls.module("tls"));
 ```
 
-The module has to be compatible with the version Dusty pins. If you forget the import, the build
-fails with an error that tells you what to add.
+ztls names its module `ztls`, so for it use `tls.module("ztls")`. Dusty looks at the options the
+module takes and fills in the ones it has, so small differences between versions don't matter. If
+you forget the import, the build fails with an error that tells you what to add. You import zio
+the same way, see [Deployment](server/deployment.md#running-on-zio).
 
-You import zio the same way. See [Deployment](server/deployment.md#running-on-zio).
+## use_zlib
+
+`use_zlib` builds in gzip and deflate with [zlib.zig](https://github.com/lalinsky/zlib.zig). It's
+on by default. Without it, compressed bodies can't be decoded, and responses are sent
+uncompressed, even when compression is turned on.
