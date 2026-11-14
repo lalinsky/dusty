@@ -2569,9 +2569,22 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
     try slow_writer.interface.flush();
     try sync.started.wait(io);
 
-    // Idle by the time the drain starts.
+    // Idle by the time the drain starts. Its first request is answered
+    // before the shutdown, so the server has accepted it and its handler is
+    // waiting for the next one; connecting alone would leave it racing the
+    // shutdown in the accept queue.
     const idle = try server.address.ip.connect(io, .{ .mode = .stream });
     defer idle.close(io);
+    var write_buf: [256]u8 = undefined;
+    var writer = idle.writer(io, &write_buf);
+    var read_buf: [1024]u8 = undefined;
+    var reader = idle.reader(io, &read_buf);
+    var status: [64]u8 = undefined;
+    var body: [16]u8 = undefined;
+    try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    try writer.interface.flush();
+    const first = try readResponse(&reader.interface, &status, &body);
+    try std.testing.expectEqualStrings("OK", first.body);
 
     // The drain blocks on the slow handler, so it runs on a task of its own.
     var shutdown_future = try io.concurrent(struct {
@@ -2584,15 +2597,8 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
         try io.sleep(.fromMilliseconds(1), .awake);
     }
 
-    var write_buf: [256]u8 = undefined;
-    var writer = idle.writer(io, &write_buf);
     try writer.interface.writeAll("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     try writer.interface.flush();
-
-    var read_buf: [1024]u8 = undefined;
-    var reader = idle.reader(io, &read_buf);
-    var status: [64]u8 = undefined;
-    var body: [16]u8 = undefined;
     const resp = try readResponse(&reader.interface, &status, &body);
     try std.testing.expectStringStartsWith(resp.status, "HTTP/1.1 503 ");
     try std.testing.expectError(error.EndOfStream, reader.interface.fillMore());
