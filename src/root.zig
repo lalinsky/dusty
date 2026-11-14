@@ -7,6 +7,7 @@ pub const ServerConfig = @import("config.zig").ServerConfig;
 pub const TlsCa = @import("config.zig").TlsCa;
 pub const TlsCertificate = @import("config.zig").TlsCertificate;
 pub const TlsPath = @import("config.zig").TlsPath;
+pub const TlsVersion = @import("tls.zig").Version;
 pub const Router = @import("router.zig").Router;
 pub const Action = @import("router.zig").Action;
 pub const RouteInfo = @import("router.zig").RouteInfo;

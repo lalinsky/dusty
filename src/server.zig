@@ -196,6 +196,7 @@ pub const Connection = struct {
         auth: *tls.CertKeyPair,
         client_auth: ?ClientAuthRef,
         alpn_protocols: []const []const u8,
+        min_version: tls.Version,
     ) !void {
         try self.init(allocator, io, stream, tls.input_buffer_len + tls.output_buffer_len);
 
@@ -213,6 +214,7 @@ pub const Connection = struct {
             .client_auth = client_auth,
             .rng = self.tls_rng.interface(),
             .alpn_protocols = alpn_protocols,
+            .min_version = min_version,
         });
         self.tls_reader = self.tls_conn.?.reader(&.{});
         self.tls_writer = if (tls_in_place) self.tls_conn.?.writerInPlace() else self.tls_conn.?.writer(&.{});
@@ -1073,7 +1075,8 @@ pub fn Server(comptime App: type) type {
                             .mode = l.client_auth_mode,
                         } else null;
 
-                        connection.initTls(self.allocator, self.io, stream, auth, client_auth, l.config.tls.?.alpn_protocols) catch |err| {
+                        const tls_config = l.config.tls.?;
+                        connection.initTls(self.allocator, self.io, stream, auth, client_auth, tls_config.alpn_protocols, tls_config.min_version) catch |err| {
                             // tls.zig only saw the ciphertext reader or
                             // writer fail generically, so the cause is a
                             // layer down -- and when the handshake ran out
