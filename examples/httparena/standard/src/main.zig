@@ -234,13 +234,13 @@ fn specOptions(req: *http.Request, res: *http.Response) !void {
 
 fn specHeaders(req: *http.Request, res: *http.Response) !void {
     _ = try req.body();
-    var out: std.Io.Writer.Allocating = .init(req.arena);
+    var body = res.writer();
     var it = req.headers.iterator();
     while (it.next()) |h| {
-        try out.writer.print("{s}: {s}\n", .{ h.key, h.value });
+        try body.interface.print("{s}: {s}\n", .{ h.key, h.value });
     }
+    try body.end();
     res.content_type = .text;
-    res.body = out.written();
 }
 
 pub fn main(init: std.process.Init) !void {
