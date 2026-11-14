@@ -13,12 +13,12 @@
             .path = "../../..",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#32bbf047aac8b1fa7e49dc1a79ae8082b4a1b33a",
-            .hash = "zio-0.19.0-xHbVVOehLQCpyVIYHdtdeEHRc-gMZgF5WUdhm52KnRqQ",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#5357759537d43c902d04c57cfa1a8a9e2a574fe3",
+            .hash = "zio-0.20.1-xHbVVEIyLwBDRNXDTm2cJE9-yMPIbVICCUcelHSMDgz6",
         },
         .pg = .{
-            .url = "git+https://github.com/lalinsky/pg.zig?ref=v2026.10.25.0#865dab2d86d14d76fa82e2ef7d61905d40197fa0",
-            .hash = "pg-0.0.0-Wp_7gVkXBwAosCT75tkekt6ZaVDCzugFEdCGdLxBFzLv",
+            .url = "git+https://github.com/lalinsky/pg.zig?ref=v2026.11.14.0#269084176288f9a439141b5d76d159c5066db689",
+            .hash = "pg-0.0.0-Wp_7gThpBwCVmFFQ1a1vs6zK3MByN2KZgFLKRjD257tE",
         },
         .zt = .{
             .url = "git+https://github.com/lalinsky/zt?ref=v0.2.1#061e59dfec493d1c43e4417e8394daf6d70ddcc3",
