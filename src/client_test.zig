@@ -1870,7 +1870,7 @@ test "Client: a redirect body is not drained from a connection that won't be reu
 }
 
 test "Server: res.compress gzips buffered and streamed bodies for a client that accepts it" {
-    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    if (!@import("build_options").compression) return error.SkipZigTest;
     const io = std.testing.io;
 
     var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});

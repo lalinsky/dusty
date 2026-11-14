@@ -948,7 +948,7 @@ pub fn BodyReader(comptime Parser: type) type {
             encoding: ContentEncoding,
         ) StartDecodingError!void {
             // Built without zlib, nothing here can undo a coding.
-            if (!build_options.use_zlib and encoding != .identity) return error.UnsupportedContentEncoding;
+            if (!build_options.compression and encoding != .identity) return error.UnsupportedContentEncoding;
             const container: zlib.Container = switch (encoding) {
                 .identity => return,
                 .gzip => .gzip,

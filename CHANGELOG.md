@@ -48,6 +48,7 @@ This release changes how handlers are written: they take only the parameters the
 
 ### Upgrade notes
 
+- The `use_zlib` build option is now `compression`, and it is off by default, so Dusty fetches no dependency you don't ask for. Pass `.compression = true` to decode gzip and deflate bodies and to compress responses.
 - `Server.ctx` is renamed to `Server.app`. In middleware, `executor.ctx` is now the request context; the app is `executor.app`.
 - Declaring `App.dispatch` is now a compile error. Use a middleware instead.
 - The `Session` middleware keeps the session in the request context, so the app must declare `pub const RequestContext = struct { session: http.SessionData = .{} };`. `req.session` is removed; use `ctx.session`.

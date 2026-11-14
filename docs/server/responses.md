@@ -68,7 +68,8 @@ directory. See [Static Files and Assets](static-files.md).
 
 ## Compression
 
-With `res.compress = true`, the body is sent gzipped to clients that accept it:
+With `res.compress = true`, the body is sent gzipped to clients that accept it. This needs the
+[`compression`](../build-options.md#compression) build option:
 
 ```zig
 --8<-- "examples/responses.zig:compress"

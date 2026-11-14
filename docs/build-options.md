@@ -48,8 +48,8 @@ module takes and fills in the ones it has, so small differences between versions
 you forget the import, the build fails with an error that tells you what to add. You import zio
 the same way, see [Deployment](server/deployment.md#running-on-zio).
 
-## use_zlib
+## compression
 
-`use_zlib` builds in gzip and deflate with [zlib.zig](https://github.com/lalinsky/zlib.zig). It's
-on by default. Without it, compressed bodies can't be decoded, and responses are sent
-uncompressed, even when compression is turned on.
+`compression` builds in gzip and deflate with [zlib.zig](https://github.com/lalinsky/zlib.zig).
+It's off by default. Without it, compressed bodies can't be decoded, the client doesn't ask for
+them, and responses are sent uncompressed, even with `res.compress = true`.
