@@ -77,7 +77,7 @@ pub fn Router(comptime App: type) type {
 
         /// What the router calls. A handler registered with `get`, `post`
         /// and the like can instead take any of `*App`, `*Request`,
-        /// `*Response`, `*App.RequestContext` and `Param`s of its path, in
+        /// `*Response`, `*App.RequestContext` and `Path`s of its route, in
         /// any order.
         pub const Handler = if (App == void)
             fn (*Request, *Response) anyerror!void
@@ -88,7 +88,7 @@ pub fn Router(comptime App: type) type {
             info: RouteInfo,
             action: *const Handler,
             middlewares: []const Middleware(App),
-            /// Whether the handler's `Param`s parse. If they don't, the
+            /// Whether the handler's `Path`s parse. If they don't, the
             /// route does not match.
             accepts: ?*const fn (req: *const Request) bool = null,
             /// Registered by `static` for its directory index, and replaced
@@ -725,7 +725,7 @@ fn pathParams(comptime path: []const u8) []const []const u8 {
     }
 }
 
-/// A compile error unless every `Param` of `F` names a parameter of
+/// A compile error unless every `Path` of `F` names a parameter of
 /// `path`, and no two name the same one.
 fn checkParams(comptime path: []const u8, comptime F: type) void {
     const names = pathParams(path);
@@ -736,7 +736,7 @@ fn checkParams(comptime path: []const u8, comptime F: type) void {
         }
         for (names) |name| {
             if (std.mem.eql(u8, name, P.param_name)) break;
-        } else @compileError("handler for route " ++ path ++ " takes dusty.Param(\"" ++ P.param_name ++ "\", " ++ @typeName(P.Value) ++ "), but the path has no :" ++ P.param_name);
+        } else @compileError("handler for route " ++ path ++ " takes dusty.Path(\"" ++ P.param_name ++ "\", " ++ @typeName(P.Value) ++ "), but the path has no :" ++ P.param_name);
     }
 }
 
@@ -2006,21 +2006,21 @@ test "Router: a route's path is decoded segment by segment, like a request's" {
     try std.testing.expectEqual(&testHandler2, (try router.findHandler(try split(&req))).?.action);
 }
 
-const Param = @import("extract.zig").Param;
+const Path = @import("extract.zig").Path;
 const RequestContext = @import("request.zig").RequestContext;
 
 fn testRequest(arena: std.mem.Allocator, url: []const u8) Request {
     return .{ .method = .get, .url = url, .arena = arena, .parser = undefined, .transport = undefined };
 }
 
-test "Router: a Param that does not parse makes the route not match" {
+test "Router: a Path that does not parse makes the route not match" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     const App = struct {
         page: u32 = 0,
 
-        fn handle(app: *@This(), page: Param("page", u32)) void {
+        fn handle(app: *@This(), page: Path("page", u32)) void {
             app.page = page.value;
         }
     };
@@ -2042,14 +2042,14 @@ test "Router: a Param that does not parse makes the route not match" {
     try std.testing.expect(try router.findHandler(try split(&negative)) == null);
 }
 
-test "Router: a route its Param rejects falls through to the next match" {
+test "Router: a route its Path rejects falls through to the next match" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
     var router = Router(void).init(std.testing.allocator);
     defer router.deinit();
     const H = struct {
-        fn byId(_: Param("id", u64)) void {}
+        fn byId(_: Path("id", u64)) void {}
         fn rest(_: *Response) void {}
     };
     router.get("/users/:id", H.byId);
@@ -2065,7 +2065,7 @@ test "Router: a route its Param rejects falls through to the next match" {
     try std.testing.expectEqualStrings("alice", name.params.get("rest").?);
 }
 
-test "Router: an enum Param in a group prefix filters the values" {
+test "Router: an enum Path in a group prefix filters the values" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -2074,7 +2074,7 @@ test "Router: an enum Param in a group prefix filters the values" {
     defer router.deinit();
     const localized = router.group("/:lang", &.{});
     localized.get("/page", struct {
-        fn handle(_: Param("lang", Lang)) void {}
+        fn handle(_: Path("lang", Lang)) void {}
     }.handle);
 
     var de = testRequest(arena.allocator(), "/de/page");

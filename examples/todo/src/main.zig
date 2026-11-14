@@ -133,19 +133,19 @@ fn create(app: *App, req: *http.Request, res: *http.Response) !void {
     try renderList(app, req, res);
 }
 
-fn toggle(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Response) !void {
+fn toggle(app: *App, id: http.Path("id", i32), req: *http.Request, res: *http.Response) !void {
     const todo = try app.queryTodo(req.arena, "UPDATE todos SET done = NOT done WHERE id = $1 RETURNING id, title, done", .{id.value}) orelse return error.NotFound;
     try res.render(.html, templates.TodoItemWithCount, .{ todo, try app.countActive() });
 }
 
 // --8<-- [start:edit]
-fn edit(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Response) !void {
+fn edit(app: *App, id: http.Path("id", i32), req: *http.Request, res: *http.Response) !void {
     const todo = try app.queryTodo(req.arena, "SELECT id, title, done FROM todos WHERE id = $1", .{id.value}) orelse return error.NotFound;
     try res.render(.html, templates.TodoEdit, .{todo});
 }
 // --8<-- [end:edit]
 
-fn update(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.Response) !void {
+fn update(app: *App, id: http.Path("id", i32), req: *http.Request, res: *http.Response) !void {
     const form = try req.formData();
     const title = std.mem.trim(u8, form.get("title") orelse "", &std.ascii.whitespace);
 
@@ -157,7 +157,7 @@ fn update(app: *App, id: http.Param("id", i32), req: *http.Request, res: *http.R
 }
 
 // --8<-- [start:exec]
-fn delete(app: *App, id: http.Param("id", i32), res: *http.Response) !void {
+fn delete(app: *App, id: http.Path("id", i32), res: *http.Response) !void {
     const deleted = try app.pool.exec("DELETE FROM todos WHERE id = $1", .{id.value});
     if (deleted != 1) return error.NotFound;
     try res.render(.html, templates.Count, .{ try app.countActive(), true });

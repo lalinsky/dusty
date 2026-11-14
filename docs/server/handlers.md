@@ -8,14 +8,14 @@ parameters it needs, in any order, and each one is filled in by its type:
 - [`*http.Response`](../../apidocs/#http.Response)
 - `*App.RequestContext`, a struct that each request gets its own copy of, see
   [Middleware](middleware.md)
-- `http.Param`, `http.Query` and `http.Header`, values from the request
+- `http.Path`, `http.Query` and `http.Header`, values from the request
 - Your own types, filled in by their `extract` function
 
 The return type is `void` or `!void`.
 
 ## Values from the Request
 
-[`http.Param`](../../apidocs/#http.Param), [`http.Query`](../../apidocs/#http.Query) and
+[`http.Path`](../../apidocs/#http.Path), [`http.Query`](../../apidocs/#http.Query) and
 [`http.Header`](../../apidocs/#http.Header) give the handler a path parameter, a query parameter
 and a header, parsed as the type you ask for:
 
@@ -99,7 +99,7 @@ The app can replace the default 404 and error responses by declaring `notFound` 
 route. The 405 for a method with no route on the path goes through `methodNotAllowed` the same way,
 which gets the response with the status and the `Allow` header already set. `uncaughtError` returns
 `void`, so it can't fail. It can take the error as `anyerror`, but not
-`http.Param`, `http.Query`, `http.Header` or your own types.
+`http.Path`, `http.Query`, `http.Header` or your own types.
 
 The 400, 413 and 415 for what the client got wrong don't go through `uncaughtError`. To answer
 those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request

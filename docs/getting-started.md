@@ -71,7 +71,7 @@ Here is what the code does:
 
 A handler declares only the parameters it needs. The order doesn't matter. Both handlers take
 `*App` and [`*http.Response`](../apidocs/#http.Response). The `*App` is the pointer you passed to `init`. `hello` also takes
-[`http.Param("name", []const u8)`](../apidocs/#http.Param), which holds the `:name` segment in `.value`. A handler that
+[`http.Path("name", []const u8)`](../apidocs/#http.Path), which holds the `:name` segment in `.value`. A handler that
 needs the request itself, for example to read its headers or body, can also take [`*http.Request`](../apidocs/#http.Request).
 
 [`res.print`](../apidocs/#http.Response.print) formats the body and sets the content type from its first argument. `.text` sends
