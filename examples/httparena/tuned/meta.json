@@ -1,0 +1,30 @@
+{
+  "display_name": "dusty-tuned",
+  "language": "Zig",
+  "type": "emerging",
+  "mode": "tuned",
+  "completeness": {
+    "routing": true,
+    "middleware": true,
+    "request": true,
+    "response": true
+  },
+  "engine": "zio",
+  "description": "Dusty HTTP framework on the zio async runtime, the dusty entry with two changes: JSON through json.zig instead of std.json, and no request or keep-alive timeouts. Same routes, static and TLS paths as dusty.",
+  "repo": "https://github.com/lalinsky/dusty",
+  "enabled": true,
+  "tests": [
+    "baseline", "latency-1m", "latency-10k", "latency-500k-8cpu",
+    "pipelined",
+    "limited-conn",
+    "async",
+    "json-comp", "json-tls", "static-tls",
+    "8gbit",
+    "async-db",
+    "fortunes",
+    "echo-ws", "echo-ws-pipeline", "echo-ws-limited"
+  ],
+  "maintainers": [
+    "lalinsky"
+  ]
+}
