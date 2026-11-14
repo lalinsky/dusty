@@ -13,7 +13,7 @@ come from [examples/todo](https://github.com/lalinsky/dusty/tree/main/examples/t
 Add pg.zig to the project:
 
 ```sh
-$ zig fetch --save "git+https://github.com/lalinsky/pg.zig#v2026.10.25.0"
+$ zig fetch --save "git+https://github.com/lalinsky/pg.zig#v2026.11.14.0"
 ```
 
 And import the module in `build.zig`:

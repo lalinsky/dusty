@@ -4,19 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-This release changes how handlers are written: they take only the parameters they need, including typed path, query and header values. Middleware gets per-request context and hooks around sending the response. HTTP/1.1 handling is stricter and follows RFC 9110 and RFC 9112 more closely, after an audit with HTTP Garden. Dusty also has a documentation site now, at https://lalinsky.github.io/dusty/.
+## [0.6.0] - 2026-11-14
+
+This release changes how handlers are written: they take only the parameters they need, including typed path, query and header values. Middleware gets per-request context and hooks around sending the response. HTTP/1.1 handling is stricter and follows RFC 9110 and RFC 9112 more closely, after an audit with HTTP Garden. TLS now uses ztls, with a choice of native and libssl engines, and both TLS and compression are opt-in. Development tools can restart the server and reload open pages after a rebuild. Dusty also has a documentation site now, at https://lalinsky.github.io/dusty/.
 
 ### Highlights
 
-- Handlers take only the parameters they need, in any order: `*App`, `*Request`, `*Response`, `*App.RequestContext`, and typed values from the request. `fn index(res: *http.Response) !void` is a valid handler. `notFound` and `uncaughtError` take their parameters the same way.
+- Handlers take only the parameters they need, in any order: `*App`, `*Request`, `*Response`, `*App.RequestContext`, and typed values from the request. `fn index(res: *http.Response) !void` is a valid handler. `notFound`, `methodNotAllowed` and `uncaughtError` take their parameters the same way.
 - `http.Path("id", u64)` reads a path parameter as an integer, enum, bool, string, or your own type with `parseParam`. The name is checked against the route path at compile time. A value that doesn't parse doesn't match the route, and routing moves on to the next one.
 - `http.Query` and `http.Header` read a query parameter or header the same way. A missing or malformed value is answered with a 400. Use `?T` for an optional one.
 - `App.RequestContext` declares per-request data that middleware can fill in for handlers, such as the logged-in user. Middleware uses `executor.ctx`. Handlers take `*App.RequestContext` or call `req.ctx(App)`.
 - Middleware can declare `onHeaders`, which runs just before the response headers are sent, and `onComplete`, which runs after the response is sent or fails.
 - Groups can be nested with `group.group(...)`, and a group can have no prefix. The outer group's middleware runs before the inner group's.
 
+### TLS
+
+- TLS is now built on ztls v0.2.1 and AWS-LC. Choose `.tls = .ztls` for the native Zig engine, `.tls = .libssl` for AWS-LC's TLS implementation, or `.tls = .custom` to inject a compatible module.
+- The native engine supports TLS 1.3 for clients and servers, and TLS 1.2 for clients. The libssl engine supports TLS 1.0 through 1.3 for both.
+- With ztls, certificates can also use PKCS#1 private keys (`BEGIN RSA PRIVATE KEY`).
+- After a failed TLS handshake, the server shuts down its send side and drains unread input before closing, so clients can receive the TLS alert instead of a connection reset, including on Windows.
+
+### Development
+
+- Added the `addRunServer` build helper, which runs an installed server and restarts it whenever a new build is installed. Use it alongside `zig build --watch -fincremental`; a failed build leaves the running server in place.
+- Added `http.dev` for reloading open browser pages after a server restart. It is enabled by `DUSTY_DEV`, which `addRunServer` sets. The reload script is served as a separate file and accepts a nonce for Content Security Policy.
+- Asset modules keep the same path as their contents change, so embedded assets work with incremental rebuilds.
+
 ### Routing
 
+- Routing is about four times faster, with faster path and query parsing and array-backed parameters. Typical requests route without allocating.
+- A path registered for other methods now gets a 405 with an `Allow` header instead of a 404. GET routes also allow HEAD. Declare `App.methodNotAllowed` to customize the response.
 - Routes are matched against the decoded path, one segment at a time. `/a%2Fb` is the single segment `a/b`, and route paths are decoded the same way. `req.path` holds the decoded path and `req.query_string` the raw query.
 - A malformed percent escape in the path is answered with a 400. In the query string and form bodies, a `%` that doesn't start an escape is now kept as a literal `%`.
 - Routes can name a parameter at the same position differently, such as `/users/:id` and `/users/:name/posts`. The second route used to get its value under the first route's name.
@@ -42,12 +59,16 @@ This release changes how handlers are written: they take only the parameters the
 ### Other changes
 
 - The `Session` middleware now also sets the session cookie on streamed responses.
+- File responses now give the file reader a buffer, so I/O backends that copy files have room to read them.
+- Added standard and tuned HttpArena examples, built in CI, and more examples covering the server and client APIs.
+- CI now tests Zig 0.17.1 alongside Zig 0.16. The Todo example now uses Zig 0.17.
 - Added `ContentType.cbor` (`application/cbor`).
 - `ServerConfig.request.max_header_count` now defaults to 64 instead of 32.
 - `zig build docs` builds the API reference.
 
 ### Upgrade notes
 
+- `use_tls` and `use_bundled_tls` are replaced by `tls`, which defaults to `.none`. Set `.tls = .ztls` or `.tls = .libssl` to enable HTTPS. For an injected module, use `.tls = .custom` and add the `"tls"` import as before. Without TLS, HTTPS requests fail with `error.TlsNotConfigured`, and a server with a TLS listener fails to start.
 - The `use_zlib` build option is now `compression`, and it is off by default, so Dusty fetches no dependency you don't ask for. Pass `.compression = true` to decode gzip and deflate bodies and to compress responses.
 - `Server.ctx` is renamed to `Server.app`. In middleware, `executor.ctx` is now the request context; the app is `executor.app`.
 - Declaring `App.dispatch` is now a compile error. Use a middleware instead.
@@ -56,6 +77,7 @@ This release changes how handlers are written: they take only the parameters the
 - `Router.Group` is now a function of the prefix, `Router.Group(prefix)`. Code that names the type should use `@TypeOf(router.group(...))` instead.
 - Registering two routes for the same method and path now panics, instead of the second one replacing the first.
 - Values in `req.params` are now percent-decoded.
+- `Params.map` is removed. Use `get`, `put`, `count`, `entries` or `iterator` on `Params` directly. `Request.formData()` now returns `Params` instead of `std.StringHashMapUnmanaged([]const u8)`.
 - `ServerConfig.request.max_param_count` is removed. A request gets only the parameters its route declares, so there is nothing to limit.
 - An HTTP/1.1 request without `Host` is answered with a 400.
 - `uncaughtError` no longer receives the 400, 413 and 415 client errors. To handle them yourself, for example as JSON, set `ServerConfig.request.answer_client_errors = false`; `req.clientErrorStatus()` returns the status the server would have sent.
@@ -206,7 +228,8 @@ Initial release.
 - Cookie support.
 - Request/keepalive timeouts via coroutine auto-cancellation.
 
-[Unreleased]: https://github.com/lalinsky/dusty/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/lalinsky/dusty/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/lalinsky/dusty/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/lalinsky/dusty/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/lalinsky/dusty/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/lalinsky/dusty/compare/v0.3.0...v0.3.1

@@ -41,7 +41,7 @@ Requires Zig 0.16 or 0.17.
 1) Add Dusty as a dependency in your `build.zig.zon`:
 
 ```sh
-zig fetch --save "git+https://github.com/lalinsky/dusty"
+zig fetch --save "git+https://github.com/lalinsky/dusty#v0.6.0"
 ```
 
 2) In your `build.zig`, add the `dusty` module as a dependency to your program:
@@ -135,7 +135,7 @@ across browser tabs over Server-Sent Events.
 
 Databases:
 
-- [pg.zig](https://github.com/lalinsky/pg.zig) - PostgreSQL client (fork that uses [tls.zig](https://github.com/ianic/tls.zig) instead of `OpenSSL` for `std.Io` compatibility)
+- [pg.zig](https://github.com/lalinsky/pg.zig) - PostgreSQL client for `std.Io`, with optional TLS through [ztls](https://github.com/lalinsky/ztls)
 - [mysql](https://github.com/speed2exe/myzql) - MySQL client
 - [redis.zig](https://github.com/lalinsky/redis.zig) - Redis client
 - [memcached.zig](https://github.com/lalinsky/memcached.zig) - Memcached client
