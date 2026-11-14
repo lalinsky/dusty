@@ -233,7 +233,6 @@ fn specOptions(req: *http.Request, res: *http.Response) !void {
 }
 
 fn specHeaders(req: *http.Request, res: *http.Response) !void {
-    _ = try req.body();
     var body = res.writer();
     var it = req.headers.iterator();
     while (it.next()) |h| {
@@ -241,6 +240,8 @@ fn specHeaders(req: *http.Request, res: *http.Response) !void {
     }
     try body.end();
     res.content_type = .text;
+    // Decoding the body drops Content-Encoding and Content-Length.
+    _ = try req.body();
 }
 
 pub fn main(init: std.process.Init) !void {
