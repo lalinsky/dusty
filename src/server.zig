@@ -1025,6 +1025,14 @@ pub fn Server(comptime App: type) type {
                 self.request_buffers.release(b);
                 buffers.* = null;
             }
+            return self.linger(connection, connection.reader, timer);
+        }
+
+        /// The part of `lingeringClose` that hangs up: shuts the send side,
+        /// then throws away what `reader` gets until the peer hangs up. A
+        /// failed TLS handshake passes the socket's own reader, since the
+        /// TLS layer above it can read no more.
+        fn linger(self: *Self, connection: *Connection, reader: *std.Io.Reader, timer: *Timer) !void {
             connection.stream.shutdown(self.io, .send) catch |err| switch (err) {
                 // Already gone: nothing left to throw away.
                 error.SocketUnconnected, error.ConnectionResetByPeer, error.ConnectionAborted => return,
@@ -1033,7 +1041,7 @@ pub fn Server(comptime App: type) type {
             if (!timer.canBound()) return self.io.sleep(linger_timeout, .awake);
             timer.set(self.io, .{ .duration = .{ .raw = linger_timeout, .clock = .awake } });
             defer timer.clear(self.io);
-            _ = connection.reader.discardShort(linger_limit) catch {
+            _ = reader.discardShort(linger_limit) catch {
                 const cause = connection.getReadError() orelse error.Unexpected;
                 // The peer hanging up is the end this waits for. The
                 // deadline arrives as a cancel, and stays one.
@@ -1105,6 +1113,15 @@ pub fn Server(comptime App: type) type {
                                 // flood the error log (nginx logs these at
                                 // info too).
                                 log.info("TLS handshake failed: {}", .{cause});
+                            }
+                            // The handshake ended with an alert to the
+                            // client, which in TLS 1.3 may already have
+                            // sent its request. Closing with that unread
+                            // would reset the connection, and a reset can
+                            // throw the alert away before the client reads
+                            // it, as Windows does.
+                            if (cause != error.OutOfMemory and !Connection.isPeerGone(cause)) {
+                                try self.linger(&connection, &connection.tcp_reader.interface, &timer);
                             }
                             return;
                         };
