@@ -222,7 +222,6 @@ fn specHeaders(req: *http.Request, res: *http.Response) !void {
     }
     try body.end();
     res.content_type = .text;
-    // Decoding the body drops Content-Encoding and Content-Length.
     _ = try req.body();
 }
 
