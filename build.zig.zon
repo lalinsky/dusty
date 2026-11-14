@@ -38,8 +38,8 @@
             .lazy = true,
         },
         .ztls = .{
-            .url = "git+https://github.com/lalinsky/ztls?ref=v0.2.0#ec851ff799611a999fbe2b9d257fe729029d4f09",
-            .hash = "ztls-0.2.0-kXOuzk-4CwBLdINRxhDQRpH_F7YyYqjk1cp8mFiG8trK",
+            .url = "git+https://github.com/lalinsky/ztls?ref=v0.2.1#a367bac13af75c3c8c4b428cacbd584fd828f813",
+            .hash = "ztls-0.2.1-kXOuzkXFCwD3bWm1745QXL056y6OnFOoYqiRh9VHLTPO",
             .lazy = true,
         },
     },
