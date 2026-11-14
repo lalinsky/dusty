@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const dusty = @import("root.zig");
 const loopback_addr: dusty.Address = .{ .ip = .{ .ip4 = .loopback(0) } };
 const loopback: []const dusty.Listener = &.{.{ .address = loopback_addr }};
@@ -2521,6 +2522,13 @@ fn expectIdleConnectionsClosedOnShutdown(timeout: dusty.ServerConfig.Timeout) !v
 }
 
 test "Server: a request arriving during the shutdown drain is refused, not served" {
+    // On macOS, std.debug's unwinder takes a cancelable lock and then drops
+    // the error.Canceled, so a cancel that arrives while the testing
+    // allocator captures a stack trace is lost, and an accept loop can hang
+    // in an accept that can no longer be canceled. Skipped until that is
+    // fixed in Zig.
+    if (builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
     const io = std.testing.io;
 
     const sync = struct {
