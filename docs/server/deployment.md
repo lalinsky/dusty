@@ -10,10 +10,12 @@ development and small servers.
 For production, run the server on [zio](https://lalinsky.github.io/zio/). It runs each connection
 as a coroutine, and many coroutines share a few OS threads.
 
+The version below requires Zig 0.17. Dusty itself also supports Zig 0.16 with other `std.Io` implementations.
+
 Add it to the project:
 
 ```sh
-$ zig fetch --save "git+https://github.com/lalinsky/zio"
+$ zig fetch --save "git+https://github.com/lalinsky/zio#v0.20.1"
 ```
 
 In `build.zig`, import it into your module and into Dusty's module. Dusty uses it for its timeouts:
