@@ -10,19 +10,27 @@
     "response": true
   },
   "engine": "zio",
-  "description": "Dusty HTTP framework on the zio async runtime (io_uring where available, epoll fallback). Router with params/wildcards, JSON, gzip, WebSocket. Standard configuration, no tuning.",
+  "description": "Dusty HTTP server on the zio multi-threaded async runtime (io_uring where available, epoll fallback). Router with params/wildcards, JSON through std.json, gzip, WebSocket, TLS through AWS-LC's libssl. Standard configuration, no tuning.",
   "repo": "https://github.com/lalinsky/dusty",
   "enabled": true,
+  "spec": ["h1", "ws"],
   "tests": [
-    "baseline", "latency-1m", "latency-10k", "latency-500k-8cpu",
+    "baseline",
+    "latency-1m",
+    "latency-10k",
+    "latency-500k-8cpu",
     "pipelined",
     "limited-conn",
     "async",
-    "json-comp", "json-tls", "static-tls",
+    "json-comp",
+    "json-tls",
+    "static-tls",
     "8gbit",
     "async-db",
     "fortunes",
-    "echo-ws", "echo-ws-pipeline", "echo-ws-limited"
+    "echo-ws",
+    "echo-ws-pipeline",
+    "echo-ws-limited"
   ],
   "maintainers": [
     "lalinsky"

@@ -222,6 +222,27 @@ fn echoBody(req: *http.Request, res: *http.Response) !void {
     res.body = body;
 }
 
+fn specGet(res: *http.Response) !void {
+    res.content_type = .text;
+    res.body = "spec ok";
+}
+
+fn specOptions(req: *http.Request, res: *http.Response) !void {
+    _ = try req.body();
+    try res.header("Allow", "GET, HEAD, POST, OPTIONS");
+}
+
+fn specHeaders(req: *http.Request, res: *http.Response) !void {
+    _ = try req.body();
+    var out: std.Io.Writer.Allocating = .init(req.arena);
+    var it = req.headers.iterator();
+    while (it.next()) |h| {
+        try out.writer.print("{s}: {s}\n", .{ h.key, h.value });
+    }
+    res.content_type = .text;
+    res.body = out.written();
+}
+
 pub fn main(init: std.process.Init) !void {
     var rt = try zio.Runtime.init(init.gpa, .{ .executors = .auto });
     defer rt.deinit();
@@ -274,6 +295,11 @@ pub fn main(init: std.process.Init) !void {
     server.router.get("/ws", wsEcho);
     server.router.get("/async-db", asyncDb);
     server.router.get("/fortunes", fortunes);
+    server.router.get("/spec", specGet);
+    server.router.options("/spec", specOptions);
+    server.router.post("/spec", echoBody);
+    server.router.get("/spec/headers", specHeaders);
+    server.router.post("/spec/headers", specHeaders);
 
     // Mounted by the harness; absent when the server is run on its own.
     const static_dir: ?std.Io.Dir = std.Io.Dir.cwd().openDir(rt.io(), "/data/static", .{}) catch null;
