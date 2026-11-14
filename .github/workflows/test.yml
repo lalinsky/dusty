@@ -60,6 +60,20 @@ jobs:
       if: startsWith(matrix.zig-version, '0.17.')
       timeout-minutes: 5
 
+    - name: Build HttpArena standard example
+      run: zig build
+      working-directory: examples/httparena/standard
+      # It pins a zio that needs Zig 0.17.
+      if: startsWith(matrix.zig-version, '0.17.')
+      timeout-minutes: 15
+
+    - name: Build HttpArena tuned example
+      run: zig build
+      working-directory: examples/httparena/tuned
+      # It pins a zio that needs Zig 0.17.
+      if: startsWith(matrix.zig-version, '0.17.')
+      timeout-minutes: 15
+
     - name: Test httpbin example
       run: python3 test_httpbin.py
       working-directory: examples/httpbin
