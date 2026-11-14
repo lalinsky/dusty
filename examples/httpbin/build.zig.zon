@@ -2,7 +2,7 @@
     .name = .dusty_httpbin_example,
     .fingerprint = 0x606b7e3dc7789aaf,
     .version = "0.0.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .dusty = .{
             .path = "../..",
