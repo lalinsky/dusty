@@ -8,8 +8,8 @@
             .path = "../..",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio?ref=v0.18.0#417757935ef6d0f0a2396d4023a44ca82ac1901c",
-            .hash = "zio-0.18.0-xHbVVELgKQAU2hnwYL9MA0iXUydUZYlBfXxOUUM6v_Uv",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#5357759537d43c902d04c57cfa1a8a9e2a574fe3",
+            .hash = "zio-0.20.1-xHbVVEIyLwBDRNXDTm2cJE9-yMPIbVICCUcelHSMDgz6",
         },
     },
     .paths = .{

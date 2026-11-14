@@ -8,16 +8,16 @@
             .path = "../..",
         },
         .zio = .{
-            .url = "git+https://github.com/lalinsky/zio#d606d6d011bc8d8e2a02305b5201fd843f6fa0ad",
-            .hash = "zio-0.19.0-xHbVVLceLgCAbKRqorvYHNTHbdnD1NV8loV-RwQlh9gs",
+            .url = "git+https://github.com/lalinsky/zio?ref=v0.20.1#5357759537d43c902d04c57cfa1a8a9e2a574fe3",
+            .hash = "zio-0.20.1-xHbVVEIyLwBDRNXDTm2cJE9-yMPIbVICCUcelHSMDgz6",
         },
         .json = .{
             .url = "git+https://github.com/lalinsky/json.zig?ref=v0.2.0#9d3d4d951507a73732ae2f49275ad8fefd4a3cf8",
             .hash = "json-0.2.0-XOh3KrE4AgCdShVOsbwBkMkH2H2oAHX_L3cPVQlU8bOE",
         },
         .pg = .{
-            .url = "git+https://github.com/lalinsky/pg.zig?ref=v2026.10.25.0#865dab2d86d14d76fa82e2ef7d61905d40197fa0",
-            .hash = "pg-0.0.0-Wp_7gVkXBwAosCT75tkekt6ZaVDCzugFEdCGdLxBFzLv",
+            .url = "git+https://github.com/lalinsky/pg.zig?ref=v2026.11.14.0#269084176288f9a439141b5d76d159c5066db689",
+            .hash = "pg-0.0.0-Wp_7gThpBwCVmFFQ1a1vs6zK3MByN2KZgFLKRjD257tE",
         },
         .zt = .{
             .url = "git+https://github.com/lalinsky/zt?ref=v0.2.1#061e59dfec493d1c43e4417e8394daf6d70ddcc3",

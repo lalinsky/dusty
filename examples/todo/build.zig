@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const pg = b.dependency("pg", .{
         .target = target,
         .optimize = optimize,
+        .tls = .none,
     });
     const zt_dep = b.dependency("zt", .{
         .target = target,
