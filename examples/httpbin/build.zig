@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Tls = enum { none, ztls, libssl, custom };
+const Tls = enum { none, ztls, libssl };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -22,14 +22,6 @@ pub fn build(b: *std.Build) void {
     // request/keepalive timeouts use zio.AutoCancel.
     const dusty_mod = dusty.module("dusty");
     dusty_mod.addImport("zio", zio.module("zio"));
-    if (tls == .custom) {
-        if (b.lazyDependency("custom_tls", .{
-            .target = target,
-            .optimize = optimize,
-        })) |custom_tls| {
-            dusty_mod.addImport("tls", custom_tls.module("tls"));
-        }
-    }
 
     const exe = b.addExecutable(.{
         .name = "server",
