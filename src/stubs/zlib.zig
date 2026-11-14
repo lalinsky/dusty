@@ -1,9 +1,9 @@
-//! Stub used when the `use_zlib` build option is disabled.
+//! Stub used when the `compression` build option is off.
 //!
 //! It mirrors just enough of the zlib.zig API surface for `parser.zig` and
 //! `response.zig` to type check. The bodies are never reached: `startDecoding`
 //! refuses gzip and deflate with `error.UnsupportedContentEncoding` up front
-//! when `use_zlib` is false, and a response is never compressed.
+//! when `compression` is off, and a response is never compressed.
 
 const std = @import("std");
 

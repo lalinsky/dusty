@@ -87,7 +87,7 @@ test "Server: POST with body" {
 }
 
 test "Server: a gzip request body reaches the handler decoded" {
-    if (!@import("build_options").use_zlib) return error.SkipZigTest;
+    if (!@import("build_options").compression) return error.SkipZigTest;
     const TestApp = struct {
         const Self = @This();
 

@@ -83,7 +83,7 @@ export TEST_LOG_CAPTURE="$TEST_LOG_CAPTURE"
 export TEST_FAIL_FIRST="$TEST_FAIL_FIRST" 
 export TEST_VERBOSE="$TEST_VERBOSE"
 
-BUILD_ARGS=("-Dtls=$TLS")
+BUILD_ARGS=("-Dtls=$TLS" "-Dcompression=true")
 if [ -n "$ZIO_BACKEND" ]; then
     BUILD_ARGS+=("-Dzio_backend=$ZIO_BACKEND")
 fi

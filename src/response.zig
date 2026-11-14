@@ -1129,7 +1129,7 @@ pub const Response = struct {
     /// `markCompressed`, which have their room reserved here, so that
     /// nothing fails after a response has started claiming a coding.
     fn negotiateCompression(self: *const Response) Compression {
-        if (!build_options.use_zlib or !self.compress) return .off;
+        if (!build_options.compression or !self.compress) return .off;
         if (self.file != null) return .off;
         const not_modified = self.status == .not_modified;
         if (!not_modified and !statusHasBody(self.status)) return .off;
@@ -3407,7 +3407,7 @@ test "Response: compress without room for its headers sends the body as it is" {
 }
 
 test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
-    if (!build_options.use_zlib) return error.SkipZigTest;
+    if (!build_options.compression) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3432,7 +3432,7 @@ test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
 }
 
 test "Response: a 304 gets the Vary and ETag of a gzipped 200, without its coding" {
-    if (!build_options.use_zlib) return error.SkipZigTest;
+    if (!build_options.compression) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3473,7 +3473,7 @@ test "Response: variesByAcceptEncoding matches whole names, and *" {
 }
 
 test "Response: a stream without the memory for a compressor goes out as it is" {
-    if (!build_options.use_zlib) return error.SkipZigTest;
+    if (!build_options.compression) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var failing = std.testing.FailingAllocator.init(arena.allocator(), .{});

@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     if (use_http2 and !use_tls) {
         std.process.fatal("use_http2 needs TLS: set -Dtls to ztls, libssl or custom", .{});
     }
-    const use_zlib = b.option(bool, "use_zlib", "Build with gzip/deflate support via zlib.zig") orelse true;
+    const compression = b.option(bool, "compression", "Build in gzip and deflate, with zlib.zig (default: false)") orelse false;
 
     const mod = b.addModule("dusty", .{
         .root_source_file = b.path("src/root.zig"),
@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_tls", use_tls);
     build_options.addOption(bool, "use_http2", use_http2);
-    build_options.addOption(bool, "use_zlib", use_zlib);
+    build_options.addOption(bool, "compression", compression);
     mod.addOptions("build_options", build_options);
 
     // Default `zio` import — a marker stub that selects the portable std.Io
@@ -61,11 +61,12 @@ pub fn build(b: *std.Build) void {
         }),
     }
 
-    // Content decoding (gzip, deflate) of request and response bodies is a
-    // lazy dependency, like TLS: only fetched when `use_zlib` is set (the
-    // default). When disabled, a stub is imported so everything still builds,
-    // and a coded body is refused with error.UnsupportedContentEncoding.
-    if (use_zlib) {
+    // gzip and deflate, both decoding bodies and compressing responses, need
+    // zlib, a lazy dependency like TLS: only fetched when `compression` is
+    // set. Without it, a stub is imported so everything still builds, a
+    // coded body is refused with error.UnsupportedContentEncoding, and
+    // responses are sent uncompressed.
+    if (compression) {
         if (b.lazyDependency("zlib", .{
             .target = target,
             .optimize = optimize,

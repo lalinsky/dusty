@@ -56,8 +56,8 @@ doesn't follow redirects and you get the redirect response itself.
 
 ## Compressed Responses
 
-The client asks for gzip and deflate, and decodes the body for you. Pass `.decompress = false` to
-get the body as it was sent. `response.contentEncoding()` tells you how it was encoded.
+Built with [`compression`](../build-options.md#compression), the client asks for gzip and
+deflate, and decodes the body for you. Pass `.decompress = false` to get the body as it was sent. `response.contentEncoding()` tells you how it was encoded.
 
 ## Errors and Timeouts
 

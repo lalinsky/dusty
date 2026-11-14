@@ -34,16 +34,16 @@ jobs:
       timeout-minutes: 15
 
     - name: Run tests
-      run: zig build test --summary all -Dtls=ztls
+      run: zig build test --summary all -Dtls=ztls -Dcompression=true
       timeout-minutes: 5
 
     - name: Run tests with ztls on libssl
       run: zig build test --summary all -Dtls=libssl
       timeout-minutes: 10
 
-    - name: Run tests without TLS and zlib
+    - name: Run tests without TLS and compression
       if: runner.os == 'Linux'
-      run: zig build test --summary all -Duse_zlib=false
+      run: zig build test --summary all
       timeout-minutes: 5
 
     - name: Build httpbin example
