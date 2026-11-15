@@ -12,7 +12,8 @@ through `body.interface`, a `std.Io.Reader`. Chunked encoding and compression ar
 When a read fails with `error.ReadFailed`, `body.err` holds the underlying error.
 
 The buffer you pass to `reader` is what the reader keeps bytes in until you take them. Code that only
-streams the body somewhere else, like the download above, can pass an empty one.
+streams the body somewhere else, like the download above, or throws it away with `discardRemaining`,
+can pass an empty one.
 
 ## Reading Lines
 

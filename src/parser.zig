@@ -195,6 +195,13 @@ pub const RequestParser = struct {
     }
 
     pub fn feed(self: *RequestParser, data: []const u8) (ParseError || error{Paused})!void {
+        // `onBody` can find a slice in a feed that then fails, on the
+        // framing around it. Bytes must not follow the error out.
+        var paused = false;
+        errdefer if (!paused) {
+            self.state.body = &.{};
+            self.state.body_paused = false;
+        };
         if (self.framing.err) |e| return e;
         // llhttp keeps a failure and returns it from every later execute
         // without reading anything. Charging the framing again would count
@@ -215,6 +222,7 @@ pub const RequestParser = struct {
         }
 
         if (err == c.HPE_PAUSED) {
+            paused = true;
             return error.Paused;
         }
 
@@ -601,6 +609,13 @@ pub const ResponseParser = struct {
     }
 
     pub fn feed(self: *ResponseParser, data: []const u8) !void {
+        // `onBody` can find a slice in a feed that then fails, on the
+        // framing around it. Bytes must not follow the error out.
+        var paused = false;
+        errdefer if (!paused) {
+            self.state.body = &.{};
+            self.state.body_paused = false;
+        };
         if (self.framing.err) |e| return e;
         // llhttp keeps a failure and returns it from every later execute
         // without reading anything. Charging the framing again would count
@@ -631,6 +646,7 @@ pub const ResponseParser = struct {
         }
 
         if (err == c.HPE_PAUSED) {
+            paused = true;
             return error.Paused;
         }
 
@@ -996,16 +1012,26 @@ pub fn BodyReader(comptime Parser: type) type {
         }
 
         /// Drops body bytes where they lie rather than copying them into
-        /// `interface.buffer` first, as the default would. A decoded body
-        /// has no such slices to drop: what it is made of only exists once
-        /// it has been inflated, so it goes the default way.
+        /// `interface.buffer` first, as the default would.
         fn discard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
-            if (self.decode != null) return std.Io.Reader.defaultDiscard(io_r, limit);
+            if (self.decode) |decode| return self.discardDecoded(decode, limit);
             // Unbuffered, so `write` hands each slice straight to `drain`,
             // which only counts it.
             var discarding: std.Io.Writer.Discarding = .init(&.{});
             return self.streamFramed(&discarding.writer, limit) catch |err| switch (err) {
+                error.WriteFailed => unreachable,
+                else => |e| return e,
+            };
+        }
+
+        /// A decoded body only exists once it has been inflated, and the
+        /// decoder needs space to inflate into, which `interface.buffer`
+        /// may not have.
+        fn discardDecoded(self: *Self, decode: *Decode, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+            var scratch: [4096]u8 = undefined;
+            var discarding: std.Io.Writer.Discarding = .init(&scratch);
+            return self.streamDecoded(decode, &discarding.writer, limit) catch |err| switch (err) {
                 error.WriteFailed => unreachable,
                 else => |e| return e,
             };
@@ -1339,4 +1365,253 @@ test "ResponseParser: rejects a status code Status cannot name" {
         parser.feed("HTTP/1.1 250 Weird\r\nContent-Length: 0\r\n\r\n"),
     );
     try std.testing.expectEqual(false, parser.state.has_status);
+}
+
+/// Headers are parsed separately so the transport starts exactly at the body.
+/// The fixed input also makes an accidental read past a complete body fail.
+fn BodyReaderTest(comptime Parser: type) type {
+    return struct {
+        request: Request,
+        response: ParsedResponse,
+        parser: Parser,
+        input: std.Io.Reader,
+
+        fn init(self: *@This(), arena: std.mem.Allocator, framing: []const u8, wire: []const u8) !void {
+            self.input = .fixed(wire);
+            self.request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+            self.response = .{ .arena = arena };
+            const prefix = if (Parser == RequestParser) "POST / HTTP/1.1\r\nHost: localhost\r\n" else "HTTP/1.1 200 OK\r\n";
+            if (Parser == RequestParser) {
+                self.request.headers = try Headers.init(arena, 32);
+                try self.parser.init(&self.request);
+            } else {
+                try self.parser.init(&self.response, 32);
+            }
+            const head = try std.fmt.allocPrint(arena, "{s}{s}\r\n", .{ prefix, framing });
+            try std.testing.expectError(error.Paused, self.parser.feed(head));
+            self.parser.resumeParsing();
+            self.parser.feed(head[head.len..]) catch |err| switch (err) {
+                error.Paused => {},
+                else => return err,
+            };
+        }
+
+        fn reader(self: *@This(), buffer: []u8) BodyReader(Parser) {
+            return .init(&self.parser, .{ .reader = &self.input, .writer = undefined }, buffer);
+        }
+    };
+}
+
+/// Accepts short writes, including zero, and checks that the bytes still
+/// point into the original input rather than a body staging buffer.
+const BorrowedBodySink = struct {
+    expected: []const u8,
+    pos: usize = 0,
+    zero_next: bool = true,
+    fail_next: bool = false,
+    borrowed: bool = true,
+    interface: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *BorrowedBodySink = @fieldParentPtr("interface", w);
+        std.debug.assert(w.end == 0 and data.len == 1 and splat == 1);
+        self.borrowed = self.borrowed and data[0].ptr == self.expected[self.pos..].ptr;
+        if (self.zero_next) {
+            self.zero_next = false;
+            return 0;
+        }
+        if (self.fail_next) {
+            self.fail_next = false;
+            return error.WriteFailed;
+        }
+        const n = @min(data[0].len, 2);
+        self.borrowed = self.borrowed and std.mem.eql(u8, data[0][0..n], self.expected[self.pos..][0..n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+test "BodyReader: borrowed slices survive short, zero and failed writes" {
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const wire = "helloNEXT";
+        var t: BodyReaderTest(Parser) = undefined;
+        try t.init(arena.allocator(), "Content-Length: 5\r\n", wire);
+        var body = t.reader(&.{});
+        var sink: BorrowedBodySink = .{ .expected = wire[0..5] };
+        try std.testing.expectEqual(0, try body.interface.stream(&sink.interface, .nothing));
+        try std.testing.expectEqual(0, t.parser.state.body.len);
+        try std.testing.expectEqual(0, try body.interface.stream(&sink.interface, .limited(1)));
+        try std.testing.expect(!t.parser.isBodyComplete());
+        sink.fail_next = true;
+        try std.testing.expectError(error.WriteFailed, body.interface.stream(&sink.interface, .unlimited));
+        try std.testing.expectEqual(null, body.err);
+        try std.testing.expectEqual(1, try body.interface.stream(&sink.interface, .limited(1)));
+        try body.interface.streamExact(&sink.interface, 4);
+        try std.testing.expect(sink.borrowed);
+        try std.testing.expectEqual(5, sink.pos);
+        // Completion must not require reading the socket or the next message.
+        try std.testing.expect(t.parser.isBodyComplete());
+        try std.testing.expectEqualStrings("NEXT", t.input.buffered());
+        try std.testing.expectError(error.EndOfStream, body.interface.stream(&sink.interface, .unlimited));
+    }
+}
+
+test "BodyReader: a replacement reader discards the pending slice without a buffer" {
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var t: BodyReaderTest(Parser) = undefined;
+        try t.init(arena.allocator(), "Content-Length: 5\r\n", "helloNEXT");
+        var body = t.reader(&.{});
+        var bytes: [2]u8 = undefined;
+        try body.interface.readSliceAll(&bytes);
+        try std.testing.expectEqualStrings("he", &bytes);
+        var drain = t.reader(&.{});
+        try std.testing.expectEqual(0, try drain.interface.discard(.nothing));
+        try std.testing.expectEqual(1, try drain.interface.discardShort(1));
+        try std.testing.expect(!t.parser.isBodyComplete());
+        try std.testing.expectEqual(2, try drain.interface.discardRemaining());
+        try std.testing.expect(t.parser.isBodyComplete());
+        try std.testing.expectEqualStrings("NEXT", t.input.buffered());
+    }
+}
+
+test "BodyReader: discard and buffered reads cross chunks and leave the next message" {
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var t: BodyReaderTest(Parser) = undefined;
+        try t.init(arena.allocator(), "Transfer-Encoding: chunked\r\n", "2\r\nhe\r\n3\r\nllo\r\n0\r\nX-Trailer: ignored\r\n\r\nNEXT");
+        var buffer: [3]u8 = undefined;
+        var body = t.reader(&buffer);
+        try std.testing.expectEqualStrings("hel", try body.interface.take(3));
+        try std.testing.expectEqual(2, try body.interface.discardRemaining());
+        try std.testing.expect(t.parser.isBodyComplete());
+        try std.testing.expectEqualStrings("NEXT", t.input.buffered());
+    }
+}
+
+test "BodyReader: bufferless discard reports truncated framing" {
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        inline for (.{ "Content-Length: 6\r\n", "Transfer-Encoding: chunked\r\n" }) |framing| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var t: BodyReaderTest(Parser) = undefined;
+            const wire = if (framing[0] == 'C') "hello" else "5\r\nhello\r\n";
+            try t.init(arena.allocator(), framing, wire);
+            var body = t.reader(&.{});
+            try std.testing.expectError(error.ReadFailed, body.interface.discardRemaining());
+            try std.testing.expectEqual(error.IncompleteBody, body.err.?);
+        }
+    }
+}
+
+const FragmentedBodySource = struct {
+    remaining: []const u8,
+    step: usize,
+    storage: [7]u8 = undefined,
+    interface: std.Io.Reader = undefined,
+
+    fn init(self: *FragmentedBodySource, bytes: []const u8, step: usize) void {
+        self.* = .{ .remaining = bytes, .step = step };
+        self.interface = .{
+            .buffer = &self.storage,
+            .seek = 0,
+            .end = 0,
+            .vtable = &.{ .stream = stream, .readVec = readVec },
+        };
+    }
+
+    fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        unreachable; // BodyReader refills the transport through readVec.
+    }
+
+    fn readVec(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+        const self: *FragmentedBodySource = @fieldParentPtr("interface", r);
+        if (self.remaining.len == 0) return error.EndOfStream;
+        const n = @min(self.step, self.remaining.len, r.buffer.len - r.end);
+        std.debug.assert(n != 0);
+        @memcpy(r.buffer[r.end..][0..n], self.remaining[0..n]);
+        r.end += n;
+        self.remaining = self.remaining[n..];
+        return 0;
+    }
+};
+
+test "BodyReader: fragmented chunks survive transport refills and rebases" {
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        for (1..8) |step| {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            var t: BodyReaderTest(Parser) = undefined;
+            try t.init(arena.allocator(), "Transfer-Encoding: chunked\r\n", "");
+            var source: FragmentedBodySource = undefined;
+            source.init("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", step);
+            var body = t.reader(&.{});
+            body.transport.reader = &source.interface;
+            var bytes: [11]u8 = undefined;
+            var out: std.Io.Writer = .fixed(&bytes);
+            try std.testing.expectEqual(11, try body.interface.streamRemaining(&out));
+            try std.testing.expectEqualStrings("hello world", out.buffered());
+            try std.testing.expect(t.parser.isBodyComplete());
+        }
+    }
+}
+
+test "BodyReader: a close-delimited response can be discarded without a buffer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var t: BodyReaderTest(ResponseParser) = undefined;
+    try t.init(arena.allocator(), "Connection: close\r\n", "hello");
+    var body = t.reader(&.{});
+    try std.testing.expectEqual(5, try body.interface.discardRemaining());
+    try std.testing.expect(t.parser.isBodyComplete());
+}
+
+test "BodyReader: decoded bodies can be discarded with an empty caller buffer" {
+    if (!build_options.compression) return error.SkipZigTest;
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        // "Hello from test!", gzip compressed.
+        const gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xf3\x48\xcd\xc9\xc9\x57" ++
+            "\x48\x2b\xca\xcf\x55\x28\x49\x2d\x2e\x51\x04\x00\x7c\xe6\xd9\x99\x10\x00\x00\x00";
+        var t: BodyReaderTest(Parser) = undefined;
+        const framing = try std.fmt.allocPrint(arena.allocator(), "Content-Length: {d}\r\n", .{gzip.len});
+        try t.init(arena.allocator(), framing, gzip);
+        var body = t.reader(&.{});
+        try body.startDecoding(arena.allocator(), .gzip);
+        try std.testing.expectEqual(3, try body.interface.discardShort(3));
+        try std.testing.expectEqual(13, try body.interface.discardRemaining());
+        try std.testing.expect(t.parser.isBodyComplete());
+    }
+}
+
+test "BodyReader: a fatal framing error never publishes its pending slice" {
+    inline for (.{ RequestParser, ResponseParser }) |Parser| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var t: BodyReaderTest(Parser) = undefined;
+        // The payload callback runs before the framing budget is charged.
+        // Keep both in one input buffer so a rejected feed has a pending slice.
+        const extension = try arena.allocator().alloc(u8, max_chunk_framing + 64);
+        @memset(extension, 'a');
+        const wire = try std.fmt.allocPrint(arena.allocator(), "1;{s}\r\nx\r\n0\r\n\r\n", .{extension});
+        try t.init(arena.allocator(), "Transfer-Encoding: chunked\r\n", wire);
+        var body = t.reader(&.{});
+        try std.testing.expectError(error.ReadFailed, body.interface.discardRemaining());
+        try std.testing.expectEqual(error.ChunkFramingTooLarge, body.err.?);
+        try std.testing.expectEqual(0, t.parser.state.body.len);
+        try std.testing.expectError(error.ReadFailed, body.interface.discard(.limited(1)));
+        var bytes: [1]u8 = undefined;
+        var out: std.Io.Writer = .fixed(&bytes);
+        try std.testing.expectError(error.ReadFailed, body.interface.stream(&out, .unlimited));
+        try std.testing.expectEqual(0, out.end);
+        // Cleanup hands the parser to a new reader; that reader must fail too.
+        var replacement = t.reader(&.{});
+        try std.testing.expectError(error.ReadFailed, replacement.interface.discardRemaining());
+        try std.testing.expectEqual(error.ChunkFramingTooLarge, replacement.err.?);
+    }
 }

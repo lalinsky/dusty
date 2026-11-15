@@ -203,7 +203,7 @@ pub const Request = struct {
     /// the way `Response.stream` takes one for the other direction. It is
     /// what `peek` and the `take` family read out of, so size it for the
     /// longest thing they need to see at once; an empty slice is fine for a
-    /// caller that only ever streams.
+    /// caller that only streams or discards.
     ///
     /// One per body. `body` takes it if you have not, so a handler that
     /// streams cannot then ask for the body whole.
