@@ -37,7 +37,7 @@ with the rest of the response.
 
 ## Streaming
 
-`res.stream` sends the headers right away, and then the body as the handler writes it:
+`res.stream` fixes the headers right away, and then sends the body as the handler writes it:
 
 ```zig
 --8<-- "examples/responses.zig:stream"
@@ -46,8 +46,13 @@ with the rest of the response.
 `buf` collects the body before it's sent. `flush` sends what is in it. The body is sent with chunked
 encoding, unless the handler set a `Content-Length` header. Call `end` when the body is done.
 
-Once the headers are sent, they can't change. If the handler fails after that, the server closes the
-connection, since it can't send an error response anymore.
+The headers go out together with the first part of the body, so a body that fits in `buf` is sent in
+one write, chunked or not.
+If the client should see the headers before there is any body to send, call `flush` right after
+`res.stream`.
+
+Once `res.stream` returns, the headers can't change. If the handler fails after that, the server
+closes the connection, since it can't send an error response anymore.
 
 For events sent to a browser as they happen, see [Server-Sent Events](sse.md).
 

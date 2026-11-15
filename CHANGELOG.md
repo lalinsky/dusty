@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `res.stream` no longer flushes the headers right away. The response is sent when the buffer fills, on `flush`, or at `end`.
+
 ## [0.6.0] - 2026-11-14
 
 This release changes how handlers are written: they take only the parameters they need, including typed path, query and header values. Middleware gets per-request context and hooks around sending the response. HTTP/1.1 handling is stricter and follows RFC 9110 and RFC 9112 more closely, after an audit with HTTP Garden. TLS now uses ztls, with a choice of native and libssl engines, and both TLS and compression are opt-in. Development tools can restart the server and reload open pages after a rebuild. Dusty also has a documentation site now, at https://lalinsky.github.io/dusty/.
