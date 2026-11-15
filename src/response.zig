@@ -479,9 +479,11 @@ pub const StreamingBodyWriter = struct {
     /// A flush of a gzipped body has to reach through zlib, which would
     /// otherwise hold on to what it was given until it had more.
     ///
-    /// It also reaches the connection when nothing is buffered here: the
-    /// headers wait there for the first body bytes, and a flush is how a
-    /// handler that has none yet sends them anyway.
+    /// Writing to the connection does not send anything by itself; this is
+    /// what does, along with `end`. It reaches the connection even when
+    /// nothing is buffered here: the headers wait there for the first body
+    /// bytes, and a flush is how a handler that has none yet sends them
+    /// anyway.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *StreamingBodyWriter = @alignCast(@fieldParentPtr("interface", w));
         if (self.compressor) |compressor| {
@@ -490,7 +492,7 @@ pub const StreamingBodyWriter = struct {
         } else {
             try std.Io.Writer.defaultFlush(w);
         }
-        if (!self.res.hold_flush) try self.record(self.res.conn.writer.flush());
+        try self.record(self.res.conn.writer.flush());
     }
 
     /// Finishes the body: flushes what is left and, for a chunked body,
@@ -510,15 +512,14 @@ pub const StreamingBodyWriter = struct {
         // response.
         errdefer res.keepalive = false;
 
-        // The last of the body, the terminator and the flush below all go
-        // out as one write.
-        res.hold_flush = true;
-        defer res.hold_flush = false;
+        // Not `interface.flush`, which would send what is left of the body
+        // on its own: it goes out with the terminator, in the one flush
+        // below.
         if (self.compressor) |compressor| {
             try res.resolve(compressor.finish(self.interface.buffered()));
             self.interface.end = 0;
         } else {
-            try res.resolve(self.interface.flush());
+            try res.resolve(std.Io.Writer.defaultFlush(&self.interface));
         }
         if (res.chunked and res.sendsBody()) try res.resolve(res.conn.writer.writeAll("0\r\n\r\n"));
         try res.resolve(res.conn.writer.flush());
@@ -631,9 +632,6 @@ pub const Response = struct {
     content_length: ?usize = null,
     /// Body bytes handed to the connection by a streaming writer.
     body_sent: usize = 0,
-    /// Set while `StreamingBodyWriter.end` sends what is left of the body,
-    /// so that goes out in the same write as the terminator after it.
-    hold_flush: bool = false,
     /// The request this answers, when the server built the pair. Set by the
     /// server.
     request: ?*const Request = null,
@@ -1260,8 +1258,9 @@ pub const Response = struct {
         return compressed;
     }
 
-    /// Body bytes on the wire, framed as the headers said: a chunk, or as
-    /// they are.
+    /// Body bytes into the connection's buffer, framed as the headers said:
+    /// a chunk, or as they are. Nothing is flushed here; `flush` and `end`
+    /// on the body writer decide when they go out.
     fn sendFramed(
         self: *Response,
         pending: []const u8,
@@ -1279,7 +1278,6 @@ pub const Response = struct {
         for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
         try out.splatBytesAll(data[data.len - 1], splat);
         if (self.chunked) try out.writeAll("\r\n");
-        if (!self.hold_flush) try out.flush();
     }
 
     /// Sends the headers ahead of a body that is not buffered: a stream,
@@ -3866,5 +3864,28 @@ test "StreamingBodyWriter: a flush before end still goes out on its own" {
     try body.interface.writeAll("second");
     try body.end();
     try std.testing.expectEqual(2, counter.writes);
-    try std.testing.expect(!response.hold_flush);
+}
+
+test "StreamingBodyWriter: a body bigger than the buffer is not flushed piece by piece" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "11");
+
+    // Drained three times over, but sent once, by `end`.
+    var body_buf: [4]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello ");
+    try body.interface.writeAll("world");
+    try std.testing.expectEqual(0, counter.writes);
+    try body.end();
+
+    try std.testing.expectEqual(1, counter.writes);
+    try std.testing.expect(std.mem.endsWith(u8, counter.sent(), "\r\n\r\nhello world"));
 }
