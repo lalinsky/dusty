@@ -478,11 +478,19 @@ pub const StreamingBodyWriter = struct {
 
     /// A flush of a gzipped body has to reach through zlib, which would
     /// otherwise hold on to what it was given until it had more.
+    ///
+    /// It also reaches the connection when nothing is buffered here: the
+    /// headers wait there for the first body bytes, and a flush is how a
+    /// handler that has none yet sends them anyway.
     fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
         const self: *StreamingBodyWriter = @alignCast(@fieldParentPtr("interface", w));
-        const compressor = self.compressor orelse return std.Io.Writer.defaultFlush(w);
-        try self.record(compressor.flush(w.buffered()));
-        w.end = 0;
+        if (self.compressor) |compressor| {
+            try self.record(compressor.flush(w.buffered()));
+            w.end = 0;
+        } else {
+            try std.Io.Writer.defaultFlush(w);
+        }
+        try self.record(self.res.conn.writer.flush());
     }
 
     /// Finishes the body: flushes what is left and, for a chunked body,
@@ -759,14 +767,17 @@ pub const Response = struct {
         return .init(self);
     }
 
-    /// A writer that sends the headers now and streams the body as it is
+    /// A writer that commits the headers now and streams the body as it is
     /// written. Chunked, unless a `Content-Length` header says how long the
     /// body will be, in which case it is streamed as-is. An HTTP/1.0 peer
     /// gets neither: the body is streamed as-is and the connection closed
     /// after it.
     ///
-    /// The headers are on the wire when this returns, so nothing can change
-    /// them afterwards. Call `end` on the result before returning.
+    /// The headers are final when this returns, so nothing can change them
+    /// afterwards. They are sent together with the first body bytes, so a
+    /// short body goes out in one write; call `flush` on the result to send
+    /// them before there is any body. Call `end` on the result before
+    /// returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
         try self.runHeadersHook();
         self.startBody();
@@ -804,7 +815,17 @@ pub const Response = struct {
         } else {
             self.chunked = true;
         }
-        try self.resolve(self.sendHeaderAlone(self.conn.writer));
+        // Left in the buffer for the first body bytes to take with them,
+        // which is one write instead of two. Unless the peer is waiting for
+        // 100 Continue before it sends the body: these headers are what
+        // tell it to stop waiting, and a handler reading the body next
+        // would otherwise wait on a peer that is waiting on it.
+        const peer_waits = if (self.request) |req| req.expects_continue else false;
+        if (peer_waits) {
+            try self.resolve(self.sendHeaderAlone(self.conn.writer));
+        } else {
+            try self.resolve(self.sendHeader(self.conn.writer));
+        }
         return .init(self, buf, compressor);
     }
 
@@ -1035,7 +1056,13 @@ pub const Response = struct {
         // A HEAD gets the headers an event stream would have opened with
         // and none of the events; the body writer already drops what it is
         // given for a HEAD, so no send has to ask.
-        return .{ .body = try self.stream(buf) };
+        //
+        // The headers go out now rather than with the first event, which
+        // may be a long way off: they are what tells the client the stream
+        // is open.
+        var body = try self.stream(buf);
+        body.interface.flush() catch return body.err orelse error.Unexpected;
+        return .{ .body = body };
     }
 
     /// Upgrade HTTP connection to WebSocket.
@@ -1258,10 +1285,10 @@ pub const Response = struct {
     }
 
     /// The headers with nothing behind them. `write` sends them with a body
-    /// and flushes once for both; everything else -- a streaming body, an
-    /// event stream, a WebSocket -- has nothing queued, and the headers
-    /// must not wait in the buffer for a body that may be seconds away, or
-    /// that is the peer's turn to send.
+    /// and flushes once for both, and `stream` leaves them for its first
+    /// body bytes; a WebSocket, or a peer waiting for 100 Continue, has
+    /// nothing queued, and the headers must not wait in the buffer for
+    /// what is the peer's turn to send.
     fn sendHeaderAlone(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try self.sendHeader(w);
         return w.flush();
@@ -3650,4 +3677,137 @@ test "Response: a Date set by the handler is not sent twice" {
         "HTTP/1.1 200 OK\r\ndate: Sun, 06 Nov 1994 08:49:37 GMT\r\nContent-Length: 0\r\n\r\n",
         conn_writer.buffered(),
     );
+}
+
+/// A connection writer that counts the writes that reach the wire: a flush
+/// of what is buffered is one, however many pieces it was put together
+/// from.
+const WriteCounter = struct {
+    out: std.Io.Writer,
+    buf: [1024]u8 = undefined,
+    wire: [1024]u8 = undefined,
+    wire_len: usize = 0,
+    writes: usize = 0,
+
+    fn init(self: *WriteCounter) void {
+        self.* = .{ .out = .{ .buffer = &self.buf, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *WriteCounter = @alignCast(@fieldParentPtr("out", w));
+        const total = w.end + std.Io.Writer.countSplat(data, splat);
+        if (total == 0) return 0;
+        self.append(w.buffered());
+        for (data[0 .. data.len - 1]) |bytes| self.append(bytes);
+        for (0..splat) |_| self.append(data[data.len - 1]);
+        self.writes += 1;
+        return w.consume(total);
+    }
+
+    fn append(self: *WriteCounter, bytes: []const u8) void {
+        @memcpy(self.wire[self.wire_len..][0..bytes.len], bytes);
+        self.wire_len += bytes.len;
+    }
+
+    fn sent(self: *WriteCounter) []u8 {
+        return self.wire[0..self.wire_len];
+    }
+};
+
+test "StreamingBodyWriter: the headers go out with the first body bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    try response.header("Content-Length", "5");
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    // Committed, but not sent on their own.
+    try std.testing.expect(response.headers_written);
+    try std.testing.expectEqual(0, counter.writes);
+
+    try body.interface.writeAll("hello");
+    try body.end();
+
+    try std.testing.expectEqual(1, counter.writes);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "\r\n" ++
+            "hello",
+        try withoutDate(counter.sent()),
+    );
+}
+
+test "StreamingBodyWriter: flush sends the headers before there is any body" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.flush();
+
+    try std.testing.expectEqual(1, counter.writes);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n",
+        try withoutDate(counter.sent()),
+    );
+
+    // And no zero length chunk to end the body early.
+    try body.interface.writeAll("hi");
+    try body.end();
+    try std.testing.expect(std.mem.endsWith(u8, counter.sent(), "\r\n\r\n2\r\nhi\r\n0\r\n\r\n"));
+}
+
+test "StreamingBodyWriter: a peer waiting for 100 Continue gets the headers right away" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var request = try testGzipRequest(arena.allocator());
+    request.expects_continue = true;
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    response.request = &request;
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try std.testing.expectEqual(1, counter.writes);
+    try body.end();
+}
+
+test "Response: startEventStream sends the headers right away" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+    var event_buf: [256]u8 = undefined;
+    _ = try response.startEventStream(&event_buf);
+
+    try std.testing.expectEqual(1, counter.writes);
+    try std.testing.expect(std.mem.startsWith(u8, counter.sent(), "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, counter.sent(), "Content-Type: text/event-stream\r\n") != null);
 }
