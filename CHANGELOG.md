@@ -7,7 +7,10 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - `res.stream` no longer flushes the headers right away. The response is sent when the buffer fills, on `flush`, or at `end`.
-- Body readers hand body bytes to the writer they stream into without copying them into its buffer first, and discard them without copying at all. A body without a content coding can now be streamed into a writer with no buffer, such as `res.stream(&.{})`.
+
+### Fixed
+
+- Streaming a body into a writer with no buffer, such as `res.stream(&.{})`, no longer panics.
 
 ## [0.6.0] - 2026-11-14
 
