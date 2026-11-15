@@ -1078,6 +1078,9 @@ test "Request.body: a chunked gzip body is unwrapped by both layers" {
 
     const body = try req.body();
     try std.testing.expectEqualStrings("Hello from test!", body.?);
+    // zlib stops at the gzip footer and never asks for the end of the body,
+    // so the message is complete without that read.
+    try std.testing.expect(parser.isBodyComplete());
 }
 
 /// Serves `source` into the reader's buffer, as much as fits each time, the
@@ -1701,4 +1704,219 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
     try parseHeaders(&reader, &parser);
 
     try std.testing.expectError(error.InvalidMultiPartEncoding, req.multiFormData());
+}
+
+/// A writer with no buffer of its own: everything it is given arrives
+/// through `drain`, as the slices the caller had.
+const UnbufferedSink = struct {
+    out: std.Io.Writer,
+    received: [256]u8 = undefined,
+    len: usize = 0,
+    drains: usize = 0,
+    /// Refuse every write.
+    fail: bool = false,
+
+    fn init(self: *UnbufferedSink) void {
+        self.* = .{ .out = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *UnbufferedSink = @alignCast(@fieldParentPtr("out", w));
+        if (self.fail) return error.WriteFailed;
+        // `writeAll` hands over one slice at a time.
+        std.debug.assert(data.len == 1 and splat == 1);
+        @memcpy(self.received[self.len..][0..data[0].len], data[0]);
+        self.len += data[0].len;
+        self.drains += 1;
+        return data[0].len;
+    }
+};
+
+fn testStreamingRequest(arena: std.mem.Allocator, raw: []const u8, reader: *std.Io.Reader, req: *Request, parser: *RequestParser) !void {
+    reader.* = try fixedMessageReader(arena, raw);
+    req.* = .{
+        .arena = arena,
+        .transport = .{ .reader = reader, .writer = undefined },
+        .parser = undefined,
+    };
+    try parser.init(req);
+    req.parser = parser;
+    try parseHeaders(reader, parser);
+}
+
+test "Request: a body streams into a writer with no buffer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
+    var reader: std.Io.Reader = undefined;
+    var req: Request = undefined;
+    var parser: RequestParser = undefined;
+    try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+    defer parser.deinit();
+
+    var sink: UnbufferedSink = undefined;
+    sink.init();
+    var r = try req.reader(&.{});
+    try std.testing.expectEqual(11, try r.interface.streamRemaining(&sink.out));
+    try std.testing.expectEqualStrings("hello world", sink.received[0..sink.len]);
+    // Handed over as it lay in the connection's buffer, in one piece.
+    try std.testing.expectEqual(1, sink.drains);
+}
+
+test "Request: a chunked body streams into a writer with no buffer, one slice per chunk" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n";
+    var reader: std.Io.Reader = undefined;
+    var req: Request = undefined;
+    var parser: RequestParser = undefined;
+    try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+    defer parser.deinit();
+
+    var sink: UnbufferedSink = undefined;
+    sink.init();
+    var r = try req.reader(&.{});
+    try std.testing.expectEqual(11, try r.interface.streamRemaining(&sink.out));
+    try std.testing.expectEqualStrings("hello world", sink.received[0..sink.len]);
+    try std.testing.expectEqual(3, sink.drains);
+}
+
+test "Request: a streaming read gives no more than the limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
+    var reader: std.Io.Reader = undefined;
+    var req: Request = undefined;
+    var parser: RequestParser = undefined;
+    try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+    defer parser.deinit();
+
+    var sink: UnbufferedSink = undefined;
+    sink.init();
+    var r = try req.reader(&.{});
+    try std.testing.expectEqual(4, try r.interface.stream(&sink.out, .limited(4)));
+    try std.testing.expectEqualStrings("hell", sink.received[0..sink.len]);
+    // The rest is still there for the next read.
+    try std.testing.expectEqual(7, try r.interface.streamRemaining(&sink.out));
+    try std.testing.expectEqualStrings("hello world", sink.received[0..sink.len]);
+}
+
+test "Request: a write that fails leaves the body for the next read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
+    var reader: std.Io.Reader = undefined;
+    var req: Request = undefined;
+    var parser: RequestParser = undefined;
+    try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+    defer parser.deinit();
+
+    var sink: UnbufferedSink = undefined;
+    sink.init();
+    sink.fail = true;
+    var r = try req.reader(&.{});
+    try std.testing.expectError(error.WriteFailed, r.interface.stream(&sink.out, .unlimited));
+    // The writer's failure, not the reader's, and not the peer's.
+    try std.testing.expectEqual(null, r.err);
+    try std.testing.expectEqual(null, req.bodyClientErrorStatus());
+
+    // Nothing was lost: the bytes the write refused are still there.
+    sink.fail = false;
+    try std.testing.expectEqual(11, try r.interface.streamRemaining(&sink.out));
+    try std.testing.expectEqualStrings("hello world", sink.received[0..sink.len]);
+}
+
+test "Request: the message is complete once its last body byte is read" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const requests = [_][]const u8{
+        "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world",
+        "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    };
+    for (requests) |raw_request| {
+        var reader: std.Io.Reader = undefined;
+        var req: Request = undefined;
+        var parser: RequestParser = undefined;
+        try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+        defer parser.deinit();
+
+        // Exactly the body, and no read that would find its end.
+        var sink: UnbufferedSink = undefined;
+        sink.init();
+        var r = try req.reader(&.{});
+        try r.interface.streamExact(&sink.out, 11);
+        try std.testing.expectEqualStrings("hello world", sink.received[0..sink.len]);
+        try std.testing.expect(parser.isBodyComplete());
+    }
+}
+
+test "Request: bad framing after the last read slice is reported as itself" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    // The second chunk's extension is long, and then broken. It is parsed
+    // as soon as the first chunk is handed over, and reported on the read
+    // after; charging its framing twice on the way would call it too large.
+    const extension = try arena.allocator().alloc(u8, 9000);
+    @memset(extension, 'a');
+    const raw_request = try std.mem.concat(arena.allocator(), u8, &.{
+        "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "5\r\nhello\r\n5;",
+        extension,
+        "\x01\r\n",
+    });
+    var reader: std.Io.Reader = undefined;
+    var req: Request = undefined;
+    var parser: RequestParser = undefined;
+    try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+    defer parser.deinit();
+
+    var sink: UnbufferedSink = undefined;
+    sink.init();
+    var r = try req.reader(&.{});
+    try r.interface.streamExact(&sink.out, 5);
+    try std.testing.expectError(error.ReadFailed, r.interface.stream(&sink.out, .unlimited));
+
+    // The same request read in one go, where nothing is fed twice.
+    var whole_reader: std.Io.Reader = undefined;
+    var whole_req: Request = undefined;
+    var whole_parser: RequestParser = undefined;
+    try testStreamingRequest(arena.allocator(), raw_request, &whole_reader, &whole_req, &whole_parser);
+    defer whole_parser.deinit();
+    const expected = if (whole_req.body()) |_| unreachable else |err| err;
+
+    try std.testing.expect(expected != error.ChunkFramingTooLarge);
+    try std.testing.expectEqual(expected, r.err.?);
+}
+
+test "Request: a body is discarded without a buffer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const requests = [_][]const u8{
+        "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world",
+        "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    };
+    for (requests) |raw_request| {
+        var reader: std.Io.Reader = undefined;
+        var req: Request = undefined;
+        var parser: RequestParser = undefined;
+        try testStreamingRequest(arena.allocator(), raw_request, &reader, &req, &parser);
+        defer parser.deinit();
+
+        var r = try req.reader(&.{});
+        // Part of it, then the rest: what a short discard leaves is still
+        // there for the next one.
+        try std.testing.expectEqual(3, try r.interface.discardShort(3));
+        try std.testing.expectEqual(8, try r.interface.discardRemaining());
+        try std.testing.expect(parser.isBodyComplete());
+    }
 }

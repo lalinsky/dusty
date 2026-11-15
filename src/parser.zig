@@ -146,9 +146,12 @@ pub const RequestParser = struct {
         headers_complete: bool = false,
         message_complete: bool = false,
 
-        // Body reading state
-        body_dest_buf: []u8 = &.{}, // Where onBody should copy to
-        body_dest_pos: usize = 0, // How much onBody has written
+        /// Body bytes `onBody` found, still lying in the connection's
+        /// read buffer, and not yet handed to a reader.
+        body: []const u8 = &.{},
+        /// `onBody` paused llhttp, which has to be resumed and fed again
+        /// before it goes on.
+        body_paused: bool = false,
     };
 
     pub fn init(self: *RequestParser, request: *Request) !void {
@@ -193,6 +196,12 @@ pub const RequestParser = struct {
 
     pub fn feed(self: *RequestParser, data: []const u8) (ParseError || error{Paused})!void {
         if (self.framing.err) |e| return e;
+        // llhttp keeps a failure and returns it from every later execute
+        // without reading anything. Charging the framing again would count
+        // bytes already charged, and could report a budget overrun in place
+        // of what went wrong.
+        const lingering = c.llhttp_get_errno(&self.parser);
+        if (lingering != c.HPE_OK and lingering != c.HPE_PAUSED) return self.state.err orelse mapError(lingering);
         const chunked = inChunkedBody(&self.parser, self.state.headers_complete);
         self.framing.body_len = 0;
         self.framing.earned = 0;
@@ -226,11 +235,6 @@ pub const RequestParser = struct {
 
     pub fn resumeParsing(self: *RequestParser) void {
         c.llhttp_resume(&self.parser);
-    }
-
-    pub fn prepareBodyRead(self: *RequestParser, dest: []u8) void {
-        self.state.body_dest_buf = dest;
-        self.state.body_dest_pos = 0;
     }
 
     pub fn getConsumedBytes(self: *RequestParser, buf_start: [*c]const u8) usize {
@@ -419,19 +423,15 @@ pub const RequestParser = struct {
         self.request.url = rest[authority_end..];
     }
 
+    /// Keeps the slice where it is and stops: one slice per feed, which
+    /// the body reader hands over before feeding again.
     fn onBody(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *RequestParser = @fieldParentPtr("parser", parser.?);
         self.framing.body_len += length;
-
-        const available = self.state.body_dest_buf.len - self.state.body_dest_pos;
-        const to_copy = @min(length, available);
-
-        if (to_copy > 0) {
-            @memcpy(self.state.body_dest_buf[self.state.body_dest_pos..][0..to_copy], at[0..to_copy]);
-            self.state.body_dest_pos += to_copy;
-        }
-
-        return 0;
+        if (length == 0) return 0;
+        self.state.body = at[0..length];
+        self.state.body_paused = true;
+        return c.HPE_PAUSED;
     }
 
     fn onChunkHeader(parser: ?*c.llhttp_t) callconv(.c) c_int {
@@ -549,9 +549,12 @@ pub const ResponseParser = struct {
         // An interim response was read and dropped on the way to this one.
         saw_interim: bool = false,
 
-        // Body reading state
-        body_dest_buf: []u8 = &.{}, // Where onBody should copy to
-        body_dest_pos: usize = 0, // How much onBody has written
+        /// Body bytes `onBody` found, still lying in the connection's
+        /// read buffer, and not yet handed to a reader.
+        body: []const u8 = &.{},
+        /// `onBody` paused llhttp, which has to be resumed and fed again
+        /// before it goes on.
+        body_paused: bool = false,
     };
 
     pub fn init(self: *ResponseParser, response: *ParsedResponse, max_headers: usize) !void {
@@ -599,6 +602,15 @@ pub const ResponseParser = struct {
 
     pub fn feed(self: *ResponseParser, data: []const u8) !void {
         if (self.framing.err) |e| return e;
+        // llhttp keeps a failure and returns it from every later execute
+        // without reading anything. Charging the framing again would count
+        // bytes already charged, and could report a budget overrun in place
+        // of what went wrong.
+        const lingering = c.llhttp_get_errno(&self.parser);
+        if (lingering != c.HPE_OK and lingering != c.HPE_PAUSED) {
+            self.state.failed = true;
+            return self.state.err orelse mapError(lingering);
+        }
         const chunked = inChunkedBody(&self.parser, self.state.headers_complete);
         self.framing.body_len = 0;
         self.framing.earned = 0;
@@ -643,11 +655,6 @@ pub const ResponseParser = struct {
 
     pub fn resumeParsing(self: *ResponseParser) void {
         c.llhttp_resume(&self.parser);
-    }
-
-    pub fn prepareBodyRead(self: *ResponseParser, dest: []u8) void {
-        self.state.body_dest_buf = dest;
-        self.state.body_dest_pos = 0;
     }
 
     pub fn getConsumedBytes(self: *ResponseParser, buf_start: [*c]const u8) usize {
@@ -783,19 +790,15 @@ pub const ResponseParser = struct {
         return c.HPE_PAUSED; // Always pause so we can track consumed bytes
     }
 
+    /// Keeps the slice where it is and stops: one slice per feed, which
+    /// the body reader hands over before feeding again.
     fn onBody(parser: ?*c.llhttp_t, at: [*c]const u8, length: usize) callconv(.c) c_int {
         const self: *ResponseParser = @fieldParentPtr("parser", parser.?);
         self.framing.body_len += length;
-
-        const available = self.state.body_dest_buf.len - self.state.body_dest_pos;
-        const to_copy = @min(length, available);
-
-        if (to_copy > 0) {
-            @memcpy(self.state.body_dest_buf[self.state.body_dest_pos..][0..to_copy], at[0..to_copy]);
-            self.state.body_dest_pos += to_copy;
-        }
-
-        return 0;
+        if (length == 0) return 0;
+        self.state.body = at[0..length];
+        self.state.body_paused = true;
+        return c.HPE_PAUSED;
     }
 
     fn onChunkHeader(parser: ?*c.llhttp_t) callconv(.c) c_int {
@@ -814,9 +817,9 @@ pub const ResponseParser = struct {
 
 /// Generic streaming body reader for HTTP messages.
 /// Works with any parser type that has the standard body reading interface:
-/// - `state.body_dest_pos: usize`
+/// - `state.body: []const u8` and `state.body_paused: bool`, set by `onBody`
 /// - `isBodyComplete() bool`
-/// - `prepareBodyRead(dest: []u8) void`
+/// - `resumeParsing() void`
 /// - `feed(data: []const u8) (ParseError || error{Paused})!void`
 /// - `finish() ParseError!void`
 /// - `getConsumedBytes(ptr: [*c]const u8) usize`
@@ -901,7 +904,7 @@ pub fn BodyReader(comptime Parser: type) type {
                 .parser = parser,
                 .transport = transport,
                 .interface = .{
-                    .vtable = &.{ .stream = stream },
+                    .vtable = &.{ .stream = stream, .discard = discard },
                     .buffer = buffer,
                     .seek = 0,
                     .end = 0,
@@ -992,10 +995,49 @@ pub fn BodyReader(comptime Parser: type) type {
             };
         }
 
+        /// Drops body bytes where they lie rather than copying them into
+        /// `interface.buffer` first, as the default would. A decoded body
+        /// has no such slices to drop: what it is made of only exists once
+        /// it has been inflated, so it goes the default way.
+        fn discard(io_r: *std.Io.Reader, limit: std.Io.Limit) std.Io.Reader.Error!usize {
+            const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
+            if (self.decode != null) return std.Io.Reader.defaultDiscard(io_r, limit);
+            // Unbuffered, so `write` hands each slice straight to `drain`,
+            // which only counts it.
+            var discarding: std.Io.Writer.Discarding = .init(&.{});
+            return self.streamFramed(&discarding.writer, limit) catch |err| switch (err) {
+                error.WriteFailed => unreachable,
+                else => |e| return e,
+            };
+        }
+
         fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
             const self: *Self = @alignCast(@fieldParentPtr("interface", io_r));
             if (self.decode) |decode| return self.streamDecoded(decode, w, limit);
             return self.streamFramed(w, limit);
+        }
+
+        /// Resumes llhttp if `onBody` paused it, and feeds it what the
+        /// connection has already buffered, which may be nothing. Reads no
+        /// new input. Stops at the next body slice or at the end of the
+        /// message. A slice stays readable after the toss: nothing refills
+        /// the buffer until it has been handed over.
+        fn feedBuffered(self: *Self) ParseError!void {
+            const parser = self.parser;
+            const conn = self.transport.reader;
+            if (parser.state.body_paused) {
+                parser.state.body_paused = false;
+                parser.resumeParsing();
+            }
+            const buffered = conn.buffered();
+            parser.feed(buffered) catch |err| switch (err) {
+                error.Paused => {
+                    conn.toss(parser.getConsumedBytes(buffered.ptr));
+                    return;
+                },
+                else => |e| return e,
+            };
+            conn.toss(buffered.len);
         }
 
         fn streamFramed(self: *Self, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
@@ -1020,25 +1062,29 @@ pub fn BodyReader(comptime Parser: type) type {
                 }
             }
 
-            const dest = limit.slice(try w.writableSliceGreedy(1));
-            if (dest.len == 0) return 0;
+            if (limit == .nothing) return 0;
 
-            // Check if body is already complete
-            if (parser.isBodyComplete()) {
-                return error.EndOfStream;
-            }
-
-            // Setup destination for onBody callback (resets body_dest_pos to 0)
-            parser.prepareBodyRead(dest);
-
-            // Loop until we have body bytes, body is complete, or error occurs
-            // This handles cases where parser consumes framing data (chunk headers)
-            // but doesn't produce body bytes yet - we must not return 0 mid-body
+            // Loop until there are body bytes to hand over, the body is
+            // complete, or something fails. A feed can consume only framing
+            // (chunk headers) and produce no body, and we must not return 0
+            // mid-body for that.
             while (true) {
-                // If we have body bytes, return them
-                if (parser.state.body_dest_pos > 0) {
-                    w.advance(parser.state.body_dest_pos);
-                    return parser.state.body_dest_pos;
+                // What `onBody` found goes to `w` from where it lies in the
+                // connection's read buffer. Whatever `w` does not take, or
+                // fails to, stays for the next read.
+                if (parser.state.body.len > 0) {
+                    const n = try w.write(limit.sliceConst(parser.state.body));
+                    parser.state.body = parser.state.body[n..];
+                    if (parser.state.body.len == 0) {
+                        // Go on with what has already arrived, so a message
+                        // whose end is buffered is complete once its last
+                        // body byte is read: a reader that takes exactly the
+                        // body, as a decoder does, never asks again. A
+                        // failure here is llhttp's to repeat on the next
+                        // read, which reports it.
+                        self.feedBuffered() catch {};
+                    }
+                    return n;
                 }
 
                 // Check if body is complete
@@ -1046,7 +1092,9 @@ pub fn BodyReader(comptime Parser: type) type {
                     return error.EndOfStream;
                 }
 
-                // Ensure connection buffer has data
+                // Handing over the last of a slice resumed llhttp.
+                std.debug.assert(!parser.state.body_paused);
+
                 if (conn.bufferedLen() == 0) {
                     conn.fillMore() catch |err| switch (err) {
                         error.EndOfStream => {
@@ -1068,34 +1116,8 @@ pub fn BodyReader(comptime Parser: type) type {
                     };
                 }
 
-                // Get buffered data
-                const buffered = conn.buffered();
-                if (buffered.len == 0) {
-                    return 0;
-                }
-
-                // Limit feed size to available dest space to avoid consuming more than we can store
-                const available = dest.len - parser.state.body_dest_pos;
-                const to_feed = @min(buffered.len, available);
-
-                // Feed data to parser (may consume framing data without producing body bytes)
-                if (parser.feed(buffered[0..to_feed])) {
-                    // Not paused - consumed all bytes
-                    conn.toss(to_feed);
-                } else |err| {
-                    switch (err) {
-                        // Paused means onMessageComplete was called
-                        error.Paused => {
-                            const consumed = parser.getConsumedBytes(buffered.ptr);
-                            conn.toss(consumed);
-                        },
-                        // Framing the parser rejected: the bytes arrived, they
-                        // just were not a body.
-                        else => |e| return self.fail(e),
-                    }
-                }
-
-                // Continue loop to check if we got body bytes now
+                // May consume framing (chunk headers) and produce no body.
+                self.feedBuffered() catch |e| return self.fail(e);
             }
         }
     };
