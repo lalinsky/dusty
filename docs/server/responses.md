@@ -46,7 +46,8 @@ with the rest of the response.
 `buf` collects the body before it's sent. `flush` sends what is in it. The body is sent with chunked
 encoding, unless the handler set a `Content-Length` header. Call `end` when the body is done.
 
-The headers go out together with the first part of the body, so a short body is sent in one write.
+The headers go out together with the first part of the body, so a body that fits in `buf` is sent in
+one write, chunked or not.
 If the client should see the headers before there is any body to send, call `flush` right after
 `res.stream`.
 

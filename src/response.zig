@@ -490,7 +490,7 @@ pub const StreamingBodyWriter = struct {
         } else {
             try std.Io.Writer.defaultFlush(w);
         }
-        try self.record(self.res.conn.writer.flush());
+        if (!self.res.hold_flush) try self.record(self.res.conn.writer.flush());
     }
 
     /// Finishes the body: flushes what is left and, for a chunked body,
@@ -510,6 +510,10 @@ pub const StreamingBodyWriter = struct {
         // response.
         errdefer res.keepalive = false;
 
+        // The last of the body, the terminator and the flush below all go
+        // out as one write.
+        res.hold_flush = true;
+        defer res.hold_flush = false;
         if (self.compressor) |compressor| {
             try res.resolve(compressor.finish(self.interface.buffered()));
             self.interface.end = 0;
@@ -627,6 +631,9 @@ pub const Response = struct {
     content_length: ?usize = null,
     /// Body bytes handed to the connection by a streaming writer.
     body_sent: usize = 0,
+    /// Set while `StreamingBodyWriter.end` sends what is left of the body,
+    /// so that goes out in the same write as the terminator after it.
+    hold_flush: bool = false,
     /// The request this answers, when the server built the pair. Set by the
     /// server.
     request: ?*const Request = null,
@@ -775,7 +782,8 @@ pub const Response = struct {
     ///
     /// The headers are final when this returns, so nothing can change them
     /// afterwards. They are sent together with the first body bytes, so a
-    /// short body goes out in one write; call `flush` on the result to send
+    /// body that fits in `buf` goes out in one write, chunked or not; call
+    /// `flush` on the result to send
     /// them before there is any body. Call `end` on the result before
     /// returning.
     pub fn stream(self: *Response, buf: []u8) !StreamingBodyWriter {
@@ -1271,7 +1279,7 @@ pub const Response = struct {
         for (data[0 .. data.len - 1]) |bytes| try out.writeAll(bytes);
         try out.splatBytesAll(data[data.len - 1], splat);
         if (self.chunked) try out.writeAll("\r\n");
-        try out.flush();
+        if (!self.hold_flush) try out.flush();
     }
 
     /// Sends the headers ahead of a body that is not buffered: a stream,
@@ -3810,4 +3818,53 @@ test "Response: startEventStream sends the headers right away" {
     try std.testing.expectEqual(1, counter.writes);
     try std.testing.expect(std.mem.startsWith(u8, counter.sent(), "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, counter.sent(), "Content-Type: text/event-stream\r\n") != null);
+}
+
+test "StreamingBodyWriter: a short chunked body goes out in one write, terminator included" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("hello");
+    try body.end();
+
+    try std.testing.expectEqual(1, counter.writes);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 200 OK\r\n" ++
+            "Transfer-Encoding: chunked\r\n" ++
+            "\r\n" ++
+            "5\r\nhello\r\n" ++
+            "0\r\n\r\n",
+        try withoutDate(counter.sent()),
+    );
+}
+
+test "StreamingBodyWriter: a flush before end still goes out on its own" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var counter: WriteCounter = undefined;
+    counter.init();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(&counter.out);
+
+    var response = try Response.init(arena.allocator(), &connection, 32);
+
+    var body_buf: [64]u8 = undefined;
+    var body = try response.stream(&body_buf);
+    try body.interface.writeAll("first");
+    try body.interface.flush();
+    try std.testing.expectEqual(1, counter.writes);
+    try body.interface.writeAll("second");
+    try body.end();
+    try std.testing.expectEqual(2, counter.writes);
+    try std.testing.expect(!response.hold_flush);
 }
