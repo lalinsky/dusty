@@ -10,7 +10,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Streaming a body into a writer with no buffer, such as `res.stream(&.{})`, no longer panics.
+- Passing a writer with no buffer, such as `res.stream(&.{})`, to `streamRemaining` on the reader from `req.reader` or the client's `response.reader` no longer panics.
 
 ## [0.6.0] - 2026-11-14
 
