@@ -317,6 +317,69 @@ test "Server: a streamed body to an HTTP/1.0 client is not chunked" {
     try std.testing.expect(std.mem.endsWith(u8, raw, "\r\n\r\nhello world"));
 }
 
+test "Server: a body echoed through a stream with no buffers" {
+    const io = std.testing.io;
+
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{ .listeners = loopback }, {});
+    defer server.deinit();
+
+    server.router.post("/echo", struct {
+        fn handle(req: *dusty.Request, res: *dusty.Response) !void {
+            var body = try req.reader(&.{});
+            if (req.headers.get("Content-Length")) |len| try res.header("Content-Length", len);
+            var out = try res.stream(&.{});
+            _ = try body.interface.streamRemaining(&out.interface);
+            try out.end();
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world" ++
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" ++
+        "5\r\nhello\r\n6\r\n again\r\n0\r\n\r\n");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const raw = try reader.interface.allocRemaining(std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(raw);
+
+    const second = std.mem.indexOf(u8, raw[1..], "HTTP/1.1 200 OK\r\n").? + 1;
+    try std.testing.expect(std.mem.indexOf(u8, raw[0..second], "Content-Length: 11\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, raw[0..second], "\r\n\r\nhello world"));
+    try std.testing.expect(std.mem.indexOf(u8, raw[second..], "Transfer-Encoding: chunked\r\n") != null);
+
+    // How the chunks come back depends on how the server's reads fell, so
+    // only what they add up to is checked.
+    var rest = raw[second + std.mem.indexOf(u8, raw[second..], "\r\n\r\n").? + 4 ..];
+    var echoed: std.ArrayList(u8) = .empty;
+    defer echoed.deinit(std.testing.allocator);
+    while (true) {
+        const line_end = std.mem.indexOf(u8, rest, "\r\n").?;
+        const size = try std.fmt.parseInt(usize, rest[0..line_end], 16);
+        rest = rest[line_end + 2 ..];
+        if (size == 0) break;
+        try echoed.appendSlice(std.testing.allocator, rest[0..size]);
+        try std.testing.expectEqualStrings("\r\n", rest[size..][0..2]);
+        rest = rest[size + 2 ..];
+    }
+    try std.testing.expectEqualStrings("\r\n", rest);
+    try std.testing.expectEqualStrings("hello again", echoed.items);
+}
+
 test "Server: WebSocket echo" {
     const io = std.testing.io;
 

@@ -422,8 +422,7 @@ pub const ConnectionPool = struct {
 
     /// No decoding: the body is being thrown away to keep the connection.
     fn discardBody(conn: *Connection) ResponseBodyReader.Error!bool {
-        var buf: [1024]u8 = undefined;
-        var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &buf);
+        var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &.{});
         _ = body_reader.interface.discardShort(drain_max_bytes + 1) catch |err| switch (err) {
             error.ReadFailed => return body_reader.err orelse error.Unexpected,
         };
@@ -886,7 +885,7 @@ pub const ClientResponse = struct {
     /// the way `Response.stream` takes one for the other direction. It is
     /// what `peek` and the `take` family read out of, so size it for the
     /// longest thing they need to see at once; an empty slice is fine for a
-    /// caller that only ever streams.
+    /// caller that only streams or discards.
     ///
     /// One per response. `body` takes it if you have not, so a caller that
     /// streams cannot then ask for the body whole.
@@ -1230,10 +1229,9 @@ pub const Client = struct {
                 // be returned to the pool rather than closed.
                 if (!conn.closing and !conn.parser.isBodyComplete()) {
                     const max_drain = 2048;
-                    var drain_buf: [1024]u8 = undefined;
                     // No decoding: this is throwing the body away to keep the
                     // connection, so what it would decode to does not matter.
-                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &drain_buf);
+                    var body_reader = ResponseBodyReader.init(&conn.parser, conn.transport(), &.{});
                     _ = body_reader.interface.discardShort(max_drain + 1) catch |err| switch (err) {
                         error.ReadFailed => {
                             conn.closing = true;

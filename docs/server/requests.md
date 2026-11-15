@@ -37,6 +37,10 @@ For a body too large to keep in memory, read it piece by piece with `req.reader`
 apply. When a read fails with `error.ReadFailed`, `body.err` has the underlying error. A handler
 that has taken the reader can't call `req.body()` after it.
 
+The buffer you pass to `req.reader` is what the reader keeps bytes in until you take them. A handler
+that only streams the body somewhere else, or throws it away with `discardRemaining`, can pass an
+empty one.
+
 ## Forms
 
 `req.formData()` reads a form sent as `application/x-www-form-urlencoded`, which is what an HTML
