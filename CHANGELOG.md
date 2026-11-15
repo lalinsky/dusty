@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- `res.stream` no longer sends the headers on their own. They go out with the first body bytes, and `end` sends the rest of the body together with the chunked terminator, so a short streamed body takes one write instead of two or three, and one TLS record instead of two or three, whether it is chunked or has a `Content-Length`. A body bigger than the stream's buffer is also no longer flushed to the connection every time the buffer fills; it is sent as the connection's own buffer fills, or on `flush` or `end`. `flush` on the stream sends them early when needed. `res.startEventStream` still sends them right away, and so does `res.stream` when the client is waiting for `100 Continue`.
+- `res.stream` no longer flushes the headers right away. The response is sent when the buffer fills, on `flush`, or at `end`.
 
 ## [0.6.0] - 2026-11-14
 
