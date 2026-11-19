@@ -265,8 +265,10 @@ pub const ServerConfig = struct {
         /// Answer what the client got wrong with a 400, 413 or 415: a
         /// parameter such as `http.Query` that is missing or doesn't parse,
         /// or a body that is too large, broken, or in a coding the server
-        /// can't undo. Turn off to have the app's `uncaughtError` answer
-        /// these too, with `Request.clientErrorStatus` telling them apart.
+        /// can't undo; and the status of a handler's `Response.fail`. Turn
+        /// off to have the app's `uncaughtError` answer these too, with
+        /// `Request.clientErrorStatus` telling them apart, or
+        /// `error.HttpFail` with `Response.fail_status`.
         answer_client_errors: bool = true,
         /// Buffer size (bytes) for reading the request head: the request
         /// line and all headers. This is also the limit on it -- the parsed

@@ -152,7 +152,7 @@ pub fn Executor(comptime App: type) type {
 
         fn recover(self: *Self, returned: anyerror) !void {
             const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
-            const client_status = self.req.clientErrorStatus();
+            const client_status = if (err == error.HttpFail) self.res.fail_status else self.req.clientErrorStatus();
             switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
@@ -301,9 +301,10 @@ pub fn Executor(comptime App: type) type {
                     self.res.status = status;
                     self.res.content_type = .text;
                     self.res.body = switch (status) {
+                        .bad_request => "400 Bad Request\n",
                         .payload_too_large => "413 Content Too Large\n",
                         .unsupported_media_type => "415 Unsupported Media Type\n",
-                        else => "400 Bad Request\n",
+                        else => statusBody(status),
                     };
                     return;
                 }
@@ -320,6 +321,17 @@ pub fn Executor(comptime App: type) type {
             }
         }
     };
+}
+
+fn statusBody(status: http.Status) []const u8 {
+    @setEvalBranchQuota(100_000);
+    switch (status) {
+        inline else => |s| {
+            const code = @intFromEnum(s);
+            const phrase = comptime @as(std.http.Status, @enumFromInt(code)).phrase();
+            return if (phrase) |p| std.fmt.comptimePrint("{d} {s}\n", .{ code, p }) else std.fmt.comptimePrint("{d}\n", .{code});
+        },
+    }
 }
 
 // Tests
@@ -850,6 +862,44 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "500 Internal Server Error\n"));
+}
+
+test "Executor: res.fail answers with its status, unless another error comes back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+
+    inline for (.{
+        .{ struct {
+            fn handle(r: *Response) !void {
+                return r.fail(.unprocessable_entity);
+            }
+        }.handle, http.Status.unprocessable_entity, "422 Unprocessable Entity\n" },
+        .{ struct {
+            fn handle(r: *Response) !void {
+                r.fail(.unprocessable_entity) catch {};
+                return error.Boom;
+            }
+        }.handle, http.Status.internal_server_error, "500 Internal Server Error\n" },
+    }) |case| {
+        var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
+        var res = try Response.init(arena.allocator(), &connection, 32);
+        var executor = Executor(void){
+            .req = &req,
+            .res = &res,
+            .app = {},
+            .action = struct {
+                fn handle(_: *Request, r: *Response) !void {
+                    return case[0](r);
+                }
+            }.handle,
+            .middlewares = &.{},
+        };
+        try executor.run();
+        try std.testing.expectEqual(case[1], res.status);
+        try std.testing.expectEqualStrings(case[2], res.body);
+    }
 }
 
 const WritingMiddleware = struct {

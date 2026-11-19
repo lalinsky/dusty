@@ -658,6 +658,8 @@ pub const Response = struct {
     /// sends the headers. Set by the executor, which runs them itself for
     /// a buffered body.
     headers_hook: ?HeadersHook = null,
+    /// The status passed to the last `fail`.
+    fail_status: ?http.Status = null,
 
     pub const HeadersHook = struct {
         ptr: *anyopaque,
@@ -881,6 +883,22 @@ pub const Response = struct {
         _ = self.headers.remove("Content-Type");
         _ = self.headers.remove("Content-Length");
         _ = self.headers.remove("Content-Encoding");
+    }
+
+    /// Records `status` and returns `error.HttpFail`. If a handler or
+    /// middleware returns that error, the server answers with `status`
+    /// instead of a 500:
+    ///
+    ///     if (!valid) return res.fail(.unprocessable_entity);
+    ///
+    /// The answer is the same as for other client errors: plain text, or
+    /// `uncaughtError` when `answer_client_errors` is off. The body the
+    /// handler wrote is thrown away, but headers such as
+    /// `WWW-Authenticate` stay. A handler that catches the error and
+    /// returns a different one gets the 500.
+    pub fn fail(self: *Response, status: http.Status) error{HttpFail} {
+        self.fail_status = status;
+        return error.HttpFail;
     }
 
     /// Writes `value` as the body with `std.json`. `encode` with json.zig's
