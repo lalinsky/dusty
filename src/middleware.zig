@@ -153,7 +153,7 @@ pub fn Executor(comptime App: type) type {
         fn recover(self: *Self, returned: anyerror) !void {
             const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
             const failure = if (err == error.HttpFail) self.res.failure else null;
-            const client_status = if (err == error.HttpFail) if (failure) |f| f.status else null else self.req.clientErrorStatus();
+            const client_status = if (failure) |f| f.status else if (err == error.HttpFail) null else self.req.clientErrorStatus();
             switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
@@ -179,9 +179,15 @@ pub fn Executor(comptime App: type) type {
                 log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                 return err;
             }
-            if (client_status != null) {
-                const cause = if (failure) |f| f.cause orelse err else err;
-                log.debug("request rejected: {} ({f} {s})", .{ cause, self.req.method, self.req.url });
+            if (failure) |f| {
+                const cause = f.cause orelse err;
+                if (@intFromEnum(f.status) >= 500) {
+                    log.err("request failed with {d}: {} ({f} {s})", .{ @intFromEnum(f.status), cause, self.req.method, self.req.url });
+                } else {
+                    log.debug("request rejected with {d}: {} ({f} {s})", .{ @intFromEnum(f.status), cause, self.req.method, self.req.url });
+                }
+            } else if (client_status != null) {
+                log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
             } else {
                 log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
             }
@@ -303,9 +309,8 @@ pub fn Executor(comptime App: type) type {
                     self.res.status = status;
                     self.res.content_type = .text;
                     const line = switch (status) {
-                        .bad_request => "400 Bad Request\n",
+                        // The RFC 9110 name; std still has "Payload Too Large".
                         .payload_too_large => "413 Content Too Large\n",
-                        .unsupported_media_type => "415 Unsupported Media Type\n",
                         else => statusBody(status),
                     };
                     self.res.body = if (message) |m|

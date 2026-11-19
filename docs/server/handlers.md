@@ -112,8 +112,8 @@ which gets the response with the status and the `Allow` header already set. `unc
 `void`, so it can't fail. It can take the error as `anyerror`, but not
 `http.Path`, `http.Query`, `http.Header` or your own types.
 
-The 400, 413 and 415 for what the client got wrong don't go through `uncaughtError`. To answer
-those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request
+The 400, 413 and 415 for what the client got wrong, and the statuses from `res.fail`, don't go
+through `uncaughtError`. To answer those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request
 settings:
 
 ```zig
@@ -122,8 +122,8 @@ settings:
 
 `uncaughtError` then gets them as well, and
 [`req.clientErrorStatus()`](../../apidocs/#http.Request.clientErrorStatus) gives the status the
-server would have used, or null when the client got nothing wrong. A handler that used `res.fail`
-gives `error.HttpFail`, with the status, message and cause in `res.failure`.
+server would have used, or null when the client got nothing wrong. That doesn't cover `res.fail`:
+for `error.HttpFail`, the status, message and cause are in `res.failure`.
 
 ## Timeouts
 

@@ -284,7 +284,8 @@ pub const Request = struct {
     /// nothing wrong: a parameter such as `http.Query` that is missing or
     /// doesn't parse, a body over `max_body_size`, broken framing or coding,
     /// or a coding this server can't undo. Set where the failure happens,
-    /// whatever error the handler then returns.
+    /// whatever error the handler then returns. Not set by `Response.fail`,
+    /// which records its status in `Response.failure`.
     pub fn clientErrorStatus(self: *const Request) ?http.Status {
         // A custom extractor can fail on the body, which has the more
         // specific status.
