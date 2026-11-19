@@ -746,8 +746,9 @@ pub fn Server(comptime App: type) type {
                     // trying again turns that into latency; returning would
                     // turn a condition that clears on its own into an outage
                     // that needs a restart. `NetworkDown` is also a pending
-                    // connection error on Linux, and `Unexpected` is where the
-                    // rest of those (EHOSTUNREACH, ENETUNREACH, ...) end up.
+                    // connection error on Linux, and the rest of those
+                    // (EHOSTUNREACH, ENETUNREACH, ...) can end up as
+                    // `Unexpected`, depending on the `Io` implementation.
                     // `BlockedByFirewall` can also be a security policy
                     // denying every accept, which would spin without a pause.
                     error.ProcessFdQuotaExceeded,
