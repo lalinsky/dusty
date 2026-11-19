@@ -658,8 +658,8 @@ pub const Response = struct {
     /// sends the headers. Set by the executor, which runs them itself for
     /// a buffered body.
     headers_hook: ?HeadersHook = null,
-    /// The status passed to the last `fail`.
-    fail_status: ?http.Status = null,
+    /// What the last `fail` recorded.
+    failure: ?http.Failure = null,
 
     pub const HeadersHook = struct {
         ptr: *anyopaque,
@@ -889,17 +889,25 @@ pub const Response = struct {
     /// middleware returns that error, the server answers with `status`
     /// instead of a 500:
     ///
-    ///     if (!valid) return res.fail(.unprocessable_entity);
+    ///     if (!valid) return res.fail(.unprocessable_entity, .{ .message = "name is required" });
+    ///
+    /// `message` is for the client, and must live until the response is
+    /// written. `cause` is the error behind the failure, for the logs.
     ///
     /// The answer is the same as for other client errors: plain text, or
     /// `uncaughtError` when `answer_client_errors` is off. The body the
     /// handler wrote is thrown away, but headers such as
     /// `WWW-Authenticate` stay. A handler that catches the error and
     /// returns a different one gets the 500.
-    pub fn fail(self: *Response, status: http.Status) error{HttpFail} {
-        self.fail_status = status;
+    pub fn fail(self: *Response, status: http.Status, options: FailOptions) error{HttpFail} {
+        self.failure = .{ .status = status, .message = options.message, .cause = options.cause };
         return error.HttpFail;
     }
+
+    pub const FailOptions = struct {
+        message: ?[]const u8 = null,
+        cause: ?anyerror = null,
+    };
 
     /// Writes `value` as the body with `std.json`. `encode` with json.zig's
     /// `json.encode` is considerably faster for types known at compile time.

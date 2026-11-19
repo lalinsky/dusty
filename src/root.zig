@@ -20,6 +20,7 @@ pub const EventWriter = @import("response.zig").EventWriter;
 pub const WebSocket = @import("websocket.zig").WebSocket;
 pub const Method = @import("http.zig").Method;
 pub const Status = @import("http.zig").Status;
+pub const Failure = @import("http.zig").Failure;
 pub const Headers = @import("http.zig").Headers;
 pub const Params = @import("http.zig").Params;
 pub const Path = @import("extract.zig").Path;

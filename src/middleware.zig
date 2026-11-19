@@ -152,7 +152,8 @@ pub fn Executor(comptime App: type) type {
 
         fn recover(self: *Self, returned: anyerror) !void {
             const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
-            const client_status = if (err == error.HttpFail) self.res.fail_status else self.req.clientErrorStatus();
+            const failure = if (err == error.HttpFail) self.res.failure else null;
+            const client_status = if (err == error.HttpFail) if (failure) |f| f.status else null else self.req.clientErrorStatus();
             switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
@@ -179,7 +180,8 @@ pub fn Executor(comptime App: type) type {
                 return err;
             }
             if (client_status != null) {
-                log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
+                const cause = if (failure) |f| f.cause orelse err else err;
+                log.debug("request rejected: {} ({f} {s})", .{ cause, self.req.method, self.req.url });
             } else {
                 log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
             }
@@ -187,7 +189,7 @@ pub fn Executor(comptime App: type) type {
             // writes it, instead of tearing down the connection with no reply.
             self.failure = err;
             self.headers_hooks_ran = true;
-            self.handleError(err, client_status);
+            self.handleError(err, client_status, if (failure) |f| f.message else null);
         }
 
         fn callHeadersHooks(ptr: *anyopaque) Response.HeadersHookError!void {
@@ -290,7 +292,7 @@ pub fn Executor(comptime App: type) type {
             }
         }
 
-        fn handleError(self: *Self, err: anyerror, client_status: ?http.Status) void {
+        fn handleError(self: *Self, err: anyerror, client_status: ?http.Status, message: ?[]const u8) void {
             // Whatever the handler managed to write is half of something
             // it did not finish, and `write` would send it in place of the
             // error response. The caller has already checked that the
@@ -300,12 +302,16 @@ pub fn Executor(comptime App: type) type {
                 if (self.req.config.answer_client_errors) {
                     self.res.status = status;
                     self.res.content_type = .text;
-                    self.res.body = switch (status) {
+                    const line = switch (status) {
                         .bad_request => "400 Bad Request\n",
                         .payload_too_large => "413 Content Too Large\n",
                         .unsupported_media_type => "415 Unsupported Media Type\n",
                         else => statusBody(status),
                     };
+                    self.res.body = if (message) |m|
+                        std.fmt.allocPrint(self.res.arena, "{s}: {s}\n", .{ line[0 .. line.len - 1], m }) catch line
+                    else
+                        line;
                     return;
                 }
             }
@@ -873,12 +879,17 @@ test "Executor: res.fail answers with its status, unless another error comes bac
     inline for (.{
         .{ struct {
             fn handle(r: *Response) !void {
-                return r.fail(.unprocessable_entity);
+                return r.fail(.unprocessable_entity, .{ .message = "name is required", .cause = error.MissingField });
             }
-        }.handle, http.Status.unprocessable_entity, "422 Unprocessable Entity\n" },
+        }.handle, http.Status.unprocessable_entity, "422 Unprocessable Entity: name is required\n" },
         .{ struct {
             fn handle(r: *Response) !void {
-                r.fail(.unprocessable_entity) catch {};
+                return r.fail(.forbidden, .{});
+            }
+        }.handle, http.Status.forbidden, "403 Forbidden\n" },
+        .{ struct {
+            fn handle(r: *Response) !void {
+                r.fail(.unprocessable_entity, .{}) catch {};
                 return error.Boom;
             }
         }.handle, http.Status.internal_server_error, "500 Internal Server Error\n" },

@@ -85,11 +85,13 @@ A handler that returns `error.NotFound` gets the same 404 as a request with no r
 To answer with some other status, return `res.fail` with it:
 
 ```zig
-if (!valid) return res.fail(.unprocessable_entity);
+if (!valid) return res.fail(.unprocessable_entity, .{ .message = "name is required" });
 ```
 
 It returns `error.HttpFail`, and the server answers with the status, the same way it answers the
-client errors above. If the handler catches the error and returns a different one, it gets the 500.
+client errors above. The message is optional and goes to the client. You can also pass the error
+that caused the failure as `.cause`, which goes to the log. If the handler catches `error.HttpFail`
+and returns a different error, it gets the 500.
 
 The body the handler wrote before the error is thrown away. If the handler has
 already started sending the response, for example with `res.stream`, the server can't replace it
@@ -121,7 +123,7 @@ settings:
 `uncaughtError` then gets them as well, and
 [`req.clientErrorStatus()`](../../apidocs/#http.Request.clientErrorStatus) gives the status the
 server would have used, or null when the client got nothing wrong. A handler that used `res.fail`
-gives `error.HttpFail`, with the status in `res.fail_status`.
+gives `error.HttpFail`, with the status, message and cause in `res.failure`.
 
 ## Timeouts
 
