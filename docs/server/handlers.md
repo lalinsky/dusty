@@ -92,9 +92,10 @@ It returns `error.HttpFail`, and the server answers with the status, the same wa
 client errors above. The message is optional and goes to the client. You can also pass the error
 that caused the failure as `.cause`, which goes to the log.
 
-For both `res.fail` and the client errors above, the status only applies to the error it was
-recorded for. If the handler catches `error.HttpFail` or `error.BodyTooBig` and then returns a
-different error, that error is handled like any other.
+For both `res.fail` and the client errors above, the status only applies when the handler returns
+the error it was recorded for: `error.HttpFail` or the cause, or `error.ReadFailed` from a body
+the handler was streaming. If the handler catches it and returns a different error, that error is
+handled like any other.
 
 The body the handler wrote before the error is thrown away. If the handler has
 already started sending the response, for example with `res.stream`, the server can't replace it

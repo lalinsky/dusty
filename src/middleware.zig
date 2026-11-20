@@ -271,9 +271,10 @@ pub fn Executor(comptime App: type) type {
             else
                 action(self.app, self.req, self.res);
             // A handler that finds nothing to answer with answers as if no
-            // route had matched.
+            // route had matched, unless it already started its response.
             result catch |err| switch (err) {
                 error.NotFound => {
+                    if (self.res.headers_written) return err;
                     self.res.failure = null;
                     return self.handleNotFound();
                 },
@@ -716,6 +717,29 @@ test "Executor: error after headers written propagates instead of rewriting the 
     // so status/body are left untouched rather than rewritten to a 500.
     try std.testing.expectEqual(.ok, res.status);
     try std.testing.expectEqualStrings("", res.body);
+}
+
+test "Executor: error.NotFound after headers written propagates instead of ending the response" {
+    var req = testRequest();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+    var res = makeTestResponse(&connection);
+    res.headers_written = true;
+
+    var executor = Executor(void){
+        .req = &req,
+        .res = &res,
+        .app = {},
+        .action = struct {
+            fn handle(_: *Request, _: *Response) !void {
+                return error.NotFound;
+            }
+        }.handle,
+        .middlewares = &.{},
+    };
+
+    try std.testing.expectError(error.NotFound, executor.run());
+    try std.testing.expectEqual(.ok, res.status);
 }
 
 const CustomApp = struct {
