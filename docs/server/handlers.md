@@ -82,6 +82,17 @@ A handler that returns `error.NotFound` gets the same 404 as a request with no r
 --8<-- "examples/handlers.zig:not_found"
 ```
 
+To answer with some other status, return `res.fail` with it:
+
+```zig
+if (!valid) return res.fail(.unprocessable_entity, .{ .message = "name is required" });
+```
+
+It returns `error.HttpFail`, and the server answers with the status, the same way it answers the
+client errors above. The message is optional and goes to the client. You can also pass the error
+that caused the failure as `.cause`, which goes to the log. If the handler catches `error.HttpFail`
+and returns a different error, it gets the 500.
+
 The body the handler wrote before the error is thrown away. If the handler has
 already started sending the response, for example with `res.stream`, the server can't replace it
 and closes the connection.
@@ -101,8 +112,8 @@ which gets the response with the status and the `Allow` header already set. `unc
 `void`, so it can't fail. It can take the error as `anyerror`, but not
 `http.Path`, `http.Query`, `http.Header` or your own types.
 
-The 400, 413 and 415 for what the client got wrong don't go through `uncaughtError`. To answer
-those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request
+The 400, 413 and 415 for what the client got wrong, and the statuses from `res.fail`, don't go
+through `uncaughtError`. To answer those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request
 settings:
 
 ```zig
@@ -111,7 +122,8 @@ settings:
 
 `uncaughtError` then gets them as well, and
 [`req.clientErrorStatus()`](../../apidocs/#http.Request.clientErrorStatus) gives the status the
-server would have used, or null when the client got nothing wrong.
+server would have used, or null when the client got nothing wrong. That doesn't cover `res.fail`:
+for `error.HttpFail`, the status, message and cause are in `res.failure`.
 
 ## Timeouts
 

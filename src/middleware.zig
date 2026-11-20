@@ -152,7 +152,8 @@ pub fn Executor(comptime App: type) type {
 
         fn recover(self: *Self, returned: anyerror) !void {
             const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
-            const client_status = self.req.clientErrorStatus();
+            const failure = if (err == error.HttpFail) self.res.failure else null;
+            const client_status = if (failure) |f| f.status else if (err == error.HttpFail) null else self.req.clientErrorStatus();
             switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
@@ -178,7 +179,14 @@ pub fn Executor(comptime App: type) type {
                 log.err("unhandled error after response headers were sent: {} ({f} {s})", .{ err, self.req.method, self.req.url });
                 return err;
             }
-            if (client_status != null) {
+            if (failure) |f| {
+                const cause = f.cause orelse err;
+                if (@intFromEnum(f.status) >= 500) {
+                    log.err("request failed with {d}: {} ({f} {s})", .{ @intFromEnum(f.status), cause, self.req.method, self.req.url });
+                } else {
+                    log.debug("request rejected with {d}: {} ({f} {s})", .{ @intFromEnum(f.status), cause, self.req.method, self.req.url });
+                }
+            } else if (client_status != null) {
                 log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
             } else {
                 log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
@@ -187,7 +195,7 @@ pub fn Executor(comptime App: type) type {
             // writes it, instead of tearing down the connection with no reply.
             self.failure = err;
             self.headers_hooks_ran = true;
-            self.handleError(err, client_status);
+            self.handleError(err, client_status, if (failure) |f| f.message else null);
         }
 
         fn callHeadersHooks(ptr: *anyopaque) Response.HeadersHookError!void {
@@ -290,7 +298,7 @@ pub fn Executor(comptime App: type) type {
             }
         }
 
-        fn handleError(self: *Self, err: anyerror, client_status: ?http.Status) void {
+        fn handleError(self: *Self, err: anyerror, client_status: ?http.Status, message: ?[]const u8) void {
             // Whatever the handler managed to write is half of something
             // it did not finish, and `write` would send it in place of the
             // error response. The caller has already checked that the
@@ -300,11 +308,15 @@ pub fn Executor(comptime App: type) type {
                 if (self.req.config.answer_client_errors) {
                     self.res.status = status;
                     self.res.content_type = .text;
-                    self.res.body = switch (status) {
+                    const line = switch (status) {
+                        // The RFC 9110 name; std still has "Payload Too Large".
                         .payload_too_large => "413 Content Too Large\n",
-                        .unsupported_media_type => "415 Unsupported Media Type\n",
-                        else => "400 Bad Request\n",
+                        else => statusBody(status),
                     };
+                    self.res.body = if (message) |m|
+                        std.fmt.allocPrint(self.res.arena, "{s}: {s}\n", .{ line[0 .. line.len - 1], m }) catch line
+                    else
+                        line;
                     return;
                 }
             }
@@ -320,6 +332,17 @@ pub fn Executor(comptime App: type) type {
             }
         }
     };
+}
+
+fn statusBody(status: http.Status) []const u8 {
+    @setEvalBranchQuota(100_000);
+    switch (status) {
+        inline else => |s| {
+            const code = @intFromEnum(s);
+            const phrase = comptime @as(std.http.Status, @enumFromInt(code)).phrase();
+            return if (phrase) |p| std.fmt.comptimePrint("{d} {s}\n", .{ code, p }) else std.fmt.comptimePrint("{d}\n", .{code});
+        },
+    }
 }
 
 // Tests
@@ -850,6 +873,49 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     try std.testing.expect(std.mem.indexOf(u8, written, "half") == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "application/json") == null);
     try std.testing.expect(std.mem.endsWith(u8, written, "500 Internal Server Error\n"));
+}
+
+test "Executor: res.fail answers with its status, unless another error comes back" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+
+    inline for (.{
+        .{ struct {
+            fn handle(r: *Response) !void {
+                return r.fail(.unprocessable_entity, .{ .message = "name is required", .cause = error.MissingField });
+            }
+        }.handle, http.Status.unprocessable_entity, "422 Unprocessable Entity: name is required\n" },
+        .{ struct {
+            fn handle(r: *Response) !void {
+                return r.fail(.forbidden, .{});
+            }
+        }.handle, http.Status.forbidden, "403 Forbidden\n" },
+        .{ struct {
+            fn handle(r: *Response) !void {
+                r.fail(.unprocessable_entity, .{}) catch {};
+                return error.Boom;
+            }
+        }.handle, http.Status.internal_server_error, "500 Internal Server Error\n" },
+    }) |case| {
+        var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
+        var res = try Response.init(arena.allocator(), &connection, 32);
+        var executor = Executor(void){
+            .req = &req,
+            .res = &res,
+            .app = {},
+            .action = struct {
+                fn handle(_: *Request, r: *Response) !void {
+                    return case[0](r);
+                }
+            }.handle,
+            .middlewares = &.{},
+        };
+        try executor.run();
+        try std.testing.expectEqual(case[1], res.status);
+        try std.testing.expectEqualStrings(case[2], res.body);
+    }
 }
 
 const WritingMiddleware = struct {

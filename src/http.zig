@@ -195,6 +195,14 @@ pub const Status = enum(c.llhttp_status_t) {
     }
 };
 
+/// What `Response.fail` records: the status to answer with, a message for
+/// the client, and the error behind it, for the logs.
+pub const Failure = struct {
+    status: Status,
+    message: ?[]const u8 = null,
+    cause: ?anyerror = null,
+};
+
 test "Status: construct from llhttp_status_t" {
     const status: Status = @enumFromInt(c.HTTP_STATUS_OK);
     try std.testing.expectEqual(.ok, status);
