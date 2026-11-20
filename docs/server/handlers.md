@@ -90,8 +90,12 @@ if (!valid) return res.fail(.unprocessable_entity, .{ .message = "name is requir
 
 It returns `error.HttpFail`, and the server answers with the status, the same way it answers the
 client errors above. The message is optional and goes to the client. You can also pass the error
-that caused the failure as `.cause`, which goes to the log. If the handler catches `error.HttpFail`
-and returns a different error, it gets the 500.
+that caused the failure as `.cause`, which goes to the log.
+
+For both `res.fail` and the client errors above, the status only applies when the handler returns
+the error it was recorded for: `error.HttpFail` or the cause, or `error.ReadFailed` from a body
+the handler was streaming. If the handler catches it and returns a different error, that error is
+handled like any other.
 
 The body the handler wrote before the error is thrown away. If the handler has
 already started sending the response, for example with `res.stream`, the server can't replace it
@@ -120,10 +124,8 @@ settings:
 .request = .{ .answer_client_errors = false },
 ```
 
-`uncaughtError` then gets them as well, and
-[`req.clientErrorStatus()`](../../apidocs/#http.Request.clientErrorStatus) gives the status the
-server would have used, or null when the client got nothing wrong. That doesn't cover `res.fail`:
-for `error.HttpFail`, the status, message and cause are in `res.failure`.
+`uncaughtError` then gets them as well, and `res.failure` holds the status the server would have
+used, with the message and cause, or null when the error is the server's own.
 
 ## Timeouts
 
