@@ -73,6 +73,8 @@ the client's fault, and get a different status:
 
 - Reading a body that is too large gives a 413. A body in an encoding the server can't decode
   gives a 415, and a broken body gives a 400.
+- `req.json`, `req.formData` and `req.multiFormData` give a 415 when the request has a different
+  content type, and a 400 when the body doesn't parse.
 - A query parameter, header or your own parameter type that is missing or doesn't parse gives a
   400, as described above.
 

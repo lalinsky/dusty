@@ -1867,6 +1867,14 @@ const ClientErrorApp = struct {
     fn upload(req: *dusty.Request) !void {
         _ = try req.body();
     }
+
+    fn json(req: *dusty.Request) !void {
+        _ = try req.jsonValue();
+    }
+
+    fn form(req: *dusty.Request) !void {
+        _ = try req.formData();
+    }
 };
 
 fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !void {
@@ -1879,6 +1887,8 @@ fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !
     defer server.deinit();
     server.router.get("/list", ClientErrorApp.list);
     server.router.post("/upload", ClientErrorApp.upload);
+    server.router.post("/json", ClientErrorApp.json);
+    server.router.post("/form", ClientErrorApp.form);
 
     var server_future = try io.concurrent(struct {
         fn run(s: *dusty.Server(ClientErrorApp)) !void {
@@ -1895,6 +1905,10 @@ fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !
     var write_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &write_buf);
     try writer.interface.writeAll("GET /list?page=x HTTP/1.1\r\nHost: x\r\n\r\n" ++
+        "POST /json HTTP/1.1\r\nHost: x\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}" ++
+        "POST /json HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{x" ++
+        "POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}" ++
+        // The 413 closes the connection, so it goes last.
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\n12345678");
     try writer.interface.flush();
 
@@ -1912,6 +1926,9 @@ fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !
 test "Server: what the client got wrong is answered by the server" {
     try expectClientErrors(true, &.{
         .{ "400", "400 Bad Request\n" },
+        .{ "415", "415 Unsupported Media Type\n" },
+        .{ "400", "400 Bad Request: SyntaxError\n" },
+        .{ "415", "415 Unsupported Media Type\n" },
         .{ "413", "413 Content Too Large\n" },
     });
 }
@@ -1919,6 +1936,9 @@ test "Server: what the client got wrong is answered by the server" {
 test "Server: with answer_client_errors off, uncaughtError answers what the client got wrong" {
     try expectClientErrors(false, &.{
         .{ "400", "app 400 InvalidValue" },
+        .{ "415", "app 415 NotJson" },
+        .{ "400", "app 400 InvalidJson" },
+        .{ "415", "app 415 NotForm" },
         .{ "413", "app 413 BodyTooBig" },
     });
 }

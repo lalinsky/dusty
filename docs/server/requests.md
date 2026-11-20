@@ -58,11 +58,18 @@ entry has the `value`, and the `filename` for a file:
 ```
 
 Both read the whole body with `req.body()`, so the same size limit applies. If the request has a
-different content type, they fail with `error.NotForm` or `error.NotMultipartForm`.
+different content type, they fail with `error.NotForm` or `error.NotMultipartForm`, and the server
+answers with a 415. A form that doesn't parse fails with `error.InvalidForm`, and the server answers
+with a 400.
 
 ## JSON
 
-`req.json(T)` parses the body with `std.json`, and returns null when there is no body.
+`req.json(T)` parses the body with `std.json`, and returns null when there is no body. A body has
+to be sent as `application/json`, or as an `application/...+json` type such as
+`application/problem+json`. Otherwise it fails with `error.NotJson`, and the server answers with a
+415. That keeps a page on another site from posting JSON to your endpoints, because a browser
+sends a form or `text/plain` across sites without a CORS preflight. A body that doesn't parse
+fails with `error.InvalidJson`, and the server answers with a 400 that names the `std.json` error.
 [Serialization](serialization.md) shows how to decode it with json.zig, which is faster.
 
 ## Cookies

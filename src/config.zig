@@ -263,9 +263,10 @@ pub const ServerConfig = struct {
         /// coded body.
         decompress: bool = true,
         /// Answer what the client got wrong with a 400, 413 or 415: a
-        /// parameter such as `http.Query` that is missing or doesn't parse,
-        /// or a body that is too large, broken, or in a coding the server
-        /// can't undo; and the status of a handler's `Response.fail`. Turn
+        /// parameter such as `http.Query` that is missing or doesn't parse;
+        /// a body that is too large, broken, or in a coding the server
+        /// can't undo, or a JSON or form body of the wrong type or that
+        /// doesn't parse; and the status of a handler's `Response.fail`. Turn
         /// off to have the app's `uncaughtError` answer these too, with
         /// `Response.failure` saying what failed.
         answer_client_errors: bool = true,
