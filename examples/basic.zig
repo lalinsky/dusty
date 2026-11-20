@@ -126,7 +126,7 @@ fn handleCreateUser(app: *App, req: *http.Request, res: *http.Response) !void {
     // Parse JSON body
     const user_data = try req.json(CreateUserRequest) orelse {
         res.status = .bad_request;
-        try res.json(.{ .err = "Missing or invalid JSON body" }, .{});
+        try res.json(.{ .err = "Missing JSON body" }, .{});
         return;
     };
 

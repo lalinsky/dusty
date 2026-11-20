@@ -305,24 +305,59 @@ pub const Request = struct {
 
     /// Parse body as JSON into type T, with `std.json`. json.zig is
     /// considerably faster for types known at compile time.
+    ///
+    /// A body has to say it is JSON: `application/json` or
+    /// `application/*+json`. Otherwise this fails with `error.NotJson`,
+    /// answered with a 415, and a body that does not parse with
+    /// `error.InvalidJson`, answered with a 400 whose message names the
+    /// `std.json` error.
     pub fn json(self: *Request, comptime T: type) !?T {
-        const b = try self.body() orelse return null;
-        return try std.json.parseFromSliceLeaky(T, self.arena, b, .{});
+        const b = try self.jsonBody() orelse return null;
+        return std.json.parseFromSliceLeaky(T, self.arena, b, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => |e| return self.bodyFail(.bad_request, error.InvalidJson, @errorName(e)),
+        };
     }
 
-    /// Parse body as a generic JSON value
+    /// Parse body as a generic JSON value, like `json`.
     pub fn jsonValue(self: *Request) !?std.json.Value {
-        const b = try self.body() orelse return null;
-        return try std.json.parseFromSliceLeaky(std.json.Value, self.arena, b, .{});
+        return self.json(std.json.Value);
     }
 
-    /// Parse body as a JSON object
+    /// Parse body as a JSON object, like `json`. Null when it is something
+    /// else.
     pub fn jsonObject(self: *Request) !?std.json.ObjectMap {
         const value = try self.jsonValue() orelse return null;
         switch (value) {
             .object => |o| return o,
             else => return null,
         }
+    }
+
+    fn jsonBody(self: *Request) !?[]const u8 {
+        const b = try self.body() orelse return null;
+        if (!self.isJson()) return self.bodyFail(.unsupported_media_type, error.NotJson, null);
+        return b;
+    }
+
+    fn isJson(self: *const Request) bool {
+        if (self.content_type == .json) return true;
+        const value = self.headers.get("Content-Type") orelse return false;
+        const end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
+        const media_type = std.mem.trim(u8, value[0..end], " \t");
+        if (std.ascii.eqlIgnoreCase(media_type, "application/json")) return true;
+        return media_type.len > "application/+json".len and
+            std.ascii.startsWithIgnoreCase(media_type, "application/") and
+            std.ascii.endsWithIgnoreCase(media_type, "+json");
+    }
+
+    /// Records what the client got wrong as the response's `failure`, and
+    /// returns the error for the caller to return. Each gets an error of its
+    /// own, so a handler that catches it cannot later return one of the same
+    /// name from somewhere else and have it answered with this status.
+    fn bodyFail(self: *Request, status: http.Status, err: anytype, message: ?[]const u8) @TypeOf(err) {
+        if (self.response) |res| res.failure = .{ .status = status, .message = message, .cause = err };
+        return err;
     }
 
     /// Get cookies from the request
@@ -333,21 +368,32 @@ pub const Request = struct {
     }
 
     /// Parse the body as a form (application/x-www-form-urlencoded)
+    ///
+    /// A request of another content type fails with `error.NotForm`,
+    /// answered with a 415, and a form that does not parse with
+    /// `error.InvalidForm`, answered with a 400.
     pub fn formData(self: *Request) !*http.Params {
         if (self._fd_read) {
             return &self._fd;
         }
 
-        if (self.content_type == null or self.content_type != .form) {
-            return error.NotForm;
+        if (self.content_type != .form) {
+            return self.bodyFail(.unsupported_media_type, error.NotForm, null);
         }
 
-        const buffer = try self.body() orelse {
-            self._fd_read = true;
+        if (try self.body()) |buffer| {
+            self.parseForm(buffer) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => |e| return self.bodyFail(.bad_request, error.InvalidForm, @errorName(e)),
+            };
+        }
 
-            return &self._fd;
-        };
+        self._fd_read = true;
 
+        return &self._fd;
+    }
+
+    fn parseForm(self: *Request, buffer: []const u8) !void {
         var entry_iterator = std.mem.splitScalar(u8, buffer, '&');
 
         while (entry_iterator.next()) |entry| {
@@ -364,28 +410,35 @@ pub const Request = struct {
                 try self._fd.put(self.arena, try Request.urlUnescape(self.arena, entry), "");
             }
         }
-
-        self._fd_read = true;
-
-        return &self._fd;
     }
 
     /// Parse the body as a multipart form (multipart/form-data)
+    ///
+    /// A request of another content type fails with
+    /// `error.NotMultipartForm`, answered with a 415, and a form that does
+    /// not parse with `error.InvalidForm`, answered with a 400.
     pub fn multiFormData(self: *Request) !*std.StringHashMapUnmanaged(MultipartForm.Entry) {
         if (self._mfd_read) {
             return &self._mfd;
         }
 
-        if (self.content_type == null or self.content_type != .multipart_form) {
-            return error.NotMultipartForm;
+        if (self.content_type != .multipart_form) {
+            return self.bodyFail(.unsupported_media_type, error.NotMultipartForm, null);
         }
 
-        const buffer = try self.body() orelse {
-            self._mfd_read = true;
+        if (try self.body()) |buffer| {
+            self.parseMultipartForm(buffer) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => |e| return self.bodyFail(.bad_request, error.InvalidForm, @errorName(e)),
+            };
+        }
 
-            return &self._mfd;
-        };
+        self._mfd_read = true;
 
+        return &self._mfd;
+    }
+
+    fn parseMultipartForm(self: *Request, buffer: []const u8) !void {
         // The following chunk of code is from https://github.com/karlseguin/http.zig, see LICENSE for more details.
 
         var boundary_buf: [72]u8 = undefined;
@@ -425,10 +478,7 @@ pub const Request = struct {
 
         {
             // We expect the body to begin with a boundary
-            const first = entry_it.next() orelse {
-                self._mfd_read = true;
-                return &self._mfd;
-            };
+            const first = entry_it.next() orelse return;
             if (first.len != 0) {
                 return error.InvalidMultiPartEncoding;
             }
@@ -452,10 +502,6 @@ pub const Request = struct {
         }
 
         // End of chunk.
-
-        self._mfd_read = true;
-
-        return &self._mfd;
     }
 
     /// Splits `url` into `path` and `query_string`, and `path` into the
@@ -1307,7 +1353,7 @@ test "Request.body: a body read that failed before it started can be asked for a
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
+    const raw_request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Encoding: br\r\nContent-Length: 5\r\n\r\nhello";
     var reader = try fixedMessageReader(arena.allocator(), raw_request);
 
     var req: Request = .{
@@ -1490,6 +1536,30 @@ test "Request.cookies: parse cookies from header" {
     try std.testing.expectEqual(null, cookies.get("missing"));
 }
 
+test "Request.json: takes only JSON media types" {
+    const cases = [_]struct { []const u8, bool }{
+        .{ "application/json", true },
+        .{ "Application/JSON; charset=utf-8", true },
+        .{ "application/problem+json", true },
+        .{ "application/vnd.api+json ; charset=utf-8", true },
+        .{ "application/json ; charset=utf-8", true },
+        .{ "application/+json", false },
+        .{ "text/plain", false },
+        .{ "application/x-www-form-urlencoded", false },
+        .{ "text/json+json", false },
+    };
+    for (cases) |c| {
+        var req: Request = .{ .arena = undefined, .transport = undefined, .parser = undefined };
+        req.headers = try .init(std.testing.allocator, 1);
+        defer req.headers.deinit(std.testing.allocator);
+        try req.headers.put("Content-Type", c[0]);
+        req.content_type = http.ContentType.fromContentType(c[0]);
+        try std.testing.expectEqual(c[1], req.isJson());
+    }
+    var req: Request = .{ .arena = undefined, .transport = undefined, .parser = undefined };
+    try std.testing.expect(!req.isJson());
+}
+
 test "Request.formData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1656,7 +1726,7 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
 
     // Quoted name value ends with a backslash and no closing quote — the parser
     // currently looks at fields[pos+1] without bounds-checking, panicking on
-    // safety-checked builds. Should return InvalidMultiPartEncoding instead.
+    // safety-checked builds. Should fail to parse instead.
     const body = "----b\r\nContent-Disposition: form-data; name=\"x\\\r\n\r\nval\r\n----b--\r\n";
     var cl_buf: [16]u8 = undefined;
     const cl = try std.fmt.bufPrint(&cl_buf, "{d}", .{body.len});
@@ -1683,7 +1753,7 @@ test "Request.multiFormData: trailing backslash in quoted attribute (regression)
 
     try parseHeaders(&reader, &parser);
 
-    try std.testing.expectError(error.InvalidMultiPartEncoding, req.multiFormData());
+    try std.testing.expectError(error.InvalidForm, req.multiFormData());
 }
 
 /// A writer with no buffer of its own: everything it is given arrives
