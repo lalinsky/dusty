@@ -44,11 +44,11 @@ const App = struct {
     ///
     /// Also answers what the client got wrong, since the server is told not
     /// to, so those come back as JSON too.
-    pub fn uncaughtError(_: *App, req: *Request, res: *Response, err: anyerror) void {
-        if (req.clientErrorStatus()) |status| return switch (status) {
-            .payload_too_large => fail(res, status, "Content Too Large"),
-            .unsupported_media_type => fail(res, status, "Unsupported Media Type"),
-            else => fail(res, status, "Bad Request"),
+    pub fn uncaughtError(_: *App, res: *Response, err: anyerror) void {
+        if (res.failure) |f| return switch (f.status) {
+            .payload_too_large => fail(res, f.status, "Content Too Large"),
+            .unsupported_media_type => fail(res, f.status, "Unsupported Media Type"),
+            else => fail(res, f.status, "Bad Request"),
         };
         // The name goes to the log rather than the response: it names an
         // internal failure, and the client can do nothing with it.

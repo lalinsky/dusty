@@ -267,8 +267,7 @@ pub const ServerConfig = struct {
         /// or a body that is too large, broken, or in a coding the server
         /// can't undo; and the status of a handler's `Response.fail`. Turn
         /// off to have the app's `uncaughtError` answer these too, with
-        /// `Request.clientErrorStatus` telling them apart, or
-        /// `error.HttpFail` with `Response.failure`.
+        /// `Response.failure` saying what failed.
         answer_client_errors: bool = true,
         /// Buffer size (bytes) for reading the request head: the request
         /// line and all headers. This is also the limit on it -- the parsed

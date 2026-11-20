@@ -152,15 +152,16 @@ pub fn Executor(comptime App: type) type {
 
         fn recover(self: *Self, returned: anyerror) !void {
             const err = if (returned == error.HeadersHookFailed) self.hook_err orelse returned else returned;
-            const failure = if (err == error.HttpFail) self.res.failure else null;
-            const client_status = if (failure) |f| f.status else if (err == error.HttpFail) null else self.req.clientErrorStatus();
+            const failure = self.matchFailure(err);
+            // From here on, `res.failure` is what the response answers.
+            self.res.failure = failure;
             switch (err) {
                 // Connection-level failures can't produce a response; propagate
                 // so the connection loop aborts.
                 error.WriteFailed, error.Canceled => return err,
                 // Unless the read failed on what the client sent, which a
                 // handler streaming the body sees as `ReadFailed`.
-                error.ReadFailed => if (self.req.bodyClientErrorStatus() == null) return err,
+                error.ReadFailed => if (failure == null) return err,
                 else => {},
             }
             // Unless the peer is what went away. `Response` resolves its
@@ -186,8 +187,6 @@ pub fn Executor(comptime App: type) type {
                 } else {
                     log.debug("request rejected with {d}: {} ({f} {s})", .{ @intFromEnum(f.status), cause, self.req.method, self.req.url });
                 }
-            } else if (client_status != null) {
-                log.debug("request rejected: {} ({f} {s})", .{ err, self.req.method, self.req.url });
             } else {
                 log.err("unhandled error in request handler: {} ({f} {s})", .{ err, self.req.method, self.req.url });
             }
@@ -195,7 +194,22 @@ pub fn Executor(comptime App: type) type {
             // writes it, instead of tearing down the connection with no reply.
             self.failure = err;
             self.headers_hooks_ran = true;
-            self.handleError(err, client_status, if (failure) |f| f.message else null);
+            self.handleError(err, failure);
+        }
+
+        /// The recorded failure, if `err` is what it was recorded for:
+        /// `error.HttpFail` from `res.fail`, or its cause. A failure the
+        /// handler caught and moved on from answers nothing.
+        fn matchFailure(self: *Self, err: anyerror) ?http.Failure {
+            const f = self.res.failure orelse return null;
+            if (err == error.HttpFail) return f;
+            const cause = f.cause orelse return null;
+            if (err == cause) return f;
+            // A handler streaming the body sees its failure as `ReadFailed`.
+            if (err == error.ReadFailed) {
+                if (self.req._body_err) |body_err| if (body_err == cause) return f;
+            }
+            return null;
         }
 
         fn callHeadersHooks(ptr: *anyopaque) Response.HeadersHookError!void {
@@ -257,9 +271,12 @@ pub fn Executor(comptime App: type) type {
             else
                 action(self.app, self.req, self.res);
             // A handler that finds nothing to answer with answers as if no
-            // route had matched, unless the client got something wrong.
+            // route had matched.
             result catch |err| switch (err) {
-                error.NotFound => if (self.req.clientErrorStatus() == null) return self.handleNotFound() else return err,
+                error.NotFound => {
+                    self.res.failure = null;
+                    return self.handleNotFound();
+                },
                 else => return err,
             };
         }
@@ -298,14 +315,15 @@ pub fn Executor(comptime App: type) type {
             }
         }
 
-        fn handleError(self: *Self, err: anyerror, client_status: ?http.Status, message: ?[]const u8) void {
+        fn handleError(self: *Self, err: anyerror, failure: ?http.Failure) void {
             // Whatever the handler managed to write is half of something
             // it did not finish, and `write` would send it in place of the
             // error response. The caller has already checked that the
             // headers are still open.
             self.res.resetBody();
-            if (client_status) |status| {
+            if (failure) |f| {
                 if (self.req.config.answer_client_errors) {
+                    const status = f.status;
                     self.res.status = status;
                     self.res.content_type = .text;
                     const line = switch (status) {
@@ -313,7 +331,7 @@ pub fn Executor(comptime App: type) type {
                         .payload_too_large => "413 Content Too Large\n",
                         else => statusBody(status),
                     };
-                    self.res.body = if (message) |m|
+                    self.res.body = if (f.message) |m|
                         std.fmt.allocPrint(self.res.arena, "{s}: {s}\n", .{ line[0 .. line.len - 1], m }) catch line
                     else
                         line;
@@ -915,6 +933,40 @@ test "Executor: res.fail answers with its status, unless another error comes bac
         try executor.run();
         try std.testing.expectEqual(case[1], res.status);
         try std.testing.expectEqualStrings(case[2], res.body);
+    }
+}
+
+test "Executor: a body failure answers the error it was recorded for" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var connection: Connection = undefined;
+    connection.initWriterForTesting(undefined);
+
+    inline for (.{
+        .{ error.BodyTooBig, http.Status.payload_too_large },
+        // What a handler streaming the body sees.
+        .{ error.ReadFailed, http.Status.payload_too_large },
+        .{ error.Mine, http.Status.internal_server_error },
+        .{ error.NotFound, http.Status.not_found },
+    }) |case| {
+        var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .post, .url = "/test" };
+        var res = try Response.init(arena.allocator(), &connection, 32);
+        req.response = &res;
+        var executor = Executor(void){
+            .req = &req,
+            .res = &res,
+            .app = {},
+            .action = struct {
+                fn handle(r: *Request, _: *Response) !void {
+                    r.setBodyError(error.BodyTooBig);
+                    return case[0];
+                }
+            }.handle,
+            .middlewares = &.{},
+        };
+        try executor.run();
+        try std.testing.expectEqual(case[1], res.status);
+        try std.testing.expectEqual(case[1] == .payload_too_large, res.failure != null);
     }
 }
 

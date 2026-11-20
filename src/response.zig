@@ -658,7 +658,11 @@ pub const Response = struct {
     /// sends the headers. Set by the executor, which runs them itself for
     /// a buffered body.
     headers_hook: ?HeadersHook = null,
-    /// What the last `fail` recorded.
+    /// What failed: recorded by `fail`, by a body read the client got
+    /// wrong, or by a handler parameter that is missing or doesn't parse.
+    /// When the handler returns an error, it is null unless it is the
+    /// failure the server is answering. A handler that recovers and
+    /// answers by itself leaves it set.
     failure: ?http.Failure = null,
 
     pub const HeadersHook = struct {

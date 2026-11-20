@@ -1854,8 +1854,8 @@ test "Server: Query and Header extractors, and a 400 for a missing or bad value"
 }
 
 const ClientErrorApp = struct {
-    pub fn uncaughtError(req: *dusty.Request, res: *dusty.Response, err: anyerror) void {
-        const status = req.clientErrorStatus() orelse .internal_server_error;
+    pub fn uncaughtError(res: *dusty.Response, err: anyerror) void {
+        const status = if (res.failure) |f| f.status else .internal_server_error;
         res.status = status;
         res.print(.text, "app {d} {t}", .{ @intFromEnum(status), err }) catch {};
     }
@@ -1865,7 +1865,7 @@ const ClientErrorApp = struct {
     }
 
     fn upload(req: *dusty.Request) !void {
-        _ = req.body() catch return error.Mine;
+        _ = try req.body();
     }
 };
 
@@ -1895,7 +1895,6 @@ fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !
     var write_buf: [1024]u8 = undefined;
     var writer = stream.writer(io, &write_buf);
     try writer.interface.writeAll("GET /list?page=x HTTP/1.1\r\nHost: x\r\n\r\n" ++
-        // The handler turns the failed read into an error of its own.
         "POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 8\r\n\r\n12345678");
     try writer.interface.flush();
 
@@ -1910,7 +1909,7 @@ fn expectClientErrors(answer_client_errors: bool, want: []const [2][]const u8) !
     }
 }
 
-test "Server: what the client got wrong is answered by the server, whatever error the handler returns" {
+test "Server: what the client got wrong is answered by the server" {
     try expectClientErrors(true, &.{
         .{ "400", "400 Bad Request\n" },
         .{ "413", "413 Content Too Large\n" },
@@ -1920,7 +1919,7 @@ test "Server: what the client got wrong is answered by the server, whatever erro
 test "Server: with answer_client_errors off, uncaughtError answers what the client got wrong" {
     try expectClientErrors(false, &.{
         .{ "400", "app 400 InvalidValue" },
-        .{ "413", "app 413 Mine" },
+        .{ "413", "app 413 BodyTooBig" },
     });
 }
 

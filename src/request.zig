@@ -127,8 +127,6 @@ pub const Request = struct {
     _body_reader_taken: bool = false,
     // What the last failed body read failed with.
     _body_err: ?anyerror = null,
-    // A handler parameter such as `http.Query` was missing or did not parse.
-    _extract_failed: bool = false,
     // The non-empty segments of `path`, each a slice of it.
     _segments: []const []const u8 = &.{},
     // Room for what routing a typical request needs, so it takes nothing
@@ -227,7 +225,7 @@ pub const Request = struct {
             r.decode = decode;
         } else if (self.config.decompress) {
             r.startDecoding(self.arena, self.content_encoding) catch |err| {
-                self._body_err = err;
+                self.setBodyError(err);
                 return err;
             };
             if (r.decode != null) self.dropEncodedBodyHeaders();
@@ -262,7 +260,7 @@ pub const Request = struct {
         var r = try self.reader(&no_buf);
         const result = r.interface.allocRemaining(self.arena, .limited(self.config.max_body_size)) catch |err| switch (err) {
             error.StreamTooLong => {
-                self._body_err = error.BodyTooBig;
+                self.setBodyError(error.BodyTooBig);
                 return error.BodyTooBig;
             },
             // The interface can only say that a read failed; the reader
@@ -280,22 +278,17 @@ pub const Request = struct {
         return result;
     }
 
-    /// The 4xx status for what the client got wrong, or null if it got
-    /// nothing wrong: a parameter such as `http.Query` that is missing or
-    /// doesn't parse, a body over `max_body_size`, broken framing or coding,
-    /// or a coding this server can't undo. Set where the failure happens,
-    /// whatever error the handler then returns. Not set by `Response.fail`,
-    /// which records its status in `Response.failure`.
-    pub fn clientErrorStatus(self: *const Request) ?http.Status {
-        // A custom extractor can fail on the body, which has the more
-        // specific status.
-        return self.bodyClientErrorStatus() orelse if (self._extract_failed) .bad_request else null;
+    /// Keeps what a body read failed with. When the client is at fault, it
+    /// is also recorded as the response's `failure`, which the server
+    /// answers if the handler returns that error.
+    pub fn setBodyError(self: *Request, err: anyerror) void {
+        self._body_err = err;
+        const status = bodyErrorStatus(err) orelse return;
+        if (self.response) |res| res.failure = .{ .status = status, .cause = err };
     }
 
-    /// `clientErrorStatus`, for the body alone.
-    pub fn bodyClientErrorStatus(self: *const Request) ?http.Status {
-        const cause = self._body_err orelse return null;
-        return switch (cause) {
+    fn bodyErrorStatus(err: anyerror) ?http.Status {
+        return switch (err) {
             error.BodyTooBig => .payload_too_large,
             // RFC 9110 15.5.16 names this status for an unsupported content coding.
             error.UnsupportedContentEncoding => .unsupported_media_type,
@@ -1570,20 +1563,6 @@ test "Request.formData: entry with no value" {
     try std.testing.expectEqualStrings("", form_data.get("foo").?);
 }
 
-test "Request.clientErrorStatus: set by a failed body read or parameter" {
-    var req: Request = undefined;
-    req._body_err = null;
-    req._extract_failed = false;
-    try std.testing.expectEqual(null, req.clientErrorStatus());
-    req._body_err = error.Canceled;
-    try std.testing.expectEqual(null, req.clientErrorStatus());
-    req._body_err = error.BodyTooBig;
-    try std.testing.expectEqual(.payload_too_large, req.clientErrorStatus().?);
-    req._body_err = null;
-    req._extract_failed = true;
-    try std.testing.expectEqual(.bad_request, req.clientErrorStatus().?);
-}
-
 test "Request.multiFormData: basic key and value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1824,7 +1803,7 @@ test "Request: a write that fails leaves the body for the next read" {
     try std.testing.expectError(error.WriteFailed, r.interface.stream(&sink.out, .unlimited));
     // The writer's failure, not the reader's, and not the peer's.
     try std.testing.expectEqual(null, r.err);
-    try std.testing.expectEqual(null, req.bodyClientErrorStatus());
+    try std.testing.expectEqual(null, req._body_err);
 
     // Nothing was lost: the bytes the write refused are still there.
     sink.fail = false;
