@@ -106,6 +106,8 @@ pub const Request = struct {
     listener: *const Listener = &placeholder_listener,
     /// Whether the connection is TLS.
     secure: bool = false,
+    /// When the request arrived, by the wall clock. Used for the `Date` header.
+    started_at: std.Io.Timestamp = .zero,
 
     arena: std.mem.Allocator,
     io: std.Io = undefined,

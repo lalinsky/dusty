@@ -1339,7 +1339,7 @@ pub const Response = struct {
     fn sendHeader(self: *Response, w: *std.Io.Writer) std.Io.Writer.Error!void {
         // Write status line
         try w.print("HTTP/1.1 {d} {f}\r\n", .{ @intFromEnum(self.status), self.status });
-        if (self.headers.get("Date") == null) try writeDateLine(w, self.conn.io);
+        if (self.headers.get("Date") == null) try writeDateLine(w, self.request.started_at);
 
         // Write headers
         var iter = self.headers.iterator();
@@ -3752,7 +3752,7 @@ test "Response: print formats the body" {
     try std.testing.expect(std.mem.endsWith(u8, conn_writer.buffered(), "Content-Type: text/plain; charset=UTF-8\r\nContent-Length: 5\r\n\r\nhi x3"));
 }
 
-test "Response: a Date header for the current second follows the status line" {
+test "Response: a Date header for when the request arrived follows the status line" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
@@ -3761,23 +3761,13 @@ test "Response: a Date header for the current second follows the status line" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = testRequest(arena.allocator());
+    var request = testRequest(arena.allocator());
+    request.started_at = .fromNanoseconds(784111777 * std.time.ns_per_s);
     var response = try Response.init(&request, &connection, 32);
     response.body = "hi";
-    const before = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
     try response.write();
-    const after = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
 
-    const written = conn_writer.buffered();
-    const status_line = "HTTP/1.1 200 OK\r\n";
-    try std.testing.expectStringStartsWith(written, status_line);
-    const sent = written[status_line.len..][0..http.date_line_len];
-    var second = before;
-    while (second <= after) : (second += 1) {
-        var expected: [http.date_line_len]u8 = undefined;
-        http.formatDateLine(&expected, second);
-        if (std.mem.eql(u8, sent, &expected)) break;
-    } else return error.TestUnexpectedResult;
+    try std.testing.expectStringStartsWith(conn_writer.buffered(), "HTTP/1.1 200 OK\r\nDate: Sun, 06 Nov 1994 08:49:37 GMT\r\n");
 }
 
 test "Response: a Date set by the handler is not sent twice" {
