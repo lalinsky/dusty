@@ -632,9 +632,8 @@ pub const Response = struct {
     content_length: ?usize = null,
     /// Body bytes handed to the connection by a streaming writer.
     body_sent: usize = 0,
-    /// The request this answers, when the server built the pair. Set by the
-    /// server.
-    request: ?*const Request = null,
+    /// The request this answers.
+    request: *const Request,
     /// Send the body gzipped if the request's `Accept-Encoding` allows it.
     /// Settled with the headers: by `stream`, or by `write` for a buffered
     /// body, which goes out as it is when it is short or does not shrink.
@@ -704,12 +703,15 @@ pub const Response = struct {
     /// `InvalidContentLength` is such a header that is not a number.
     pub const WriteError = HeaderError || SendError || error{ ContentLengthMismatch, InvalidContentLength };
 
-    pub fn init(arena: std.mem.Allocator, conn: *Connection, max_headers: usize) !Response {
+    /// A response to `request`, allocating from its arena.
+    pub fn init(request: *const Request, conn: *Connection, max_headers: usize) !Response {
+        const arena = request.arena;
         return .{
             .arena = arena,
             .body_buffer = try .init(arena),
             .conn = conn,
             .headers = try http.Headers.init(arena, max_headers),
+            .request = request,
         };
     }
 
@@ -832,7 +834,7 @@ pub const Response = struct {
         // 100 Continue before it sends the body: these headers are what
         // tell it to stop waiting, and a handler reading the body next
         // would otherwise wait on a peer that is waiting on it.
-        const peer_waits = if (self.request) |req| req.expects_continue else false;
+        const peer_waits = self.request.expects_continue;
         if (peer_waits) {
             try self.resolve(self.sendHeaderAlone(self.conn.writer));
         } else {
@@ -1209,8 +1211,7 @@ pub const Response = struct {
         if (!self.variesByAcceptEncoding()) needed += 1;
         if (self.headers.keys.len - self.headers.len < needed) return .off;
 
-        const request = self.request orelse return .identity;
-        return if (http.acceptsGzip(&request.headers)) .gzip else .identity;
+        return if (http.acceptsGzip(&self.request.headers)) .gzip else .identity;
     }
 
     /// `Vary: *` included, which says the response varies by anything.
@@ -1529,6 +1530,10 @@ fn testBody(response: *const Response, buf: []u8) ![]const u8 {
     return w.buffered();
 }
 
+fn testRequest(arena: std.mem.Allocator) Request {
+    return .{ .arena = arena, .parser = undefined, .transport = undefined };
+}
+
 test "Response: body used when buffer is empty" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1539,7 +1544,8 @@ test "Response: body used when buffer is empty" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "body content";
 
     // Don't write to buffer
@@ -1559,7 +1565,8 @@ test "Response: write() with body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "Hello World";
 
     try response.write();
@@ -1580,7 +1587,8 @@ test "Response: write() only writes once" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "First";
 
     try response.write();
@@ -1604,7 +1612,8 @@ test "Response: writeHeader() basic" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.status = .created;
     try response.header("X-Custom", "value");
     response.body = "Hello";
@@ -1629,7 +1638,8 @@ test "Response: writeHeader() only writes once" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "Test";
 
     try response.writeHeader();
@@ -1653,7 +1663,8 @@ test "Response: write() after writeHeader() doesn't duplicate headers" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "Body content";
 
     // Write headers first
@@ -1683,7 +1694,8 @@ test "Response: keepalive defaults to true" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try std.testing.expectEqual(true, response.keepalive);
 
     response.body = "test";
@@ -1704,7 +1716,8 @@ test "Response: Connection close header when keepalive is false" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.keepalive = false;
     response.body = "test";
 
@@ -1723,7 +1736,8 @@ test "Response: chunked flag defaults to false" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    const response = try Response.init(&request, &connection, 32);
     try std.testing.expectEqual(false, response.chunked);
 }
 
@@ -1737,7 +1751,8 @@ test "BodyWriter: sends nothing until the response is written" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body = response.writer();
     try body.interface.writeAll("Hello, ");
@@ -1767,7 +1782,8 @@ test "BodyWriter: a body larger than one write still arrives whole" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body = response.writer();
     for (0..100) |i| try body.interface.print("{d},", .{i});
@@ -1789,7 +1805,8 @@ test "StreamingBodyWriter: sends the headers immediately and chunks the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -1823,7 +1840,8 @@ test "StreamingBodyWriter: writes between flushes are framed as one chunk" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -1846,7 +1864,8 @@ test "StreamingBodyWriter: an empty flush does not terminate the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [1024]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -1874,7 +1893,8 @@ test "StreamingBodyWriter: a declared Content-Length streams without chunk frami
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [4]u8 = undefined;
@@ -1903,7 +1923,8 @@ test "StreamingBodyWriter: reports a body that does not match the declared lengt
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [64]u8 = undefined;
@@ -1922,7 +1943,8 @@ test "StreamingBodyWriter: rejects a Content-Length it cannot parse" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     // A proxy can forward whatever an upstream sent.
     try response.header("Content-Length", "99999999999999999999999999");
 
@@ -1942,7 +1964,8 @@ test "StreamingBodyWriter: stream reports the real error, not error.WriteFailed"
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body_buf: [64]u8 = undefined;
     try std.testing.expectError(error.ConnectionResetByPeer, response.stream(&body_buf));
 }
@@ -1961,7 +1984,8 @@ test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
         var connection: Connection = undefined;
         connection.initWriterForTesting(&conn_writer);
 
-        var response = try Response.init(arena.allocator(), &connection, 32);
+        const request = testRequest(arena.allocator());
+        var response = try Response.init(&request, &connection, 32);
         var body_buf: [64]u8 = undefined;
         var body = try response.stream(&body_buf);
         try body.interface.writeAll("hello");
@@ -1976,7 +2000,8 @@ test "StreamingBodyWriter: end reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
     try body.interface.writeAll("hello");
@@ -1999,7 +2024,8 @@ test "Response: write reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "hello";
 
     try std.testing.expectError(error.ConnectionResetByPeer, response.write());
@@ -2016,7 +2042,8 @@ test "Response: writeHeader reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try std.testing.expectError(error.ConnectionResetByPeer, response.writeHeader());
 }
 
@@ -2032,7 +2059,8 @@ test "Response: a write that recorded no cause reports Unexpected" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "hello";
 
     try std.testing.expectError(error.Unexpected, response.write());
@@ -2073,7 +2101,8 @@ test "BodyWriter: end is idempotent" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body = response.writer();
     try body.interface.writeAll("hello");
@@ -2095,7 +2124,8 @@ test "StreamingBodyWriter: end does not write a second terminator" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2122,7 +2152,8 @@ test "Response: an abandoned buffered body goes out as far as it was flushed" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body = response.writer();
     try body.interface.writeAll("hello");
@@ -2146,7 +2177,8 @@ test "Response: an abandoned short body closes the connection" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [64]u8 = undefined;
@@ -2171,7 +2203,8 @@ test "Response: an abandoned chunked body is still terminated" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2195,7 +2228,8 @@ test "StreamingBodyWriter: a failed end does not let write add to the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "11");
 
     var body_buf: [64]u8 = undefined;
@@ -2223,7 +2257,8 @@ test "StreamingBodyWriter: a failed end does not leave a second terminator" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -2246,7 +2281,8 @@ test "Response: json() with simple object" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.json(.{ .name = "Alice", .age = 30 }, .{});
 
     var body_buf: [256]u8 = undefined;
@@ -2269,7 +2305,8 @@ test "Response: json() writes complete response" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.status = .created;
     try response.json(.{ .id = 123, .message = "Created" }, .{});
     try response.write();
@@ -2297,7 +2334,8 @@ test "Response: json() with array" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     const items = [_]i32{ 1, 2, 3, 4, 5 };
     try response.json(items, .{});
 
@@ -2316,7 +2354,8 @@ test "Response: json() with nested object" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.json(.{
         .user = .{
             .name = "Bob",
@@ -2338,6 +2377,7 @@ const TestEventStream = struct {
     arena: std.heap.ArenaAllocator,
     conn_writer: std.Io.Writer,
     connection: Connection,
+    request: Request,
     response: Response,
     stream: EventStream,
     header_end: usize,
@@ -2348,7 +2388,8 @@ const TestEventStream = struct {
         self.arena = .init(std.testing.allocator);
         self.conn_writer = .fixed(buf);
         self.connection.initWriterForTesting(&self.conn_writer);
-        self.response = try Response.init(self.arena.allocator(), &self.connection, 32);
+        self.request = testRequest(self.arena.allocator());
+        self.response = try Response.init(&self.request, &self.connection, 32);
         self.stream = try self.response.startEventStream(&self.event_buf);
         self.header_end = self.conn_writer.end;
     }
@@ -2441,7 +2482,8 @@ test "Response: startEventStream" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
 
@@ -2489,7 +2531,8 @@ test "EventStream: send reports the real error, not error.WriteFailed" {
         var probe_writer: std.Io.Writer = .fixed(&probe);
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
-        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        const request = testRequest(arena.allocator());
+        var probe_res = try Response.init(&request, &probe_conn, 32);
         var event_buf: [4096]u8 = undefined;
         _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
@@ -2501,7 +2544,8 @@ test "EventStream: send reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
 
@@ -2518,7 +2562,8 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
         var probe_writer: std.Io.Writer = .fixed(&probe);
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
-        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        const request = testRequest(arena.allocator());
+        var probe_res = try Response.init(&request, &probe_conn, 32);
         var event_buf: [4096]u8 = undefined;
         _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
@@ -2530,7 +2575,8 @@ test "EventWriter: end reports the real error, not error.WriteFailed" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
 
@@ -2550,7 +2596,8 @@ test "EventWriter: an event too long for the buffer reports the real error" {
         var probe_writer: std.Io.Writer = .fixed(&probe);
         var probe_conn: Connection = undefined;
         probe_conn.initWriterForTesting(&probe_writer);
-        var probe_res = try Response.init(arena.allocator(), &probe_conn, 32);
+        const request = testRequest(arena.allocator());
+        var probe_res = try Response.init(&request, &probe_conn, 32);
         var event_buf: [4096]u8 = undefined;
         _ = try probe_res.startEventStream(&event_buf);
         break :blk probe_writer.end;
@@ -2562,7 +2609,8 @@ test "EventWriter: an event too long for the buffer reports the real error" {
     connection.initWriterForTesting(&conn_writer);
     connection.tcp_writer.err = error.ConnectionResetByPeer;
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var event_buf: [4096]u8 = undefined;
     var stream = try response.startEventStream(&event_buf);
     var w = try stream.startSend(.{});
@@ -2590,7 +2638,8 @@ test "Response: setCookie basic" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.setCookie("session", "abc123", .{});
     response.body = "OK";
 
@@ -2610,7 +2659,8 @@ test "Response: setCookie with options" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.setCookie("auth", "token123", .{
         .path = "/",
         .http_only = true,
@@ -2635,7 +2685,8 @@ test "Response: header() rejects CRLF in value" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try std.testing.expectError(error.InvalidHeaderValue, response.header("Location", "/ok\r\nX-Evil: 1"));
     try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\nbaz"));
     try std.testing.expectError(error.InvalidHeaderValue, response.header("X-Foo", "bar\x00baz"));
@@ -2651,7 +2702,8 @@ test "Response: header() rejects invalid name" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try std.testing.expectError(error.InvalidHeaderName, response.header("", "value"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("X-Bad\r\n", "value"));
     try std.testing.expectError(error.InvalidHeaderName, response.header("X: Bad", "value"));
@@ -2668,7 +2720,8 @@ test "Response: setCookie rejects a value that would inject a header" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     // Caught as a bad cookie value now, which is the earlier and narrower
     // of the two checks -- CRLF is not a cookie-octet in the first place.
     try std.testing.expectError(error.InvalidCookieValue, response.setCookie("session", "abc\r\nSet-Cookie: evil=1", .{}));
@@ -2812,7 +2865,8 @@ test "Response: resetBody replaces a half written body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.content_type = .json;
     var body = response.writer();
     try body.interface.writeAll("{\"half\":");
@@ -2843,7 +2897,8 @@ test "Response: resetBody drops the headers that described the old body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     // Set directly rather than through `content_type`, which is the case
     // clearing that field alone does not cover.
     try response.header("Content-Type", "application/json");
@@ -2878,7 +2933,8 @@ test "Response: a stream to an HTTP/1.0 peer is delimited by closing, not chunke
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.http10 = true;
     var stream_buf: [64]u8 = undefined;
     var body = try response.stream(&stream_buf);
@@ -2904,7 +2960,8 @@ test "Response: a HEAD streamed to an HTTP/1.0 peer keeps the connection" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.http10 = true;
     response.head = true;
     var stream_buf: [64]u8 = undefined;
@@ -2930,7 +2987,8 @@ test "Response: a kept HTTP/1.0 connection is announced with Connection: keep-al
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.http10 = true;
     response.body = "hello";
     try response.write();
@@ -2950,7 +3008,8 @@ test "Response: an HTTP/1.1 response that keeps the connection sends no Connecti
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "hello";
     try response.write();
 
@@ -2969,7 +3028,8 @@ test "BodyWriter: a body over many segments goes out whole, with its length" {
     var expected: [10_000]u8 = undefined;
     for (&expected, 0..) |*b, i| b.* = @intCast('a' + i % 26);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     // Short writes, as an encoder makes, crossing every segment boundary.
     var i: usize = 0;
@@ -2996,7 +3056,8 @@ test "BodyWriter: a body of more segments than one vectored write takes goes out
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     var chunk: [1000]u8 = undefined;
     for (0..total / chunk.len) |i| {
@@ -3027,7 +3088,8 @@ test "BodyWriter: a write bigger than any segment, and a long splat" {
     connection.initWriterForTesting(&conn_writer);
 
     const big: [100 * 1024]u8 = @splat('x');
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     try body.interface.writeAll("<");
     try body.interface.writeAll(&big);
@@ -3056,7 +3118,8 @@ test "BodyWriter: rebase keeps the bytes it was asked to preserve" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     const head: [500]u8 = @splat('h');
     try body.interface.writeAll(&head);
@@ -3094,7 +3157,8 @@ test "BodyWriter: a file streamed into the body arrives whole" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     const file = try tmp.dir.openFile(io, "body.txt", .{});
     defer file.close(io);
@@ -3119,7 +3183,8 @@ test "BodyWriter: rebase asked to preserve more than is buffered keeps it all" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     try body.interface.writeAll("abc");
     const slice = try body.interface.writableSliceGreedyPreserve(100, 1000);
@@ -3142,7 +3207,8 @@ test "Response: json is refused while a body writer is open" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     try body.interface.writeAll("[");
     try std.testing.expectError(error.BodyWriterOpen, response.json(.{ .a = 1 }, .{}));
@@ -3162,7 +3228,8 @@ test "BodyWriter: resetBody after several segments leaves only the replacement" 
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var body = response.writer();
     try body.interface.splatByteAll('y', 300);
     try body.interface.splatByteAll('z', 5000);
@@ -3189,7 +3256,8 @@ test "Response: a handler's own Content-Length must match the buffered body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "10");
     response.body = "hello";
     try std.testing.expectError(error.ContentLengthMismatch, response.write());
@@ -3206,7 +3274,8 @@ test "Response: a handler's Content-Length that is not a number is refused" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "five");
     response.body = "hello";
     try std.testing.expectError(error.InvalidContentLength, response.write());
@@ -3222,7 +3291,8 @@ test "Response: a 204 carries no Content-Length and no body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.status = .no_content;
     // A handler's mistake, which must not reach the wire.
     response.body = "hello";
@@ -3244,7 +3314,8 @@ test "Response: a 204 streamed is neither chunked nor terminated" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.status = .no_content;
     var stream_buf: [64]u8 = undefined;
     var body = try response.stream(&stream_buf);
@@ -3268,7 +3339,8 @@ test "Response: a 304 sends no body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.status = .not_modified;
     response.body = "hello";
     try response.write();
@@ -3288,7 +3360,8 @@ test "Response: a HEAD reports the length but sends no body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.head = true;
     response.content_type = .text;
     response.body = "hello";
@@ -3312,7 +3385,8 @@ test "Response: a HEAD sends no body written through the writer" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.head = true;
     var body = response.writer();
     try body.interface.writeAll("hello");
@@ -3334,7 +3408,8 @@ test "Response: a streamed HEAD sends the framing headers and nothing after" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.head = true;
 
     var body_buf: [64]u8 = undefined;
@@ -3361,7 +3436,8 @@ test "Response: a streamed HEAD still checks a declared length" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.head = true;
     try response.header("Content-Length", "5");
 
@@ -3387,7 +3463,8 @@ test "Response: a HEAD event stream sends the headers and no events" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.head = true;
 
     var event_buf: [4096]u8 = undefined;
@@ -3408,7 +3485,7 @@ test "Response: a HEAD event stream sends the headers and no events" {
 }
 
 fn testGzipRequest(arena: std.mem.Allocator) !Request {
-    var request: Request = .{ .arena = arena, .parser = undefined, .transport = undefined };
+    var request = testRequest(arena);
     request.headers = try http.Headers.init(arena, 4);
     try request.headers.put("Accept-Encoding", "gzip");
     return request;
@@ -3424,8 +3501,7 @@ test "Response: a stream refused at the headers leaves nothing for the error res
     connection.initWriterForTesting(&conn_writer);
 
     const request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 2);
-    response.request = &request;
+    var response = try Response.init(&request, &connection, 2);
     response.compress = true;
     response.content_type = .text;
     try response.header("X-A", "1");
@@ -3457,8 +3533,7 @@ test "Response: compress without room for its headers sends the body as it is" {
     connection.initWriterForTesting(&conn_writer);
 
     const request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 1);
-    response.request = &request;
+    var response = try Response.init(&request, &connection, 1);
     response.compress = true;
     response.body = &@as([300]u8, @splat('a'));
     try response.write();
@@ -3480,8 +3555,7 @@ test "Response: a gzipped body weakens its ETag and drops Accept-Ranges" {
     connection.initWriterForTesting(&conn_writer);
 
     const request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 8);
-    response.request = &request;
+    var response = try Response.init(&request, &connection, 8);
     response.compress = true;
     try response.header("ETag", "\"v1\"");
     try response.header("Accept-Ranges", "bytes");
@@ -3505,8 +3579,7 @@ test "Response: a 304 gets the Vary and ETag of a gzipped 200, without its codin
     connection.initWriterForTesting(&conn_writer);
 
     const request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(arena.allocator(), &connection, 8);
-    response.request = &request;
+    var response = try Response.init(&request, &connection, 8);
     response.compress = true;
     response.status = .not_modified;
     try response.header("ETag", "\"v1\"");
@@ -3529,7 +3602,8 @@ test "Response: variesByAcceptEncoding matches whole names, and *" {
         .{ "X-Accept-Encoding-Hint", false },
     };
     for (cases) |case| {
-        var response = try Response.init(arena.allocator(), &connection, 2);
+        const request = testRequest(arena.allocator());
+        var response = try Response.init(&request, &connection, 2);
         try response.header("Vary", case[0]);
         try std.testing.expectEqual(case[1], response.variesByAcceptEncoding());
     }
@@ -3546,9 +3620,11 @@ test "Response: a stream without the memory for a compressor goes out as it is" 
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    const request = try testGzipRequest(arena.allocator());
-    var response = try Response.init(failing.allocator(), &connection, 8);
-    response.request = &request;
+    // The headers built with the real arena; the response allocates from
+    // the failing one.
+    var request = try testGzipRequest(arena.allocator());
+    request.arena = failing.allocator();
+    var response = try Response.init(&request, &connection, 8);
     response.compress = true;
     failing.fail_index = failing.alloc_index;
 
@@ -3591,13 +3667,14 @@ test "Response: render calls a function or a template type" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.render(.html, test_templates.greeting, .{ "hi", 3 });
     var body_buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("<p>hi x3</p>", try testBody(&response, &body_buf));
     try std.testing.expectEqual(.html, response.content_type);
 
-    var page = try Response.init(arena.allocator(), &connection, 32);
+    var page = try Response.init(&request, &connection, 32);
     page.content_type = .xml;
     try page.render(null, test_templates.Page, .{"Title"});
     try std.testing.expectEqualStrings("<h1>Title</h1>", try testBody(&page, &body_buf));
@@ -3626,12 +3703,13 @@ test "Response: encode finds the writer, the allocator and the value by type" {
     connection.initWriterForTesting(&conn_writer);
     var body_buf: [256]u8 = undefined;
 
-    var first = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var first = try Response.init(&request, &connection, 32);
     try first.encode(.json, test_encoders.valueFirst, 42);
     try std.testing.expectEqualStrings("[42]", try testBody(&first, &body_buf));
     try std.testing.expectEqual(.json, first.content_type);
 
-    var second = try Response.init(arena.allocator(), &connection, 32);
+    var second = try Response.init(&request, &connection, 32);
     try second.encode(.msgpack, test_encoders.writerFirst, @as(u32, 7));
     try std.testing.expectEqualStrings("<7>", try testBody(&second, &body_buf));
     try std.testing.expectEqual(.msgpack, second.content_type);
@@ -3646,7 +3724,8 @@ test "Response: a failed render can be replaced" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try std.testing.expectError(error.Broken, response.render(.html, test_templates.failing, .{}));
     try response.render(.html, test_templates.Page, .{"Fallback"});
     var body_buf: [256]u8 = undefined;
@@ -3662,7 +3741,8 @@ test "Response: print formats the body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.print(.text, "{s} x{d}", .{ "hi", 3 });
     try response.write();
 
@@ -3678,7 +3758,8 @@ test "Response: a Date header for the current second follows the status line" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     response.body = "hi";
     const before = std.Io.Timestamp.now(std.testing.io, .real).toSeconds();
     try response.write();
@@ -3705,7 +3786,8 @@ test "Response: a Date set by the handler is not sent twice" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("date", "Sun, 06 Nov 1994 08:49:37 GMT");
     try response.write();
 
@@ -3759,7 +3841,8 @@ test "StreamingBodyWriter: the headers go out with the first body bytes" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&counter.out);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "5");
 
     var body_buf: [64]u8 = undefined;
@@ -3790,7 +3873,8 @@ test "StreamingBodyWriter: flush sends the headers before there is any body" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&counter.out);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -3821,8 +3905,7 @@ test "StreamingBodyWriter: a peer waiting for 100 Continue gets the headers righ
 
     var request = try testGzipRequest(arena.allocator());
     request.expects_continue = true;
-    var response = try Response.init(arena.allocator(), &connection, 32);
-    response.request = &request;
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -3839,7 +3922,8 @@ test "Response: startEventStream sends the headers right away" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&counter.out);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     var event_buf: [256]u8 = undefined;
     _ = try response.startEventStream(&event_buf);
 
@@ -3857,7 +3941,8 @@ test "StreamingBodyWriter: a short chunked body goes out in one write, terminato
     var connection: Connection = undefined;
     connection.initWriterForTesting(&counter.out);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -3884,7 +3969,8 @@ test "StreamingBodyWriter: a flush before end still goes out on its own" {
     var connection: Connection = undefined;
     connection.initWriterForTesting(&counter.out);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
 
     var body_buf: [64]u8 = undefined;
     var body = try response.stream(&body_buf);
@@ -3905,7 +3991,8 @@ test "StreamingBodyWriter: a body bigger than the buffer is not flushed piece by
     var connection: Connection = undefined;
     connection.initWriterForTesting(&counter.out);
 
-    var response = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var response = try Response.init(&request, &connection, 32);
     try response.header("Content-Length", "11");
 
     // Drained three times over, but sent once, by `end`.

@@ -224,6 +224,10 @@ fn signSession(self: *const Session, arena: std.mem.Allocator, session: *const S
 
 const testing = std.testing;
 
+fn testRequest(arena: std.mem.Allocator) Request {
+    return .{ .arena = arena, .parser = undefined, .transport = undefined };
+}
+
 test "SessionData: get and set" {
     var s = SessionData{};
     try s.set("user_id", "42");
@@ -459,7 +463,8 @@ test "Session: the handler reads and writes the session in the request context" 
     try req.headers.add("Cookie", try std.fmt.allocPrint(arena.allocator(), "session={s}", .{signed}));
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var res = try Response.init(&request, &connection, 32);
 
     const middlewares = [_]Middleware(App){.init(&session)};
     var app: App = .{};
@@ -509,7 +514,8 @@ test "Session: a streaming handler that changes the session still gets the cooki
     var conn_writer: std.Io.Writer = .fixed(&buf);
     var connection: Connection = undefined;
     connection.initWriterForTesting(&conn_writer);
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    const request = testRequest(arena.allocator());
+    var res = try Response.init(&request, &connection, 32);
 
     const middlewares = [_]Middleware(App){.init(&session)};
     var app: App = .{};

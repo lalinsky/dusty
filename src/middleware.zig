@@ -418,8 +418,9 @@ fn testRequest() Request {
     return .{ .arena = undefined, .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
 }
 
-fn makeTestResponse(conn: *Connection) Response {
+fn makeTestResponse(req: *const Request, conn: *Connection) Response {
     return Response{
+        .request = req,
         .body = "",
         .status = .ok,
         .headers = .{},
@@ -434,6 +435,10 @@ fn makeTestResponse(conn: *Connection) Response {
     };
 }
 
+fn testArenaRequest(arena: std.mem.Allocator) Request {
+    return .{ .arena = arena, .parser = undefined, .transport = undefined };
+}
+
 test "Middleware: single middleware executes before handler" {
     var tracker = CallTracker{};
     var mw = TestMiddleware{ .tracker = &tracker, .id = 1 };
@@ -442,7 +447,7 @@ test "Middleware: single middleware executes before handler" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -475,7 +480,7 @@ test "Middleware: multiple middlewares execute in order" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -510,7 +515,7 @@ test "Middleware: short-circuit prevents handler execution" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -533,7 +538,7 @@ test "Middleware: no middlewares calls handler directly" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -552,7 +557,7 @@ test "Executor: a handler returning NotFound gets the 404" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -577,7 +582,7 @@ test "Executor: no action with allowed methods gets the 405" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     res.headers = try http.Headers.init(arena.allocator(), 4);
@@ -606,7 +611,7 @@ test "Middleware: no action returns 404" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -631,7 +636,7 @@ test "Executor: default 500 handler on action error" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -655,7 +660,7 @@ test "Executor: a departed peer is not the handler's fault" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -678,7 +683,7 @@ test "Executor: a peer-shaped error of the handler's own is still a 500" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(void){
         .req = &req,
@@ -698,7 +703,7 @@ test "Executor: error after headers written propagates instead of rewriting the 
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
     // Simulate a response that already started (e.g. a streamed/chunked body
     // or a WebSocket upgrade) before the handler failed.
     res.headers_written = true;
@@ -723,7 +728,7 @@ test "Executor: error.NotFound after headers written propagates instead of endin
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
     res.headers_written = true;
 
     var executor = Executor(void){
@@ -785,7 +790,7 @@ test "Executor: custom notFound handler" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(CustomApp){
         .req = &req,
@@ -807,7 +812,7 @@ test "Executor: custom methodNotAllowed handler" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     res.headers = try http.Headers.init(arena.allocator(), 4);
@@ -833,7 +838,7 @@ test "Executor: custom uncaughtError handler" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var executor = Executor(CustomApp){
         .req = &req,
@@ -856,7 +861,7 @@ test "Executor: middleware error triggers custom uncaughtError" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var mw = ErrorMiddleware{};
     const middlewares = [_]Middleware(CustomApp){Middleware(CustomApp).init(&mw)};
@@ -887,7 +892,8 @@ test "Executor: a handler that fails mid-body does not send the fragment" {
     connection.initWriterForTesting(&conn_writer);
 
     var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    const request = testArenaRequest(arena.allocator());
+    var res = try Response.init(&request, &connection, 32);
 
     var executor = Executor(void){
         .req = &req,
@@ -942,7 +948,8 @@ test "Executor: res.fail answers with its status, unless another error comes bac
         }.handle, http.Status.internal_server_error, "500 Internal Server Error\n" },
     }) |case| {
         var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
-        var res = try Response.init(arena.allocator(), &connection, 32);
+        const request = testArenaRequest(arena.allocator());
+        var res = try Response.init(&request, &connection, 32);
         var executor = Executor(void){
             .req = &req,
             .res = &res,
@@ -974,7 +981,8 @@ test "Executor: a body failure answers the error it was recorded for" {
         .{ error.NotFound, http.Status.not_found },
     }) |case| {
         var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .post, .url = "/test" };
-        var res = try Response.init(arena.allocator(), &connection, 32);
+        const request = testArenaRequest(arena.allocator());
+        var res = try Response.init(&request, &connection, 32);
         req.response = &res;
         var executor = Executor(void){
             .req = &req,
@@ -1014,7 +1022,8 @@ test "Executor: a middleware that wrote a body does not supply the 404" {
     connection.initWriterForTesting(&conn_writer);
 
     var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    const request = testArenaRequest(arena.allocator());
+    var res = try Response.init(&request, &connection, 32);
 
     var mw = WritingMiddleware{};
     const middlewares = [_]Middleware(void){Middleware(void).init(&mw)};
@@ -1055,7 +1064,7 @@ test "Executor: middleware passes the request context to the handler" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var mw: AuthMiddleware = .{};
     const middlewares = [_]Middleware(AuthApp){.init(&mw)};
@@ -1115,7 +1124,7 @@ test "Executor: hooks run innermost first, only for middleware that ran" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var outer: HookingMiddleware = .{ .log = &hooks, .name = "outer" };
     var inner: HookingMiddleware = .{ .log = &hooks, .name = "inner", .short_circuit = true };
@@ -1146,7 +1155,7 @@ test "Executor: onHeaders failing on a buffered response gives an error response
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var failing: HookingMiddleware = .{ .log = &hooks, .name = "failing", .fail_headers = true };
     const middlewares = [_]Middleware(void){.init(&failing)};
@@ -1178,7 +1187,7 @@ test "Executor: the error response for a failed handler gets no onHeaders" {
     var req = testRequest();
     var connection: Connection = undefined;
     connection.initWriterForTesting(undefined);
-    var res = makeTestResponse(&connection);
+    var res = makeTestResponse(&req, &connection);
 
     var mw: HookingMiddleware = .{ .log = &hooks, .name = "mw" };
     const middlewares = [_]Middleware(void){.init(&mw)};
@@ -1213,7 +1222,8 @@ test "Executor: a stream whose onHeaders fails reports the hook's error" {
 
     var hooks: HookLog = .{};
     var req: Request = .{ .arena = arena.allocator(), .transport = undefined, .parser = undefined, .method = .get, .url = "/test" };
-    var res = try Response.init(arena.allocator(), &connection, 32);
+    const request = testArenaRequest(arena.allocator());
+    var res = try Response.init(&request, &connection, 32);
 
     var failing: HookingMiddleware = .{ .log = &hooks, .name = "failing", .fail_headers = true };
     const middlewares = [_]Middleware(void){.init(&failing)};
