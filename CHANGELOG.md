@@ -7,11 +7,13 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - `request.arena_retain_limit` and `ws.arena_retain_limit`, the most memory a request's arena and a WebSocket's message arena keep for the next request or message. Both default to 1 MiB; what a larger request or message grew them past is given back.
+- `req.started_at`, when the request arrived by the wall clock. The response's `Date` header is made from it, so the clock is read once per request.
 
 ### Changed
 
 - `Response.init` takes the request it answers, and allocates from its arena: `Response.init(&request, conn, max_headers)`. `res.request` is no longer optional.
 - On the server, a WebSocket's message memory comes from the server's allocator instead of the request arena, so `ws.arena_retain_limit` can give it back. A handler that does not call `ws.deinit()` now leaks it.
+- A keep-alive connection whose requests come more than 500 ms apart gives its request buffers back to the pool between them, as `keep_buffers_between_requests = false` does, and a new connection does so after its first request. A busy connection takes them again and keeps them. A server holding many mostly idle connections now needs buffers only for the requests in flight.
 - `res.stream` no longer flushes the headers right away. The response is sent when the buffer fills, on `flush`, or at `end`.
 
 ### Fixed

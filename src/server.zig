@@ -99,6 +99,10 @@ const ClientAuthRef = tls.ClientAuth;
 /// `request.arena_retain_limit` of it.
 const request_arena_reserve = 8 * 1024;
 
+/// Requests further apart than this release the connection's request buffers
+/// between them.
+const release_buffers_after_idle_ns = 500 * std.time.ns_per_ms;
+
 /// What a connection reads into while it waits for a request without a set
 /// of request buffers -- its first, or any with
 /// `request.keep_buffers_between_requests` off -- in place of the pooled
@@ -363,11 +367,13 @@ const DateCache = struct {
 
 threadlocal var date_cache: DateCache = .{};
 
-/// Writes the `Date` header line for the current second of the wall clock,
-/// reformatted only when the second changes.
-pub fn writeDateLine(w: *std.Io.Writer, io: std.Io) std.Io.Writer.Error!void {
+/// Writes the `Date` header line for the second of `at`, reformatted only
+/// when the second changes.
+pub fn writeDateLine(w: *std.Io.Writer, at: std.Io.Timestamp) std.Io.Writer.Error!void {
     const dest = try w.writableArray(http.date_line_len);
-    const second = std.Io.Timestamp.now(io, .real).toSeconds();
+    // i64 covers 1678 to 2262 and avoids a 128-bit division.
+    const ns: i64 = @truncate(at.nanoseconds);
+    const second = @divTrunc(ns, std.time.ns_per_s);
     if (second != date_cache.second) {
         http.formatDateLine(&date_cache.line, second);
         date_cache.second = second;
@@ -383,7 +389,7 @@ fn sendBareStatus(conn: *Connection, status: []const u8) std.Io.Writer.Error!voi
     var buf: [1024]u8 = undefined;
     var reply: std.Io.Writer = .fixed(&buf);
     reply.print("HTTP/1.1 {s}\r\n", .{status}) catch unreachable;
-    writeDateLine(&reply, conn.io) catch unreachable;
+    writeDateLine(&reply, std.Io.Timestamp.now(conn.io, .real)) catch unreachable;
     reply.writeAll("Connection: close\r\n" ++
         "Content-Length: 0\r\n" ++
         "\r\n") catch unreachable;
@@ -1181,6 +1187,9 @@ pub fn Server(comptime App: type) type {
             request.parser = &parser;
 
             var request_count: usize = 0;
+            // A new connection releases its buffers after the first request.
+            var last_started_at: std.Io.Timestamp = .zero;
+            var idle = true;
 
             while (true) {
                 // Nothing buffered means the next request has not begun.
@@ -1190,7 +1199,7 @@ pub fn Server(comptime App: type) type {
                 // request pipelined behind the last one is already here.
                 const first = request_count == 0;
                 if (connection.reader.bufferedLen() == 0) {
-                    if (!self.config.request.keep_buffers_between_requests) {
+                    if (!self.config.request.keep_buffers_between_requests or idle) {
                         if (buffers) |b| {
                             connection.useReadBuffer(&idle_read_buffer);
                             connection.releaseWriteBuffer();
@@ -1208,6 +1217,11 @@ pub fn Server(comptime App: type) type {
                 }
                 if (!first) self.armTimer(timer, self.config.timeout.request);
                 request_count += 1;
+
+                const started_at = std.Io.Timestamp.now(self.io, .real);
+                if (!first) idle = last_started_at.durationTo(started_at).nanoseconds > release_buffers_after_idle_ns;
+                last_started_at = started_at;
+                request.started_at = started_at;
 
                 if (buffers == null) {
                     const b = try self.request_buffers.acquire(@intFromPtr(connection));
