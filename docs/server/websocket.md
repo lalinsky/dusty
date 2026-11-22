@@ -28,7 +28,8 @@ connection.
 `receive` answers pings for you. `ws.ping(data)` sends a ping of your own.
 
 A message can be up to 16 MiB. A bigger one fails `receive` with `error.MessageTooLarge`.
-`ws.max_message_size` changes the limit.
+`ws.max_message_size` changes the limit. Memory a large message took is kept for the next one up
+to `ws.arena_retain_limit`, 1 MiB by default.
 
 ## Pipelining
 

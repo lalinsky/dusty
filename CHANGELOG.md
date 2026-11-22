@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `request.arena_retain_limit` and `ws.arena_retain_limit`, the most memory a request's arena and a WebSocket's message arena keep for the next request or message. Both default to 1 MiB; what a larger request or message grew them past is given back.
+
 ### Changed
 
 - `Response.init` takes the request it answers, and allocates from its arena: `Response.init(&request, conn, max_headers)`. `res.request` is no longer optional.

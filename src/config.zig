@@ -247,10 +247,16 @@ pub const ServerConfig = struct {
         ///
         /// Which is the limit worth enforcing, but note what it costs: a
         /// request can grow its arena by this much, the pooled arena keeps
-        /// it, and a compressed request reaches it for a fraction of the
-        /// bytes on the wire. Size memory for `max_connections` of these,
-        /// not for what a peer has to send to get one.
+        /// up to `arena_retain_limit` of it, and a compressed request
+        /// reaches it for a fraction of the bytes on the wire. Size memory
+        /// for `max_connections` of these, not for what a peer has to send
+        /// to get one.
         max_body_size: usize = 1_048_576, // 1MB default
+        /// The most a request's arena keeps once the request is done. A
+        /// request that grew it past this, with a large body say, gives
+        /// the rest back, so the connection, or the pool when it closes,
+        /// doesn't hold on to that much for the next one.
+        arena_retain_limit: usize = 1_048_576,
         /// Undo `Content-Encoding` on request bodies. A coding we cannot
         /// undo fails the read with `error.UnsupportedContentEncoding`
         /// rather than handing the handler bytes it would misread.
