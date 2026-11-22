@@ -95,8 +95,8 @@ fn remoteAddress(peer: std.Io.net.IpAddress, headers: *const Headers, trusted_pr
 const ClientAuthRef = tls.ClientAuth;
 
 /// Primed into each pooled request arena, so an ordinary request is served
-/// without growing it. A request that needs more grows it once, and the
-/// arena keeps what it grew to.
+/// without growing it. A request that needs more grows it, and keeps up to
+/// `request.arena_retain_limit` of it.
 const request_arena_reserve = 8 * 1024;
 
 /// What a connection reads into while it waits for a request without a set
@@ -498,7 +498,7 @@ pub fn Server(comptime App: type) type {
                 .address = undefined,
                 .ready = .unset,
                 ._middleware_registry = .{},
-                .request_buffers = .init(allocator, io, config.request.buffer_size + body_read_reserve, config.response.write_buffer_size, request_arena_reserve),
+                .request_buffers = .init(allocator, io, config.request.buffer_size + body_read_reserve, config.response.write_buffer_size, request_arena_reserve, config.request.arena_retain_limit),
             };
         }
 
@@ -1406,7 +1406,7 @@ pub fn Server(comptime App: type) type {
 
                 parser.reset();
                 request.reset();
-                _ = buffers.?.arena.reset(.retain_capacity);
+                self.request_buffers.resetArena(buffers.?);
                 connection.rewindReader();
             }
         }

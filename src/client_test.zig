@@ -481,6 +481,7 @@ test "Client: WebSocket upgrade" {
                 res.status = .bad_request;
                 return;
             };
+            defer ws.deinit();
 
             try ws.send(.text, "Welcome!");
 

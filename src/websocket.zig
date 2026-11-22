@@ -16,6 +16,10 @@ pub const WebSocket = struct {
     is_client: bool = false,
     prng: std.Random.DefaultPrng,
     max_message_size: usize = default_max_message_size,
+    /// The most the message arena keeps from one batch of messages to the
+    /// next. A large message grows it, up to `max_message_size`, and what
+    /// it grew past this is given back before the next batch is read.
+    arena_retain_limit: usize = default_arena_retain_limit,
     closed: bool = false,
     auto_responded: bool = false,
     fragmented_type: ?MessageType = null,
@@ -29,6 +33,7 @@ pub const WebSocket = struct {
     autoflush: bool = true,
 
     pub const default_max_message_size: usize = 16 * 1024 * 1024; // 16MB
+    pub const default_arena_retain_limit: usize = 1024 * 1024; // 1MB
 
     pub const MessageType = enum(u4) {
         continuation = 0x0,
@@ -153,7 +158,7 @@ pub const WebSocket = struct {
     }
 
     fn resetMessages(self: *WebSocket) void {
-        _ = self.msg_arena.reset(.retain_capacity);
+        _ = self.msg_arena.reset(.{ .retain_with_limit = self.arena_retain_limit });
         self.auto_responded = false;
     }
 

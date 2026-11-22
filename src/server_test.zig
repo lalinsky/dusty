@@ -401,6 +401,7 @@ test "Server: WebSocket echo" {
                 res.status = .bad_request;
                 return;
             };
+            defer ws.deinit();
 
             app.ws_upgraded = true;
 

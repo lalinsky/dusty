@@ -67,6 +67,7 @@ See [`http.Listener`](../../apidocs/#http.Listener) for the other listener optio
 |---|---|---|
 | `max_connections` | 10,000 | Most connections open at once |
 | `request.max_body_size` | 1 MiB | Largest request body |
+| `request.arena_retain_limit` | 1 MiB | Most memory a request's arena keeps for the next request |
 | `request.buffer_size` | 16 KiB | Largest request line and headers, together |
 | `request.max_header_count` | 64 | Most headers in a request |
 | `request.max_query_count` | 32 | Most query parameters |

@@ -24,6 +24,9 @@ pub const RequestBuffersPool = struct {
     /// Primed into each arena, so an ordinary request is served without
     /// growing it.
     arena_reserve: usize,
+    /// The most an arena keeps once a request is done with it, and never
+    /// less than `arena_reserve`.
+    arena_retain_limit: usize,
     shards: [shard_count]Shard = @splat(.{}),
 
     const shard_count = 16;
@@ -35,13 +38,14 @@ pub const RequestBuffersPool = struct {
         _: void align(std.atomic.cache_line) = {},
     };
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, read_buffer_len: usize, write_buffer_len: usize, arena_reserve: usize) RequestBuffersPool {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, read_buffer_len: usize, write_buffer_len: usize, arena_reserve: usize, arena_retain_limit: usize) RequestBuffersPool {
         return .{
             .allocator = allocator,
             .io = io,
             .read_buffer_len = read_buffer_len,
             .write_buffer_len = write_buffer_len,
             .arena_reserve = arena_reserve,
+            .arena_retain_limit = @max(arena_retain_limit, arena_reserve),
         };
     }
 
@@ -69,9 +73,15 @@ pub const RequestBuffersPool = struct {
         return buffers;
     }
 
+    /// Empties a set's arena for the next request, keeping at most
+    /// `arena_retain_limit` of it.
+    pub fn resetArena(self: *const RequestBuffersPool, buffers: *RequestBuffers) void {
+        _ = buffers.arena.reset(.{ .retain_with_limit = self.arena_retain_limit });
+    }
+
     /// Gives a set back to the shard it was taken from, its arena reset.
     pub fn release(self: *RequestBuffersPool, buffers: *RequestBuffers) void {
-        _ = buffers.arena.reset(.retain_capacity);
+        self.resetArena(buffers);
         const shard = &self.shards[buffers.shard];
         shard.mutex.lockUncancelable(self.io);
         defer shard.mutex.unlock(self.io);
@@ -108,7 +118,7 @@ pub const RequestBuffersPool = struct {
 };
 
 test "RequestBuffersPool: a set given back is the next one taken with the same key" {
-    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256);
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256, 1024);
     defer pool.deinit();
 
     const a = try pool.acquire(1);
@@ -130,7 +140,7 @@ test "RequestBuffersPool: a set given back is the next one taken with the same k
 }
 
 test "RequestBuffersPool: a set goes back to the shard it came from" {
-    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256);
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256, 1024);
     defer pool.deinit();
 
     // Two keys that land on different shards.
@@ -145,4 +155,19 @@ test "RequestBuffersPool: a set goes back to the shard it came from" {
     pool.release(b);
     try std.testing.expectEqual(a, try pool.acquire(1));
     pool.release(a);
+}
+
+test "RequestBuffersPool: an arena grown past the limit gives the rest back" {
+    var pool: RequestBuffersPool = .init(std.testing.allocator, std.testing.io, 128, 64, 256, 1024);
+    defer pool.deinit();
+
+    const a = try pool.acquire(1);
+    _ = try a.arena.allocator().alloc(u8, 64 * 1024);
+    try std.testing.expect(a.arena.queryCapacity() > 1024);
+    pool.resetArena(a);
+    try std.testing.expect(a.arena.queryCapacity() <= 1024);
+
+    _ = try a.arena.allocator().alloc(u8, 64 * 1024);
+    pool.release(a);
+    try std.testing.expect(a.arena.queryCapacity() <= 1024);
 }

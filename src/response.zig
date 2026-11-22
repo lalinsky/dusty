@@ -1139,7 +1139,10 @@ pub const Response = struct {
 
         var seed: u64 = undefined;
         req.io.random(std.mem.asBytes(&seed));
-        return WebSocket.init(req.io, self.conn.transport(), self.arena, seed);
+        // The server's allocator, not the request arena: the arena is not
+        // reset while the WebSocket lives, and could not take back what the
+        // message arena gives up between batches. `ws.deinit` frees it.
+        return WebSocket.init(req.io, self.conn.transport(), self.conn.allocator, seed);
     }
 
     /// Turns the sentinel a `std.Io.Writer` reports into the cause the
