@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - `Response.init` takes the request it answers, and allocates from its arena: `Response.init(&request, conn, max_headers)`. `res.request` is no longer optional.
+- On the server, a WebSocket's message memory comes from the server's allocator instead of the request arena, so `ws.arena_retain_limit` can give it back. A handler that does not call `ws.deinit()` now leaks it.
 - `res.stream` no longer flushes the headers right away. The response is sent when the buffer fills, on `flush`, or at `end`.
 
 ### Fixed

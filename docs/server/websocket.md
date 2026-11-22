@@ -15,7 +15,7 @@ server.router.get("/ws", echo);
 `res.upgradeWebSocket(req)` sends the response that accepts the upgrade and returns an
 [`http.WebSocket`](../../apidocs/#http.WebSocket). If the request isn't a WebSocket upgrade, it
 returns null. The handler can then answer it like any other request. Call `ws.deinit()` when you're
-done with the connection.
+done with the connection; it frees the memory messages were received into.
 
 ## Messages
 
