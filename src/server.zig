@@ -1277,11 +1277,10 @@ pub fn Server(comptime App: type) type {
 
                 log.debug("Received: {f} {s}", .{ request.method, request.url });
 
-                var response = try Response.init(request.arena, connection, self.config.request.max_header_count);
+                var response = try Response.init(&request, connection, self.config.request.max_header_count);
                 defer response.deinit();
                 response.head = request.method == .head;
                 response.http10 = request.version_major == 1 and request.version_minor == 0;
-                response.request = &request;
                 request.response = &response;
 
                 // Handle Expect header (100-continue)
