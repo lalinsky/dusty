@@ -64,6 +64,17 @@ pub fn Header(comptime name: []const u8, comptime T: type) type {
     }.get);
 }
 
+/// The whole request body, read with `req.body()`, so it fails the same
+/// way, with `error.BodyTooBig` for one over `max_body_size` and so on.
+/// A request with no body gives an empty `value`.
+pub const Body = struct {
+    value: []const u8,
+
+    pub fn extract(scope: anytype) !Body {
+        return .{ .value = try scope.req.body() orelse "" };
+    }
+};
+
 fn Value(
     comptime T: type,
     comptime what: []const u8,

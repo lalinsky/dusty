@@ -27,6 +27,9 @@ It returns null when the request has no body. `request.max_body_size` limits the
 default. A larger body fails with `error.BodyTooBig`, and if the handler returns that error, the
 client gets a 413. A body sent with gzip or deflate `Content-Encoding` is decoded as it's read.
 
+A handler can also take [`http.Body`](../../apidocs/#http.Body), which reads the body the same way
+and has it in `.value`, or an empty one when there's no body.
+
 For a body too large to keep in memory, read it piece by piece with `req.reader`:
 
 ```zig

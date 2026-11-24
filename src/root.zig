@@ -26,6 +26,7 @@ pub const Params = @import("http.zig").Params;
 pub const Path = @import("extract.zig").Path;
 pub const Query = @import("extract.zig").Query;
 pub const Header = @import("extract.zig").Header;
+pub const Body = @import("extract.zig").Body;
 pub const ContentType = @import("http.zig").ContentType;
 pub const ContentEncoding = @import("http.zig").ContentEncoding;
 pub const Cookie = @import("cookie.zig").Cookie;
