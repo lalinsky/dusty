@@ -9,15 +9,15 @@ parameters it needs, in any order, and each one is filled in by its type:
 - `*App.RequestContext`, a struct that each request gets its own copy of, see
   [Middleware](middleware.md)
 - `http.Path`, `http.Query` and `http.Header`, values from the request
+- `http.Body`, the request body
 - Your own types, filled in by their `extract` function
 
 The return type is `void` or `!void`.
 
 ## Values from the Request
 
-[`http.Path`](../../apidocs/#http.Path), [`http.Query`](../../apidocs/#http.Query) and
-[`http.Header`](../../apidocs/#http.Header) give the handler a path parameter, a query parameter
-and a header, parsed as the type you ask for:
+Dusty has parameter types that read a part of the request and give the handler its value,
+already parsed:
 
 ```zig
 --8<-- "examples/handlers.zig:values"
@@ -27,18 +27,34 @@ and a header, parsed as the type you ask for:
 server.router.get("/users/:id/posts", listPosts);
 ```
 
-Each one takes a name and a type. The parsed value is in `.value`. They parse the same types:
-integers, enums, `bool`, `[]const u8`, and types with a `parseParam` function. See
-[Routing](routing.md#path-parameters) for the details.
+The value is in `.value`. When a value is missing or doesn't parse, the handler isn't called, and
+the request gets an error status instead, except where the table says otherwise.
 
-They differ in what happens when the value isn't there or doesn't parse:
+| Type | Value | Missing | Doesn't parse |
+|---|---|---|---|
+| [`http.Path(name, T)`](../../apidocs/#http.Path) | Path parameter | Compile error | 404 |
+| [`http.Query(name, T)`](../../apidocs/#http.Query) | Query parameter | 400, or null for `?T` | 400 |
+| [`http.Header(name, T)`](../../apidocs/#http.Header) | Request header | 400, or null for `?T` | 400 |
+| [`http.Body`](../../apidocs/#http.Body) | The whole body | Empty | — |
 
-- A path parameter that doesn't parse makes the route not match, so the request gets a 404 unless
-  another route matches it.
-- A query parameter or header that is missing is a 400. With an optional type, like
-  `?enum { new, top }` above, it's null instead.
-- A query parameter or header that doesn't parse is a 400, optional or not. `?sort=old` gets a
-  400 here.
+### Path, Query and Header
+
+These take a name and a type. They parse the same types: integers, enums, `bool`, `[]const u8`,
+and types with a `parseParam` function. See [Routing](routing.md#path-parameters) for the details.
+
+A path parameter must be in the route, `:id` here, or the code doesn't compile. One that doesn't
+parse makes the route not match, so the request gets a 404 unless another route matches it.
+
+A query parameter or header that is missing is a 400. With an optional type, like
+`?enum { new, top }` above, it's null instead. One that is there but doesn't parse is a 400,
+optional or not, so `?sort=old` gets a 400 here. Header names ignore case, and when a header is
+sent more than once, the first one counts.
+
+### Body
+
+`http.Body` reads the whole body with `req.body()`, and fails the same way, for example with a 413
+for a body over `request.max_body_size`. A request with no body gets an empty `.value`. See
+[Requests](requests.md#body).
 
 ## Your Own Parameter Types
 
@@ -116,7 +132,7 @@ The app can replace the default 404 and error responses by declaring `notFound` 
 route. The 405 for a method with no route on the path goes through `methodNotAllowed` the same way,
 which gets the response with the status and the `Allow` header already set. `uncaughtError` returns
 `void`, so it can't fail. It can take the error as `anyerror`, but not
-`http.Path`, `http.Query`, `http.Header` or your own types.
+`http.Path`, `http.Query`, `http.Header`, `http.Body` or your own types.
 
 The 400, 413 and 415 for what the client got wrong, and the statuses from `res.fail`, don't go
 through `uncaughtError`. To answer those yourself too, for example as JSON, turn off `answer_client_errors` in the server's request

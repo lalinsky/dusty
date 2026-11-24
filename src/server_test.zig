@@ -1854,6 +1854,53 @@ test "Server: Query and Header extractors, and a 400 for a missing or bad value"
     }
 }
 
+test "Server: Body extractor, with an empty body and one too large" {
+    const io = std.testing.io;
+    var server = dusty.Server(void).init(std.testing.allocator, io, .{
+        .listeners = loopback,
+        .request = .{ .max_body_size = 8 },
+    }, {});
+    defer server.deinit();
+    server.router.post("/echo", struct {
+        fn handle(body: dusty.Body, res: *dusty.Response) !void {
+            try res.print(.text, "[{s}]", .{body.value});
+        }
+    }.handle);
+
+    var server_future = try io.concurrent(struct {
+        fn run(s: *dusty.Server(void)) !void {
+            try s.run();
+        }
+    }.run, .{&server});
+    defer server_future.cancel(io) catch {};
+    try server.ready.wait(io);
+
+    const stream = try server.address.ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    defer stream.shutdown(io, .both) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello" ++
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n" ++
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n123456789");
+    try writer.interface.flush();
+
+    var read_buf: [1024]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "200", "[hello]" },
+        .{ "200", "[]" },
+        .{ "413", "413 Content Too Large\n" },
+    }) |want| {
+        var status: [64]u8 = undefined;
+        var body: [64]u8 = undefined;
+        const resp = try readResponse(&reader.interface, &status, &body);
+        try std.testing.expect(std.mem.indexOf(u8, resp.status, want[0]) != null);
+        try std.testing.expectEqualStrings(want[1], resp.body);
+    }
+}
+
 const ClientErrorApp = struct {
     pub fn uncaughtError(res: *dusty.Response, err: anyerror) void {
         const status = if (res.failure) |f| f.status else .internal_server_error;
