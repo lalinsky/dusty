@@ -16,6 +16,8 @@ const default_listeners = @import("config.zig").default_listeners;
 const body_read_reserve = @import("config.zig").body_read_reserve;
 const RequestBuffersPool = @import("server/request_buffers.zig").RequestBuffersPool;
 const RequestBuffers = @import("server/request_buffers.zig").RequestBuffers;
+const ConnectionRegistry = @import("server/connection_registry.zig").ConnectionRegistry;
+const ConnectionEntry = @import("server/connection_registry.zig").ConnectionEntry;
 const Executor = @import("middleware.zig").Executor;
 const Middleware = @import("middleware.zig").Middleware;
 const Transport = @import("transport.zig").Transport;
@@ -404,6 +406,11 @@ fn sendBareStatus(conn: *Connection, status: []const u8) std.Io.Writer.Error!voi
 const linger_limit: usize = 64 * 1024;
 const linger_timeout: std.Io.Duration = .fromSeconds(1);
 
+/// How often the drain counts the connections in flight again without
+/// being woken. A connection that finishes a request as the drain starts
+/// may go back to waiting without seeing it, and so without waking it.
+const drain_poll_interval: std.Io.Duration = .fromMilliseconds(100);
+
 pub const Address = @import("config.zig").Address;
 pub const Listener = @import("config.zig").Listener;
 
@@ -427,15 +434,18 @@ pub fn Server(comptime App: type) type {
         app: if (App == void) void else *App,
         config: ServerConfig,
         active_connections: std.atomic.Value(u32),
-        /// What the drain waits on: connections with a request in flight,
-        /// from accept or the first byte of a request until they go back to
-        /// waiting for one, and whether the drain is on. One word, so a
-        /// request arriving as the drain starts is either counted before
-        /// the drain looks or refused after seeing the flag: the two
-        /// updates are ordered by the word, whichever comes second sees the
-        /// first. A connection waiting between requests is not counted; it
-        /// has nothing to lose to the cancel that follows the drain.
-        busy: std.atomic.Value(Busy),
+        /// Every connection's task, once it has started. The drain closes
+        /// it and waits for the busy ones; a connection waiting between
+        /// requests has nothing to lose to the cancel that follows the
+        /// drain. Once it is closed, a request that arrives is refused, and
+        /// one already in flight is answered with `Connection: close`.
+        connections: ConnectionRegistry,
+        /// Connections accepted whose task has not linked itself into
+        /// `connections` yet, which the drain waits for too.
+        starting: std.atomic.Value(u32) = .init(0),
+        /// Bumped to wake the drain, when the count it waits on may have
+        /// reached zero.
+        drain_wake: std.atomic.Value(u32) = .init(0),
         /// The first listener's bound address, once `ready` is set. A
         /// listener given port zero has its real port here.
         address: Address,
@@ -487,11 +497,6 @@ pub fn Server(comptime App: type) type {
 
         const AcceptError = @typeInfo(@typeInfo(@TypeOf(acceptConnections)).@"fn".return_type.?).error_union.error_set;
 
-        const Busy = packed struct(u32) {
-            count: u31 = 0,
-            draining: bool = false,
-        };
-
         pub fn init(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig, app: if (App == void) void else *App) Self {
             return .{
                 .allocator = allocator,
@@ -500,7 +505,7 @@ pub fn Server(comptime App: type) type {
                 .app = app,
                 .config = config,
                 .active_connections = std.atomic.Value(u32).init(0),
-                .busy = .init(.{}),
+                .connections = .init(io),
                 .address = undefined,
                 .ready = .unset,
                 ._middleware_registry = .{},
@@ -612,10 +617,7 @@ pub fn Server(comptime App: type) type {
             for (active) |*l| log.info("Listening on {f}", .{l.address});
 
             var connections: std.Io.Group = .init;
-            defer {
-                _ = self.busy.fetchOr(.{ .draining = true }, .release);
-                connections.cancel(self.io);
-            }
+            defer connections.cancel(self.io);
 
             // Set by the first accept loop to give up; a cancel arrives
             // through the wait instead. Either way the accept loops are
@@ -788,10 +790,10 @@ pub fn Server(comptime App: type) type {
                     stream.close(self.io);
                     return err;
                 };
-                _ = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
+                _ = self.starting.fetchAdd(1, .monotonic);
                 connections.concurrent(self.io, handleConnectionWrapper, .{ self, l, stream }) catch |err| {
                     log.err("Failed to spawn connection handler: {}", .{err});
-                    self.finishRequest();
+                    self.finishStarting();
                     self.releaseConnectionSlot();
                     stream.close(self.io);
                     continue;
@@ -816,7 +818,7 @@ pub fn Server(comptime App: type) type {
             defer _ = self.io.swapCancelProtection(protection);
 
             log.info("Graceful shutdown requested", .{});
-            _ = self.busy.fetchOr(.{ .draining = true }, .acq_rel);
+            self.connections.close();
 
             // Turned into a deadline once, so the budget covers the drain as
             // a whole. A per-wait duration would restart it every time a
@@ -827,23 +829,33 @@ pub fn Server(comptime App: type) type {
             else
                 .none;
 
+            var logged: usize = 0;
             while (true) {
-                const state = self.busy.load(.acquire);
-                const remaining = state.count;
+                // Read before the count, so a wake that lands in between is
+                // one the wait below refuses to sleep through.
+                const wake = self.drain_wake.load(.acquire);
+                const remaining = self.inFlight();
                 if (remaining == 0) return;
 
+                // The wait ends at whichever comes first: the next poll, or
+                // the deadline.
+                var wait: std.Io.Timeout = std.Io.Timeout.toDeadline(.{ .duration = .{ .raw = drain_poll_interval, .clock = .awake } }, self.io);
                 if (timeout.toTimestamp(self.io)) |deadline| {
                     if (std.Io.Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
                         log.warn("Shutdown timed out with {d} request(s) still in flight", .{remaining});
                         return;
                     }
+                    if (wait.toTimestamp(self.io).?.compare(.gte, deadline)) wait = timeout;
                 }
 
-                log.info("Waiting for {} in-flight request(s) to finish", .{remaining});
-                // Wakes when a request finishes, or when the deadline
-                // arrives; the loop above decides which happened. Spurious
-                // wakeups just re-read the count.
-                self.io.futexWaitTimeout(Busy, &self.busy.raw, state, timeout) catch |err| switch (err) {
+                if (remaining != logged) {
+                    log.info("Waiting for {} in-flight request(s) to finish", .{remaining});
+                    logged = remaining;
+                }
+                // Wakes when the last connection of a shard finishes, at
+                // the next poll, or at the deadline; the loop above decides
+                // which happened.
+                self.io.futexWaitTimeout(u32, &self.drain_wake.raw, wake, wait) catch |err| switch (err) {
                     // Cannot happen: protection is blocked for this whole
                     // function, so no Io call here is a cancelation point.
                     error.Canceled => unreachable,
@@ -899,11 +911,28 @@ pub fn Server(comptime App: type) type {
             if (was >= max) self.io.futexWake(u32, &self.active_connections.raw, std.math.maxInt(u32));
         }
 
-        /// Wakes the drain when this was the last one: zero is the only
-        /// count it acts on, so the others are not worth a syscall.
-        fn finishRequest(self: *Self) void {
-            const was = self.busy.fetchSub(.{ .count = 1 }, .acq_rel);
-            if (was.count == 1) self.io.futexWake(Busy, &self.busy.raw, 1);
+        /// The connection's task has linked it into `connections`, or it
+        /// never got a task.
+        fn finishStarting(self: *Self) void {
+            _ = self.starting.fetchSub(1, .release);
+        }
+
+        fn wakeDrain(self: *Self) void {
+            _ = self.drain_wake.fetchAdd(1, .release);
+            self.io.futexWake(u32, &self.drain_wake.raw, 1);
+        }
+
+        /// A closing connection has gone idle.
+        fn settle(self: *Self, entry: *ConnectionEntry) void {
+            if (self.connections.settle(entry)) self.wakeDrain();
+        }
+
+        /// Connections the drain waits for. `starting` first: a task links
+        /// itself before it stops counting there, so one is never missed by
+        /// both.
+        fn inFlight(self: *Self) usize {
+            const starting = self.starting.load(.acquire);
+            return starting + self.connections.countPending();
         }
 
         const RequestWait = enum {
@@ -917,9 +946,9 @@ pub fn Server(comptime App: type) type {
         /// Waits for the first byte of a request, with nothing in flight:
         /// the drain does not wait for a connection here, and the cancel
         /// that follows it closes the socket cleanly.
-        fn waitForRequest(self: *Self, connection: *Connection, busy: *bool) !RequestWait {
-            busy.* = false;
-            self.finishRequest();
+        fn waitForRequest(self: *Self, connection: *Connection, entry: *ConnectionEntry) !RequestWait {
+            entry.setIdle();
+            if (entry.isClosing()) self.settle(entry);
 
             connection.reader.fillMore() catch |err| switch (err) {
                 error.EndOfStream => return .peer_gone,
@@ -932,11 +961,8 @@ pub fn Server(comptime App: type) type {
                 },
             };
 
-            const was = self.busy.fetchAdd(.{ .count = 1 }, .acq_rel);
-            busy.* = true;
-            if (was.draining) {
-                busy.* = false;
-                self.finishRequest();
+            if (!entry.setBusy()) {
+                self.settle(entry);
                 sendBareStatus(connection, "503 Service Unavailable") catch
                     return connection.getWriteError() orelse error.Unexpected;
                 return .refused;
@@ -954,7 +980,9 @@ pub fn Server(comptime App: type) type {
             var watch: Watch = .{};
             var future = self.io.concurrent(runConnection, .{ self, l, stream, &watch }) catch |err| {
                 log.warn("No task to watch the connection deadline: {}; refusing", .{err});
-                self.finishRequest();
+                self.finishStarting();
+                // The drain may have been waiting for this one.
+                self.wakeDrain();
                 self.releaseConnectionSlot();
                 stream.close(self.io);
                 return;
@@ -1048,10 +1076,14 @@ pub fn Server(comptime App: type) type {
         fn handleConnection(self: *Self, l: *ActiveListener, stream: std.Io.net.Stream, watch: ?*Watch) !void {
             defer self.releaseConnectionSlot();
 
-            // Counted since accept, so a handshake in progress is waited for
-            // like a request. Handed back and taken again in `waitForRequest`.
-            var busy = true;
-            defer if (busy) self.finishRequest();
+            // Busy until the first wait for a request, so a handshake in
+            // progress is waited for like a request.
+            var entry: ConnectionEntry = .{};
+            self.connections.link(&entry);
+            defer {
+                if (self.connections.unlink(&entry)) self.wakeDrain();
+            }
+            self.finishStarting();
 
             defer stream.close(self.io);
 
@@ -1123,12 +1155,12 @@ pub fn Server(comptime App: type) type {
                         };
                     }
 
-                    return self.handleRequests(l, &connection, &timer, &busy);
+                    return self.handleRequests(l, &connection, &timer, &entry);
                 }
             }
 
             try connection.initPlain(self.allocator, self.io, stream);
-            return self.handleRequests(l, &connection, &timer, &busy);
+            return self.handleRequests(l, &connection, &timer, &entry);
         }
 
         /// Whether the peer sent, or may still send, input that was not
@@ -1156,7 +1188,7 @@ pub fn Server(comptime App: type) type {
             l: *ActiveListener,
             connection: *Connection,
             timer: *Timer,
-            busy: *bool,
+            entry: *ConnectionEntry,
         ) !void {
             var idle_read_buffer: [idle_read_buffer_len]u8 = undefined;
             connection.useReadBuffer(&idle_read_buffer);
@@ -1208,7 +1240,7 @@ pub fn Server(comptime App: type) type {
                         }
                     }
                     self.armTimer(timer, if (first) self.config.timeout.request else self.config.timeout.keepalive);
-                    switch (try self.waitForRequest(connection, busy)) {
+                    switch (try self.waitForRequest(connection, entry)) {
                         .arrived => {},
                         .peer_gone => return,
                         // The request it refused was not read.
@@ -1400,7 +1432,7 @@ pub fn Server(comptime App: type) type {
                     }
                 }
 
-                if (self.busy.load(.acquire).draining) {
+                if (entry.isClosing()) {
                     response.keepalive = false;
                 }
 

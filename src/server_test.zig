@@ -2723,7 +2723,7 @@ test "Server: a request arriving during the shutdown drain is refused, not serve
         }
     }.run, .{ &server_future, io });
     defer shutdown_future.cancel(io) catch {};
-    while (!server.busy.load(.acquire).draining) {
+    while (!server.connections.isClosed()) {
         try io.sleep(.fromMilliseconds(1), .awake);
     }
 
