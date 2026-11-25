@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 - On the server, a WebSocket's message memory comes from the server's allocator instead of the request arena, so `ws.arena_retain_limit` can give it back. A handler that does not call `ws.deinit()` now leaks it.
 - A keep-alive connection whose requests come more than 500 ms apart gives its request buffers back to the pool between them, as `keep_buffers_between_requests = false` does, and a new connection does so after its first request. A busy connection takes them again and keeps them. A server holding many mostly idle connections now needs buffers only for the requests in flight.
 - `res.stream` no longer flushes the headers right away. The response is sent when the buffer fills, on `flush`, or at `end`.
+- TLS uses ztls v0.3.0, with AWS-LC 5.15.0.
 
 ### Fixed
 
